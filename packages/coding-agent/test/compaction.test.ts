@@ -310,6 +310,49 @@ describe("shouldCompact", () => {
 		expect(shouldCompact(95000, 100000, settings)).toBe(false);
 		expect(shouldCompact(95000, 0, { ...settings, enabled: true })).toBe(false);
 	});
+
+	describe("model-aware max output reserve", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			reserveTokens: 10000,
+			keepRecentTokens: 20000,
+		};
+
+		it("compacts when a full-length response would not fit the window", () => {
+			const contextWindow = 1_000_000;
+			const maxOutputTokens = 384_000;
+			const outputBoundary = contextWindow - maxOutputTokens; // 616k
+
+			expect(shouldCompact(outputBoundary - 1, contextWindow, settings, maxOutputTokens)).toBe(false);
+			expect(shouldCompact(outputBoundary, contextWindow, settings, maxOutputTokens)).toBe(true);
+		});
+
+		it("does not trigger earlier than the reserve/ratio boundary when output is small", () => {
+			// A small max output must not push the trigger earlier than reserve/ratio.
+			const contextWindow = 100000;
+			const maxOutputTokens = 5000;
+			const ratioBoundary = Math.floor(contextWindow * DEFAULT_COMPACTION_TRIGGER_RATIO);
+			expect(shouldCompact(ratioBoundary, contextWindow, settings, maxOutputTokens)).toBe(true);
+			// reserve boundary (window - 10000 = 90000) is later than ratio (87000).
+			expect(shouldCompact(86999, contextWindow, settings, maxOutputTokens)).toBe(false);
+		});
+
+		it("ignores max output when omitted or non-positive (backward compatible)", () => {
+			const contextWindow = 100000;
+			const ratioBoundary = Math.floor(contextWindow * DEFAULT_COMPACTION_TRIGGER_RATIO);
+			expect(shouldCompact(ratioBoundary, contextWindow, settings)).toBe(true);
+			expect(shouldCompact(ratioBoundary, contextWindow, settings, 0)).toBe(true);
+			expect(shouldCompact(ratioBoundary, contextWindow, settings, Number.NaN)).toBe(true);
+		});
+
+		it("compacts immediately when a single response cannot fit the window", () => {
+			// If max output exceeds the whole window, no response could ever fit, so
+			// compaction must fire as early as possible rather than allowing overflow.
+			const contextWindow = 100000;
+			const maxOutputTokens = 200000;
+			expect(shouldCompact(1, contextWindow, settings, maxOutputTokens)).toBe(true);
+		});
+	});
 });
 
 describe("findCutPoint", () => {

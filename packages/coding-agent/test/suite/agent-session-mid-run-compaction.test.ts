@@ -25,8 +25,32 @@ describe("AgentSession mid-run compaction", () => {
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
 	});
 
-	it("compacts at 87% between tool turns before the next provider request", async () => {
-		const echoTool: AgentTool = {
+	/**
+	 * Derive a context window that lands the tool-turn context estimate in the
+	 * 87%-threshold band, regardless of the default system prompt's size.
+	 *
+	 * The faux provider computes the tool-turn usage from the full serialized
+	 * context (system prompt + conversation, at ~chars/4), so the mid-run
+	 * compaction trigger depends on the actual system prompt length. Probing the
+	 * harness once and sizing the window from that length keeps this test stable
+	 * when the default prompt grows (e.g. new always-on guidelines).
+	 */
+	async function thresholdWindowForDefaultPrompt(): Promise<number> {
+		const probe = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 1_000_000, maxTokens: 20 }],
+			settings: { compaction: { enabled: true, reserveTokens: 0, keepRecentTokens: 1 } },
+			tools: [echoTool()],
+		});
+		harnesses.push(probe);
+		const systemPromptLength = probe.session.systemPrompt.length;
+		// Conversation overhead is stable (~72 tokens) for this harness; the window
+		// is chosen so the tool-turn estimate sits at ~90% of it, inside [87%, 100%).
+		const estimate = Math.ceil(systemPromptLength / 4) + 72;
+		return Math.floor(estimate / 0.9);
+	}
+
+	function echoTool(): AgentTool {
+		return {
 			name: "echo",
 			label: "Echo",
 			description: "Return text",
@@ -36,10 +60,13 @@ describe("AgentSession mid-run compaction", () => {
 				return { content: [{ type: "text", text }], details: undefined };
 			},
 		};
+	}
+
+	it("compacts at 87% between tool turns before the next provider request", async () => {
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 600, maxTokens: 20 }],
+			models: [{ id: "faux-1", contextWindow: await thresholdWindowForDefaultPrompt(), maxTokens: 20 }],
 			settings: { compaction: { enabled: true, reserveTokens: 0, keepRecentTokens: 1 } },
-			tools: [echoTool],
+			tools: [echoTool()],
 			extensionFactories: [
 				(pi) => {
 					pi.on("session_before_compact", async (event) => ({

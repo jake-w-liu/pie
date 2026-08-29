@@ -237,13 +237,26 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
  * The ratio boundary prevents large-context models from waiting until nearly
  * full, while the reserve boundary remains authoritative when it is stricter.
  */
-export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
+export function shouldCompact(
+	contextTokens: number,
+	contextWindow: number,
+	settings: CompactionSettings,
+	maxOutputTokens?: number,
+): boolean {
 	if (!settings.enabled || !Number.isFinite(contextWindow) || contextWindow <= 0 || contextTokens <= 0) return false;
 
 	const reserveTokens = Number.isFinite(settings.reserveTokens) ? Math.max(0, settings.reserveTokens) : 0;
 	const ratioBoundary = Math.floor(contextWindow * DEFAULT_COMPACTION_TRIGGER_RATIO);
 	const reserveBoundary = contextWindow - reserveTokens;
-	const triggerBoundary = Math.max(1, Math.min(ratioBoundary, reserveBoundary));
+	// Model-aware guarantee: compact early enough that a full-length response can
+	// always fit. Without this, a model whose max output exceeds the 87% headroom
+	// (e.g. 384k output in a 1M window leaves only 130k) can overflow right after
+	// compaction. Only applies when the model reports a bounded max output.
+	const outputBoundary =
+		maxOutputTokens !== undefined && Number.isFinite(maxOutputTokens) && maxOutputTokens > 0
+			? contextWindow - maxOutputTokens
+			: Number.POSITIVE_INFINITY;
+	const triggerBoundary = Math.max(1, Math.min(ratioBoundary, reserveBoundary, outputBoundary));
 	return contextTokens >= triggerBoundary;
 }
 

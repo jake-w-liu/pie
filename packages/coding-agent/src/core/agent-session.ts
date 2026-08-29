@@ -588,12 +588,13 @@ export class AgentSession {
 			let refreshedTurn = turn;
 			const compactionSettings = this.settingsManager.getCompactionSettings();
 			const contextWindow = this.agent.state.model.contextWindow;
+			const maxOutputTokens = this.agent.state.model.maxTokens > 0 ? this.agent.state.model.maxTokens : undefined;
 			const contextTokens = this._estimateProjectedContextTokens(turn.context.messages);
 			const willContinue = turn.toolResults.length > 0 || this.agent.hasQueuedMessages();
 			if (
 				willContinue &&
 				turn.message.stopReason !== "length" &&
-				shouldCompact(contextTokens, contextWindow, compactionSettings)
+				shouldCompact(contextTokens, contextWindow, compactionSettings, maxOutputTokens)
 			) {
 				const previousCompactionId = getLatestCompactionEntry(this.sessionManager.getBranch())?.id;
 				const reason = contextTokens >= contextWindow ? "overflow" : "threshold";
@@ -606,7 +607,7 @@ export class AgentSession {
 					};
 				}
 				const remainingTokens = this._estimateProjectedContextTokens(refreshedTurn.context.messages);
-				if (shouldCompact(remainingTokens, contextWindow, compactionSettings)) {
+				if (shouldCompact(remainingTokens, contextWindow, compactionSettings, maxOutputTokens)) {
 					this._stopAfterTurnForContextLimit = true;
 					this._emit({ type: "context_limit", tokens: remainingTokens, contextWindow });
 				}
@@ -2272,7 +2273,8 @@ export class AgentSession {
 		} else {
 			contextTokens = directContextTokens;
 		}
-		if (shouldCompact(contextTokens, contextWindow, settings)) {
+		const maxOutputTokens = this.model && this.model.maxTokens > 0 ? this.model.maxTokens : undefined;
+		if (shouldCompact(contextTokens, contextWindow, settings, maxOutputTokens)) {
 			return await this._runAutoCompaction("threshold", false);
 		}
 		return false;

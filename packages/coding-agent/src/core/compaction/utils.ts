@@ -98,6 +98,26 @@ function truncateForSummary(text: string, maxChars: number): string {
 	return `${text.slice(0, maxChars)}\n\n[... ${truncatedChars} more characters truncated]`;
 }
 
+function boundedContentText(content: string | readonly { type: string; text?: string }[], maxChars: number): string {
+	if (typeof content === "string") return truncateForSummary(content, maxChars);
+
+	let totalChars = 0;
+	let remainingChars = maxChars;
+	const parts: string[] = [];
+	for (const block of content) {
+		if (block.type !== "text" || block.text === undefined) continue;
+		totalChars += block.text.length;
+		if (remainingChars <= 0) continue;
+		const part = block.text.slice(0, remainingChars);
+		parts.push(part);
+		remainingChars -= part.length;
+	}
+
+	const text = parts.join("");
+	if (totalChars <= maxChars) return text;
+	return `${text}\n\n[... ${totalChars - maxChars} more characters truncated]`;
+}
+
 /**
  * Serialize LLM messages to text for summarization.
  * This prevents the model from treating it as a conversation to continue.
@@ -139,14 +159,19 @@ export function serializeConversation(messages: Message[]): string {
 				parts.push(`[Assistant tool calls]: ${toolCalls.join("; ")}`);
 			}
 		} else if (msg.role === "toolResult") {
-			const content = contentText(msg.content, "");
+			const content = boundedContentText(msg.content, TOOL_RESULT_MAX_CHARS);
 			if (content) {
-				parts.push(`[Tool result]: ${truncateForSummary(content, TOOL_RESULT_MAX_CHARS)}`);
+				parts.push(`[Tool result]: ${content}`);
 			}
 		}
 	}
 
 	return parts.join("\n\n");
+}
+
+/** Estimate the token footprint of one message after summary serialization and truncation. */
+export function estimateSerializedSummaryTokens(message: Message): number {
+	return Math.ceil(serializeConversation([message]).length / 4);
 }
 
 // ============================================================================

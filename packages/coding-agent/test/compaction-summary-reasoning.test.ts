@@ -5,6 +5,7 @@ import {
 	type CompactionPreparation,
 	compact,
 	completeSummarization,
+	DEFAULT_COMPACTION_SETTINGS,
 	generateSummary,
 	generateSummaryWithUsage,
 } from "../src/core/compaction/index.ts";
@@ -184,6 +185,17 @@ describe("generateSummary reasoning options", () => {
 		);
 	});
 
+	it("rejects a history summary without text", async () => {
+		completeSimpleMock.mockResolvedValueOnce({
+			...mockSummaryResponse,
+			content: [{ type: "thinking", thinking: "internal only" }],
+		});
+
+		await expect(generateSummaryWithUsage(messages, createModel(false), 2000, "test-key")).rejects.toThrow(
+			"response contained no summary text",
+		);
+	});
+
 	it("rejects a length-limited split-turn summary", async () => {
 		completeSimpleMock.mockResolvedValueOnce({
 			...mockSummaryResponse,
@@ -202,6 +214,34 @@ describe("generateSummary reasoning options", () => {
 
 		await expect(compact(preparation, createModel(false), "test-key")).rejects.toThrow(
 			"generation hit the token cap",
+		);
+	});
+
+	it("rejects a split-turn summary without text", async () => {
+		completeSimpleMock.mockResolvedValueOnce({
+			...mockSummaryResponse,
+			content: [{ type: "thinking", thinking: "internal only" }],
+		});
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: "entry-keep",
+			messagesToSummarize: [],
+			turnPrefixMessages: messages,
+			isSplitTurn: true,
+			tokensBefore: 100,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
+		};
+
+		await expect(compact(preparation, createModel(false), "test-key")).rejects.toThrow(
+			"response contained no summary text",
+		);
+	});
+
+	it("uses the default summary budget when the response reserve is zero", async () => {
+		await generateSummaryWithUsage(messages, createModel(false), 0, "test-key");
+
+		expect(completeSimpleMock.mock.calls[0][2]?.maxTokens).toBe(
+			Math.min(createModel(false).maxTokens, Math.floor(DEFAULT_COMPACTION_SETTINGS.reserveTokens * 0.8)),
 		);
 	});
 

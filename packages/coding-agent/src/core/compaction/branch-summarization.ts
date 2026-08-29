@@ -16,10 +16,11 @@ import {
 	createCustomMessage,
 } from "../messages.ts";
 import type { ReadonlySessionManager, SessionEntry } from "../session-manager.ts";
-import { completeSummarization, estimateTokens, getSummarizationFailure } from "./compaction.ts";
+import { completeSummarization, getSummarizationFailure } from "./compaction.ts";
 import {
 	computeFileLists,
 	createFileOps,
+	estimateSerializedSummaryTokens,
 	extractFileOpsFromMessage,
 	type FileOperations,
 	formatFileOperations,
@@ -156,8 +157,6 @@ export function collectEntriesForBranchSummary(
 function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 	switch (entry.type) {
 		case "message":
-			// Skip tool results - context is in assistant's tool call
-			if (entry.message.role === "toolResult") return undefined;
 			return entry.message;
 
 		case "custom_message":
@@ -198,10 +197,10 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 	let totalTokens = 0;
 
 	// First pass: collect file ops from ALL entries (even if they don't fit in token budget)
-	// This ensures we capture cumulative file tracking from nested branch summaries
+	// This ensures we capture cumulative file tracking from prior generated summaries.
 	// Only extract from pi-generated summaries (fromHook !== true), not extension-generated ones
 	for (const entry of entries) {
-		if (entry.type === "branch_summary" && !entry.fromHook && entry.details) {
+		if ((entry.type === "branch_summary" || entry.type === "compaction") && !entry.fromHook && entry.details) {
 			const details = entry.details as BranchSummaryDetails;
 			if (Array.isArray(details.readFiles)) {
 				for (const f of details.readFiles) fileOps.read.add(f);
@@ -220,11 +219,13 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 		const entry = entries[i];
 		const message = getMessageFromEntry(entry);
 		if (!message) continue;
+		const serializedMessage = convertToLlm([message])[0];
+		if (!serializedMessage) continue;
 
 		// Extract file ops from assistant messages (tool calls)
 		extractFileOpsFromMessage(message, fileOps);
 
-		const tokens = estimateTokens(message);
+		const tokens = estimateSerializedSummaryTokens(serializedMessage);
 
 		// Check budget before adding
 		if (tokenBudget > 0 && totalTokens + tokens > tokenBudget) {
@@ -354,7 +355,8 @@ export async function generateBranchSummary(
 	if (response.stopReason === "aborted") {
 		return { aborted: true };
 	}
-	const failure = getSummarizationFailure(response, "Branch summarization");
+	const summaryText = contentText(response.content);
+	const failure = getSummarizationFailure(response, "Branch summarization", summaryText);
 	if (failure) {
 		return { error: failure };
 	}
@@ -362,7 +364,7 @@ export async function generateBranchSummary(
 		return { error: "Branch summarization attempted to call a tool" };
 	}
 
-	let summary = contentText(response.content);
+	let summary = summaryText;
 
 	// Prepend preamble to provide context about the branch summary
 	summary = BRANCH_SUMMARY_PREAMBLE + summary;
@@ -372,7 +374,7 @@ export async function generateBranchSummary(
 	summary += formatFileOperations(readFiles, modifiedFiles);
 
 	return {
-		summary: summary || "No summary generated",
+		summary,
 		usage: response.usage,
 		readFiles,
 		modifiedFiles,

@@ -10,12 +10,19 @@
 
 ### Changed
 
+- Reduced repeat-frame allocation churn by reusing unchanged normalized fullscreen rows, releasing the final-document copy after shutdown, and streaming large fullscreen writes through bounded buffers.
 - Reduced long-transcript main-screen allocation churn by reusing normalized unchanged rows, and stopped fullscreen from writing no-op frames.
 - Bypassed Markdown tokenization for syntax-free plain text while retaining full parsing for links, formatting, math, lists, tables, and code.
 - Extended slash-command autocomplete to a whitespace-bounded `/` token anywhere on the first line, so `please run /` opens the same command menu as a line-start `/`; slashes inside words and paths with a second separator still complete as files.
 
 ### Fixed
 
+- Fixed fullscreen manual scrolling resuming follow mode after transient content or layout shrink reached the current offset.
+- Fixed animated text rows being erased before their replacements were drawn, which could expose a blank flashing row on terminals without synchronized output.
+- Fixed component timers requesting a frame while stopped from suppressing the first render after a later restart.
+- Fixed rejected fullscreen clipboard callbacks surfacing as unhandled promise rejections instead of a visible copy failure.
+- Fixed alternate-screen shutdown truncating flexible `VStack` content to its viewport basis instead of printing the complete final document.
+- Fixed `Box.setBgFn()` reusing stale cached rows when two different background functions happened to style a probe string identically.
 - Fixed fullscreen follow-end scrolling being restored after an explicit upward scroll at the top of a short transcript.
 - Fixed pending render requests suppressing the first frame after restarting a TUI instance.
 - Fixed timed-out terminal background-color queries retaining one callback object per unanswered query.

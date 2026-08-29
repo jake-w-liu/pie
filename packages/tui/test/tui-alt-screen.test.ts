@@ -113,6 +113,33 @@ describe("TuiAltScreen", () => {
 		tui.stop();
 	});
 
+	it("preserves manual scrolling when transient content shrink reaches the current offset", async () => {
+		const terminal = new VirtualTerminal(20, 4);
+		const tui = new TuiAltScreen(terminal);
+		const text = new Text(Array.from({ length: 8 }, (_, index) => `line ${index + 1}`).join("\n"), 0, 0);
+		tui.setLayoutRoot(new ScrollView(text, { follow: "end", primary: true }));
+		tui.start();
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<64;1;1M");
+		await terminal.waitForRender();
+		assert.strictEqual(tui.viewportTop, 3);
+		assert.strictEqual(tui.isFollowingOutput, false);
+
+		text.setText(Array.from({ length: 7 }, (_, index) => `line ${index + 1}`).join("\n"));
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.strictEqual(tui.viewportTop, 3);
+		assert.strictEqual(tui.isFollowingOutput, false);
+
+		text.setText(Array.from({ length: 8 }, (_, index) => `line ${index + 1}`).join("\n"));
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.strictEqual(tui.viewportTop, 3);
+		assert.strictEqual(tui.isFollowingOutput, false);
+		tui.stop();
+	});
+
 	it("keeps an explicit dock fixed while the transcript scrolls", async () => {
 		const terminal = new VirtualTerminal(20, 6);
 		const tui = new TuiAltScreen(terminal);
@@ -170,6 +197,46 @@ describe("TuiAltScreen", () => {
 		tui.renderNow();
 
 		assert.strictEqual(terminal.events.filter((event) => event.type === "write").length, writeCount);
+		tui.stop();
+	});
+
+	it("repaints changed text before clearing stale trailing cells", async () => {
+		const terminal = new RecordingTerminal(20, 2);
+		const tui = new TuiAltScreen(terminal);
+		let line = "longer text";
+		tui.addChild({
+			render: () => [line],
+			invalidate: () => {},
+		});
+		tui.start();
+		await terminal.waitForRender();
+		const eventCount = terminal.events.length;
+
+		line = "short";
+		tui.requestRender();
+		await terminal.waitForRender();
+		const update = terminal.events
+			.slice(eventCount)
+			.filter((event): event is { type: "write"; data: string } => event.type === "write")
+			.map((event) => event.data)
+			.join("");
+		assert.ok(update.indexOf("short") >= 0);
+		assert.ok(update.indexOf("short") < update.indexOf("\x1b[K"));
+		assert.ok(!update.includes("\x1b[2K"));
+		assert.strictEqual(terminal.getViewport()[0]?.trimEnd(), "short");
+
+		const fullWidth = "x".repeat(20);
+		const fullWidthEventCount = terminal.events.length;
+		line = fullWidth;
+		tui.requestRender();
+		await terminal.waitForRender();
+		const fullWidthUpdate = terminal.events
+			.slice(fullWidthEventCount)
+			.filter((event): event is { type: "write"; data: string } => event.type === "write")
+			.map((event) => event.data)
+			.join("");
+		assert.ok(!fullWidthUpdate.includes("\x1b[K"));
+		assert.strictEqual(terminal.getViewport()[0], fullWidth);
 		tui.stop();
 	});
 
@@ -1123,6 +1190,31 @@ describe("TuiAltScreen", () => {
 		tui.stop();
 	});
 
+	it("contains rejected copySelection handlers and reports failure", async () => {
+		const terminal = new RecordingTerminal(20, 2);
+		const tui = new TuiAltScreen(terminal, undefined, undefined, {
+			copyOnSelect: false,
+			copySelection: async () => {
+				throw new Error("clipboard unavailable");
+			},
+		});
+		tui.addChild(new Text("alpha\nbeta", 0, 0));
+		tui.start();
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;1;1M");
+		terminal.sendInput("\x1b[<32;4;2M");
+		terminal.sendInput("\x1b[<0;4;2m");
+		await terminal.waitForRender();
+
+		await assert.doesNotReject(async () => {
+			assert.strictEqual(await tui.copyActiveSelectionToClipboard(), false);
+		});
+		await terminal.waitForRender();
+		assert.ok(terminal.getViewport().some((line) => line.includes("Copy failed")));
+		tui.stop();
+	});
+
 	it("does not append whitespace to double-click word highlighting", async () => {
 		const terminal = new RecordingTerminal(20, 1);
 		const tui = new TuiAltScreen(terminal);
@@ -1466,6 +1558,34 @@ describe("TuiAltScreen", () => {
 			assert.ok(restoreEvent.data.includes("fifth"));
 			assert.ok(restoreEvent.data.includes("sixth"));
 			assert.ok(restoreEvent.data.indexOf("first") < restoreEvent.data.indexOf("sixth"));
+		}
+	});
+
+	it("prints complete flexible stack content when leaving alt mode", async () => {
+		const terminal = new RecordingTerminal(20, 3);
+		const tui = new TuiAltScreen(terminal);
+		const transcript = new ScrollView(new Text("first\nsecond\nthird\nfourth", 0, 0), {
+			follow: "end",
+			primary: true,
+		});
+		tui.setLayoutRoot(
+			new VStack([
+				{ component: transcript, basis: 0, grow: 1, minSize: 1 },
+				{ component: new Text("dock", 0, 0), basis: "auto", minSize: 1 },
+			]),
+		);
+		tui.start();
+		await terminal.waitForRender();
+		tui.stop();
+
+		const restoreEvent = terminal.events.find(
+			(event) => event.type === "write" && event.data.includes("\x1b[?1049l"),
+		);
+		assert.strictEqual(restoreEvent?.type, "write");
+		if (restoreEvent?.type === "write") {
+			for (const line of ["first", "second", "third", "fourth", "dock"]) {
+				assert.ok(restoreEvent.data.includes(line), `missing ${line}`);
+			}
 		}
 	});
 

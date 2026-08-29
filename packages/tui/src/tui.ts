@@ -250,6 +250,59 @@ export class Container implements Component {
  * TUI - Main class for managing terminal UI with differential rendering
  */
 const SEGMENT_RESET = "\x1b[0m\x1b]8;;\x07";
+const MAX_RENDER_WRITE_CHARS = 1024 * 1024;
+
+/** Streams terminal output in bounded chunks without splitting UTF-16 surrogate pairs. */
+export class BoundedTerminalWriter {
+	private buffer = "";
+	private writtenChars = 0;
+	private readonly write: (data: string) => void;
+
+	constructor(write: (data: string) => void) {
+		this.write = write;
+	}
+
+	append(value: string): void {
+		let offset = 0;
+		while (offset < value.length) {
+			const capacity = MAX_RENDER_WRITE_CHARS - this.buffer.length;
+			if (capacity === 0) {
+				this.flush();
+				continue;
+			}
+
+			let end = Math.min(value.length, offset + capacity);
+			if (
+				end < value.length &&
+				value.charCodeAt(end - 1) >= 0xd800 &&
+				value.charCodeAt(end - 1) <= 0xdbff &&
+				value.charCodeAt(end) >= 0xdc00 &&
+				value.charCodeAt(end) <= 0xdfff
+			) {
+				end--;
+			}
+			if (end === offset) {
+				this.flush();
+				continue;
+			}
+
+			this.buffer += value.slice(offset, end);
+			offset = end;
+			if (this.buffer.length === MAX_RENDER_WRITE_CHARS) this.flush();
+		}
+	}
+
+	flush(): void {
+		if (!this.buffer) return;
+		this.write(this.buffer);
+		this.writtenChars += this.buffer.length;
+		this.buffer = "";
+	}
+
+	get length(): number {
+		return this.writtenChars + this.buffer.length;
+	}
+}
 
 /** Composite overlay content into a terminal line at a fixed column. */
 export function compositeTuiLine(
@@ -406,7 +459,7 @@ export abstract class TuiBase extends Container implements TUI {
 
 	/**
 	 * Set whether to trigger full re-render when content shrinks.
-	 * When true (default), empty rows are cleared when content shrinks.
+	 * When true, empty rows are cleared when content shrinks.
 	 * When false, empty rows remain (reduces redraws on slower terminals).
 	 */
 	setClearOnShrink(enabled: boolean): void {
@@ -776,6 +829,10 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	requestRender(force = false): void {
+		if (this.stopped) {
+			if (force) this.resetRenderState();
+			return;
+		}
 		if (force) {
 			this.resetRenderState();
 			this.requestImmediateRender();
@@ -1187,14 +1244,14 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	protected applyLineResets(lines: string[]): string[] {
-		const reset = SEGMENT_RESET;
 		for (let i = 0; i < lines.length; i++) {
-			const line = lines[i];
-			if (!isImageLine(line)) {
-				lines[i] = normalizeTerminalOutput(line) + reset;
-			}
+			lines[i] = this.applyLineReset(lines[i]);
 		}
 		return lines;
+	}
+
+	protected applyLineReset(line: string): string {
+		return isImageLine(line) ? line : normalizeTerminalOutput(line) + SEGMENT_RESET;
 	}
 
 	private compositeLineAt(

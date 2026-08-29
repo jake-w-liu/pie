@@ -161,6 +161,44 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	keepRecentTokens: 20000,
 };
 
+function getSummarizationTokenBudget(reserveTokens: number, ratio: number, modelMaxTokens: number): number {
+	const effectiveReserve =
+		Number.isFinite(reserveTokens) && reserveTokens > 0 ? reserveTokens : DEFAULT_COMPACTION_SETTINGS.reserveTokens;
+	const reserveBudget = Math.max(1, Math.floor(effectiveReserve * ratio));
+	const modelBudget =
+		Number.isFinite(modelMaxTokens) && modelMaxTokens > 0
+			? Math.max(1, Math.floor(modelMaxTokens))
+			: Number.POSITIVE_INFINITY;
+	return Math.min(reserveBudget, modelBudget);
+}
+
+function extractSummaryText(response: AssistantMessage, label: string): Result<string, CompactionError> {
+	if (response.stopReason === "aborted") {
+		return err(new CompactionError("aborted", response.errorMessage || `${label} aborted`));
+	}
+	if (response.stopReason === "error") {
+		return err(
+			new CompactionError("summarization_failed", `${label} failed: ${response.errorMessage || "Unknown error"}`),
+		);
+	}
+	if (response.stopReason === "length") {
+		return err(
+			new CompactionError(
+				"summarization_failed",
+				`${label} failed: generation hit the token cap and the summary is incomplete`,
+			),
+		);
+	}
+	if (response.content.some((block) => block.type === "toolCall")) {
+		return err(new CompactionError("summarization_failed", `${label} attempted to call a tool`));
+	}
+	const text = contentText(response.content);
+	if (text.trim().length === 0) {
+		return err(new CompactionError("summarization_failed", `${label} failed: response contained no summary text`));
+	}
+	return ok(text);
+}
+
 /** Calculate total context tokens from provider usage. */
 export function calculateContextTokens(usage: Usage): number {
 	return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
@@ -538,10 +576,7 @@ export async function generateSummaryWithUsage(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 ): Promise<Result<{ text: string; usage: Usage }, CompactionError>> {
-	const maxTokens = Math.min(
-		Math.floor(0.8 * reserveTokens),
-		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
-	);
+	const maxTokens = getSummarizationTokenBudget(reserveTokens, 0.8, model.maxTokens);
 	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
 	if (customInstructions) {
 		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
@@ -575,21 +610,8 @@ export async function generateSummaryWithUsage(
 		retry,
 		callbacks,
 	);
-	if (response.stopReason === "aborted") {
-		return err(new CompactionError("aborted", response.errorMessage || "Summarization aborted"));
-	}
-	if (response.stopReason === "error") {
-		return err(
-			new CompactionError(
-				"summarization_failed",
-				`Summarization failed: ${response.errorMessage || "Unknown error"}`,
-			),
-		);
-	}
-
-	const textContent = contentText(response.content);
-
-	return ok({ text: textContent, usage: response.usage });
+	const text = extractSummaryText(response, "Summarization");
+	return text.ok ? ok({ text: text.value, usage: response.usage }) : err(text.error);
 }
 
 /** Prepared inputs for a compaction run. */
@@ -819,10 +841,7 @@ async function generateTurnPrefixSummary(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 ): Promise<Result<{ text: string; usage: Usage }, CompactionError>> {
-	const maxTokens = Math.min(
-		Math.floor(0.5 * reserveTokens),
-		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
-	);
+	const maxTokens = getSummarizationTokenBudget(reserveTokens, 0.5, model.maxTokens);
 	const llmMessages = convertToLlm(messages);
 	const conversationText = serializeConversation(llmMessages);
 	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
@@ -846,20 +865,6 @@ async function generateTurnPrefixSummary(
 		retry,
 		callbacks,
 	);
-	if (response.stopReason === "aborted") {
-		return err(new CompactionError("aborted", response.errorMessage || "Turn prefix summarization aborted"));
-	}
-	if (response.stopReason === "error") {
-		return err(
-			new CompactionError(
-				"summarization_failed",
-				`Turn prefix summarization failed: ${response.errorMessage || "Unknown error"}`,
-			),
-		);
-	}
-
-	return ok({
-		text: contentText(response.content),
-		usage: response.usage,
-	});
+	const text = extractSummaryText(response, "Turn prefix summarization");
+	return text.ok ? ok({ text: text.value, usage: response.usage }) : err(text.error);
 }

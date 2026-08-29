@@ -14,6 +14,7 @@ import {
 	setCellDimensions,
 } from "../src/terminal-image.ts";
 import type { Component, TUI } from "../src/tui.ts";
+import { TuiAltScreen } from "../src/tui-alt-screen.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
@@ -152,6 +153,26 @@ describe("TUI render scheduling", () => {
 		assert.ok(terminal.getViewport()[0]?.includes("restarted content"));
 		tui.stop();
 	});
+
+	it("ignores render requests issued while stopped", async () => {
+		const terminal = new VirtualTerminal(40, 4);
+		const tui = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		component.lines = ["before stop"];
+		tui.addChild(component);
+		tui.start();
+		await terminal.waitForRender();
+		tui.stop();
+
+		component.lines = ["changed while stopped"];
+		tui.requestRender();
+		await new Promise<void>((resolve) => process.nextTick(resolve));
+		tui.start();
+		await terminal.waitForRender();
+
+		assert.ok(terminal.getViewport().some((line) => line.includes("changed while stopped")));
+		tui.stop();
+	});
 });
 
 describe("TUI debug logging", () => {
@@ -218,6 +239,26 @@ describe("TUI bounded render output", () => {
 		assert.ok(output.startsWith("\x1b[?2026h"));
 		assert.ok(output.endsWith("\x1b[?2026l"));
 		assert.ok(!output.includes("\x1b[2J"), "the update should stay on the differential render path");
+	});
+
+	it("splits large alternate-screen frames and final-document output", () => {
+		const terminal = new BoundedWriteTerminal();
+		const tui = new TuiAltScreen(terminal);
+		const component = new TestComponent();
+		const kittyLine = `\x1b_Ga=T,f=100;${"A".repeat(1_200_000)}\x1b\\`;
+		component.lines = [kittyLine, kittyLine];
+		tui.addChild(component);
+		tui.start();
+		terminal.writes.length = 0;
+
+		tui.renderNow();
+		assert.ok(terminal.writes.length > 2, "large fullscreen output should be split across writes");
+		assert.ok(terminal.writes.every((write) => write.length <= MAX_RENDER_WRITE_CHARS));
+
+		terminal.writes.length = 0;
+		tui.stop();
+		assert.ok(terminal.writes.length > 2, "large final-document output should be split across writes");
+		assert.ok(terminal.writes.every((write) => write.length <= MAX_RENDER_WRITE_CHARS));
 	});
 });
 
@@ -686,6 +727,34 @@ describe("TUI differential rendering", () => {
 			assert.ok(viewport[2]?.includes("Footer"), `Footer preserved: ${viewport[2]}`);
 		}
 
+		tui.stop();
+	});
+
+	it("repaints changed text before clearing stale trailing cells", async () => {
+		const terminal = new LoggingVirtualTerminal(20, 4);
+		const tui: TUI = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+		component.lines = ["longer text"];
+		tui.start();
+		await terminal.waitForRender();
+		terminal.clearWrites();
+
+		component.lines = ["short"];
+		tui.requestRender();
+		await terminal.waitForRender();
+		const update = terminal.getWrites();
+		assert.ok(update.indexOf("short") >= 0);
+		assert.ok(update.indexOf("short") < update.indexOf("\x1b[K"));
+		assert.ok(!update.includes("\x1b[2K"));
+		assert.strictEqual(terminal.getViewport()[0]?.trimEnd(), "short");
+
+		terminal.clearWrites();
+		component.lines = ["x".repeat(20)];
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.ok(!terminal.getWrites().includes("\x1b[K"));
+		assert.strictEqual(terminal.getViewport()[0], "x".repeat(20));
 		tui.stop();
 	});
 

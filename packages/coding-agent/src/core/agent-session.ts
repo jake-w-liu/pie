@@ -101,7 +101,7 @@ import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import { exportSessionToJsonl } from "./session-export.ts";
-import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
+import type { BranchSummaryEntry, SessionEntry, SessionManager } from "./session-manager.ts";
 import { getLatestCompactionEntry } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
@@ -588,13 +588,12 @@ export class AgentSession {
 			let refreshedTurn = turn;
 			const compactionSettings = this.settingsManager.getCompactionSettings();
 			const contextWindow = this.agent.state.model.contextWindow;
-			const maxOutputTokens = this.agent.state.model.maxTokens > 0 ? this.agent.state.model.maxTokens : undefined;
 			const contextTokens = this._estimateProjectedContextTokens(turn.context.messages);
 			const willContinue = turn.toolResults.length > 0 || this.agent.hasQueuedMessages();
 			if (
 				willContinue &&
 				turn.message.stopReason !== "length" &&
-				shouldCompact(contextTokens, contextWindow, compactionSettings, maxOutputTokens)
+				shouldCompact(contextTokens, contextWindow, compactionSettings)
 			) {
 				const previousCompactionId = getLatestCompactionEntry(this.sessionManager.getBranch())?.id;
 				const reason = contextTokens >= contextWindow ? "overflow" : "threshold";
@@ -607,7 +606,7 @@ export class AgentSession {
 					};
 				}
 				const remainingTokens = this._estimateProjectedContextTokens(refreshedTurn.context.messages);
-				if (shouldCompact(remainingTokens, contextWindow, compactionSettings, maxOutputTokens)) {
+				if (shouldCompact(remainingTokens, contextWindow, compactionSettings)) {
 					this._stopAfterTurnForContextLimit = true;
 					this._emit({ type: "context_limit", tokens: remainingTokens, contextWindow });
 				}
@@ -2072,16 +2071,21 @@ export class AgentSession {
 				throw new Error("Compaction cancelled");
 			}
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
-			const newEntries = this.sessionManager.getEntries();
+			const savedCompactionId = this.sessionManager.appendCompaction(
+				summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				fromExtension,
+				usage,
+			);
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
 			const estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
 
 			// Get the saved compaction entry for the extension event
-			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
-				| CompactionEntry
-				| undefined;
+			const savedEntry = this.sessionManager.getEntry(savedCompactionId);
+			const savedCompactionEntry = savedEntry?.type === "compaction" ? savedEntry : undefined;
 
 			if (this._extensionRunner && savedCompactionEntry) {
 				await this._extensionRunner.emit({
@@ -2273,8 +2277,7 @@ export class AgentSession {
 		} else {
 			contextTokens = directContextTokens;
 		}
-		const maxOutputTokens = this.model && this.model.maxTokens > 0 ? this.model.maxTokens : undefined;
-		if (shouldCompact(contextTokens, contextWindow, settings, maxOutputTokens)) {
+		if (shouldCompact(contextTokens, contextWindow, settings)) {
 			return await this._runAutoCompaction("threshold", false);
 		}
 		return false;
@@ -2398,16 +2401,21 @@ export class AgentSession {
 				return false;
 			}
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
-			const newEntries = this.sessionManager.getEntries();
+			const savedCompactionId = this.sessionManager.appendCompaction(
+				summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				fromExtension,
+				usage,
+			);
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
 			const estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
 
 			// Get the saved compaction entry for the extension event
-			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
-				| CompactionEntry
-				| undefined;
+			const savedEntry = this.sessionManager.getEntry(savedCompactionId);
+			const savedCompactionEntry = savedEntry?.type === "compaction" ? savedEntry : undefined;
 
 			if (this._extensionRunner && savedCompactionEntry) {
 				await this._extensionRunner.emit({
@@ -2448,22 +2456,26 @@ export class AgentSession {
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
 			if (started) {
-				const formattedErrorMessage =
-					reason === "overflow"
+				const aborted =
+					this._autoCompactionAbortController?.signal.aborted === true ||
+					(error instanceof Error && error.name === "AbortError");
+				const formattedErrorMessage = aborted
+					? undefined
+					: reason === "overflow"
 						? `Context overflow recovery failed: ${errorMessage}`
 						: `Auto-compaction failed: ${errorMessage}`;
 				this._emit({
 					type: "compaction_end",
 					reason,
 					result: undefined,
-					aborted: false,
+					aborted,
 					willRetry: false,
-					errorMessage: formattedErrorMessage,
+					...(formattedErrorMessage === undefined ? {} : { errorMessage: formattedErrorMessage }),
 				});
 				await this._emitSessionCompactFailed({
 					reason,
-					errorMessage: formattedErrorMessage,
-					aborted: false,
+					...(formattedErrorMessage === undefined ? {} : { errorMessage: formattedErrorMessage }),
+					aborted,
 					willRetry: false,
 					fromExtension,
 				});

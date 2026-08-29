@@ -28,6 +28,12 @@
 
 ### Fixed
 
+- Fixed model catalogs with output limits near or equal to their context windows triggering immediate auto-compaction and false context-limit stops during valid tool runs.
+- Fixed zero response-token reserves producing invalid summary request limits, and rejected empty compaction or branch summaries instead of persisting checkpoints without usable context.
+- Fixed branch summaries dropping tool results, including large results that fit after the summary serializer's bounded truncation.
+- Fixed branch summaries losing cumulative read and modified file tracking from earlier compactions on the abandoned branch.
+- Fixed repeated summary text making `session_compact` emit an older compaction entry instead of the entry that was just saved.
+- Fixed aborted summarization responses being misreported as empty-summary failures during compaction retry cancellation.
 - Fixed the interactive footer crashing when the active model has no cost metadata, so it no longer renders peak/off-peak status for models without pricing info.
 - Fixed the agent making one extra provider request before stopping when required auto-compaction is cancelled or the context still overflows; the run now stops before the next request.
 - Fixed Headroom compressing freshly produced tool results before the model received them, which forced an immediate `headroom_retrieve` round trip for every large `read`/`bash` result; only historical results (already followed by an assistant reply) are now compressed.

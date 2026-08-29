@@ -37,6 +37,6 @@ export function getWebSearchConfigPath(): string {
 export function seedDistributionWebSearchDefaults(webSearchPath = getWebSearchConfigPath()): boolean {
 	if (existsSync(webSearchPath)) return false;
 	mkdirSync(dirname(webSearchPath), { recursive: true });
-	writeFileSync(webSearchPath, JSON.stringify({ workflow: "auto-summary", autoOpenBrowser: false }, null, 2) + "\n");
+	writeFileSync(webSearchPath, `${JSON.stringify({ workflow: "auto-summary", autoOpenBrowser: false }, null, 2)}\n`);
 	return true;
 }

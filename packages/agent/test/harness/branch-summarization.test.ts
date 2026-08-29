@@ -1,7 +1,13 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { type Context, createModels, fauxAssistantMessage, fauxProvider, fauxToolCall } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
-import { collectEntriesForBranchSummary } from "../../src/harness/compaction/branch-summarization.ts";
+import {
+	collectEntriesForBranchSummary,
+	generateBranchSummary,
+} from "../../src/harness/compaction/branch-summarization.ts";
 import { InMemorySessionStorage, Session } from "../../src/harness/session/index.ts";
+import type { Entry } from "../../src/harness/session/types.ts";
+import { getOrThrow } from "../../src/harness/types.ts";
+import type { AgentMessage } from "../../src/types.ts";
 
 function message(text: string): AgentMessage {
 	return { role: "user", content: [{ type: "text", text }], timestamp: 1 };
@@ -35,5 +41,146 @@ describe("v4 branch summarization", () => {
 			entries: [],
 			commonAncestorId: null,
 		});
+	});
+
+	it("includes large tool results at their bounded serialized size", async () => {
+		const toolCallId = "branch-tool";
+		const branchEntries: Entry[] = [
+			{
+				type: "message",
+				id: "assistant",
+				parentId: null,
+				seq: 1,
+				timestamp: 1,
+				message: fauxAssistantMessage(fauxToolCall("read", { path: "result.txt" }, { id: toolCallId }), {
+					stopReason: "toolUse",
+				}),
+			},
+			{
+				type: "message",
+				id: "result",
+				parentId: "assistant",
+				seq: 2,
+				timestamp: 2,
+				message: {
+					role: "toolResult",
+					toolCallId,
+					toolName: "read",
+					content: [{ type: "text", text: `critical result ${"x".repeat(20_000)}` }],
+					isError: false,
+					timestamp: 2,
+				},
+			},
+		];
+		let requestContext: Context | undefined;
+		const models = createModels();
+		const faux = fauxProvider({
+			provider: "branch-tool-result",
+			models: [{ id: "model", contextWindow: 5000, maxTokens: 2048 }],
+		});
+		models.setProvider(faux.provider);
+		faux.setResponses([
+			(context) => {
+				requestContext = context;
+				return fauxAssistantMessage("summary");
+			},
+		]);
+
+		getOrThrow(
+			await generateBranchSummary(branchEntries, {
+				models,
+				model: faux.getModel(),
+				reserveTokens: 1000,
+				signal: new AbortController().signal,
+			}),
+		);
+
+		const prompt = JSON.stringify(requestContext?.messages);
+		expect(prompt).toContain("[Tool result]: critical result");
+		expect(prompt).toContain("more characters truncated");
+	});
+
+	it("carries file tracking forward from compaction details", async () => {
+		const entriesWithCompaction: Entry[] = [
+			{
+				type: "compaction",
+				id: "compaction",
+				parentId: null,
+				seq: 1,
+				timestamp: 1,
+				summary: "Earlier work",
+				retainedTail: [],
+				tokensBefore: 1000,
+				details: { readFiles: ["read-before.txt"], modifiedFiles: ["changed-before.ts"] },
+			},
+			{
+				type: "message",
+				id: "user",
+				parentId: "compaction",
+				seq: 2,
+				timestamp: 2,
+				message: message("continue"),
+			},
+		];
+		const models = createModels();
+		const faux = fauxProvider({ provider: "branch-file-details", models: [{ id: "model" }] });
+		models.setProvider(faux.provider);
+		faux.setResponses([fauxAssistantMessage("summary")]);
+
+		const result = getOrThrow(
+			await generateBranchSummary(entriesWithCompaction, {
+				models,
+				model: faux.getModel(),
+				signal: new AbortController().signal,
+			}),
+		);
+
+		expect(result.readFiles).toEqual(["read-before.txt"]);
+		expect(result.modifiedFiles).toEqual(["changed-before.ts"]);
+	});
+
+	it("rejects truncated, tool-only, and empty branch summaries", async () => {
+		const branchEntries: Entry[] = [
+			{
+				type: "message",
+				id: "user",
+				parentId: null,
+				seq: 1,
+				timestamp: 1,
+				message: message("summarize"),
+			},
+		];
+		const cases = [
+			{
+				response: fauxAssistantMessage("partial", { stopReason: "length" }),
+				message: "Branch summary failed: generation hit the token cap and the summary is incomplete",
+			},
+			{
+				response: fauxAssistantMessage(fauxToolCall("read", { path: "README.md" }), { stopReason: "toolUse" }),
+				message: "Branch summary attempted to call a tool",
+			},
+			{
+				response: { ...fauxAssistantMessage(""), content: [{ type: "thinking" as const, thinking: "internal" }] },
+				message: "Branch summary failed: response contained no summary text",
+			},
+		];
+
+		for (let index = 0; index < cases.length; index++) {
+			const testCase = cases[index]!;
+			const models = createModels();
+			const faux = fauxProvider({ provider: `branch-invalid-${index}`, models: [{ id: "model" }] });
+			models.setProvider(faux.provider);
+			faux.setResponses([testCase.response]);
+
+			const result = await generateBranchSummary(branchEntries, {
+				models,
+				model: faux.getModel(),
+				signal: new AbortController().signal,
+			});
+			expect(result).toMatchObject({
+				ok: false,
+				error: { code: "summarization_failed", message: testCase.message },
+			});
+		}
 	});
 });

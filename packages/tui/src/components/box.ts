@@ -4,7 +4,6 @@ import { applyBackgroundToLine, visibleWidth } from "../utils.ts";
 type RenderCache = {
 	childLines: string[];
 	width: number;
-	bgSample: string | undefined;
 	lines: string[];
 };
 
@@ -46,19 +45,18 @@ export class Box implements Component {
 
 	setBgFn(bgFn?: (text: string) => string): void {
 		this.bgFn = bgFn;
-		// Don't invalidate here - we'll detect bgFn changes by sampling output
+		this.invalidateCache();
 	}
 
 	private invalidateCache(): void {
 		this.cache = undefined;
 	}
 
-	private matchCache(width: number, childLines: string[], bgSample: string | undefined): boolean {
+	private matchCache(width: number, childLines: string[]): boolean {
 		const cache = this.cache;
 		return (
 			!!cache &&
 			cache.width === width &&
-			cache.bgSample === bgSample &&
 			cache.childLines.length === childLines.length &&
 			cache.childLines.every((line, i) => line === childLines[i])
 		);
@@ -92,11 +90,8 @@ export class Box implements Component {
 			return [];
 		}
 
-		// Check if bgFn output changed by sampling
-		const bgSample = this.bgFn ? this.bgFn("test") : undefined;
-
 		// Check cache validity
-		if (this.matchCache(width, childLines, bgSample)) {
+		if (this.matchCache(width, childLines)) {
 			return this.cache!.lines;
 		}
 
@@ -119,7 +114,7 @@ export class Box implements Component {
 		}
 
 		// Update cache
-		this.cache = { childLines, width, bgSample, lines: result };
+		this.cache = { childLines, width, lines: result };
 
 		return result;
 	}

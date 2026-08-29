@@ -111,6 +111,31 @@ describe("AgentSession mid-run compaction", () => {
 		expect(harness.session.messages.at(-1)?.role).toBe("assistant");
 	});
 
+	it("continues tool turns when catalog output caps consume most or all of the context window", async () => {
+		for (const model of [
+			{ id: "equal-window", contextWindow: 100_000, maxTokens: 100_000 },
+			{ id: "near-window", contextWindow: 20_000, maxTokens: 18_000 },
+		]) {
+			const harness = await createHarness({
+				models: [model],
+				settings: { compaction: { enabled: true, reserveTokens: 0, keepRecentTokens: 1 } },
+				tools: [echoTool()],
+			});
+			harnesses.push(harness);
+			harness.setResponses([
+				fauxAssistantMessage(fauxToolCall("echo", { text: "first result" }), { stopReason: "toolUse" }),
+				fauxAssistantMessage(fauxToolCall("echo", { text: "second result" }), { stopReason: "toolUse" }),
+				fauxAssistantMessage("done"),
+			]);
+
+			await harness.session.prompt("start");
+
+			expect(harness.faux.state.callCount).toBe(3);
+			expect(harness.eventsOfType("compaction_start")).toHaveLength(0);
+			expect(harness.eventsOfType("context_limit")).toHaveLength(0);
+		}
+	});
+
 	it("projects fresh results as raw (matching the transform) without mutating stores", async () => {
 		const headroom = new HeadroomController({ env: {}, minChars: 50, keepLines: 6 });
 		const largeResultTool: AgentTool = {

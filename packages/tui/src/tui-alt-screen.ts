@@ -29,6 +29,7 @@ import {
 	type TerminalCapabilities,
 } from "./terminal-image.ts";
 import {
+	BoundedTerminalWriter,
 	type Component,
 	CURSOR_MARKER,
 	compositeTuiLine,
@@ -170,7 +171,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	readonly mode = "fullscreen" as const;
 	readonly [VIEWPORT_TUI] = true as const;
 	private previousScreen: string[] = [];
-	private lastDocument: string[] = [];
+	private previousRawScreen: string[] = [];
 	private previousScreenWidth = 0;
 	private previousScreenHeight = 0;
 	private previousCursorSequence = "";
@@ -294,7 +295,6 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			setCapabilities({ ...capabilities, images: null });
 			this.invalidate();
 		}
-		this.lastDocument = [];
 		this.selectionAnchor = undefined;
 		this.selectionFocus = undefined;
 		this.selectionGranularity = "character";
@@ -341,16 +341,27 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		} else {
 			const width = Math.max(1, this.terminal.columns);
 			const documentLines = this.render(width).map((line) => line.replace(OSC133_ZONE_PREFIX, ""));
-			this.lastDocument = this.applyLineResets(documentLines.map((line) => line.replaceAll(CURSOR_MARKER, ""))).map(
-				(line) => (isImageLine(line) || visibleWidth(line) <= width ? line : sliceByColumn(line, 0, width, true)),
+			const finalDocument = this.applyLineResets(
+				documentLines.map((line) => line.replaceAll(CURSOR_MARKER, "")),
+			).map((line) =>
+				isImageLine(line) || visibleWidth(line) <= width ? line : sliceByColumn(line, 0, width, true),
 			);
-			let buffer = `${BEGIN_SYNCHRONIZED_OUTPUT}${EXIT_ALT_SCREEN}${DISABLE_AUTOWRAP}`;
-			for (let row = 0; row < this.lastDocument.length; row++) {
-				if (row > 0) buffer += "\r\n";
-				buffer += `\r\x1b[2K${this.lastDocument[row] ?? ""}`;
+			const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
+			output.append(`${BEGIN_SYNCHRONIZED_OUTPUT}${EXIT_ALT_SCREEN}${DISABLE_AUTOWRAP}`);
+			for (let row = 0; row < finalDocument.length; row++) {
+				if (row > 0) output.append("\r\n");
+				const line = finalDocument[row] ?? "";
+				output.append("\r");
+				if (isImageLine(line)) {
+					output.append("\x1b[2K");
+					output.append(line);
+				} else {
+					output.append(line);
+					if (visibleWidth(line) < width) output.append("\x1b[K");
+				}
 			}
-			buffer += `\x1b[0m${ENABLE_AUTOWRAP}\r\n\x1b[?25h${END_SYNCHRONIZED_OUTPUT}`;
-			this.terminal.write(buffer);
+			output.append(`\x1b[0m${ENABLE_AUTOWRAP}\r\n\x1b[?25h${END_SYNCHRONIZED_OUTPUT}`);
+			output.flush();
 		}
 		if (this.savedCapabilities) {
 			setCapabilities(this.savedCapabilities);
@@ -414,6 +425,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 	protected override resetRenderState(): void {
 		this.previousScreen = [];
+		this.previousRawScreen = [];
 		this.previousScreenWidth = 0;
 		this.previousScreenHeight = 0;
 		this.previousCursorSequence = "";
@@ -1146,7 +1158,12 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		// "Copied!" while leaving the system clipboard untouched (e.g. macOS Terminal.app, tmux
 		// without OSC 52 clipboard passthrough), so only report success when it actually copies.
 		if (this.copySelection) {
-			const ok = await this.copySelection(text);
+			let ok = false;
+			try {
+				ok = await this.copySelection(text);
+			} catch {
+				// The clipboard callback is an external boundary; report its rejection as a copy failure.
+			}
 			this.flash(ok ? "Copied!" : "Copy failed");
 			return ok;
 		}
@@ -1326,10 +1343,21 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		screen = this.compositeFlashes(screen, width, height);
 
 		const cursorPos = this.extractCursorPosition(screen, height);
-		screen = this.applyLineResets(screen).map((line) => {
-			if (isImageLine(line) || visibleWidth(line) <= width) return line;
-			return sliceByColumn(line, 0, width, true);
-		});
+		const rawScreen = screen;
+		screen = new Array<string>(rawScreen.length);
+		for (let row = 0; row < rawScreen.length; row++) {
+			const rawLine = rawScreen[row]!;
+			if (
+				this.previousScreenWidth === width &&
+				rawLine === this.previousRawScreen[row] &&
+				this.previousScreen[row] !== undefined
+			) {
+				screen[row] = this.previousScreen[row]!;
+				continue;
+			}
+			const line = this.applyLineReset(rawLine);
+			screen[row] = isImageLine(line) || visibleWidth(line) <= width ? line : sliceByColumn(line, 0, width, true);
+		}
 
 		const fullRedraw =
 			this.previousScreen.length === 0 || this.previousScreenWidth !== width || this.previousScreenHeight !== height;
@@ -1350,6 +1378,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			? `\x1b[${cursorPos.row + 1};${Math.min(width, cursorPos.col) + 1}H${this.getShowHardwareCursor() ? "\x1b[?25h" : "\x1b[?25l"}`
 			: "\x1b[?25l";
 		if (!screenChanged && cursorSequence === this.previousCursorSequence) {
+			this.previousRawScreen = rawScreen;
 			this.currentLayout = nextLayout;
 			return;
 		}
@@ -1361,30 +1390,40 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 				? this.prepareKittyScreen(screen)
 				: { lines: screen, evictedImageDeletion: "" };
 
-		let buffer = BEGIN_SYNCHRONIZED_OUTPUT;
+		const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
+		output.append(BEGIN_SYNCHRONIZED_OUTPUT);
 		if (fullRedraw) {
 			this.fullRedrawCount += 1;
 			const clearImages =
 				this.imageProtocol === "kitty" && hadUploadedKittyImages
 					? deleteAllKittyPlacements()
 					: this.deleteKittyImages();
-			buffer += `${clearImages}\x1b[2J`;
+			output.append(`${clearImages}\x1b[2J`);
 		} else if (imagesNeedRedraw) {
-			if (this.imageProtocol === "iterm2") buffer += "\x1b[2J";
-			else if (this.imageProtocol === "kitty") buffer += deleteAllKittyPlacements();
+			if (this.imageProtocol === "iterm2") output.append("\x1b[2J");
+			else if (this.imageProtocol === "kitty") output.append(deleteAllKittyPlacements());
 		}
-		buffer += preparedKittyScreen.evictedImageDeletion;
+		output.append(preparedKittyScreen.evictedImageDeletion);
 
 		for (let row = 0; row < height; row++) {
 			if (!fullRedraw && !imagesNeedRedraw && screen[row] === this.previousScreen[row]) continue;
-			buffer += `\x1b[${row + 1};1H\x1b[2K${preparedKittyScreen.lines[row] ?? ""}`;
+			const line = preparedKittyScreen.lines[row] ?? "";
+			output.append(`\x1b[${row + 1};1H`);
+			if (isImageLine(line)) {
+				output.append("\x1b[2K");
+				output.append(line);
+			} else {
+				output.append(line);
+				if (visibleWidth(line) < width) output.append("\x1b[K");
+			}
 		}
 
-		buffer += cursorSequence;
-		buffer += END_SYNCHRONIZED_OUTPUT;
-		this.terminal.write(buffer);
+		output.append(cursorSequence);
+		output.append(END_SYNCHRONIZED_OUTPUT);
+		output.flush();
 
 		this.previousScreen = screen;
+		this.previousRawScreen = rawScreen;
 		this.previousScreenWidth = width;
 		this.previousScreenHeight = height;
 		this.previousCursorSequence = cursorSequence;

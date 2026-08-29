@@ -26,13 +26,13 @@ Both use the same structured summary format and track file operations cumulative
 
 ### When It Triggers
 
-Auto-compaction triggers at the earlier of three boundaries:
+Auto-compaction triggers at the earlier of two boundaries:
 
 ```
-contextTokens >= min(floor(contextWindow * 0.87), contextWindow - reserveTokens, contextWindow - maxOutputTokens)
+contextTokens >= min(floor(contextWindow * 0.87), contextWindow - reserveTokens)
 ```
 
-The 87% boundary keeps large-context models from reaching nearly 100% before compaction. The reserve boundary remains authoritative when it triggers earlier. The model-aware output boundary guarantees room for a full-length response: a model whose max output exceeds the 87% headroom (e.g. 384k output in a 1M window leaves only 130k) would otherwise overflow right after compaction, so Pie compacts as soon as the context leaves less than `maxOutputTokens` of free space. Pie evaluates every completed assistant/tool turn before the next provider request, combining provider-reported usage with a side-effect-free projection of Headroom-compressed tool results. Compressible results are measured at their projected request size; skipped or uncompressible results retain their full size. If compaction cannot bring the projected context below the trigger, Pie stops automatic continuation instead of sending an over-limit request. The footer caps its percentage display at 100%, while raw token counts remain available for compaction and session statistics. By default, `reserveTokens` is 16384 tokens (configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`).
+The 87% boundary keeps large-context models from reaching nearly 100% before compaction. The reserve boundary remains authoritative when it triggers earlier. Model catalog output limits do not change this threshold: many providers publish limits close to or equal to the whole context window, so treating them as mandatory free space would compact almost immediately and could stop valid tool runs. Pie evaluates every completed assistant/tool turn before the next provider request, combining provider-reported usage with a side-effect-free projection of Headroom-compressed tool results. Compressible results are measured at their projected request size; skipped or uncompressible results retain their full size. If compaction cannot bring the projected context below the trigger, Pie stops automatic continuation instead of sending an over-limit request. The footer caps its percentage display at 100%, while raw token counts remain available for compaction and session statistics. By default, `reserveTokens` is 16384 tokens (configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`).
 
 You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary.
 
@@ -409,7 +409,7 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `enabled` | `true` | Enable auto-compaction at the earlier of 87% usage, the reserve boundary, or the model's max-output boundary |
+| `enabled` | `true` | Enable auto-compaction at the earlier of 87% usage or the reserve boundary |
 | `reserveTokens` | `16384` | Tokens to reserve for the LLM response; a larger reserve can trigger before 87% |
 | `keepRecentTokens` | `20000` | Recent tokens to keep (not summarized) |
 

@@ -237,26 +237,13 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
  * The ratio boundary prevents large-context models from waiting until nearly
  * full, while the reserve boundary remains authoritative when it is stricter.
  */
-export function shouldCompact(
-	contextTokens: number,
-	contextWindow: number,
-	settings: CompactionSettings,
-	maxOutputTokens?: number,
-): boolean {
+export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
 	if (!settings.enabled || !Number.isFinite(contextWindow) || contextWindow <= 0 || contextTokens <= 0) return false;
 
 	const reserveTokens = Number.isFinite(settings.reserveTokens) ? Math.max(0, settings.reserveTokens) : 0;
 	const ratioBoundary = Math.floor(contextWindow * DEFAULT_COMPACTION_TRIGGER_RATIO);
 	const reserveBoundary = contextWindow - reserveTokens;
-	// Model-aware guarantee: compact early enough that a full-length response can
-	// always fit. Without this, a model whose max output exceeds the 87% headroom
-	// (e.g. 384k output in a 1M window leaves only 130k) can overflow right after
-	// compaction. Only applies when the model reports a bounded max output.
-	const outputBoundary =
-		maxOutputTokens !== undefined && Number.isFinite(maxOutputTokens) && maxOutputTokens > 0
-			? contextWindow - maxOutputTokens
-			: Number.POSITIVE_INFINITY;
-	const triggerBoundary = Math.max(1, Math.min(ratioBoundary, reserveBoundary, outputBoundary));
+	const triggerBoundary = Math.max(1, Math.min(ratioBoundary, reserveBoundary));
 	return contextTokens >= triggerBoundary;
 }
 
@@ -577,14 +564,39 @@ ${UPDATE_SUMMARIZATION_INSTRUCTIONS}`;
  * Returns an error message when a summarization response cannot safely be persisted.
  * A length stop contains partial text and must not become a session checkpoint.
  */
-export function getSummarizationFailure(response: AssistantMessage, label: string): string | undefined {
+export function getSummarizationFailure(
+	response: AssistantMessage,
+	label: string,
+	summaryText = contentText(response.content),
+): string | undefined {
 	if (response.stopReason === "error") {
 		return `${label} failed: ${response.errorMessage || "Unknown error"}`;
 	}
 	if (response.stopReason === "length") {
 		return `${label} failed: generation hit the token cap and the summary is incomplete`;
 	}
+	if (!response.content.some((block) => block.type === "toolCall") && summaryText.trim().length === 0) {
+		return `${label} failed: response contained no summary text`;
+	}
 	return undefined;
+}
+
+function getSummarizationTokenBudget(reserveTokens: number, ratio: number, modelMaxTokens: number): number {
+	const effectiveReserve =
+		Number.isFinite(reserveTokens) && reserveTokens > 0 ? reserveTokens : DEFAULT_COMPACTION_SETTINGS.reserveTokens;
+	const reserveBudget = Math.max(1, Math.floor(effectiveReserve * ratio));
+	const modelBudget =
+		Number.isFinite(modelMaxTokens) && modelMaxTokens > 0
+			? Math.max(1, Math.floor(modelMaxTokens))
+			: Number.POSITIVE_INFINITY;
+	return Math.min(reserveBudget, modelBudget);
+}
+
+function getSummarizationAbortError(response: AssistantMessage, label: string): Error | undefined {
+	if (response.stopReason !== "aborted") return undefined;
+	const error = new Error(response.errorMessage || `${label} aborted`);
+	error.name = "AbortError";
+	return error;
 }
 
 function createSummarizationOptions(
@@ -704,10 +716,7 @@ export async function generateSummaryWithUsage(
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
 ): Promise<{ text: string; usage: Usage }> {
-	const maxTokens = Math.min(
-		Math.floor(0.8 * reserveTokens),
-		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
-	);
+	const maxTokens = getSummarizationTokenBudget(reserveTokens, 0.8, model.maxTokens);
 
 	// Use update prompt if we have a previous summary, otherwise initial prompt
 	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
@@ -746,16 +755,17 @@ export async function generateSummaryWithUsage(
 		retry,
 		callbacks,
 	);
+	const abortError = getSummarizationAbortError(response, "Summarization");
+	if (abortError) throw abortError;
 
-	const failure = getSummarizationFailure(response, "Summarization");
+	const textContent = contentText(response.content);
+	const failure = getSummarizationFailure(response, "Summarization", textContent);
 	if (failure) {
 		throw new Error(failure);
 	}
 	if (response.content.some((block) => block.type === "toolCall")) {
 		throw new Error("Summarization attempted to call a tool");
 	}
-
-	const textContent = contentText(response.content);
 
 	return { text: textContent, usage: response.usage };
 }
@@ -1015,10 +1025,7 @@ async function generateTurnPrefixSummary(
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
 ): Promise<{ text: string; usage: Usage }> {
-	const maxTokens = Math.min(
-		Math.floor(0.5 * reserveTokens),
-		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
-	); // Smaller budget for turn prefix
+	const maxTokens = getSummarizationTokenBudget(reserveTokens, 0.5, model.maxTokens);
 	const llmMessages = convertToLlm(messages);
 	const conversationText = serializeConversation(llmMessages);
 	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
@@ -1031,8 +1038,11 @@ async function generateTurnPrefixSummary(
 		retry,
 		callbacks,
 	);
+	const abortError = getSummarizationAbortError(response, "Turn prefix summarization");
+	if (abortError) throw abortError;
 
-	const failure = getSummarizationFailure(response, "Turn prefix summarization");
+	const text = contentText(response.content);
+	const failure = getSummarizationFailure(response, "Turn prefix summarization", text);
 	if (failure) {
 		throw new Error(failure);
 	}
@@ -1041,7 +1051,7 @@ async function generateTurnPrefixSummary(
 	}
 
 	return {
-		text: contentText(response.content),
+		text,
 		usage: response.usage,
 	};
 }

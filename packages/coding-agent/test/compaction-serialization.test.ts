@@ -44,6 +44,29 @@ describe("serializeConversation", () => {
 		expect(result).not.toContain("truncated");
 	});
 
+	it("bounds combined tool-result text blocks before joining them", () => {
+		const messages: Message[] = [
+			{
+				role: "toolResult",
+				toolCallId: "tc1",
+				toolName: "read",
+				content: [
+					{ type: "text", text: "a".repeat(1500) },
+					{ type: "text", text: "b".repeat(1500) },
+				],
+				isError: false,
+				timestamp: Date.now(),
+			},
+		];
+
+		const result = serializeConversation(messages);
+
+		expect(result).toContain("a".repeat(1500));
+		expect(result).toContain("b".repeat(500));
+		expect(result).not.toContain("b".repeat(501));
+		expect(result).toContain("[... 1000 more characters truncated]");
+	});
+
 	it("should not truncate assistant or user messages", () => {
 		const longText = "y".repeat(5000);
 		const messages: Message[] = [

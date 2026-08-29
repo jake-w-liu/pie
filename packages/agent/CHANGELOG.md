@@ -8,6 +8,8 @@
 
 ### Fixed
 
+- Fixed harness compaction accepting truncated, tool-call-only, or empty summaries and producing invalid summary request limits when the configured response reserve is zero.
+- Fixed harness branch summaries dropping tool results and cumulative file tracking from earlier compactions; large tool results are now budgeted at their bounded serialized size.
 - Fixed `prepareNextTurn` compaction deciding the run must stop (e.g. required compaction cancelled or context still overflowing) after the loop had already committed to the next provider request; the loop now re-checks the stop condition after preparation so no request is made.
 - Fixed Windows `NodeExecutionEnv` aborts crashing when `taskkill.exe` is unavailable on `PATH` ([#6596](https://github.com/earendil-works/pi/issues/6596)).
 

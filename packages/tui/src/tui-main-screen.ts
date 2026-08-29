@@ -1,77 +1,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
-import { type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
+import { BoundedTerminalWriter, type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
 import { normalizeTerminalOutput, visibleWidth } from "./utils.ts";
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
 const LINE_RESET = "\x1b[0m\x1b]8;;\x07";
-const MAX_RENDER_WRITE_CHARS = 1024 * 1024;
-
-/**
- * Streams terminal output in 1 MiB chunks so a full render never forms one string large enough to exceed V8's limit.
- *
- * `append()` fills the current chunk and flushes it when full. Oversized input is split at chunk boundaries, preserving
- * surrogate pairs so each write remains valid UTF-16. Callers append synchronized-output begin/end sequences themselves;
- * the final `flush()` writes any remainder, including the end sequence.
- */
-class BoundedTerminalWriter {
-	private buffer = "";
-	private writtenChars = 0;
-	private readonly write: (data: string) => void;
-
-	constructor(write: (data: string) => void) {
-		this.write = write;
-	}
-
-	/**
-	 * Append terminal data, flushing full chunks as needed. Callers must call `flush()` after the final append.
-	 * @param value Terminal data to write in order; oversized values are split without splitting surrogate pairs.
-	 */
-	append(value: string): void {
-		let offset = 0;
-		while (offset < value.length) {
-			const capacity = MAX_RENDER_WRITE_CHARS - this.buffer.length;
-			if (capacity === 0) {
-				this.flush();
-				continue;
-			}
-
-			let end = Math.min(value.length, offset + capacity);
-			if (
-				end < value.length &&
-				value.charCodeAt(end - 1) >= 0xd800 &&
-				value.charCodeAt(end - 1) <= 0xdbff &&
-				value.charCodeAt(end) >= 0xdc00 &&
-				value.charCodeAt(end) <= 0xdfff
-			) {
-				end--;
-			}
-			if (end === offset) {
-				this.flush();
-				continue;
-			}
-
-			this.buffer += value.slice(offset, end);
-			offset = end;
-			if (this.buffer.length === MAX_RENDER_WRITE_CHARS) {
-				this.flush();
-			}
-		}
-	}
-
-	/** Write the current chunk, if any, and retain only its character count for debug output. */
-	flush(): void {
-		if (!this.buffer) return;
-		this.write(this.buffer);
-		this.writtenChars += this.buffer.length;
-		this.buffer = "";
-	}
-
-	get length(): number {
-		return this.writtenChars + this.buffer.length;
-	}
-}
 
 interface KittyImageHeader {
 	ids: number[];
@@ -534,14 +468,14 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				continue;
 			}
 
-			output.append("\x1b[2K"); // Clear current line
-			if (!isImage && visibleWidth(line) > width) {
+			const lineWidth = isImage ? 0 : visibleWidth(line);
+			if (!isImage && lineWidth > width) {
 				// Log all lines to crash file for debugging
 				const crashLogPath = path.join(this.logDirectory, "pi-crash.log");
 				const crashData = [
 					`Crash at ${new Date().toISOString()}`,
 					`Terminal width: ${width}`,
-					`Line ${i} visible width: ${visibleWidth(line)}`,
+					`Line ${i} visible width: ${lineWidth}`,
 					"",
 					"=== All rendered lines ===",
 					...newLines.map((l, idx) => `[${idx}] (w=${visibleWidth(l)}) ${l}`),
@@ -554,7 +488,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				this.stop();
 
 				const errorMsg = [
-					`Rendered line ${i} exceeds terminal width (${visibleWidth(line)} > ${width}).`,
+					`Rendered line ${i} exceeds terminal width (${lineWidth} > ${width}).`,
 					"",
 					"This is likely caused by a custom TUI component not truncating its output.",
 					"Use visibleWidth() to measure and truncateToWidth() to truncate lines.",
@@ -563,7 +497,13 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				].join("\n");
 				throw new Error(errorMsg);
 			}
-			output.append(line);
+			if (isImage) {
+				output.append("\x1b[2K");
+				output.append(line);
+			} else {
+				output.append(line);
+				if (lineWidth < width) output.append("\x1b[K");
+			}
 		}
 
 		// Track where cursor ended up after rendering

@@ -5,6 +5,7 @@ import {
 	type FauxProviderHandle,
 	fauxAssistantMessage,
 	fauxProvider,
+	fauxToolCall,
 	type Message,
 	type Model,
 	type Models,
@@ -544,6 +545,56 @@ describe("harness compaction", () => {
 		expect(abortedResult).toMatchObject({ ok: false, error: { code: "aborted", message: "stopped" } });
 	});
 
+	it("rejects truncated, tool-only, and empty summary generations", async () => {
+		const messages: AgentMessage[] = [createUserMessage("Summarize this.")];
+		const { model } = createFauxModel(false);
+		const cases: Array<{ response: AssistantMessage; message: string }> = [
+			{
+				response: fauxAssistantMessage("partial", { stopReason: "length" }),
+				message: "Summarization failed: generation hit the token cap and the summary is incomplete",
+			},
+			{
+				response: fauxAssistantMessage(fauxToolCall("read", { path: "README.md" }), { stopReason: "toolUse" }),
+				message: "Summarization attempted to call a tool",
+			},
+			{
+				response: { ...fauxAssistantMessage(""), content: [{ type: "thinking", thinking: "internal only" }] },
+				message: "Summarization failed: response contained no summary text",
+			},
+		];
+
+		for (const testCase of cases) {
+			const result = await generateSummary(
+				messages,
+				createModelsWithSimpleResponses([testCase.response]),
+				model,
+				2000,
+			);
+			expect(result).toMatchObject({
+				ok: false,
+				error: { code: "summarization_failed", message: testCase.message },
+			});
+		}
+	});
+
+	it("uses a valid default summary budget when the response reserve is zero", async () => {
+		const messages: AgentMessage[] = [createUserMessage("Summarize this.")];
+		const seenOptions: Array<Record<string, unknown> | undefined> = [];
+		const { faux, model } = createFauxModel(false);
+		faux.setResponses([
+			(_context, options) => {
+				seenOptions.push(options as Record<string, unknown> | undefined);
+				return fauxAssistantMessage("summary");
+			},
+		]);
+
+		getOrThrow(await generateSummary(messages, models, model, 0));
+
+		expect(seenOptions[0]?.maxTokens).toBe(
+			Math.min(model.maxTokens, Math.floor(DEFAULT_COMPACTION_SETTINGS.reserveTokens * 0.8)),
+		);
+	});
+
 	it("clamps compaction summary maxTokens to the model output cap", async () => {
 		const messages: AgentMessage[] = [createUserMessage("Summarize this.")];
 		const seenOptions: Array<Record<string, unknown> | undefined> = [];
@@ -669,6 +720,28 @@ describe("harness compaction", () => {
 			ok: false,
 			error: { code: "aborted", message: "prefix stopped" },
 		});
+
+		const invalidCases: Array<{ response: AssistantMessage; message: string }> = [
+			{
+				response: fauxAssistantMessage("partial", { stopReason: "length" }),
+				message: "Turn prefix summarization failed: generation hit the token cap and the summary is incomplete",
+			},
+			{
+				response: fauxAssistantMessage(fauxToolCall("read", { path: "README.md" }), { stopReason: "toolUse" }),
+				message: "Turn prefix summarization attempted to call a tool",
+			},
+			{
+				response: { ...fauxAssistantMessage(""), content: [{ type: "thinking", thinking: "internal only" }] },
+				message: "Turn prefix summarization failed: response contained no summary text",
+			},
+		];
+		for (const testCase of invalidCases) {
+			const result = await compact(preparation, createModelsWithSimpleResponses([testCase.response]), model);
+			expect(result).toMatchObject({
+				ok: false,
+				error: { code: "summarization_failed", message: testCase.message },
+			});
+		}
 	});
 
 	it("returns a compaction result with file details", async () => {

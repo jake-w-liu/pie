@@ -156,6 +156,51 @@ describe("AgentSession compaction characterization", () => {
 		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
 	});
 
+	it("emits the newly saved compaction entry when summaries repeat", async () => {
+		let emittedCompactionId: string | undefined;
+		const repeatedSummary = "same summary";
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: repeatedSummary,
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+						},
+					}));
+					pi.on("session_compact", async (event) => {
+						emittedCompactionId = event.compactionEntry.id;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const firstMessageId = harness.sessionManager.getEntries().find((entry) => entry.type === "message")?.id;
+		if (!firstMessageId) throw new Error("seed did not create a message");
+		const oldCompactionId = harness.sessionManager.appendCompaction(repeatedSummary, firstMessageId, 100);
+		seedCompactableSession(harness);
+
+		await harness.session.compact();
+
+		const compactions = harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction");
+		const latestCompactionId = compactions.at(-1)?.id;
+		expect(emittedCompactionId).toBe(latestCompactionId);
+		expect(emittedCompactionId).not.toBe(oldCompactionId);
+
+		seedCompactableSession(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		await sessionInternals._runAutoCompaction("threshold", false);
+		const latestAutoCompactionId = harness.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "compaction")
+			.at(-1)?.id;
+		expect(emittedCompactionId).toBe(latestAutoCompactionId);
+		expect(emittedCompactionId).not.toBe(latestCompactionId);
+	});
+
 	it("allows a queued prompt to start when manual compaction ends", async () => {
 		const harness = await createHarness({
 			settings: { compaction: { keepRecentTokens: 1 } },

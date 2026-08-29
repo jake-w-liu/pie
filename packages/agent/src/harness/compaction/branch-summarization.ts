@@ -12,10 +12,11 @@ import type { AgentMessage } from "../../types.ts";
 import { convertToLlm, createBranchSummaryMessage, createCompactionSummaryMessage } from "../messages.ts";
 import { type Entry, type Session, SessionError } from "../session/index.ts";
 import { BranchSummaryError, err, ok, type Result } from "../types.ts";
-import { completeSimpleWithRetries, estimateTokens, SUMMARIZATION_SYSTEM_PROMPT } from "./compaction.ts";
+import { completeSimpleWithRetries, SUMMARIZATION_SYSTEM_PROMPT } from "./compaction.ts";
 import {
 	computeFileLists,
 	createFileOps,
+	estimateSerializedSummaryTokens,
 	extractFileOpsFromMessage,
 	type FileOperations,
 	formatFileOperations,
@@ -112,7 +113,6 @@ export async function collectEntriesForBranchSummary(
 function getMessageFromEntry(entry: Entry): AgentMessage | undefined {
 	switch (entry.type) {
 		case "message":
-			if (entry.message.role === "toolResult") return undefined;
 			return entry.message;
 
 		case "branch_summary":
@@ -134,7 +134,7 @@ export function prepareBranchEntries(entries: Entry[], tokenBudget: number = 0):
 	const fileOps = createFileOps();
 	let totalTokens = 0;
 	for (const entry of entries) {
-		if (entry.type === "branch_summary" && entry.details) {
+		if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.details) {
 			const details = entry.details as BranchSummaryDetails;
 			if (Array.isArray(details.readFiles)) {
 				for (const f of details.readFiles) fileOps.read.add(f);
@@ -150,9 +150,11 @@ export function prepareBranchEntries(entries: Entry[], tokenBudget: number = 0):
 		const entry = entries[i];
 		const message = getMessageFromEntry(entry);
 		if (!message) continue;
+		const serializedMessage = convertToLlm([message])[0];
+		if (!serializedMessage) continue;
 		extractFileOpsFromMessage(message, fileOps);
 
-		const tokens = estimateTokens(message);
+		const tokens = estimateSerializedSummaryTokens(serializedMessage);
 		if (tokenBudget > 0 && totalTokens + tokens > tokenBudget) {
 			if (entry.type === "compaction" || entry.type === "branch_summary") {
 				if (totalTokens < tokenBudget * 0.9) {
@@ -265,14 +267,30 @@ export async function generateBranchSummary(
 			),
 		);
 	}
+	if (response.stopReason === "length") {
+		return err(
+			new BranchSummaryError(
+				"summarization_failed",
+				"Branch summary failed: generation hit the token cap and the summary is incomplete",
+			),
+		);
+	}
+	if (response.content.some((block) => block.type === "toolCall")) {
+		return err(new BranchSummaryError("summarization_failed", "Branch summary attempted to call a tool"));
+	}
 
 	let summary = contentText(response.content);
+	if (summary.trim().length === 0) {
+		return err(
+			new BranchSummaryError("summarization_failed", "Branch summary failed: response contained no summary text"),
+		);
+	}
 	summary = BRANCH_SUMMARY_PREAMBLE + summary;
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	summary += formatFileOperations(readFiles, modifiedFiles);
 
 	return ok({
-		summary: summary || "No summary generated",
+		summary,
 		usage: response.usage,
 		readFiles,
 		modifiedFiles,

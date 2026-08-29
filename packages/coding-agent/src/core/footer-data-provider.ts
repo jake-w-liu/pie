@@ -377,6 +377,9 @@ export class FooterDataProvider {
 					}
 				});
 			}
+			// Close the race between the initial branch read and watcher activation.
+			// The same debounce coalesces any real reftable events during this window.
+			this.scheduleRefresh();
 		}
 	}
 }

@@ -1,7 +1,44 @@
 import { describe, expect, test } from "vitest";
 import { buildSystemPrompt } from "../src/core/system-prompt.ts";
 
+const sampleSkill = {
+	name: "s",
+	description: "d",
+	filePath: "/x/s.md",
+	baseDir: "/x",
+	sourceInfo: { path: "/x/s.md", source: "settings", scope: "project", origin: "top-level" } as const,
+	disableModelInvocation: false,
+} as const;
+
 describe("buildSystemPrompt", () => {
+	describe("cache stability", () => {
+		test("outputs are deterministic for identical inputs (byte-stable cache prefix)", () => {
+			const options = {
+				selectedTools: ["read", "bash", "edit", "write"],
+				contextFiles: [{ path: "/proj/AGENTS.md", content: "project rules" }],
+				skills: [sampleSkill],
+				cwd: "/proj",
+			};
+			const first = buildSystemPrompt(options);
+			const second = buildSystemPrompt(options);
+			expect(first).toBe(second);
+		});
+
+		test("keeps volatile working directory content at the very end of the prompt", () => {
+			const cwd = "/proj/alpha-beta";
+			const prompt = buildSystemPrompt({
+				selectedTools: ["read"],
+				contextFiles: [{ path: "/proj/AGENTS.md", content: "rules" }],
+				skills: [sampleSkill],
+				cwd,
+			});
+			expect(prompt.endsWith(`Current working directory: ${cwd}`)).toBe(true);
+			expect(prompt.indexOf("Current working directory")).toBe(
+				prompt.length - `Current working directory: ${cwd}`.length,
+			);
+		});
+	});
+
 	describe("empty tools", () => {
 		test("shows (none) for empty tools list", () => {
 			const prompt = buildSystemPrompt({
@@ -98,6 +135,23 @@ describe("buildSystemPrompt", () => {
 			});
 
 			expect(prompt).not.toContain("dynamic_tool");
+		});
+	});
+
+	describe("ponytail minimal-change guide", () => {
+		test("is always present regardless of tool set", () => {
+			for (const selectedTools of [["read"], ["read", "bash", "edit", "write"], ["grep", "find", "ls"]]) {
+				const prompt = buildSystemPrompt({
+					selectedTools,
+					contextFiles: [],
+					skills: [],
+					cwd: process.cwd(),
+				});
+				expect(prompt).toContain("Build only what the request asks for");
+				expect(prompt).toContain("Reuse before writing");
+				expect(prompt).toContain("Prefer the smallest change that works");
+				expect(prompt).toContain("Never trade correctness, robustness, or error handling for brevity");
+			}
 		});
 	});
 

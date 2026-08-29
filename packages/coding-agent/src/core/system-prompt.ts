@@ -123,6 +123,15 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	addGuideline("Be concise in your responses");
 	addGuideline("Show file paths clearly when working with files");
 
+	// Ponytail: minimal-change guide, always loaded. These guidelines reduce
+	// the expensive output tokens without trading correctness or robustness.
+	addGuideline("Build only what the request asks for; skip unrequested features and speculative generality");
+	addGuideline(
+		"Reuse before writing: an existing part of the codebase, the standard library, or an installed dependency",
+	);
+	addGuideline("Prefer the smallest change that works; avoid scaffolding, placeholders, and gratuitous abstractions");
+	addGuideline("Never trade correctness, robustness, or error handling for brevity");
+
 	const guidelines = guidelinesList.map((g) => `- ${g}`).join("\n");
 
 	let prompt = `You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.

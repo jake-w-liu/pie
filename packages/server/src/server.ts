@@ -144,7 +144,7 @@ export class PiServer {
 			onClose: () => this.transportClosed(state),
 			onError: (error) => {
 				this.reportError(error);
-				void this.closeConnection(connection).then(() => this.disconnect(state));
+				void this.closeConnection(state.connection).then(() => this.disconnect(state));
 			},
 		};
 	}

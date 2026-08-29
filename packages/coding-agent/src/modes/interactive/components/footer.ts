@@ -168,7 +168,7 @@ export class FooterComponent implements Component {
 			: false;
 		// Show whether the active model is currently in its peak-pricing window (e.g. DeepSeek),
 		// so the displayed cost is understood against the peak/off-peak rate.
-		const peakStatus = state.model?.cost.peak ? (isPeakPricingActive(state.model) ? " (peak)" : " (off-peak)") : "";
+		const peakStatus = state.model?.cost?.peak ? (isPeakPricingActive(state.model) ? " (peak)" : " (off-peak)") : "";
 		if (usageTotals.cost) {
 			statsParts.push(`$${usageTotals.cost.toFixed(3)}${peakStatus}${usingSubscription ? " (sub)" : ""}`);
 		} else if (usingSubscription) {

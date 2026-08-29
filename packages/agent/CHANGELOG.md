@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Fixed `prepareNextTurn` compaction deciding the run must stop (e.g. required compaction cancelled or context still overflowing) after the loop had already committed to the next provider request; the loop now re-checks the stop condition after preparation so no request is made.
 - Fixed Windows `NodeExecutionEnv` aborts crashing when `taskkill.exe` is unavailable on `PATH` ([#6596](https://github.com/earendil-works/pi/issues/6596)).
 
 ## [0.84.3] - 2026-08-24

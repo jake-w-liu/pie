@@ -194,6 +194,13 @@ async function runLoop(
 				if (pendingMessages.length === 0) {
 					pendingMessages = (await config.getSteeringMessages?.()) || [];
 				}
+				// Preparation (for example, compaction) can decide the run must stop before the
+				// next provider request, e.g. when required compaction is cancelled or context
+				// still overflows. Re-check the stop condition so no request is made in that case.
+				if (await config.shouldStopAfterTurn?.(lastCompletedTurn)) {
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
 				await emit({ type: "turn_start" });
 			}
 

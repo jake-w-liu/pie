@@ -27,6 +27,8 @@
 
 ### Fixed
 
+- Fixed the interactive footer crashing when the active model has no cost metadata, so it no longer renders peak/off-peak status for models without pricing info.
+- Fixed the agent making one extra provider request before stopping when required auto-compaction is cancelled or the context still overflows; the run now stops before the next request.
 - Fixed Headroom compressing freshly produced tool results before the model received them, which forced an immediate `headroom_retrieve` round trip for every large `read`/`bash` result; only historical results (already followed by an assistant reply) are now compressed.
 - Fixed secret authentication prompts echoing credentials, stale asynchronous image conversions replacing newer partial results, startup help retaining old theme colors, missing OAuth cancel guidance, and unavailable context displaying as 0.0%.
 - Fixed autonomous tool runs delaying compaction until after context overflow, trailing tool results preventing a valid compaction cut, and the footer displaying context percentages above 100%.

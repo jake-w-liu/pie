@@ -146,19 +146,20 @@ export class ScrollView extends Container {
 		const moved = next - start;
 		const wasFollowingEnd = this.followingEnd;
 		this.currentScrollTop = next;
-		this.followingEnd = this.followEnd && next === maxScrollTop;
-		this.followSuppressedAtEnd = false;
+		// An explicit upward scroll is still intentional when the view is already
+		// clamped at the top. Keep follow disabled so later content cannot pull the
+		// user back to the end after this no-op scroll.
+		this.followingEnd = requested < 0 ? false : this.followEnd && next === maxScrollTop;
+		this.followSuppressedAtEnd = requested < 0 && next === maxScrollTop;
 		if (moved !== 0) this.markScrollbarActivity();
 		if (moved !== 0 || this.followingEnd !== wasFollowingEnd) this.requestRenderCallback?.();
 		return requested - moved;
 	}
 
 	scrollToStart(): void {
-		const changed =
-			this.currentScrollTop !== 0 ||
-			this.followingEnd !== (this.followEnd && this.contentHeight <= this.currentViewportHeight);
+		const changed = this.currentScrollTop !== 0 || this.followingEnd;
 		this.currentScrollTop = 0;
-		this.followingEnd = this.followEnd && this.contentHeight <= this.currentViewportHeight;
+		this.followingEnd = false;
 		this.followSuppressedAtEnd = false;
 		if (changed) {
 			this.markScrollbarActivity();

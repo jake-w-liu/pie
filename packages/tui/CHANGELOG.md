@@ -16,6 +16,8 @@
 
 ### Fixed
 
+- Fixed fullscreen follow-end scrolling being restored after an explicit upward scroll at the top of a short transcript.
+- Fixed pending render requests suppressing the first frame after restarting a TUI instance.
 - Fixed timed-out terminal background-color queries retaining one callback object per unanswered query.
 - Fixed main-screen rendering crashing when image-heavy output exceeded V8's string length limit ([#8028](https://github.com/earendil-works/pi/issues/8028)).
 - Fixed autocomplete ordering for nested results ([#8669](https://github.com/earendil-works/pi/pull/8669)).

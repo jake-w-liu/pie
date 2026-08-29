@@ -137,6 +137,21 @@ describe("TUI render scheduling", () => {
 		assert.deepStrictEqual(component.lines, ["typed"]);
 		tui.stop();
 	});
+
+	it("does not carry a pending render request across stop and start", async () => {
+		const terminal = new VirtualTerminal(40, 4);
+		const tui = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		component.lines = ["restarted content"];
+		tui.addChild(component);
+		tui.start();
+		tui.requestRender();
+		tui.stop();
+		tui.start();
+		await terminal.waitForRender();
+		assert.ok(terminal.getViewport()[0]?.includes("restarted content"));
+		tui.stop();
+	});
 });
 
 describe("TUI debug logging", () => {

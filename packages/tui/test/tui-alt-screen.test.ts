@@ -88,6 +88,31 @@ describe("TuiAltScreen", () => {
 		tui.stop();
 	});
 
+	it("keeps an explicit upward scroll at the top from re-enabling follow mode", async () => {
+		const terminal = new VirtualTerminal(20, 4);
+		const tui = new TuiAltScreen(terminal);
+		const text = new Text("line 1\nline 2", 0, 0);
+		tui.setLayoutRoot(new ScrollView(text, { follow: "end", primary: true }));
+		tui.start();
+		await terminal.waitForRender();
+		assert.strictEqual(tui.isFollowingOutput, true);
+
+		terminal.sendInput("\x1b[<64;1;1M");
+		await terminal.waitForRender();
+		assert.strictEqual(tui.viewportTop, 0);
+		assert.strictEqual(tui.isFollowingOutput, false);
+
+		text.setText(Array.from({ length: 8 }, (_, index) => `line ${index + 1}`).join("\n"));
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.deepStrictEqual(
+			terminal.getViewport().map((line) => line.trimEnd()),
+			["line 1", "line 2", "line 3", "line 4"],
+		);
+		assert.strictEqual(tui.isFollowingOutput, false);
+		tui.stop();
+	});
+
 	it("keeps an explicit dock fixed while the transcript scrolls", async () => {
 		const terminal = new VirtualTerminal(20, 6);
 		const tui = new TuiAltScreen(terminal);

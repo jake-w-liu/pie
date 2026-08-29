@@ -753,6 +753,10 @@ export abstract class TuiBase extends Container implements TUI {
 
 	stop(options: TuiStopOptions = {}): void {
 		this.stopped = true;
+		// A request that has not rendered belongs to the stopped terminal session.
+		// Leaving it set suppresses the first request after a later start(), because
+		// requestRender() coalesces against this flag.
+		this.renderRequested = false;
 		this.cancelRenderTimer();
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031l");

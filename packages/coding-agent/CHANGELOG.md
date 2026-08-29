@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added a built-in MLX provider extension that serves models from a local `mlx_lm.server` / `mlx_vlm.server` via the `MLX_BASE_URL` config or credential, discovering models from the server's `/v1/models` endpoint.
 - Added Pie distribution branding, pinned first-run defaults for pi-fff, pi-web-access, and pi-subagents, and the verified setup checklist.
 - Added default-on Headroom request compression for large tool results, with bounded exact retrieval through `headroom_retrieve` and `/headroom` controls.
 - Added complete dark and light Nippon-color palettes for the Pie terminal interface.
@@ -17,6 +18,7 @@
 
 ### Changed
 
+- Optimized the built-in grep tool to be more context-efficient: results are grouped by file, the default match limit is now 20, and a new `outputMode` parameter (`content`, `files_with_matches`, `count`) lets the model list only matching files or a total count and then read the relevant file, instead of dumping up to 100 matching lines into context.
 - Optimized high-frequency terminal rendering with cached footer aggregation, reusable streaming message components, bounded/deferred Bash previews, compact subscription status, and height-aware single-line model rows.
 - Optimized Headroom with lazy copy-on-write transforms, allocation-bounded previews and retrieval filtering, UTF-8 slicing without whole-result buffers, cached unchanged markers, and reused byte measurements.
 - Changed Pie's built-in dark and light theme selections to the corresponding Nippon palettes while leaving the normal Pi executable unchanged.

@@ -30,6 +30,7 @@ export {
 	createGrepTool,
 	createGrepToolDefinition,
 	type GrepOperations,
+	type GrepOutputMode,
 	type GrepToolDetails,
 	type GrepToolInput,
 	type GrepToolOptions,

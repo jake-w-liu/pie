@@ -803,6 +803,59 @@ describe("Coding Agent Tools", () => {
 			expect(output).not.toContain("match two");
 		});
 
+		it("should group matches by file in content mode", async () => {
+			const a = join(testDir, "a.ts");
+			const b = join(testDir, "b.ts");
+			writeFileSync(a, "line one\nneedle here\nline three");
+			writeFileSync(b, "first\nneedle there\nlast");
+
+			const result = await grepTool.execute("test-call-grep-group", {
+				pattern: "needle",
+				path: testDir,
+			});
+
+			const output = getTextOutput(result);
+			expect(output).toContain("=== a.ts ===");
+			expect(output).toContain("=== b.ts ===");
+			expect(output).toContain("a.ts:2: needle here");
+			expect(output).toContain("b.ts:2: needle there");
+		});
+
+		it("should list only matching files with outputMode files_with_matches", async () => {
+			const a = join(testDir, "a.ts");
+			const b = join(testDir, "b.ts");
+			writeFileSync(a, "line one\nneedle here\nline three\nneedle again");
+			writeFileSync(b, "first\nnothing here\nlast");
+
+			const result = await grepTool.execute("test-call-grep-files", {
+				pattern: "needle",
+				path: testDir,
+				outputMode: "files_with_matches",
+			});
+
+			const output = getTextOutput(result);
+			const lines = output
+				.split("\n")
+				.map((line) => line.trim())
+				.filter(Boolean);
+			expect(lines).toContain("a.ts");
+			expect(lines).not.toContain("b.ts");
+			expect(lines).toHaveLength(1);
+		});
+
+		it("should return a total count with outputMode count", async () => {
+			const a = join(testDir, "a.ts");
+			writeFileSync(a, "needle one\nplain\nneedle two\nneedle three");
+
+			const result = await grepTool.execute("test-call-grep-count", {
+				pattern: "needle",
+				path: testDir,
+				outputMode: "count",
+			});
+
+			expect(getTextOutput(result)).toBe("3");
+		});
+
 		it("should treat flag-like patterns as search text", async () => {
 			const marker = join(testDir, "grep-injection-marker");
 			const payload = join(testDir, "payload.sh");

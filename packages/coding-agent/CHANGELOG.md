@@ -30,6 +30,7 @@
 - Fixed Headroom compressing freshly produced tool results before the model received them, which forced an immediate `headroom_retrieve` round trip for every large `read`/`bash` result; only historical results (already followed by an assistant reply) are now compressed.
 - Fixed secret authentication prompts echoing credentials, stale asynchronous image conversions replacing newer partial results, startup help retaining old theme colors, missing OAuth cancel guidance, and unavailable context displaying as 0.0%.
 - Fixed autonomous tool runs delaying compaction until after context overflow, trailing tool results preventing a valid compaction cut, and the footer displaying context percentages above 100%.
+- Fixed large tool results crossing the auto-compaction threshold being sent to the provider before compaction. Pi now compacts between tool execution and the next assistant response in the same run, and restores interactive progress when that run resumes ([#6879](https://github.com/earendil-works/pi/issues/6879)).
 - Fixed successful login to a different provider leaving the session on the previous provider instead of selecting and persisting the authenticated provider's default model.
 - Fixed toggling thinking visibility clearing partial output from running Bash tools ([#8611](https://github.com/earendil-works/pi/issues/8611)).
 - Fixed Windows shell aborts crashing Pi when `taskkill.exe` is unavailable on `PATH` ([#6596](https://github.com/earendil-works/pi/issues/6596)).

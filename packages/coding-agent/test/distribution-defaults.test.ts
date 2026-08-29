@@ -2,7 +2,10 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { seedDistributionDefaultPackages } from "../src/core/distribution-defaults.ts";
+import {
+	seedDistributionDefaultPackages,
+	seedDistributionWebSearchDefaults,
+} from "../src/core/distribution-defaults.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 
 const shippedPackages = ["npm:pi-fff@0.1.12", "npm:pi-web-access@0.26.0", "npm:pi-subagents@0.58.0"] as const;
@@ -36,5 +39,25 @@ describe("distribution package defaults", () => {
 
 		await expect(seedDistributionDefaultPackages(manager, settingsPath, shippedPackages)).resolves.toBe(false);
 		expect(JSON.parse(readFileSync(settingsPath, "utf8"))).toEqual({ packages: ["npm:custom-package"] });
+	});
+
+	it("seeds terminal-only web search defaults for a fresh config", () => {
+		tempDir = mkdtempSync(join(tmpdir(), "pie-websearch-defaults-"));
+		const webSearchPath = join(tempDir, "web-search.json");
+
+		expect(seedDistributionWebSearchDefaults(webSearchPath)).toBe(true);
+		expect(JSON.parse(readFileSync(webSearchPath, "utf8"))).toEqual({
+			workflow: "auto-summary",
+			autoOpenBrowser: false,
+		});
+	});
+
+	it("never overwrites an existing web search config", () => {
+		tempDir = mkdtempSync(join(tmpdir(), "pie-websearch-existing-"));
+		const webSearchPath = join(tempDir, "web-search.json");
+		writeFileSync(webSearchPath, JSON.stringify({ workflow: "none" }));
+
+		expect(seedDistributionWebSearchDefaults(webSearchPath)).toBe(false);
+		expect(JSON.parse(readFileSync(webSearchPath, "utf8"))).toEqual({ workflow: "none" });
 	});
 });

@@ -42,7 +42,7 @@ import {
 } from "./core/agent-session-services.ts";
 import { formatNoModelsAvailableMessage } from "./core/auth-guidance.ts";
 import { AuthStorage, ReadOnlyAuthStorage } from "./core/auth-storage.ts";
-import { seedDistributionDefaultPackages } from "./core/distribution-defaults.ts";
+import { seedDistributionDefaultPackages, seedDistributionWebSearchDefaults } from "./core/distribution-defaults.ts";
 import { exportFromFile } from "./core/export-html/index.ts";
 import type { InlineExtension } from "./core/extensions/types.ts";
 import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.ts";
@@ -574,6 +574,9 @@ export async function main(args: string[], options?: MainOptions) {
 	const agentDir = getAgentDir();
 	const bootstrapSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
 	await seedDistributionDefaultPackages(bootstrapSettingsManager);
+	// Shipped Pie should not pop a browser curator or ask for approval on web search by
+	// default; seed that preference once for a fresh config.
+	seedDistributionWebSearchDefaults();
 	applyHttpProxySettings(bootstrapSettingsManager.getGlobalSettings().httpProxy);
 	configureHttpDispatcher();
 

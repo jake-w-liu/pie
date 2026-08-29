@@ -6,6 +6,7 @@
 
 - Added a built-in MLX provider extension that serves models from a local `mlx_lm.server` / `mlx_vlm.server` via the `MLX_BASE_URL` config or credential, discovering models from the server's `/v1/models` endpoint.
 - Added Pie distribution branding, pinned first-run defaults for pi-fff, pi-web-access, and pi-subagents, and the verified setup checklist.
+- Shipped web search with terminal-only defaults: a fresh config seeds `workflow: auto-summary` and `autoOpenBrowser: false` in `web-search.json`, so web search returns a summary in the terminal without opening a browser curator or asking for approval. Existing user config is never overwritten.
 - Added default-on Headroom request compression for large tool results, with bounded exact retrieval through `headroom_retrieve` and `/headroom` controls.
 - Added complete dark and light Nippon-color palettes for the Pie terminal interface.
 - Added `npm run refresh:pie` for validated staged installation of the current checkout with automatic source-artifact cleanup.

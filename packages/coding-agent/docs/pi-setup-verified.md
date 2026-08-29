@@ -105,6 +105,10 @@ brew install ffmpeg yt-dlp   # optional: video frame extraction
 - Config: `~/.pi/web-search.json` — all fields optional. Keys like `openaiApiKey`,
   `braveApiKey`, `exaApiKey`, `tavilyApiKey`, `geminiApiKey`, `perplexityApiKey`, …
   Accept `"$ENV_VAR"` references or `!command` credential sources.
+- Shipped Pie seeds terminal-only defaults on a fresh config: `workflow: "auto-summary"` and
+  `autoOpenBrowser: false`, so `web_search` returns a summary in the terminal without opening
+  the browser curator or asking for approval. Existing config is never overwritten; use
+  `/curator` or edit `web-search.json` to change it.
 - Fallback chain (auto mode): configured SearXNG → Codex-backed OpenAI (if signed in) →
   Exa → OpenAI → Brave → Parallel → TinyFish → Search1API → … → Gemini.
 - GitHub URLs are cloned locally; YouTube/local videos get transcript + visual analysis via

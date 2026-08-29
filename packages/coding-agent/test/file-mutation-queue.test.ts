@@ -55,20 +55,24 @@ describe("withFileMutationQueue", () => {
 
 	it("allows different files to proceed in parallel", async () => {
 		const order: string[] = [];
+		const releaseFirst = createDeferred();
+		const secondStarted = createDeferred();
+		const first = withFileMutationQueue("/tmp/file-mutation-queue-a", async () => {
+			order.push("a:start");
+			await releaseFirst.promise;
+			order.push("a:end");
+		});
+		const second = withFileMutationQueue("/tmp/file-mutation-queue-b", async () => {
+			order.push("b:start");
+			secondStarted.resolve();
+			order.push("b:end");
+		});
 
-		await Promise.all([
-			withFileMutationQueue("/tmp/file-mutation-queue-a", async () => {
-				order.push("a:start");
-				await delay(30);
-				order.push("a:end");
-			}),
-			withFileMutationQueue("/tmp/file-mutation-queue-b", async () => {
-				order.push("b:start");
-				await delay(30);
-				order.push("b:end");
-			}),
-		]);
+		const startedInParallel = await resolvesWithin(secondStarted.promise, 3000);
+		releaseFirst.resolve();
+		await Promise.all([first, second]);
 
+		expect(startedInParallel).toBe(true);
 		expect(order.indexOf("a:start")).toBeLessThan(order.indexOf("a:end"));
 		expect(order.indexOf("b:start")).toBeLessThan(order.indexOf("b:end"));
 		expect(order.indexOf("b:start")).toBeLessThan(order.indexOf("a:end"));

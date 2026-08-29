@@ -37,7 +37,7 @@ describe("AgentSession mid-run compaction", () => {
 			},
 		};
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 500, maxTokens: 20 }],
+			models: [{ id: "faux-1", contextWindow: 600, maxTokens: 20 }],
 			settings: { compaction: { enabled: true, reserveTokens: 0, keepRecentTokens: 1 } },
 			tools: [echoTool],
 			extensionFactories: [

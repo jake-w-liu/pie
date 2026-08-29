@@ -812,9 +812,27 @@ export interface ModelCostTier extends ModelCostRates {
 	inputTokensAbove: number;
 }
 
+/** A peak-pricing time window, evaluated in UTC. */
+export interface ModelPeakWindow {
+	/** Days of week (0=Sunday..6=Saturday). Omit or empty = every day. */
+	days?: number[];
+	/** Window start, minutes since midnight UTC. */
+	startMinutes: number;
+	/** Window end (exclusive), minutes since midnight UTC. May wrap past midnight when <= startMinutes. */
+	endMinutes: number;
+}
+
 export interface ModelCost extends ModelCostRates {
 	/** Request-wide pricing tiers. The highest matching input threshold applies to the full request. */
 	tiers?: ModelCostTier[];
+	/**
+	 * Time-of-day (peak) pricing. When present, the base rates are off-peak and `peak.rates`
+	 * apply during `peak.windows`. Used by providers with peak/off-peak pricing (e.g. DeepSeek).
+	 */
+	peak?: {
+		rates: ModelCostRates;
+		windows: ModelPeakWindow[];
+	};
 }
 
 // Model interface for the unified model system

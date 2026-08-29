@@ -20,6 +20,7 @@ import type {
 	KnownProvider,
 	Model,
 	ModelCost,
+	ModelPeakWindow,
 	OpenAICompletionsCompat,
 	OpenAIResponsesCompat,
 } from "../src/types.ts";
@@ -351,6 +352,47 @@ const KIMI_CODING_IMPLIED_COSTS: Record<string, Model<Api>["cost"]> = {
 	"kimi-k2-thinking": { input: 0.6, output: 2.5, cacheRead: 0.15, cacheWrite: 0 },
 };
 const OPENROUTER_KIMI_K3_MODEL_IDS = new Set(["moonshotai/kimi-k3", "~moonshotai/kimi-latest"]);
+
+// DeepSeek uses peak/off-peak pricing. Peak hours are 01:00-04:00 and 06:00-10:00 UTC,
+// Monday through Friday; all other hours (including weekends) are off-peak at exactly half
+// the peak rate. models.dev only reports a single rate, so carry the authoritative values
+// here (base = off-peak, peak = double). Source: https://api-docs.deepseek.com/quick_start/pricing/
+const DEEPSEEK_PEAK_WINDOWS: ModelPeakWindow[] = [
+	{ days: [1, 2, 3, 4, 5], startMinutes: 60, endMinutes: 240 }, // 01:00-04:00 UTC Mon-Fri
+	{ days: [1, 2, 3, 4, 5], startMinutes: 360, endMinutes: 600 }, // 06:00-10:00 UTC Mon-Fri
+];
+const DEEPSEEK_PEAK_COSTS: Record<string, ModelCost> = {
+	"deepseek-v4-flash": {
+		input: 0.22,
+		output: 0.66,
+		cacheRead: 0.007,
+		cacheWrite: 0,
+		peak: {
+			rates: { input: 0.44, output: 1.32, cacheRead: 0.014, cacheWrite: 0 },
+			windows: DEEPSEEK_PEAK_WINDOWS,
+		},
+	},
+	"deepseek-v4-flash-vision-exp": {
+		input: 0.22,
+		output: 0.66,
+		cacheRead: 0.007,
+		cacheWrite: 0,
+		peak: {
+			rates: { input: 0.44, output: 1.32, cacheRead: 0.014, cacheWrite: 0 },
+			windows: DEEPSEEK_PEAK_WINDOWS,
+		},
+	},
+	"deepseek-v4-pro": {
+		input: 0.66,
+		output: 1.98,
+		cacheRead: 0.022,
+		cacheWrite: 0,
+		peak: {
+			rates: { input: 1.32, output: 3.96, cacheRead: 0.044, cacheWrite: 0 },
+			windows: DEEPSEEK_PEAK_WINDOWS,
+		},
+	},
+};
 
 const ANT_LING_RING_THINKING_LEVEL_MAP = {
 	off: null,
@@ -2558,10 +2600,14 @@ async function generateModels() {
 			reasoning: true,
 			input: ["text"],
 			cost: {
-				input: 0.14,
-				output: 0.28,
-				cacheRead: 0.0028,
+				input: 0.22,
+				output: 0.66,
+				cacheRead: 0.007,
 				cacheWrite: 0,
+				peak: {
+					rates: { input: 0.44, output: 1.32, cacheRead: 0.014, cacheWrite: 0 },
+					windows: DEEPSEEK_PEAK_WINDOWS,
+				},
 			},
 			contextWindow: 1000000,
 			maxTokens: 384000,
@@ -2576,10 +2622,14 @@ async function generateModels() {
 			reasoning: true,
 			input: ["text", "image"],
 			cost: {
-				input: 0.14,
-				output: 0.28,
-				cacheRead: 0.0028,
+				input: 0.22,
+				output: 0.66,
+				cacheRead: 0.007,
 				cacheWrite: 0,
+				peak: {
+					rates: { input: 0.44, output: 1.32, cacheRead: 0.014, cacheWrite: 0 },
+					windows: DEEPSEEK_PEAK_WINDOWS,
+				},
 			},
 			contextWindow: 1000000,
 			maxTokens: 384000,
@@ -2594,10 +2644,14 @@ async function generateModels() {
 			reasoning: true,
 			input: ["text"],
 			cost: {
-				input: 0.435,
-				output: 0.87,
-				cacheRead: 0.003625,
+				input: 0.66,
+				output: 1.98,
+				cacheRead: 0.022,
 				cacheWrite: 0,
+				peak: {
+					rates: { input: 1.32, output: 3.96, cacheRead: 0.044, cacheWrite: 0 },
+					windows: DEEPSEEK_PEAK_WINDOWS,
+				},
 			},
 			contextWindow: 1000000,
 			maxTokens: 384000,

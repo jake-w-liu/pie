@@ -1,4 +1,5 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
+import { isPeakPricingActive } from "@earendil-works/pi-ai";
 import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentSession } from "../../../core/agent-session.ts";
 import { areExperimentalFeaturesEnabled } from "../../../core/experimental.ts";
@@ -165,8 +166,11 @@ export class FooterComponent implements Component {
 		const usingSubscription = state.model
 			? state.model.provider === "kimi-coding" || this.session.modelRuntime.isUsingSubscription(state.model.provider)
 			: false;
+		// Show whether the active model is currently in its peak-pricing window (e.g. DeepSeek),
+		// so the displayed cost is understood against the peak/off-peak rate.
+		const peakStatus = state.model?.cost.peak ? (isPeakPricingActive(state.model) ? " (peak)" : " (off-peak)") : "";
 		if (usageTotals.cost) {
-			statsParts.push(`$${usageTotals.cost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`);
+			statsParts.push(`$${usageTotals.cost.toFixed(3)}${peakStatus}${usingSubscription ? " (sub)" : ""}`);
 		} else if (usingSubscription) {
 			statsParts.push("sub");
 		}

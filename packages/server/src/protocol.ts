@@ -75,7 +75,7 @@ type _AiModelFieldsAccountedFor = Assert<
 	>
 >;
 type _AiModelCostFieldsAccountedFor = Assert<
-	ExactKeys<Model<Api>["cost"], "input" | "output" | "cacheRead" | "cacheWrite" | "tiers">
+	ExactKeys<Model<Api>["cost"], "input" | "output" | "cacheRead" | "cacheWrite" | "tiers" | "peak">
 >;
 type _AiUserMessageFieldsAccountedFor = Assert<ExactKeys<UserMessage, "role" | "content" | "timestamp">>;
 type _AiAssistantMessageFieldsAccountedFor = Assert<

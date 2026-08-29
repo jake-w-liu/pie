@@ -159,6 +159,46 @@ describe("Models runtime", () => {
 		expect(long.cacheWrite).toBe(0.0000125);
 	});
 
+	it("applies peak pricing inside peak windows and off-peak otherwise", () => {
+		const model = testModel("deepseek", "deepseek-v4-flash");
+		model.cost = {
+			input: 0.22,
+			output: 0.66,
+			cacheRead: 0.007,
+			cacheWrite: 0,
+			peak: {
+				rates: { input: 0.44, output: 1.32, cacheRead: 0.014, cacheWrite: 0 },
+				windows: [
+					{ days: [1, 2, 3, 4, 5], startMinutes: 60, endMinutes: 240 }, // 01:00-04:00 UTC Mon-Fri
+					{ days: [1, 2, 3, 4, 5], startMinutes: 360, endMinutes: 600 }, // 06:00-10:00 UTC Mon-Fri
+				],
+			},
+		};
+		const usage: Usage = {
+			input: 1_000_000,
+			output: 500_000,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 1_500_000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+
+		// Tuesday 02:00 UTC is inside the 01:00-04:00 peak window.
+		const peak = calculateCost(model, usage, new Date(Date.UTC(2026, 0, 6, 2, 0)));
+		expect(peak.input).toBeCloseTo(0.44, 5);
+		expect(peak.output).toBeCloseTo(0.66, 5);
+		expect(peak.total).toBeCloseTo(1.1, 5);
+
+		// Tuesday 20:00 UTC is off-peak.
+		const off = calculateCost(model, usage, new Date(Date.UTC(2026, 0, 6, 20, 0)));
+		expect(off.input).toBeCloseTo(0.22, 5);
+		expect(off.output).toBeCloseTo(0.33, 5);
+
+		// Sunday 02:00 UTC is off-peak even though the clock time is a peak hour.
+		const weekend = calculateCost(model, usage, new Date(Date.UTC(2026, 0, 4, 2, 0)));
+		expect(weekend.input).toBeCloseTo(0.22, 5);
+	});
+
 	it("registers, replaces, and deletes providers", () => {
 		const models = createModels();
 		models.setProvider(testProvider({ id: "p1" }));

@@ -31,6 +31,7 @@
 - Fixed secret authentication prompts echoing credentials, stale asynchronous image conversions replacing newer partial results, startup help retaining old theme colors, missing OAuth cancel guidance, and unavailable context displaying as 0.0%.
 - Fixed autonomous tool runs delaying compaction until after context overflow, trailing tool results preventing a valid compaction cut, and the footer displaying context percentages above 100%.
 - Fixed large tool results crossing the auto-compaction threshold being sent to the provider before compaction. Pi now compacts between tool execution and the next assistant response in the same run, and restores interactive progress when that run resumes ([#6879](https://github.com/earendil-works/pi/issues/6879)).
+- Fixed the footer showing a single flat price for providers with peak/off-peak pricing (e.g. DeepSeek); it now labels the displayed cost `(peak)` or `(off-peak)` and the cost itself reflects the active time-of-day rate.
 - Fixed successful login to a different provider leaving the session on the previous provider instead of selecting and persisting the authenticated provider's default model.
 - Fixed toggling thinking visibility clearing partial output from running Bash tools ([#8611](https://github.com/earendil-works/pi/issues/8611)).
 - Fixed Windows shell aborts crashing Pi when `taskkill.exe` is unavailable on `PATH` ([#6596](https://github.com/earendil-works/pi/issues/6596)).

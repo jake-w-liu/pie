@@ -25,6 +25,7 @@ import type {
 	DeferredHandle,
 	Model,
 	ModelCostRates,
+	ModelPeakWindow,
 	ModelThinkingLevel,
 	ProviderHeaders,
 	ProviderRequestOptions,
@@ -875,14 +876,52 @@ export function hasApi<TApi extends Api>(model: Model<Api>, api: TApi): model is
 	return model.api === api;
 }
 
-export function calculateCost<TApi extends Api>(model: Model<TApi>, usage: Usage): Usage["cost"] {
+/**
+ * Whether `now` (default: current time) falls inside any peak-pricing window.
+ * All times are evaluated in UTC; a window with `endMinutes <= startMinutes` wraps past midnight.
+ */
+export function isInPeakWindow(windows: ModelPeakWindow[] | undefined, now: Date = new Date()): boolean {
+	if (!windows || windows.length === 0) return false;
+	const utcDay = now.getUTCDay();
+	const utcMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+	const dayInMinutes = 24 * 60;
+	return windows.some((window) => {
+		if (window.days && window.days.length > 0 && !window.days.includes(utcDay)) return false;
+		const start = ((window.startMinutes % dayInMinutes) + dayInMinutes) % dayInMinutes;
+		const end = ((window.endMinutes % dayInMinutes) + dayInMinutes) % dayInMinutes;
+		if (start === end) {
+			// A zero-length window applies only at the exact minute; treat it as never active.
+			return false;
+		}
+		if (start < end) return utcMinutes >= start && utcMinutes < end;
+		return utcMinutes >= start || utcMinutes < end;
+	});
+}
+
+/**
+ * Whether the model currently uses peak pricing (it defines peak rates and now is in a peak window).
+ */
+export function isPeakPricingActive<TApi extends Api>(model: Model<TApi>, now: Date = new Date()): boolean {
+	return Boolean(model.cost.peak) && isInPeakWindow(model.cost.peak?.windows, now);
+}
+
+export function calculateCost<TApi extends Api>(
+	model: Model<TApi>,
+	usage: Usage,
+	now: Date = new Date(),
+): Usage["cost"] {
 	const inputTokens = usage.input + usage.cacheRead + usage.cacheWrite;
-	let rates: ModelCostRates = model.cost;
-	let matchedThreshold = -1;
-	for (const tier of model.cost.tiers ?? []) {
-		if (inputTokens > tier.inputTokensAbove && tier.inputTokensAbove > matchedThreshold) {
-			rates = tier;
-			matchedThreshold = tier.inputTokensAbove;
+	// Peak pricing overrides the base (off-peak) rates during peak windows. Volume tiers are only
+	// defined on the base cost, so they apply to the off-peak path (no peak-priced provider uses tiers).
+	const usePeak = isPeakPricingActive(model, now);
+	let rates: ModelCostRates = usePeak && model.cost.peak ? model.cost.peak.rates : model.cost;
+	if (!usePeak) {
+		let matchedThreshold = -1;
+		for (const tier of model.cost.tiers ?? []) {
+			if (inputTokens > tier.inputTokensAbove && tier.inputTokensAbove > matchedThreshold) {
+				rates = tier;
+				matchedThreshold = tier.inputTokensAbove;
+			}
 		}
 	}
 

@@ -232,7 +232,16 @@ class BashResultRenderComponent extends Container {
 }
 
 function formatDuration(ms: number): string {
-	return `${(ms / 1000).toFixed(1)}s`;
+	// Show whole seconds (or minutes:seconds), not tenths of a second. A sub-second
+	// duration changes the rendered text every ~100ms, forcing the differential
+	// renderer to repaint the status row constantly during active work. Whole
+	// seconds is the standard, correct duration format and updates at most once
+	// per second.
+	const seconds = Math.max(0, Math.round(ms / 1000));
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60);
+	const rest = seconds % 60;
+	return `${minutes}m${rest}s`;
 }
 
 function formatShellCall(args: { command?: string; timeout?: number } | undefined, prompt: string): string {

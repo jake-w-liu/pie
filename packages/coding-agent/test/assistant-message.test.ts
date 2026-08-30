@@ -175,6 +175,24 @@ describe("AssistantMessageComponent", () => {
 		expect(stripAnsi(component.render(80).join("\n"))).toContain("partial response");
 	});
 
+	test("collapses streaming thinking to a stable label instead of growing the transcript", () => {
+		initTheme("dark");
+		const component = new AssistantMessageComponent();
+
+		// While thinking streams, the reasoning must NOT be rendered into the
+		// transcript (that used to grow the scroll view and repaint on every chunk).
+		component.updateContent(createAssistantMessage([{ type: "thinking", thinking: "private reasoning" }]), true);
+		const streaming = stripAnsi(component.render(80).join("\n"));
+		expect(streaming).not.toContain("private reasoning");
+		expect(streaming).toContain("Thinking...");
+
+		// Once the message completes, the full reasoning is shown (hideThinkingBlock
+		// defaults to false).
+		component.updateContent(createAssistantMessage([{ type: "thinking", thinking: "private reasoning" }]), false);
+		const completed = stripAnsi(component.render(80).join("\n"));
+		expect(completed).toContain("private reasoning");
+	});
+
 	test("identifies partial assistant Markdown as streaming", () => {
 		initTheme("dark");
 		const streamingStates: boolean[] = [];

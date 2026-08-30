@@ -158,19 +158,14 @@ export class AssistantMessageComponent extends Container {
 				component = new Markdown(group.text, this.outputPad, 0, this.markdownTheme, undefined, {
 					transform: createMarkdownTransform("assistant", true, this.markdownTransformers),
 				});
-			} else if (this.hideThinkingBlock) {
-				component = new Text(theme.italic(theme.fg("thinkingText", this.hiddenThinkingLabel)), this.outputPad, 0);
 			} else {
-				component = new Markdown(
-					group.text,
-					this.outputPad,
-					0,
-					this.markdownTheme,
-					{ color: (text: string) => theme.fg("thinkingText", text), italic: true },
-					{
-						transform: createMarkdownTransform("assistant-thinking", true, this.markdownTransformers),
-					},
-				);
+				// While thinking is STREAMING, render it as a compact label instead of a
+				// growing markdown block. Streaming the full reasoning into the transcript
+				// grows the scroll view and repaints on every chunk, which makes the
+				// conversation scroll and refresh constantly while an agent (or subagent)
+				// is thinking. The full reasoning is shown once the message completes (see
+				// the non-streaming updateContent path), honoring hideThinkingBlock there.
+				component = new Text(theme.italic(theme.fg("thinkingText", this.hiddenThinkingLabel)), this.outputPad, 0);
 			}
 			this.contentContainer.addChild(component);
 			this.streamingBlocks.push({ kind: group.kind, component });

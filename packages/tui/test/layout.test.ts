@@ -190,6 +190,44 @@ describe("viewport layout", () => {
 		assert.strictEqual(scrollView.isFollowingEnd, true);
 	});
 
+	it("preserves the scroll position when the viewport resizes while not following", () => {
+		const scrollView = new ScrollView(new Text("1\n2\n3\n4\n5\n6\n7\n8", 0, 0), {
+			follow: "end",
+			primary: true,
+		});
+		renderLayoutFrame(scrollView, 10, 3, () => {});
+		assert.strictEqual(scrollView.scrollTop, 5);
+
+		scrollView.scrollBy(-2);
+		assert.strictEqual(scrollView.scrollTop, 3);
+		assert.strictEqual(scrollView.isFollowingEnd, false);
+
+		// The dock grows, shrinking the transcript viewport to 2 rows. Content is
+		// unchanged, so the user's scroll position must NOT jump toward the top.
+		renderLayoutFrame(scrollView, 10, 2, () => {});
+		assert.strictEqual(scrollView.scrollTop, 3);
+
+		// The dock shrinks, growing the viewport back to 4 rows. Still stable.
+		renderLayoutFrame(scrollView, 10, 4, () => {});
+		assert.strictEqual(scrollView.scrollTop, 3);
+	});
+
+	it("re-clamps the scroll position when the content itself shrinks", () => {
+		const text = new Text("1\n2\n3\n4\n5\n6\n7\n8", 0, 0);
+		const scrollView = new ScrollView(text, { follow: "end", primary: true });
+		renderLayoutFrame(scrollView, 10, 3, () => {});
+		assert.strictEqual(scrollView.scrollTop, 5);
+
+		scrollView.scrollBy(-2);
+		assert.strictEqual(scrollView.scrollTop, 3);
+
+		// Content shrinks to 4 lines with a 3-row viewport: maxScrollTop becomes 1,
+		// so the position re-clamps to stay within the content.
+		text.setText("a\nb\nc\nd");
+		renderLayoutFrame(scrollView, 10, 3, () => {});
+		assert.strictEqual(scrollView.scrollTop, 1);
+	});
+
 	it("renders a transient proportional scrollbar without replacing cell content", async () => {
 		const sourceLines = ["abcd界", "abcde2", "abcde3", "abcde4", "abcde5", "abcde6", "abcde7", "abcde8"];
 		const contentBackground = "\x1b[42m";

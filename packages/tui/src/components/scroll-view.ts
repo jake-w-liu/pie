@@ -170,12 +170,24 @@ export class ScrollView extends Container {
 	}
 
 	updateLayout(contentHeight: number, viewportHeight: number, requestRender: () => void): void {
+		const prevContentHeight = this.contentHeight;
 		this.contentHeight = Math.max(0, Math.floor(contentHeight));
 		this.currentViewportHeight = Math.max(0, Math.floor(viewportHeight));
 		this.requestRenderCallback = requestRender;
 		const maxScrollTop = Math.max(0, this.contentHeight - this.currentViewportHeight);
-		if (this.followingEnd) this.currentScrollTop = maxScrollTop;
-		else this.currentScrollTop = Math.max(0, Math.min(this.currentScrollTop, maxScrollTop));
+		if (this.followingEnd) {
+			this.currentScrollTop = maxScrollTop;
+		} else if (this.contentHeight < prevContentHeight) {
+			// Content actually shrank: re-clamp so we never show beyond the content.
+			this.currentScrollTop = Math.max(0, Math.min(this.currentScrollTop, maxScrollTop));
+		} else {
+			// The content did not shrink; only the viewport changed (e.g. the dock,
+			// a status indicator, or the editor/autocomplete resized the transcript's
+			// height). Preserve the user's scroll position so the text they are
+			// reading does not jump up/down, instead of clamping down to a maxScrollTop
+			// that shrank purely because the viewport changed.
+			this.currentScrollTop = Math.max(0, Math.min(this.currentScrollTop, Math.max(0, this.contentHeight - 1)));
+		}
 		if (this.contentHeight <= this.currentViewportHeight) this.hideTransientScrollbar();
 	}
 

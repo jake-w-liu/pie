@@ -1,0 +1,50 @@
+{
+	"name": "@earendil-works/pi-ext-fff",
+	"version": "0.1.0",
+	"description": "FFF-powered fuzzy file resolution, autocomplete, and content search extension for pie (vendored from pi-fff)",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json",
+		"prepublishOnly": "npm run clean && npm run build",
+		"typecheck": "tsgo -p tsconfig.build.json"
+	},
+	"keywords": [
+		"pi-package",
+		"pi",
+		"coding-agent",
+		"extension",
+		"autocomplete",
+		"files",
+		"fff"
+	],
+	"license": "MIT",
+	"dependencies": {
+		"@ff-labs/fff-node": "^0.9.4",
+		"@sinclair/typebox": "^0.34.41",
+		"better-result": "^2.8.2"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "^0.1.0",
+		"@earendil-works/pi-tui": "^0.1.0"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		],
+		"image": "https://github.com/user-attachments/assets/c9020bb7-f708-4f75-a802-6ac182b48e07"
+	}
+}

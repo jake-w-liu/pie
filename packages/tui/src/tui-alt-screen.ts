@@ -7,7 +7,7 @@ import {
 import { AltScreenFlashContainer } from "./components/alt-screen-flash.ts";
 import { ScrollView } from "./components/scroll-view.ts";
 import { getKeybindings } from "./keybindings.ts";
-import { isKeyRelease } from "./keys.ts";
+import { isKeyRelease, matchesKey } from "./keys.ts";
 import {
 	getScrollbarGeometry,
 	getScrollViewBox,
@@ -636,6 +636,15 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			}
 		}
 		if (this.shouldDeferViewportInputToOverlay()) return undefined;
+		// When the transcript has been scrolled up (not following the end), the Down
+		// arrow returns it to the bottom so the user can keep typing; it stops
+		// navigating the editor cursor while the user is reading earlier content.
+		// Once following again, Down reaches the editor as usual. pageDown still
+		// scrolls down incrementally.
+		if (matchesKey(data, "down") && !this.getPrimaryScrollView().isFollowingEnd) {
+			if (!isRelease) this.scrollToBottom();
+			return { consume: true };
+		}
 		if (keybindings.matches(data, "tui.altScreen.pageUp")) {
 			if (!isRelease) {
 				this.scrollBy(-Math.max(1, this.getPrimaryScrollView().viewportHeight - PAGE_SCROLL_OVERLAP));

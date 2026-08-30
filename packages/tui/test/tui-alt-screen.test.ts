@@ -711,6 +711,50 @@ describe("TuiAltScreen", () => {
 		tui.stop();
 	});
 
+	it("returns a scrolled-up transcript to the bottom on Down instead of the editor", async () => {
+		const terminal = new VirtualTerminal(20, 6);
+		const tui = new TuiAltScreen(terminal);
+		const transcript = new ScrollView(
+			new Text(Array.from({ length: 12 }, (_, index) => `line ${index + 1}`).join("\n"), 0, 0),
+			{ follow: "end", primary: true },
+		);
+		const editorInputs: string[] = [];
+		const editor = {
+			focused: false,
+			render: () => ["editor"],
+			invalidate: () => {},
+			handleInput: (data: string) => editorInputs.push(data),
+		};
+		tui.setLayoutRoot(
+			new VStack([
+				{ component: transcript, basis: 0, grow: 1, minSize: 1 },
+				{ component: editor, basis: 1, shrink: 0 },
+			]),
+		);
+		tui.setFocus(editor);
+		tui.start();
+		await terminal.waitForRender();
+		assert.strictEqual(tui.isFollowingOutput, true);
+
+		// Scroll the transcript up (wheel up) so it is no longer following.
+		terminal.sendInput("\x1b[<64;1;1M");
+		await terminal.waitForRender();
+		assert.strictEqual(tui.isFollowingOutput, false);
+
+		// Press Down: returns the transcript to the bottom and does NOT reach the editor.
+		terminal.sendInput("\x1b[B");
+		await terminal.waitForRender();
+		assert.strictEqual(tui.isFollowingOutput, true);
+		assert.deepStrictEqual(editorInputs, []);
+
+		// Now following again: Down reaches the editor as usual.
+		terminal.sendInput("\x1b[B");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(editorInputs, ["\x1b[B"]);
+
+		tui.stop();
+	});
+
 	it("jumps between OSC 133 semantic prompt markers", async () => {
 		const terminal = new VirtualTerminal(20, 3);
 		const tui = new TuiAltScreen(terminal);

@@ -34,6 +34,21 @@ import {
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
 const EXIT_STDIO_GRACE_MS = 100;
+// When a caller streams via onStdout/onStderr it already owns its own bounded
+// capture (see executeShellWithCapture), so the exec result's stdout/stderr only
+// needs a bounded tail. Unbounded accumulation here would otherwise grow the
+// process heap with the full output size (e.g. a `cat` of a large file).
+const STREAM_CAPTURE_MAX_BYTES = 100 * 1024;
+
+/** Keep only the last ~maxBytes UTF-8 of a growing streamed output string. */
+function appendStreamTail(current: string, chunk: string, maxBytes: number): string {
+	const next = current + chunk;
+	const bytes = new TextEncoder().encode(next);
+	if (bytes.byteLength <= maxBytes) return next;
+	let start = bytes.byteLength - maxBytes;
+	while (start < bytes.byteLength && ((bytes[start] ?? 0) & 0xc0) === 0x80) start++;
+	return new TextDecoder().decode(bytes.subarray(start));
+}
 
 function resolveTimeoutMs(timeout: number | undefined): Result<number | undefined, ExecutionError> {
 	if (timeout === undefined) return ok(undefined);
@@ -464,7 +479,7 @@ export class NodeExecutionEnv implements ExecutionEnv {
 			child.stdout?.setEncoding("utf8");
 			child.stderr?.setEncoding("utf8");
 			child.stdout?.on("data", (chunk: string) => {
-				stdout += chunk;
+				stdout = options?.onStdout ? appendStreamTail(stdout, chunk, STREAM_CAPTURE_MAX_BYTES) : stdout + chunk;
 				try {
 					options?.onStdout?.(chunk);
 				} catch (error) {
@@ -474,7 +489,7 @@ export class NodeExecutionEnv implements ExecutionEnv {
 				}
 			});
 			child.stderr?.on("data", (chunk: string) => {
-				stderr += chunk;
+				stderr = options?.onStderr ? appendStreamTail(stderr, chunk, STREAM_CAPTURE_MAX_BYTES) : stderr + chunk;
 				try {
 					options?.onStderr?.(chunk);
 				} catch (error) {

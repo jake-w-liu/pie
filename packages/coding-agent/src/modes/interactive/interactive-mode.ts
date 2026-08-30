@@ -542,6 +542,7 @@ export class InteractiveMode {
 
 	// Extension UI state
 	private extensionSelector: ExtensionSelectorComponent | undefined = undefined;
+	private extensionSelectorAbort?: { signal: AbortSignal; handler: () => void };
 	private extensionInput: ExtensionInputComponent | undefined = undefined;
 	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
 	private extensionTerminalInputSubscriptions = new Set<{
@@ -2537,16 +2538,24 @@ export class InteractiveMode {
 		opts?: ExtensionUIDialogOptions,
 	): Promise<string | undefined> {
 		return new Promise((resolve) => {
+			// A previously shown extension dialog may still have an active abort
+			// listener on its own signal. Remove it so an abort of the OLD signal can
+			// no longer hide a newer selector or resolve the old promise.
+			this.extensionSelectorAbort?.signal.removeEventListener("abort", this.extensionSelectorAbort.handler);
+			this.extensionSelectorAbort = undefined;
+
 			if (opts?.signal?.aborted) {
 				resolve(undefined);
 				return;
 			}
 
 			const onAbort = () => {
+				this.extensionSelectorAbort = undefined;
 				this.hideExtensionSelector();
 				resolve(undefined);
 			};
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
+			this.extensionSelectorAbort = opts?.signal ? { signal: opts.signal, handler: onAbort } : undefined;
 
 			this.extensionSelector = new ExtensionSelectorComponent(
 				title,
@@ -2576,6 +2585,8 @@ export class InteractiveMode {
 	 * Hide the extension selector.
 	 */
 	private hideExtensionSelector(): void {
+		this.extensionSelectorAbort?.signal.removeEventListener("abort", this.extensionSelectorAbort.handler);
+		this.extensionSelectorAbort = undefined;
 		this.extensionSelector?.dispose();
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);

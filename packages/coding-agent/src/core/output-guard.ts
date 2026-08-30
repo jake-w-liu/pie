@@ -10,6 +10,16 @@ const RAW_STDOUT_RETRY_DELAY_MS = 10;
 
 let rawStdoutWriteTail: Promise<void> = Promise.resolve();
 
+/**
+ * Optional synchronous cleanup run before exiting on a fatal stdout write failure
+ * (e.g. EPIPE when the client closed the pipe). Modes register this so detached
+ * children / runtime resources are released instead of orphaning them.
+ */
+let fatalStdoutCleanup: (() => void) | undefined;
+export function setFatalStdoutCleanup(fn: (() => void) | undefined): void {
+	fatalStdoutCleanup = fn;
+}
+
 function getRawStdoutWrite(): StdoutTakeoverState["rawStdoutWrite"] {
 	if (stdoutTakeoverState) {
 		return stdoutTakeoverState.rawStdoutWrite;
@@ -88,6 +98,11 @@ export function writeRawStdout(text: string): void {
 	}
 	rawStdoutWriteTail = rawStdoutWriteTail.then(() => writeRawStdoutChunk(text));
 	void rawStdoutWriteTail.catch(() => {
+		try {
+			fatalStdoutCleanup?.();
+		} catch {
+			// Cleanup must never mask the exit.
+		}
 		process.exit(1);
 	});
 }

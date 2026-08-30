@@ -21,6 +21,7 @@ import type {
 } from "../../core/extensions/index.ts";
 import {
 	flushRawStdout,
+	setFatalStdoutCleanup,
 	takeOverStdout,
 	waitForRawStdoutBackpressure,
 	writeRawStdout,
@@ -52,6 +53,12 @@ export type {
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
 export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<never> {
+	// On a fatal stdout write (client closed the pipe), release tracked children
+	// and the runtime instead of exiting and orphaning them.
+	setFatalStdoutCleanup(() => {
+		killTrackedDetachedChildren();
+		void runtimeHost.dispose();
+	});
 	takeOverStdout();
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
@@ -725,7 +732,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	 */
 	let detachInput = () => {};
 
-	async function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<never> {
+	async function shutdown(exitCode = 0, _signal?: NodeJS.Signals): Promise<never> {
 		if (shuttingDown) {
 			process.exit(exitCode);
 		}
@@ -738,8 +745,14 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		await runtimeHost.dispose();
 		detachInput();
 		process.stdin.pause();
-		if (signal !== "SIGTERM") {
+		// Always flush buffered protocol output before exit so the event stream is
+		// not truncated under backpressure (SIGTERM previously skipped this and
+		// could silently drop queued JSONL records). Guard against a peer that has
+		// already closed the pipe so a flush failure never blocks exit.
+		try {
 			await flushRawStdout();
+		} catch {
+			// The peer may already be gone; the exit code governs the result.
 		}
 		process.exit(exitCode);
 	}

@@ -13,7 +13,7 @@ import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import type { JsonAgentSessionEvent } from "../json-event.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
-import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.ts";
+import type { RpcCommand, RpcExtensionUIResponse, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.ts";
 
 // ============================================================================
 // Types
@@ -122,6 +122,17 @@ export class RpcClient {
 				this.exitError ?? new Error(`Agent process stdin error: ${error.message}. Stderr: ${this.stderr}`);
 			this.exitError = stdinError;
 			this.rejectPendingRequests(stdinError);
+		});
+		// A stdout stream error (e.g. EPIPE, or the child dying mid-stream) would
+		// otherwise fire an unhandled EventEmitter 'error' (crashing this process)
+		// and, since 'end' never fires, leave pending requests hanging until their
+		// timeout. Reject them here like the other stream error paths do.
+		childProcess.stdout?.on("error", (error) => {
+			if (this.process !== childProcess) return;
+			const stdoutError =
+				this.exitError ?? new Error(`Agent process stdout error: ${error.message}. Stderr: ${this.stderr}`);
+			this.exitError = stdoutError;
+			this.rejectPendingRequests(stdoutError);
 		});
 
 		// Set up strict JSONL reader for stdout.
@@ -514,23 +525,34 @@ export class RpcClient {
 	// =========================================================================
 
 	private handleLine(line: string): void {
+		let data: unknown;
 		try {
-			const data = JSON.parse(line);
+			data = JSON.parse(line);
+		} catch {
+			// Ignore non-JSON lines (stray output from the agent process).
+			return;
+		}
 
-			// Check if it's a response to a pending request
-			if (data.type === "response" && data.id && this.pendingRequests.has(data.id)) {
-				const pending = this.pendingRequests.get(data.id)!;
-				this.pendingRequests.delete(data.id);
+		// Check if it's a response to a pending request.
+		if (data !== null && typeof data === "object" && (data as { type?: unknown }).type === "response") {
+			const id = (data as { id?: unknown }).id;
+			if (typeof id === "string" && this.pendingRequests.has(id)) {
+				const pending = this.pendingRequests.get(id)!;
+				this.pendingRequests.delete(id);
 				pending.resolve(data as RpcResponse);
 				return;
 			}
+		}
 
-			// Otherwise it's an event
-			for (const listener of this.eventListeners) {
+		// Otherwise it's an event. Dispatch to every listener even if one throws, and
+		// surface listener errors instead of silently swallowing them (the old broad
+		// catch{} also skipped the remaining listeners for this line).
+		for (const listener of this.eventListeners) {
+			try {
 				listener(data as JsonAgentSessionEvent);
+			} catch (error) {
+				console.error("[rpc-client] event listener error:", error);
 			}
-		} catch {
-			// Ignore non-JSON lines
 		}
 	}
 
@@ -594,6 +616,31 @@ export class RpcClient {
 				pending?.reject(writeError);
 			}
 		});
+	}
+
+	/**
+	 * Respond to an `extension_ui_request` event emitted by the agent process
+	 * (e.g. a select/confirm/input/editor dialog). Sends the response over stdin as
+	 * a one-way message, which the server resolves against its pending UI request.
+	 * Without this, server-side UI dialogs hang forever because the client has no
+	 * way to answer them.
+	 */
+	respondToExtensionUI(response: RpcExtensionUIResponse): void {
+		const childProcess = this.process;
+		const stdin = childProcess?.stdin;
+		if (!childProcess || !stdin) {
+			throw new Error("Client not started");
+		}
+		if (this.exitError) {
+			throw this.exitError;
+		}
+		if (childProcess.exitCode !== null) {
+			throw this.createProcessExitError(childProcess.exitCode, childProcess.signalCode);
+		}
+		if (stdin.destroyed || !stdin.writable) {
+			throw new Error(`Agent process stdin is not writable. Stderr: ${this.stderr}`);
+		}
+		stdin.write(serializeJsonLine(response));
 	}
 
 	private getData<T>(response: RpcResponse): T {

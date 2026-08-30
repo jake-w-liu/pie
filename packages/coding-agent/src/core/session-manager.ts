@@ -546,15 +546,46 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 		closeSync(fd);
 	}
 
-	// Validate session header before repairing the file.
+	// Validate session header.
 	if (entries.length === 0) return entries;
 	const header = entries[0];
 	if (header.type !== "session" || typeof (header as { id?: unknown }).id !== "string") {
 		return [];
 	}
 
-	if (pending) appendFileSync(resolvedFilePath, "\n");
+	// Note: reads are intentionally side-effect free. The old code appended a
+	// trailing newline here to "repair" a file, but that mutated the file on every
+	// read and threw on read-only files. The trailing-newline guarantee now lives
+	// in appendSessionLine(), on the write path, where it belongs.
 	return entries;
+}
+
+/**
+ * Append one session entry to a JSONL file, guaranteeing it starts on its own
+ * line. A hand-edited or foreign file may lack a trailing newline; appending
+ * directly would glue the entry onto the previous line. Reads must stay
+ * side-effect free, so the repair happens here, only when writing.
+ */
+function appendSessionLine(filePath: string, entry: SessionEntry): void {
+	try {
+		const { size } = statSync(filePath);
+		if (size > 0) {
+			const fd = openSync(filePath, "r");
+			try {
+				const buf = Buffer.allocUnsafe(1);
+				const n = readSync(fd, buf, 0, 1, size - 1);
+				if (n === 1 && buf[0] !== 0x0a) {
+					appendFileSync(filePath, "\n");
+				}
+			} finally {
+				closeSync(fd);
+			}
+		}
+	} catch {
+		// Cannot inspect the file (e.g. it does not exist yet); append directly and
+		// let the caller surface any real error.
+	}
+	appendFileSync(filePath, `${JSON.stringify(entry)}\n`);
 }
 
 /**
@@ -1020,7 +1051,7 @@ export class SessionManager {
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 		if (!hasAssistant) {
 			if (this.flushed) {
-				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+				appendSessionLine(this.sessionFile, entry);
 			} else {
 				// Mark as not flushed so when assistant arrives, all entries get written
 				this.flushed = false;
@@ -1039,7 +1070,7 @@ export class SessionManager {
 			}
 			this.flushed = true;
 		} else {
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			appendSessionLine(this.sessionFile, entry);
 		}
 	}
 
@@ -1630,7 +1661,7 @@ export class SessionManager {
 		// Copy all non-header entries from source
 		for (const entry of sourceEntries) {
 			if (entry.type !== "session") {
-				appendFileSync(newSessionFile, `${JSON.stringify(entry)}\n`);
+				appendSessionLine(newSessionFile, entry);
 			}
 		}
 

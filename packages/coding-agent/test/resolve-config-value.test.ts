@@ -61,7 +61,7 @@ describe("resolveConfigValue", () => {
 		},
 	);
 
-	test("caches successful and failed commands until explicitly cleared", () => {
+	test("caches successful results but retries failed commands (no permanent failure cache)", () => {
 		const counterFile = join(tempDir, "counter");
 		writeFileSync(counterFile, "0");
 		const escapedPath = counterFile.replace(/\\/g, "/").replace(/"/g, '\\"');
@@ -78,7 +78,10 @@ describe("resolveConfigValue", () => {
 		const failure = `!sh -c 'count=$(cat "${escapedPath}"); echo $((count + 1)) > "${escapedPath}"; exit 1'`;
 		expect(resolveConfigValue(failure)).toBeUndefined();
 		expect(resolveConfigValue(failure)).toBeUndefined();
-		expect(readFileSync(counterFile, "utf-8").trim()).toBe("3");
+		// Failures are NOT cached: a transient failure is re-run (and thus can
+		// recover) on the next call instead of being permanently resolved to
+		// undefined until restart. Counter goes 2 -> 3 -> 4.
+		expect(readFileSync(counterFile, "utf-8").trim()).toBe("4");
 	});
 
 	test("does not cache environment values", () => {

@@ -917,12 +917,19 @@ export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
 	if (sessionId) {
 		for (const entry of websocketSessionCache.get(sessionId)?.values() ?? []) closeEntry(entry);
 		websocketSessionCache.delete(sessionId);
+		// Release the per-session scratch state too, or stats and the SSE-fallback
+		// set accumulate unboundedly for every distinct session in a long-lived
+		// process (previously only the connection cache was cleared here).
+		websocketDebugStats.delete(sessionId);
+		websocketSseFallbackSessions.delete(sessionId);
 		return;
 	}
 	for (const accountEntries of websocketSessionCache.values()) {
 		for (const entry of accountEntries.values()) closeEntry(entry);
 	}
 	websocketSessionCache.clear();
+	websocketDebugStats.clear();
+	websocketSseFallbackSessions.clear();
 }
 
 registerSessionResourceCleanup(closeOpenAICodexWebSocketSessions);

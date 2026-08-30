@@ -45,6 +45,16 @@ describe("parseFrontmatter", () => {
 		const { frontmatter } = parseFrontmatter(input);
 		expect(frontmatter).toEqual({});
 	});
+
+	it("returns empty object for scalar frontmatter instead of a non-object", () => {
+		for (const scalar of ["123", "true", "just text", "[1, 2, 3]"]) {
+			const input = `---\n${scalar}\n---\nBody`;
+			const { frontmatter, body } = parseFrontmatter(input);
+			expect(frontmatter).toEqual({});
+			expect(typeof frontmatter).toBe("object");
+			expect(body).toBe("Body");
+		}
+	});
 });
 
 describe("stripFrontmatter", () => {

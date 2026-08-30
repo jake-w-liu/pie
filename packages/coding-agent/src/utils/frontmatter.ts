@@ -34,7 +34,11 @@ export const parseFrontmatter = <T extends Record<string, unknown> = Record<stri
 		return { frontmatter: {} as T, body };
 	}
 	const parsed = parse(yamlString);
-	return { frontmatter: (parsed ?? {}) as T, body };
+	// Guard against scalar/array frontmatter (e.g. `---\n123\n---` parses to a
+	// number) which would otherwise flow into callers as a non-object cast to
+	// Record and break object indexing. Only plain-object frontmatter is valid.
+	const isObject = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed);
+	return { frontmatter: (isObject ? parsed : {}) as T, body };
 };
 
 export const stripFrontmatter = (content: string): string => parseFrontmatter(content).body;

@@ -173,8 +173,11 @@ function parseUsage(
 	const promptTokens = rawUsage.prompt_tokens || 0;
 	const reportedCachedTokens = rawUsage.prompt_tokens_details?.cached_tokens || 0;
 	const cacheWriteTokens = rawUsage.prompt_tokens_details?.cache_write_tokens || 0;
-	const cacheReadTokens =
-		cacheWriteTokens > 0 ? Math.max(0, reportedCachedTokens - cacheWriteTokens) : reportedCachedTokens;
+	// Do NOT subtract cache_write_tokens from cached_tokens: OpenRouter reports
+	// them as separate fields, and spec-compliant providers would otherwise be
+	// under-reported (see the sourced decision in openai-completions.ts, citing
+	// OpenRouterTeam/ai-sdk-provider#409 and antirez/ds4#29).
+	const cacheReadTokens = reportedCachedTokens;
 	const input = Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
 	const output = rawUsage.completion_tokens || 0;
 	const usage = {

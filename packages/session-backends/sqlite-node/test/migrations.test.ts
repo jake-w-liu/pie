@@ -58,4 +58,25 @@ describe("SQLite migrations", () => {
 			db.close();
 		}
 	});
+
+	it("concurrent first-open migrations from two connections do not race", async () => {
+		const databasePath = join(createTempDir(), "sessions.sqlite");
+		const factory = createNodeSqliteFactory();
+		const dbA = await factory.open(databasePath);
+		const dbB = await factory.open(databasePath);
+		try {
+			// Both connections start against the same fresh file; the applied-set
+			// read + apply must be atomic under BEGIN IMMEDIATE so neither sees a
+			// stale empty set and then fails a UNIQUE constraint on migrations.id.
+			await Promise.all([applyMigrations(dbA), applyMigrations(dbB)]);
+
+			const aCount = dbA.prepare("SELECT COUNT(*) AS n FROM migrations").get() as { n: number };
+			const bCount = dbB.prepare("SELECT COUNT(*) AS n FROM migrations").get() as { n: number };
+			expect(aCount.n).toBe(1);
+			expect(bCount.n).toBe(1);
+		} finally {
+			dbA.close();
+			dbB.close();
+		}
+	});
 });

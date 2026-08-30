@@ -41,6 +41,20 @@ export function applyTranscriptSnapshot(state: TranscriptState, snapshot: Sessio
 
 export function applyTranscriptProgress(state: TranscriptState, progress: TranscriptProgress): TranscriptState {
 	if (progress.type === "item_started" || progress.type === "item_updated") {
+		// An item_updated can replace an item's tool-call input. If it carries a
+		// non-null string input, re-seed that part's delta buffer so subsequent
+		// toolCall deltas build on the replaced input instead of the stale
+		// pre-update prefix (which corrupted the parsed tool input). A null input
+		// means the streaming delta buffer still holds the real content, so keep it.
+		if (progress.type === "item_updated") {
+			const toolCallBuffers = new Map(state.toolCallBuffers);
+			progress.item.content.forEach((part, index) => {
+				if (part.type === "toolCall" && typeof part.input === "string") {
+					toolCallBuffers.set(`${progress.item.id}:${index}`, part.input);
+				}
+			});
+			return setProgressItem({ ...state, toolCallBuffers }, progress.item);
+		}
 		return setProgressItem(state, progress.item);
 	}
 	if (progress.type === "item_finished") {

@@ -548,4 +548,19 @@ describe("NodeExecutionEnv", () => {
 		expect(fullOutput.split("\n").length).toBeGreaterThan(10000);
 		expect(result.output.length).toBeLessThan(fullOutput.length);
 	});
+
+	it("bounds retained stdout when streaming via onStdout (no unbounded heap growth)", async () => {
+		const env = new NodeExecutionEnv({ cwd: createTempDir() });
+		const chunks: string[] = [];
+		// ~2MB of output, far above the 100KB streaming retention cap.
+		const result = await env.exec("yes 0123456789 | head -n 200000", {
+			onStdout: (chunk) => chunks.push(chunk),
+		});
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		// All output was streamed to the callback.
+		expect(chunks.join("").length).toBeGreaterThan(1_000_000);
+		// But the exec result only retains a bounded tail.
+		expect(result.value.stdout.length).toBeLessThan(200 * 1024);
+	});
 });

@@ -1066,7 +1066,10 @@ function ansi256ToHex(index: number): string {
  */
 export function getResolvedThemeColors(themeName?: string): Record<string, string> {
 	const name = themeName ?? currentThemeName ?? getDefaultTheme();
-	const isLight = name === "light";
+	// Resolve builtin names (e.g. "light" -> "pie-nippon-light") the same way
+	// isLightTheme does, so empty-string colors get the correct light fallback
+	// in HTML export instead of the dark one.
+	const isLight = isLightTheme(themeName);
 	const themeJson = loadThemeJson(name);
 	const resolved = resolveThemeColors(withThemeColorFallbacks(themeJson.colors), themeJson.vars);
 

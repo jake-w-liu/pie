@@ -2,6 +2,11 @@ const FRAME_HEADER_LENGTH = 4;
 const MAX_UINT32 = 0xffff_ffff;
 const PAYLOAD_BLOCK_SIZE = 64 * 1024;
 
+// Zero-length frames can never form a valid CBOR message, but a malicious or
+// malformed peer can emit many of them. Reuse one shared empty buffer instead of
+// allocating a fresh Uint8Array per zero-length frame (allocation amplification).
+const EMPTY_FRAME = new Uint8Array();
+
 /** Default upper bound for one framed CBOR payload. */
 export const DEFAULT_MAX_FRAME_LENGTH = 16 * 1024 * 1024;
 
@@ -92,7 +97,7 @@ export class FrameDecoder {
 					this.fail(`Frame length ${frameLength} exceeds configured limit of ${this.maxFrameLength}`);
 				}
 				if (frameLength === 0) {
-					frames.push(new Uint8Array());
+					frames.push(EMPTY_FRAME);
 					continue;
 				}
 				this.expectedPayloadLength = frameLength;

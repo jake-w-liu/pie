@@ -30,6 +30,27 @@ describe("Git URL Parsing", () => {
 				repo: "https://github.com/user/repo",
 			});
 		});
+
+		it("should parse git:// URL without confusing it for the git: prefix", () => {
+			const result = parseGitUrl("git://github.com/user/repo");
+			expect(result).toMatchObject({
+				host: "github.com",
+				path: "user/repo",
+				repo: "git://github.com/user/repo",
+				pinned: false,
+			});
+		});
+
+		it("should parse git:// URL with ref", () => {
+			const result = parseGitUrl("git://github.com/user/repo.git@v1.0.0");
+			expect(result).toMatchObject({
+				host: "github.com",
+				path: "user/repo",
+				repo: "git://github.com/user/repo.git",
+				ref: "v1.0.0",
+				pinned: true,
+			});
+		});
 	});
 
 	describe("shorthand URLs (accepted only with git: prefix)", () => {
@@ -48,6 +69,27 @@ describe("Git URL Parsing", () => {
 				host: "github.com",
 				path: "user/repo",
 				repo: "https://github.com/user/repo",
+			});
+		});
+
+		it("should resolve hostless shorthand with git: prefix to the hosted domain", () => {
+			const result = parseGitUrl("git:user/repo");
+			expect(result).toMatchObject({
+				host: "github.com",
+				path: "user/repo",
+				repo: "https://github.com/user/repo",
+				pinned: false,
+			});
+		});
+
+		it("should resolve hostless shorthand with ref to the hosted domain", () => {
+			const result = parseGitUrl("git:user/repo@v1.0.0");
+			expect(result).toMatchObject({
+				host: "github.com",
+				path: "user/repo",
+				repo: "https://github.com/user/repo",
+				ref: "v1.0.0",
+				pinned: true,
 			});
 		});
 

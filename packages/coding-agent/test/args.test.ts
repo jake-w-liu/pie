@@ -497,4 +497,55 @@ describe("parseArgs", () => {
 			expect(result.messages).toEqual(["Do the task"]);
 		});
 	});
+
+	describe("missing flag values", () => {
+		for (const flag of [
+			"--mode",
+			"--provider",
+			"--model",
+			"--api-key",
+			"--system-prompt",
+			"--session",
+			"--session-id",
+			"--fork",
+			"--session-dir",
+			"--models",
+			"--tools",
+			"--exclude-tools",
+			"--thinking",
+			"--export",
+			"--extension",
+			"--skill",
+			"--prompt-template",
+			"--theme",
+		]) {
+			test(`reports a missing value for ${flag} at end of argv`, () => {
+				const result = parseArgs([flag]);
+				expect(result.diagnostics).toContainEqual({ type: "error", message: `${flag} requires a value` });
+			});
+		}
+
+		test("reports a missing value for --append-system-prompt", () => {
+			const result = parseArgs(["--append-system-prompt"]);
+			expect(result.diagnostics).toContainEqual({
+				type: "error",
+				message: "--append-system-prompt requires a value",
+			});
+		});
+	});
+
+	describe("invalid values", () => {
+		test("reports an invalid --mode value instead of silently ignoring it", () => {
+			const result = parseArgs(["--mode", "bogus"]);
+			expect(result.mode).toBeUndefined();
+			expect(result.diagnostics).toContainEqual({
+				type: "error",
+				message: 'Invalid mode "bogus". Valid values: text, json, rpc',
+			});
+		});
+
+		test("still accepts valid --mode values", () => {
+			expect(parseArgs(["--mode", "json"]).mode).toBe("json");
+		});
+	});
 });

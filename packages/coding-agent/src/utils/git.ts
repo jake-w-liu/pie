@@ -171,7 +171,10 @@ function parseGenericGitUrl(url: string): GitSource | null {
  */
 export function parseGitUrl(source: string): GitSource | null {
 	const trimmed = source.trim();
-	const hasGitPrefix = trimmed.startsWith("git:");
+	// `git:` is the legacy shorthand prefix (e.g. `git:user/repo`). Do NOT treat
+	// `git://` (an explicit protocol URL, like `https://`) as that prefix, or the
+	// prefix-strip below corrupts `git://host/path` into a broken `https:////...`.
+	const hasGitPrefix = trimmed.startsWith("git:") && !trimmed.startsWith("git://");
 	const url = hasGitPrefix ? trimmed.slice(4).trim() : trimmed;
 
 	if (!hasGitPrefix && !/^(https?|ssh|git):\/\//i.test(url)) {
@@ -195,8 +198,20 @@ export function parseGitUrl(source: string): GitSource | null {
 				!split.repo.startsWith("ssh://") &&
 				!split.repo.startsWith("git://") &&
 				!split.repo.startsWith("git@");
+			// A hostless shorthand (e.g. `git:user/repo`) has no host in split.repo;
+			// hosted-git-info resolved it to info.domain, so prepend that domain or
+			// the clone URL would be a broken `https://user/repo` (repo inconsistent
+			// with host/path). When the shorthand already names a host, keep it as-is
+			// so subgroup paths (e.g. gitlab group/sub/repo) are preserved.
+			const firstSegment = split.repo.split("/")[0] ?? "";
+			const hostlessRepo =
+				useHttpsPrefix && Boolean(info.domain) && !firstSegment.includes(".") && firstSegment !== "localhost";
 			return buildGitSource({
-				repo: useHttpsPrefix ? `https://${split.repo}` : split.repo,
+				repo: useHttpsPrefix
+					? hostlessRepo
+						? `https://${info.domain}/${info.user}/${info.project}`
+						: `https://${split.repo}`
+					: split.repo,
 				host: info.domain || "",
 				path: `${info.user}/${info.project}`,
 				ref: info.committish || split.ref || undefined,
@@ -213,8 +228,10 @@ export function parseGitUrl(source: string): GitSource | null {
 			if (split.ref && info.project?.includes("@")) {
 				continue;
 			}
+			const firstSegment = split.repo.split("/")[0] ?? "";
+			const hostlessRepo = Boolean(info.domain) && !firstSegment.includes(".") && firstSegment !== "localhost";
 			return buildGitSource({
-				repo: `https://${split.repo}`,
+				repo: hostlessRepo ? `https://${info.domain}/${info.user}/${info.project}` : `https://${split.repo}`,
 				host: info.domain || "",
 				path: `${info.user}/${info.project}`,
 				ref: info.committish || split.ref || undefined,

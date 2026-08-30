@@ -738,10 +738,9 @@ describe("Coding Agent Tools", () => {
 			expect(output).toMatch(/\[Showing lines \d+-\d+ of \d+\. Full output: /);
 			expect(output).not.toContain("Full output: undefined");
 
-			for (let i = 0; i < 20 && (!fullOutputPath || !existsSync(fullOutputPath)); i++) {
-				await new Promise((resolve) => setTimeout(resolve, 10));
-			}
-
+			// The temp file must be complete and readable as soon as execute resolves
+			// (regression: the stream was end()ed but not awaited, so the path could
+			// be returned before the file finished draining).
 			expect(fullOutputPath).toBeDefined();
 			expect(existsSync(fullOutputPath!)).toBe(true);
 			const fullOutput = readFileSync(fullOutputPath!, "utf-8");

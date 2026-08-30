@@ -173,11 +173,11 @@ export class BashExecutionComponent extends Container {
 		fullOutputPath?: string,
 	): void {
 		this.exitCode = exitCode;
-		this.status = cancelled
-			? "cancelled"
-			: exitCode !== 0 && exitCode !== undefined && exitCode !== null
-				? "error"
-				: "complete";
+		// exitCode === undefined/null (and not cancelled) means the execution threw
+		// or was terminated abnormally; that must render as an error, not success.
+		// Previously such a case fell through to "complete" (e.g. the catch handler
+		// in interactive-mode passed (undefined, false)).
+		this.status = cancelled ? "cancelled" : exitCode === 0 ? "complete" : "error";
 		this.truncationResult = truncationResult;
 		this.fullOutputPath = fullOutputPath;
 

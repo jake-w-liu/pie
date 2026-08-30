@@ -1,7 +1,8 @@
 import type * as ChildProcess from "node:child_process";
+import { spawnSync } from "node:child_process";
 import type * as Fs from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ensureTool, type ToolStatus } from "../src/utils/tools-manager.ts";
+import { ensureTool, getToolPath, type ToolStatus } from "../src/utils/tools-manager.ts";
 
 const originalOffline = process.env.PI_OFFLINE;
 
@@ -43,5 +44,20 @@ describe("ensureTool", () => {
 		]);
 		expect(consoleLog).not.toHaveBeenCalled();
 		consoleLog.mockRestore();
+	});
+
+	describe("getToolPath", () => {
+		it("bounds commandExists with a timeout so a wedged binary cannot block synchronously", () => {
+			const spawnSyncMock = vi.mocked(spawnSync);
+			spawnSyncMock.mockClear();
+
+			expect(getToolPath("fd")).toBeNull();
+
+			expect(spawnSyncMock).toHaveBeenCalled();
+			for (const call of spawnSyncMock.mock.calls) {
+				const options = call[2] as { timeout?: number } | undefined;
+				expect(options?.timeout).toBeGreaterThan(0);
+			}
+		});
 	});
 });

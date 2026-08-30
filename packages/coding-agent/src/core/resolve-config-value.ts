@@ -211,7 +211,14 @@ function executeCommand(commandConfig: string): string | undefined {
 	}
 
 	const result = executeCommandUncached(commandConfig);
-	commandResultCache.set(commandConfig, result);
+	// Cache only successful results. A transient failure (e.g. keyring locked
+	// during the 10s command timeout) must not be cached as undefined forever,
+	// otherwise the API key/header resolves to undefined until restart. The
+	// throwing path (resolveConfigValueOrThrow) re-runs the command each time, so
+	// caching failures would be asymmetric.
+	if (result !== undefined) {
+		commandResultCache.set(commandConfig, result);
+	}
 	return result;
 }
 

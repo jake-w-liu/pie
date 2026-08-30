@@ -73,6 +73,22 @@ export async function executeBashWithOperations(
 		}
 	};
 
+	// Close the temp file and await the write stream draining BEFORE exposing
+	// fullOutputPath. Without this, a caller reading the returned path can read a
+	// file that is still being written (worst case on the abort path).
+	const endTempFile = (): Promise<void> => {
+		if (!tempFileStream) return Promise.resolve();
+		const stream = tempFileStream;
+		tempFileStream = undefined;
+		if (stream.writableEnded) return Promise.resolve();
+		return new Promise<void>((resolve) => {
+			const done = (): void => resolve();
+			stream.once("finish", done);
+			stream.once("error", done);
+			stream.end();
+		});
+	};
+
 	const decoder = new TextDecoder();
 
 	const onData = (data: Buffer) => {
@@ -115,9 +131,7 @@ export async function executeBashWithOperations(
 		if (truncationResult.truncated) {
 			ensureTempFile();
 		}
-		if (tempFileStream) {
-			tempFileStream.end();
-		}
+		await endTempFile();
 		const cancelled = options?.signal?.aborted ?? false;
 
 		return {
@@ -135,9 +149,7 @@ export async function executeBashWithOperations(
 			if (truncationResult.truncated) {
 				ensureTempFile();
 			}
-			if (tempFileStream) {
-				tempFileStream.end();
-			}
+			await endTempFile();
 			return {
 				output: truncationResult.truncated ? truncationResult.content : fullOutput,
 				exitCode: undefined,
@@ -147,9 +159,7 @@ export async function executeBashWithOperations(
 			};
 		}
 
-		if (tempFileStream) {
-			tempFileStream.end();
-		}
+		await endTempFile();
 
 		throw err;
 	}

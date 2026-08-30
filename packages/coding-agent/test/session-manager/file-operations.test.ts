@@ -80,7 +80,7 @@ describe("loadEntriesFromFile", () => {
 		expect(entries).toHaveLength(2);
 	});
 
-	it("adds a newline after an unterminated valid record", () => {
+	it("leaves an unterminated valid record unchanged (reads are side-effect free)", () => {
 		const file = join(tempDir, "unterminated.jsonl");
 		const content =
 			'{"type":"session","id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n' +
@@ -88,17 +88,19 @@ describe("loadEntriesFromFile", () => {
 		writeFileSync(file, content);
 
 		expect(loadEntriesFromFile(file)).toHaveLength(2);
-		expect(readFileSync(file, "utf8")).toBe(`${content}\n`);
+		// Reading must not mutate the file (previously a trailing newline was
+		// appended, which failed on read-only files and changed mtime on every open).
+		expect(readFileSync(file, "utf8")).toBe(content);
 	});
 
-	it("adds a newline after an unterminated malformed final fragment", () => {
+	it("leaves an unterminated malformed final fragment unchanged", () => {
 		const file = join(tempDir, "malformed-tail.jsonl");
 		const content =
 			'{"type":"session","id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n' + '{"type":"message"';
 		writeFileSync(file, content);
 
 		expect(loadEntriesFromFile(file)).toHaveLength(1);
-		expect(readFileSync(file, "utf8")).toBe(`${content}\n`);
+		expect(readFileSync(file, "utf8")).toBe(content);
 	});
 
 	it("does not modify an unterminated non-session file", () => {
@@ -174,6 +176,23 @@ describe("loadEntriesFromFile", () => {
 		expect(sessionManager.getSessionId()).toBe("abc");
 		expect(sessionManager.getEntries()).toHaveLength(1);
 		expect(sessionManager.buildSessionContext().messages).toEqual([{ role: "user", content: "hi", timestamp: 1 }]);
+	});
+
+	it("write path starts a new line after an unterminated file instead of gluing", () => {
+		const file = join(tempDir, "no-trailing-nl.jsonl");
+		// Deliberately no trailing newline (hand-edited / foreign file).
+		const header = '{"type":"session","id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}';
+		writeFileSync(file, header);
+
+		const sessionManager = SessionManager.open(file, tempDir);
+		sessionManager.appendMessage({ role: "user", content: "hello", timestamp: 2 });
+
+		const text = readFileSync(file, "utf8");
+		const nonEmpty = text.split("\n").filter((line) => line.trim() !== "");
+		// Header on its own line, then the new message on its own line (not glued).
+		expect(nonEmpty).toHaveLength(2);
+		expect(nonEmpty[1]).toContain('"hello"');
+		expect(text.includes(`${header}{"type":"message"`)).toBe(false);
 	});
 });
 

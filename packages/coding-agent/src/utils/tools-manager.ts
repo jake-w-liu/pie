@@ -73,8 +73,10 @@ const TOOLS: Record<string, ToolConfig> = {
 // Check if a command exists in PATH by trying to run it
 function commandExists(cmd: string): boolean {
 	try {
-		const result = spawnSync(cmd, ["--version"], { stdio: "pipe" });
-		// Check for ENOENT error (command not found)
+		const result = spawnSync(cmd, ["--version"], { stdio: "pipe", timeout: 3000 });
+		// A wedged binary (or ENOENT) sets result.error; bound the wait with the
+		// timeout above and treat any failure as "not on PATH" so ensureTool never
+		// blocks synchronously on a hung tool.
 		return result.error === undefined || result.error === null;
 	} catch {
 		return false;
@@ -316,6 +318,20 @@ async function downloadTool(tool: "fd" | "rg"): Promise<string> {
 	return binaryPath;
 }
 
+// In-flight downloads keyed by tool, so concurrent ensureTool calls for the same
+// tool share a single download instead of racing on the shared archive/binary path.
+const inFlightDownloads = new Map<string, Promise<string>>();
+
+function downloadToolSingleFlight(tool: "fd" | "rg"): Promise<string> {
+	const existing = inFlightDownloads.get(tool);
+	if (existing) return existing;
+	const promise = downloadTool(tool).finally(() => {
+		inFlightDownloads.delete(tool);
+	});
+	inFlightDownloads.set(tool, promise);
+	return promise;
+}
+
 // Termux package names for tools
 const TERMUX_PACKAGES: Record<string, string> = {
 	fd: "fd",
@@ -361,7 +377,7 @@ export async function ensureTool(
 	onStatus?.({ type: "info", message: `${config.name} not found. Downloading...` });
 
 	try {
-		const path = await downloadTool(tool);
+		const path = await downloadToolSingleFlight(tool);
 		onStatus?.({ type: "info", message: `${config.name} installed to ${path}` });
 		return path;
 	} catch (e) {

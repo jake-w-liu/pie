@@ -79,6 +79,17 @@ export function parseArgs(args: string[]): Args {
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
 
+		// Consume a required value for a flag. If the flag is last in argv (no
+		// value), report an error diagnostic instead of silently ignoring it (the
+		// old `&& i + 1 < args.length` guard silently dropped these flags).
+		const takeValue = (flag: string): string | undefined => {
+			if (i + 1 >= args.length) {
+				result.diagnostics.push({ type: "error", message: `${flag} requires a value` });
+				return undefined;
+			}
+			return args[++i];
+		};
+
 		if (arg === "--") {
 			for (const positionalArg of args.slice(i + 1)) {
 				if (positionalArg.startsWith("@")) {
@@ -92,26 +103,36 @@ export function parseArgs(args: string[]): Args {
 			result.help = true;
 		} else if (arg === "--version" || arg === "-v") {
 			result.version = true;
-		} else if (arg === "--mode" && i + 1 < args.length) {
-			const mode = args[++i];
-			if (mode === "text" || mode === "json" || mode === "rpc") {
+		} else if (arg === "--mode") {
+			const mode = takeValue("--mode");
+			if (mode === undefined) {
+				// takeValue already reported the missing-value error.
+			} else if (mode === "text" || mode === "json" || mode === "rpc") {
 				result.mode = mode;
+			} else {
+				result.diagnostics.push({
+					type: "error",
+					message: `Invalid mode "${mode}". Valid values: text, json, rpc`,
+				});
 			}
 		} else if (arg === "--continue" || arg === "-c") {
 			result.continue = true;
 		} else if (arg === "--resume" || arg === "-r") {
 			result.resume = true;
-		} else if (arg === "--provider" && i + 1 < args.length) {
-			result.provider = args[++i];
-		} else if (arg === "--model" && i + 1 < args.length) {
-			result.model = args[++i];
-		} else if (arg === "--api-key" && i + 1 < args.length) {
-			result.apiKey = args[++i];
-		} else if (arg === "--system-prompt" && i + 1 < args.length) {
-			result.systemPrompt = args[++i];
-		} else if (arg === "--append-system-prompt" && i + 1 < args.length) {
-			result.appendSystemPrompt = result.appendSystemPrompt ?? [];
-			result.appendSystemPrompt.push(args[++i]);
+		} else if (arg === "--provider") {
+			result.provider = takeValue("--provider");
+		} else if (arg === "--model") {
+			result.model = takeValue("--model");
+		} else if (arg === "--api-key") {
+			result.apiKey = takeValue("--api-key");
+		} else if (arg === "--system-prompt") {
+			result.systemPrompt = takeValue("--system-prompt");
+		} else if (arg === "--append-system-prompt") {
+			const value = takeValue("--append-system-prompt");
+			if (value !== undefined) {
+				result.appendSystemPrompt = result.appendSystemPrompt ?? [];
+				result.appendSystemPrompt.push(value);
+			}
 		} else if (arg === "--name" || arg === "-n") {
 			if (i + 1 < args.length) {
 				result.name = args[++i];
@@ -120,33 +141,44 @@ export function parseArgs(args: string[]): Args {
 			}
 		} else if (arg === "--no-session") {
 			result.noSession = true;
-		} else if (arg === "--session" && i + 1 < args.length) {
-			result.session = args[++i];
-		} else if (arg === "--session-id" && i + 1 < args.length) {
-			result.sessionId = args[++i];
-		} else if (arg === "--fork" && i + 1 < args.length) {
-			result.fork = args[++i];
-		} else if (arg === "--session-dir" && i + 1 < args.length) {
-			result.sessionDir = args[++i];
-		} else if (arg === "--models" && i + 1 < args.length) {
-			result.models = args[++i].split(",").map((s) => s.trim());
+		} else if (arg === "--session") {
+			result.session = takeValue("--session");
+		} else if (arg === "--session-id") {
+			result.sessionId = takeValue("--session-id");
+		} else if (arg === "--fork") {
+			result.fork = takeValue("--fork");
+		} else if (arg === "--session-dir") {
+			result.sessionDir = takeValue("--session-dir");
+		} else if (arg === "--models") {
+			const value = takeValue("--models");
+			if (value !== undefined) {
+				result.models = value.split(",").map((s) => s.trim());
+			}
 		} else if (arg === "--no-tools" || arg === "-nt") {
 			result.noTools = true;
 		} else if (arg === "--no-builtin-tools" || arg === "-nbt") {
 			result.noBuiltinTools = true;
-		} else if ((arg === "--tools" || arg === "-t") && i + 1 < args.length) {
-			result.tools = args[++i]
-				.split(",")
-				.map((s) => s.trim())
-				.filter((name) => name.length > 0);
-		} else if ((arg === "--exclude-tools" || arg === "-xt") && i + 1 < args.length) {
-			result.excludeTools = args[++i]
-				.split(",")
-				.map((s) => s.trim())
-				.filter((name) => name.length > 0);
-		} else if (arg === "--thinking" && i + 1 < args.length) {
-			const level = args[++i];
-			if (isValidThinkingLevel(level)) {
+		} else if (arg === "--tools" || arg === "-t") {
+			const value = takeValue("--tools");
+			if (value !== undefined) {
+				result.tools = value
+					.split(",")
+					.map((s) => s.trim())
+					.filter((name) => name.length > 0);
+			}
+		} else if (arg === "--exclude-tools" || arg === "-xt") {
+			const value = takeValue("--exclude-tools");
+			if (value !== undefined) {
+				result.excludeTools = value
+					.split(",")
+					.map((s) => s.trim())
+					.filter((name) => name.length > 0);
+			}
+		} else if (arg === "--thinking") {
+			const level = takeValue("--thinking");
+			if (level === undefined) {
+				// takeValue already reported the missing-value error.
+			} else if (isValidThinkingLevel(level)) {
 				result.thinking = level;
 			} else {
 				result.diagnostics.push({
@@ -161,22 +193,34 @@ export function parseArgs(args: string[]): Args {
 				result.messages.push(next);
 				i++;
 			}
-		} else if (arg === "--export" && i + 1 < args.length) {
-			result.export = args[++i];
-		} else if ((arg === "--extension" || arg === "-e") && i + 1 < args.length) {
-			result.extensions = result.extensions ?? [];
-			result.extensions.push(args[++i]);
+		} else if (arg === "--export") {
+			result.export = takeValue("--export");
+		} else if (arg === "--extension" || arg === "-e") {
+			const value = takeValue("--extension");
+			if (value !== undefined) {
+				result.extensions = result.extensions ?? [];
+				result.extensions.push(value);
+			}
 		} else if (arg === "--no-extensions" || arg === "-ne") {
 			result.noExtensions = true;
-		} else if (arg === "--skill" && i + 1 < args.length) {
-			result.skills = result.skills ?? [];
-			result.skills.push(args[++i]);
-		} else if (arg === "--prompt-template" && i + 1 < args.length) {
-			result.promptTemplates = result.promptTemplates ?? [];
-			result.promptTemplates.push(args[++i]);
-		} else if (arg === "--theme" && i + 1 < args.length) {
-			result.themes = result.themes ?? [];
-			result.themes.push(args[++i]);
+		} else if (arg === "--skill") {
+			const value = takeValue("--skill");
+			if (value !== undefined) {
+				result.skills = result.skills ?? [];
+				result.skills.push(value);
+			}
+		} else if (arg === "--prompt-template") {
+			const value = takeValue("--prompt-template");
+			if (value !== undefined) {
+				result.promptTemplates = result.promptTemplates ?? [];
+				result.promptTemplates.push(value);
+			}
+		} else if (arg === "--theme") {
+			const value = takeValue("--theme");
+			if (value !== undefined) {
+				result.themes = result.themes ?? [];
+				result.themes.push(value);
+			}
 		} else if (arg === "--use-theme") {
 			const themeName = args[i + 1];
 			if (themeName === undefined || themeName.startsWith("-")) {

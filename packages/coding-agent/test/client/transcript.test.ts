@@ -217,4 +217,51 @@ describe("remote transcript projection", () => {
 			content: [{ type: "text", text: "authoritative" }],
 		});
 	});
+
+	test("re-seeds tool-call deltas after item_updated replaces the input", () => {
+		let state = createTranscriptState({
+			...snapshot(1),
+			transcript: [
+				{
+					id: "assistant-1",
+					role: "assistant",
+					content: [{ type: "toolCall", toolCallId: "call-1", toolName: "bash", input: '{"c' }],
+					status: "streaming",
+					model: { provider: "faux", id: "faux-1" },
+					timestamp: 1,
+				},
+			],
+		});
+
+		// Stream an incremental delta onto the initial partial input.
+		state = applyTranscriptProgress(state, {
+			type: "assistant_delta",
+			messageId: "assistant-1",
+			contentIndex: 0,
+			kind: "toolCall",
+			delta: '"',
+		});
+		// item_updated replaces the tool input entirely.
+		state = applyTranscriptProgress(state, {
+			type: "item_updated",
+			item: {
+				id: "assistant-1",
+				role: "assistant",
+				content: [{ type: "toolCall", toolCallId: "call-1", toolName: "bash", input: '{"cmd":"ls"' }],
+				status: "streaming",
+				model: { provider: "faux", id: "faux-1" },
+				timestamp: 1,
+			},
+		});
+		// The next delta must append to the REPLACED input, not the stale prefix.
+		state = applyTranscriptProgress(state, {
+			type: "assistant_delta",
+			messageId: "assistant-1",
+			contentIndex: 0,
+			kind: "toolCall",
+			delta: ',"x":1}',
+		});
+
+		expect(selectTranscript(state)[0]).toMatchObject({ content: [{ input: { cmd: "ls", x: 1 } }] });
+	});
 });

@@ -8,7 +8,12 @@
 
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
-import { flushRawStdout, waitForRawStdoutBackpressure, writeRawStdout } from "../core/output-guard.ts";
+import {
+	flushRawStdout,
+	setFatalStdoutCleanup,
+	waitForRawStdoutBackpressure,
+	writeRawStdout,
+} from "../core/output-guard.ts";
 import { killTrackedDetachedChildren } from "../utils/shell.ts";
 import { toJsonEvent } from "./json-event.ts";
 
@@ -31,6 +36,13 @@ export interface PrintModeOptions {
  * Sends prompts to the agent and outputs the result.
  */
 export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: PrintModeOptions): Promise<number> {
+	// On a fatal stdout write (client closed the pipe), release tracked children
+	// and the runtime instead of exiting and orphaning them.
+	setFatalStdoutCleanup(() => {
+		killTrackedDetachedChildren();
+		void runtimeHost.dispose();
+	});
+
 	const { mode, messages = [], initialMessage, initialImages } = options;
 	let exitCode = 0;
 	let session = runtimeHost.session;

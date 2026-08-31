@@ -230,7 +230,7 @@ export async function searchWithJina(query: string, options: JinaSearchOptions =
 			headers: {
 				"Accept": "application/json",
 				"Authorization": `Bearer ${apiKey}`,
-				"User-Agent": "pi-web-access",
+				"User-Agent": "pi-ext-web-access",
 				"X-Respond-With": options.includeContent ? "content" : "no-content",
 				"X-Retain-Images": "none",
 			},

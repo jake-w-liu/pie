@@ -17,7 +17,7 @@ const MAX_INLINE_CHECKS = 15;
 const MAX_INLINE_FILES = 50;
 const MAX_INLINE_COMMITS = 20;
 const MAX_INLINE_REVIEW_THREADS = 30;
-const REST_HEADERS = { "Accept": "application/vnd.github+json", "User-Agent": "pi-web-access" };
+const REST_HEADERS = { "Accept": "application/vnd.github+json", "User-Agent": "pi-ext-web-access" };
 const PR_SUBPATHS = new Set(["files", "commits", "checks", "conversation"]);
 
 const PR_FIELDS = [

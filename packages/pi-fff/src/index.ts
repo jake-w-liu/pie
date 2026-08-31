@@ -19,7 +19,7 @@ export default function (pi: ExtensionAPI) {
 	if (initialFeatureState.isOk()) {
 		enabledFeatures = new Set(initialFeatureState.value ?? ALL_FEATURE_KEYS);
 	} else {
-		console.warn("Failed to restore pi-fff feature state during extension load:", initialFeatureState.error);
+		console.warn("Failed to restore pi-ext-fff feature state during extension load:", initialFeatureState.error);
 	}
 	const isFeatureEnabled = (feature: FeatureKey) => enabledFeatures.has(feature);
 	const getRuntime = () => runtime;
@@ -48,7 +48,7 @@ export default function (pi: ExtensionAPI) {
 	const persistFeatures = async () => {
 		const saved = await saveGlobalFeatureState(enabledFeatures);
 		if (saved.isErr()) {
-			console.error("Failed to save pi-fff feature state:", saved.error);
+			console.error("Failed to save pi-ext-fff feature state:", saved.error);
 		}
 	};
 
@@ -57,13 +57,13 @@ export default function (pi: ExtensionAPI) {
 		if (restored.isOk()) {
 			enabledFeatures = new Set(restored.value ?? ALL_FEATURE_KEYS);
 		} else {
-			console.warn("Failed to restore pi-fff feature state:", restored.error);
+			console.warn("Failed to restore pi-ext-fff feature state:", restored.error);
 			enabledFeatures = new Set(ALL_FEATURE_KEYS);
 		}
 		syncCustomToolActivation();
 	};
 
-	const agentToolsDisabledText = () => 'pi-fff feature "agent tools" is disabled. Use /fff-features to re-enable it.';
+	const agentToolsDisabledText = () => 'pi-ext-fff feature "agent tools" is disabled. Use /fff-features to re-enable it.';
 
 	registerTools(pi, {
 		getRuntime,

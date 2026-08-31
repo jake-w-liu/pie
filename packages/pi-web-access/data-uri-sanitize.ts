@@ -300,7 +300,7 @@ function safeMarkerSource(sourcePath: string): string {
 function buildDataUriMarker(omission: DataUriOmission): string {
 	const decoded = omission.decodedBytes === null ? "unknown" : String(omission.decodedBytes);
 	const decodeError = omission.decodeError ? `; decodeError=${omission.decodeError}` : "";
-	return `[pi-web-access inline data URI omitted; ordinal=${omission.ordinal}; source=${omission.sourcePath}; mime=${omission.mimeType}; encoding=${omission.encoding}; encodedBytes=${omission.encodedBytes}; decodedBytes=${decoded}${decodeError}; sha256=${omission.sha256}; digestBasis=${omission.digestBasis}; retrieval=not-retained]`;
+	return `[pi-ext-web-access inline data URI omitted; ordinal=${omission.ordinal}; source=${omission.sourcePath}; mime=${omission.mimeType}; encoding=${omission.encoding}; encodedBytes=${omission.encodedBytes}; decodedBytes=${decoded}${decodeError}; sha256=${omission.sha256}; digestBasis=${omission.digestBasis}; retrieval=not-retained]`;
 }
 
 function sanitizeTextInternal(text: string, sourcePath: string, state: SanitizationState): string {

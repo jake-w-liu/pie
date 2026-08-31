@@ -378,7 +378,7 @@ async function fetchViaCurlOnce(url: URL, init: RequestInit, proxyUrl: string): 
 	const method = (init.method ?? "GET").toUpperCase();
 	const headers = new Headers(init.headers);
 
-	const dir = await mkdtemp(join(tmpdir(), "pi-web-access-proxy-"));
+	const dir = await mkdtemp(join(tmpdir(), "pi-ext-web-access-proxy-"));
 	const headerFile = join(dir, "headers");
 	const bodyFile = join(dir, "body");
 	const requestBodyFile = join(dir, "request-body");

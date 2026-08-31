@@ -286,7 +286,7 @@ function loadConfigForExtensionInit(): WebSearchConfig {
 		return loadConfig();
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		console.error(`[pi-web-access] ${message}`);
+		console.error(`[pi-ext-web-access] ${message}`);
 		return {};
 	}
 }

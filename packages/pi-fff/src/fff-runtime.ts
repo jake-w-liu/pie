@@ -270,7 +270,7 @@ export class FffRuntime {
 	async getMetadata(): Promise<RuntimeMetadata> {
 		const projectRoot = this.options.projectRoot ?? (this.basePath !== this.cwd ? this.basePath : await resolveProjectRoot(this.cwd));
 		this.basePath = projectRoot;
-		const root = resolve(getAgentDir(), "pi-fff");
+		const root = resolve(getAgentDir(), "pi-ext-fff");
 		const paths = getProjectDatabasePaths(root, projectRoot);
 		return {
 			cwd: this.cwd,
@@ -817,7 +817,7 @@ export class FffRuntime {
 	}
 
 	private async initialize(): Promise<AppResult<FileFinder, RuntimeInitializationError>> {
-		const root = resolve(getAgentDir(), "pi-fff");
+		const root = resolve(getAgentDir(), "pi-ext-fff");
 		const rootResult = await Result.tryPromise({
 			try: () => mkdir(root, { recursive: true }),
 			catch: (cause) => new RuntimeInitializationError({ cwd: this.cwd, step: "create runtime directory", cause }),

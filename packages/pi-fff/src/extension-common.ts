@@ -14,7 +14,7 @@ import {
 import { formatGrepError, formatPathResolutionError } from "./error-format.ts";
 import { type FindFilesResponse, type GrepSearchResponse, type HealthCheck, type ResolvedPath, type RuntimeMetadata } from "./fff.ts";
 
-const GLOBAL_FEATURES_PATH = join(getAgentDir(), "extensions", "pi-fff.json");
+const GLOBAL_FEATURES_PATH = join(getAgentDir(), "extensions", "pi-ext-fff.json");
 export const CUSTOM_TOOL_NAMES = ["find_files", "fff_multi_grep"] as const;
 export const FFF_RUNTIME_NOT_READY_TEXT = "FFF runtime is not ready.";
 

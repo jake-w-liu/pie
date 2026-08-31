@@ -73,7 +73,7 @@ function getBaseUrl(): string | null {
 
 function isValidHeaderValue(value: string): boolean {
 	try {
-		new Headers({ "x-pi-web-access-validation": value });
+		new Headers({ "x-pi-ext-web-access-validation": value });
 		return true;
 	} catch {
 		return false;

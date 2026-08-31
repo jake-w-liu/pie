@@ -23,7 +23,7 @@ export function registerCommands(pi: ExtensionAPI, deps: CommandRegistrationDeps
 	};
 
 	pi.registerCommand("fff-features", {
-		description: "Toggle pi-fff features on or off",
+		description: "Toggle pi-ext-fff features on or off",
 		handler: async (_args, ctx) => {
 			await ctx.ui.custom((tui, theme, _kb, done) => {
 				let selectedIndex = 0;
@@ -49,7 +49,7 @@ export function registerCommands(pi: ExtensionAPI, deps: CommandRegistrationDeps
 						const lines: string[] = [];
 						const add = (text: string) => lines.push(truncateToWidth(text, width));
 
-						add(theme.fg("accent", theme.bold("pi-fff feature flags")));
+						add(theme.fg("accent", theme.bold("pi-ext-fff feature flags")));
 						add(theme.fg("dim", "Space toggles • Enter saves • Esc cancels"));
 						lines.push("");
 
@@ -91,12 +91,12 @@ export function registerCommands(pi: ExtensionAPI, deps: CommandRegistrationDeps
 							deps.setEnabledFeatures(new Set(draft));
 							void deps.persistFeatures();
 							deps.applyUiConfiguration(ctx);
-							ctx.ui.notify(`pi-fff features saved (${Array.from(draft).length} enabled)`, "info");
+							ctx.ui.notify(`pi-ext-fff features saved (${Array.from(draft).length} enabled)`, "info");
 							done(undefined);
 							return;
 						}
 						if (matchesKey(data, Key.escape)) {
-							ctx.ui.notify("pi-fff feature changes cancelled", "info");
+							ctx.ui.notify("pi-ext-fff feature changes cancelled", "info");
 							done(undefined);
 						}
 					},

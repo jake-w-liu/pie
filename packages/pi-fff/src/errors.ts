@@ -13,7 +13,7 @@ export class FeatureStateReadError extends TaggedError("FeatureStateReadError")<
 	constructor(args: { path: string; cause: unknown }) {
 		super({
 			...args,
-			message: `Failed to read pi-fff feature state at ${args.path}: ${messageFromCause(args.cause)}`,
+			message: `Failed to read pi-ext-fff feature state at ${args.path}: ${messageFromCause(args.cause)}`,
 		});
 	}
 }
@@ -26,7 +26,7 @@ export class FeatureStateParseError extends TaggedError("FeatureStateParseError"
 	constructor(args: { path: string; cause: unknown }) {
 		super({
 			...args,
-			message: `Failed to parse pi-fff feature state at ${args.path}: ${messageFromCause(args.cause)}`,
+			message: `Failed to parse pi-ext-fff feature state at ${args.path}: ${messageFromCause(args.cause)}`,
 		});
 	}
 }
@@ -39,7 +39,7 @@ export class FeatureStateWriteError extends TaggedError("FeatureStateWriteError"
 	constructor(args: { path: string; cause: unknown }) {
 		super({
 			...args,
-			message: `Failed to save pi-fff feature state at ${args.path}: ${messageFromCause(args.cause)}`,
+			message: `Failed to save pi-ext-fff feature state at ${args.path}: ${messageFromCause(args.cause)}`,
 		});
 	}
 }

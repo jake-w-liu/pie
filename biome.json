@@ -35,6 +35,9 @@
 			"!**/models.generated.ts",
 			"!**/*.models.ts",
 			"!packages/mom/data/**/*",
+			"!packages/pi-fff/**/*",
+			"!packages/pi-web-access/**/*",
+			"!packages/pi-subagents/**/*",
 			"!!**/node_modules"
 		]
 	}

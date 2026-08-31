@@ -10,7 +10,7 @@ export type { ResourceCollision, ResourceDiagnostic } from "./diagnostics.ts";
 import { canonicalizePath, isLocalPath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { createEventBus, type EventBus } from "./event-bus.ts";
-import { 
+import {
 	clearExtensionCache,
 	createExtensionRuntime,
 	discoverBundledExtensions,

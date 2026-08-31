@@ -5,18 +5,18 @@
 
 Pie ships the verified package set as pinned first-run defaults:
 
-- `npm:pi-fff@0.1.12`
-- `npm:pi-web-access@0.26.0`
-- `npm:pi-subagents@0.58.0`
+- `@earendil-works/pi-ext-fff` (vendored)
+- `@earendil-works/pi-ext-web-access` (vendored)
+- `@earendil-works/pi-ext-subagents` (vendored)
 
 On a fresh configuration, Pie writes these sources to `~/.pi/agent/settings.json`; the normal package manager then installs missing packages before resources load. Pie does not overwrite an existing settings file, so later removals and user package choices survive restarts.
 
 Manual recovery commands, if needed:
 
 ```bash
-pie install npm:pi-fff@0.1.12
-pie install npm:pi-web-access@0.26.0
-pie install npm:pi-subagents@0.58.0
+# pi-fff is vendored as @earendil-works/pi-ext-fff
+# pi-web-access is vendored as @earendil-works/pi-ext-web-access
+# pi-subagents is vendored as @earendil-works/pi-ext-subagents
 ```
 
 Installed versions at verification time (run `pie list` to see yours):
@@ -136,7 +136,7 @@ Background runs keep working after control returns; FleetView shows them under t
 
 ```bash
 pie update                  # unpinned packages; pinned refs are reconciled
-pie update npm:pi-fff       # one package (pinned versions are skipped)
+# vendored; update from packages/pi-fff       # one package (pinned versions are skipped)
 ```
 
 Pie itself is source-managed and is updated by rebuilding and reinstalling from this repository.

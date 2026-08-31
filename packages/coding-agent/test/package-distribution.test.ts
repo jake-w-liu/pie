@@ -24,7 +24,11 @@ describe("package distribution entrypoints", () => {
 		expect(packageJson.bin.pie).toBe("dist/bundle/pie-cli.js");
 		expect(packageJson.piConfig).toEqual({
 			configDir: ".pi",
-			defaultPackages: ["npm:pi-fff@0.1.12", "npm:pi-web-access@0.26.0", "npm:pi-subagents@0.58.0"],
+			// The pi-fff / pi-web-access / pi-subagents extensions are now vendored into
+			// the release (as @earendil-works/pi-ext-*) and auto-discovered from the
+			// coding-agent's node_modules, so defaultPackages no longer pulls them from
+			// the npm registry.
+			defaultPackages: [],
 		});
 		expect(packageJson.main).toBe("./dist/index.js");
 		expect(packageJson.exports["."].import).toBe("./dist/index.js");

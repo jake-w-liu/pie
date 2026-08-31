@@ -26,6 +26,7 @@ export function restoreLineEndings(text: string, ending: "\r\n" | "\n"): string 
 
 /**
  * Normalize text for fuzzy matching. Applies progressive transformations:
+ * - Collapse leading indentation runs to a single space (tabs vs spaces)
  * - Strip trailing whitespace from each line
  * - Normalize smart quotes to ASCII equivalents
  * - Normalize Unicode dashes/hyphens to ASCII hyphen
@@ -35,9 +36,8 @@ export function normalizeForFuzzyMatch(text: string): string {
 	return (
 		text
 			.normalize("NFKC")
-			// Strip trailing whitespace per line
 			.split("\n")
-			.map((line) => line.trimEnd())
+			.map((line) => line.replace(/^[ \t]+/, " ").trimEnd())
 			.join("\n")
 			// Smart single quotes → '
 			.replace(/[\u2018\u2019\u201A\u201B]/g, "'")
@@ -251,14 +251,12 @@ function countOccurrences(content: string, oldText: string): number {
 }
 
 function getNotFoundError(path: string, editIndex: number, totalEdits: number): Error {
+	const hint =
+		"The old text was not found exactly or after whitespace/quote normalization. Check indentation, spelling, and line endings.";
 	if (totalEdits === 1) {
-		return new Error(
-			`Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.`,
-		);
+		return new Error(`Could not find the text in ${path}. ${hint}`);
 	}
-	return new Error(
-		`Could not find edits[${editIndex}] in ${path}. The oldText must match exactly including all whitespace and newlines.`,
-	);
+	return new Error(`Could not find edits[${editIndex}] in ${path}. ${hint}`);
 }
 
 function getDuplicateError(path: string, editIndex: number, totalEdits: number, occurrences: number): Error {

@@ -10,12 +10,12 @@ export type { ResourceCollision, ResourceDiagnostic } from "./diagnostics.ts";
 import { canonicalizePath, isLocalPath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { createEventBus, type EventBus } from "./event-bus.ts";
-import {
+import { 
 	clearExtensionCache,
 	createExtensionRuntime,
 	loadExtensionFromFactory,
-	loadExtensionsCached,
-} from "./extensions/loader.ts";
+	loadExtensionsCached,,
+	discoverBundledExtensions, } from "./extensions/loader.ts";
 import type { Extension, ExtensionRuntime, InlineExtension, LoadExtensionsResult } from "./extensions/types.ts";
 import { findGitPaths } from "./footer-data-provider.ts";
 import { DefaultPackageManager, type PathMetadata, type ResolvedResource } from "./package-manager.ts";
@@ -451,7 +451,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 		const extensionPaths = this.noExtensions
 			? cliEnabledExtensions
-			: this.mergePaths(cliEnabledExtensions, enabledExtensions);
+			: this.mergePaths(cliEnabledExtensions, enabledExtensions, discoverBundledExtensions());
 
 		const extensionsResult = await this.loadFinalExtensionSet(extensionPaths, preTrustExtensions);
 		for (const p of this.additionalExtensionPaths) {
@@ -555,7 +555,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const cliEnabledExtensions = cliExtensionPaths.extensions.filter((r) => r.enabled).map((r) => r.path);
 		const extensionPaths = this.noExtensions
 			? cliEnabledExtensions
-			: this.mergePaths(cliEnabledExtensions, enabledExtensions);
+			: this.mergePaths(cliEnabledExtensions, enabledExtensions, discoverBundledExtensions());
 		const extensionsResult = await loadExtensionsCached(extensionPaths, this.cwd, this.eventBus);
 		if (!options.includeInlineFactories) {
 			return extensionsResult;

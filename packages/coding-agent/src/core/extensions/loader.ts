@@ -724,7 +724,7 @@ function resolveExtensionEntries(dir: string): string[] | null {
  * entry via a `pi` manifest, which resolveExtensionEntries reads. Works from the
  * bundled CLI by walking up from the current module to the node_modules root.
  */
-function discoverBundledExtensions(): string[] {
+export function discoverBundledExtensions(): string[] {
 	const bundled: string[] = [];
 	try {
 		let dir = path.dirname(fileURLToPath(import.meta.url));

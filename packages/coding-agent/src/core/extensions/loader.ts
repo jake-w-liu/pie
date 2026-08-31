@@ -718,6 +718,31 @@ function resolveExtensionEntries(dir: string): string[] | null {
  *
  * No recursion beyond one level. Complex packages must use package.json manifest.
  */
+/**
+ * Discover the vendored extensions shipped with this pie release. They live in
+ * our own node_modules as `@earendil-works/pi-ext-*` packages; each declares its
+ * entry via a `pi` manifest, which resolveExtensionEntries reads.
+ */
+function discoverBundledExtensions(): string[] {
+	const bundled: string[] = [];
+	try {
+		const require_ = createRequire(import.meta.url);
+		const ourPkg = require_.resolve("@earendil-works/pi-coding-agent/package.json");
+		const scopedDir = path.dirname(path.dirname(ourPkg));
+		const entries = fs.readdirSync(scopedDir, { withFileTypes: true });
+		for (const entry of entries) {
+			if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+			if (!entry.name.startsWith("pi-ext-")) continue;
+			const entries2 = resolveExtensionEntries(path.join(scopedDir, entry.name));
+			if (entries2) bundled.push(...entries2);
+		}
+	} catch {
+		// Not running from an installed node_modules tree; fall back to the
+		// configured/global/project extension paths only.
+	}
+	return bundled;
+}
+
 function discoverExtensionsInDir(dir: string): string[] {
 	if (!fs.existsSync(dir)) {
 		return [];
@@ -783,6 +808,12 @@ export async function discoverAndLoadExtensions(
 	// 2. Global extensions: agentDir/extensions/
 	const globalExtDir = path.join(resolvedAgentDir, "extensions");
 	addPaths(discoverExtensionsInDir(globalExtDir));
+
+	// 2b. Bundled extensions shipped with this pie release: scan our own
+	// node_modules/@earendil-works/pi-ext-* packages and load their manifests, so
+	// the vendored extensions (pi-fff, pi-web-access, pi-subagents) are available
+	// at every install location without depending on a registry or a dev path.
+	addPaths(discoverBundledExtensions());
 
 	// 3. Explicitly configured paths
 	for (const p of configuredPaths) {

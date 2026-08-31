@@ -11,7 +11,8 @@
 		"packages/coding-agent/examples/extensions/sandbox",
 		"packages/coding-agent/examples/extensions/gondolin",
 		"packages/pi-fff",
-		"packages/pi-web-access"
+		"packages/pi-web-access",
+		"packages/pi-subagents"
 	],
 	"scripts": {
 		"clean": "npm run clean --workspaces",

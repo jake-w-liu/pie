@@ -1,0 +1,57 @@
+{
+	"name": "@earendil-works/pi-ext-subagents",
+	"version": "0.1.0",
+	"description": "Subagent orchestration, fleet UI, and workflow extension for pie (vendored from pi-subagents)",
+	"type": "module",
+	"exports": {
+		".": "./index.ts",
+		"./background-work": "./src/api/background-work.ts",
+		"./external-job-provider": "./src/api/external-job-provider.ts",
+		"./external-runs": "./src/api/external-runs.ts",
+		"./agents": "./src/api/agents.ts",
+		"./delegation": "./src/api/delegation.ts",
+		"./capability-ceiling": "./src/api/capability-ceiling.ts",
+		"./preflight": "./src/api/preflight.ts",
+		"./control-channel": "./src/api/control-channel.ts",
+		"./intercom-bridge": "./src/api/intercom-bridge.ts",
+		"./pi-args": "./src/api/pi-args.ts",
+		"./shared-types": "./src/api/shared-types.ts",
+		"./project-panes": "./src/api/project-panes.ts"
+	},
+	"files": [
+		"index.ts",
+		"src",
+		"skills",
+		"prompts",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"build": "tsgo -p tsconfig.build.json",
+		"typecheck": "tsgo -p tsconfig.build.json"
+	},
+	"license": "MIT",
+	"dependencies": {
+		"acorn": "8.18.0",
+		"jiti": "2.7.0",
+		"typebox": "1.1.38",
+		"yaml": "2.8.3"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "^0.1.0",
+		"@earendil-works/pi-agent-core": "^0.1.0",
+		"@earendil-works/pi-coding-agent": "^0.1.0",
+		"@earendil-works/pi-tui": "^0.1.0"
+	},
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		],
+		"skills": [
+			"./skills"
+		],
+		"prompts": [
+			"./prompts"
+		]
+	}
+}

@@ -23,7 +23,6 @@
 		"src",
 		"skills",
 		"prompts",
-		"README.md",
 		"LICENSE"
 	],
 	"scripts": {

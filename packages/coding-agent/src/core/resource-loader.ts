@@ -452,7 +452,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 		const extensionPaths = this.noExtensions
 			? cliEnabledExtensions
-			: this.mergePaths(cliEnabledExtensions, enabledExtensions, discoverBundledExtensions());
+			: this.mergePaths(this.mergePaths(cliEnabledExtensions, enabledExtensions), discoverBundledExtensions());
 
 		const extensionsResult = await this.loadFinalExtensionSet(extensionPaths, preTrustExtensions);
 		for (const p of this.additionalExtensionPaths) {
@@ -556,7 +556,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const cliEnabledExtensions = cliExtensionPaths.extensions.filter((r) => r.enabled).map((r) => r.path);
 		const extensionPaths = this.noExtensions
 			? cliEnabledExtensions
-			: this.mergePaths(cliEnabledExtensions, enabledExtensions, discoverBundledExtensions());
+			: this.mergePaths(this.mergePaths(cliEnabledExtensions, enabledExtensions), discoverBundledExtensions());
 		const extensionsResult = await loadExtensionsCached(extensionPaths, this.cwd, this.eventBus);
 		if (!options.includeInlineFactories) {
 			return extensionsResult;

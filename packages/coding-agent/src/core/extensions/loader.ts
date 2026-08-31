@@ -721,20 +721,28 @@ function resolveExtensionEntries(dir: string): string[] | null {
 /**
  * Discover the vendored extensions shipped with this pie release. They live in
  * our own node_modules as `@earendil-works/pi-ext-*` packages; each declares its
- * entry via a `pi` manifest, which resolveExtensionEntries reads.
+ * entry via a `pi` manifest, which resolveExtensionEntries reads. Works from the
+ * bundled CLI by walking up from the current module to the node_modules root.
  */
 function discoverBundledExtensions(): string[] {
 	const bundled: string[] = [];
 	try {
-		const require_ = createRequire(import.meta.url);
-		const ourPkg = require_.resolve("@earendil-works/pi-coding-agent/package.json");
-		const scopedDir = path.dirname(path.dirname(ourPkg));
-		const entries = fs.readdirSync(scopedDir, { withFileTypes: true });
-		for (const entry of entries) {
-			if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-			if (!entry.name.startsWith("pi-ext-")) continue;
-			const entries2 = resolveExtensionEntries(path.join(scopedDir, entry.name));
-			if (entries2) bundled.push(...entries2);
+		let dir = path.dirname(fileURLToPath(import.meta.url));
+		while (true) {
+			const scopedDir = path.join(dir, "node_modules", "@earendil-works");
+			if (fs.existsSync(scopedDir)) {
+				const entries = fs.readdirSync(scopedDir, { withFileTypes: true });
+				for (const entry of entries) {
+					if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+					if (!entry.name.startsWith("pi-ext-")) continue;
+					const entries2 = resolveExtensionEntries(path.join(scopedDir, entry.name));
+					if (entries2) bundled.push(...entries2);
+				}
+				if (bundled.length > 0) break;
+			}
+			const parent = path.dirname(dir);
+			if (parent === dir) break;
+			dir = parent;
 		}
 	} catch {
 		// Not running from an installed node_modules tree; fall back to the

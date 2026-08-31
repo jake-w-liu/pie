@@ -253,6 +253,15 @@ cleanup() {
 		fi
 	fi
 
+	# Remove nested node_modules that npm hoisting can leave inside the vendored
+	# extension packages; their dependencies resolve from the monorepo root, so
+	# these per-package node_modules are pure build garbage.
+	for ext_dir in "$repo_dir"/packages/pi-fff "$repo_dir"/packages/pi-web-access "$repo_dir"/packages/pi-subagents; do
+		if [[ -d "$ext_dir/node_modules" ]]; then
+			rm -rf -- "$ext_dir/node_modules" || cleanup_failed=true
+		fi
+	done
+
 	if [[ "$lock_owned" == true ]]; then
 		rm -f -- "$lock_dir/owner"
 		rmdir -- "$lock_dir" 2>/dev/null || cleanup_failed=true

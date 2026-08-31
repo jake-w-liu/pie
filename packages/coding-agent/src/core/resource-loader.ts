@@ -13,9 +13,10 @@ import { createEventBus, type EventBus } from "./event-bus.ts";
 import { 
 	clearExtensionCache,
 	createExtensionRuntime,
+	discoverBundledExtensions,
 	loadExtensionFromFactory,
-	loadExtensionsCached,,
-	discoverBundledExtensions, } from "./extensions/loader.ts";
+	loadExtensionsCached,
+} from "./extensions/loader.ts";
 import type { Extension, ExtensionRuntime, InlineExtension, LoadExtensionsResult } from "./extensions/types.ts";
 import { findGitPaths } from "./footer-data-provider.ts";
 import { DefaultPackageManager, type PathMetadata, type ResolvedResource } from "./package-manager.ts";

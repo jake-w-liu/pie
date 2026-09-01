@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { Usage } from "@earendil-works/pi-ai";
 import { discoverAgents, findBlockingAgentDiagnostic, formatUnknownAgentError, resolveAgentName, unknownAgentDiagnosticContext, type AgentConfig, type AgentDiscoveryDiagnostic, type AgentScope, type UnknownAgentDiagnosticContext } from "../../agents/agents.ts";
 import { getArtifactsDir, getChainRunsDir, getProjectArtifactPackagingWarning, getProjectSubagentsDir } from "../../shared/artifacts.ts";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
@@ -90,6 +91,37 @@ import {
 	resolveSubagentResultStatus,
 	stripDetailsOutputsForIntercomReceipt,
 } from "../../intercom/result-intercom.ts";
+
+/** Convert CostSummary from subagent details to pi-ai Usage for parent session cost tracking. */
+function costSummaryToUsage(totalCost: CostSummary | undefined): Usage | undefined {
+	if (!totalCost || (totalCost.inputTokens === 0 && totalCost.outputTokens === 0 && totalCost.costUsd === 0)) {
+		return undefined;
+	}
+	return {
+		input: totalCost.inputTokens,
+		output: totalCost.outputTokens,
+		cacheRead: 0,
+		cacheWrite: 0,
+		cacheWrite1h: 0,
+		reasoning: 0,
+		totalTokens: totalCost.inputTokens + totalCost.outputTokens,
+		cost: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			total: totalCost.costUsd,
+		},
+	};
+}
+
+/** Add subagent usage to tool result for parent session cost aggregation. */
+function withSubagentUsage(result: AgentToolResult<Details>): AgentToolResult<Details> {
+	const usage = costSummaryToUsage(result.details?.totalCost);
+	if (!usage) return result;
+	return { ...result, usage };
+}
+
 import { applySteeringRecoveryAgentConfig, asyncReviveRequiresRecoveryDescriptor, buildRevivedAsyncTask, readAsyncRecoveryDescriptor, resolveAsyncResumeTarget, resolveAsyncRunLocation } from "../background/async-resume.ts";
 import { deliverInterruptRequest, readRevivalBriefs, requestAsyncSteer, type SteerDeliveryMode } from "../background/control-channel.ts";
 import { updateSteeringTarget, waitForSteeringAction } from "../background/steering.ts";
@@ -148,6 +180,7 @@ import {
 	type ArtifactPaths,
 	type ControlConfig,
 	type ControlEvent,
+	type CostSummary,
 	type Details,
 	type ExtensionConfig,
 	type ForegroundResumeChild,
@@ -5023,10 +5056,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 							?? deps.state.activeAsyncCapacity;
 					}
 				});
-				return attachWorkflowMission(withRunFanoutBudget({
+				return withSubagentUsage(attachWorkflowMission(withRunFanoutBudget({
 					content: [{ type: "text", text: formatAsyncStartedMessage(`Async workflow [${workflowRunId}]`, ctx.hasUI === true) }],
 					details: { mode: "workflow", runId: workflowRunId, toolCallId, asyncId: workflowRunId, asyncDir, results: [], workflowChildren: status.workflowChildren, chatProgress, ...(deps.state.activeAsyncCapacity ? { activeAsyncCapacity: deps.state.activeAsyncCapacity } : {}) },
-				}, workflowFanoutBudget));
+				}, workflowFanoutBudget)));
 			}
 			const { workflowScript: _workflowScript, action: _action, agent: _agent, task: _task, resume: _resume, tasks: _tasks, chain: _chain, concurrency: _concurrency, async: _async, foregroundOnly: _foregroundOnly, clarify: _clarify, timeoutMs: _timeoutMs, maxRuntimeMs: _maxRuntimeMs, usageBudget: _usageBudget, chatProgress: _chatProgress, missionId: _missionId, mission: _mission, ...workflowChildDefaults } = requestParams;
 			const workflowOutput = typeof workflowChildDefaults.output === "string" || typeof workflowChildDefaults.output === "boolean" ? workflowChildDefaults.output : undefined;
@@ -5149,10 +5182,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				const workflowText = sections.join("\n\n");
 				const outputWarning = writeWorkflowAggregateOutput(workflowAggregateOutputPath, workflowText, producedChildOutputPaths);
 				const displayText = appendWorkflowOutputWarning(workflowText, outputWarning);
-				return attachWorkflowMission(withRunFanoutBudget({
+				return withSubagentUsage(attachWorkflowMission(withRunFanoutBudget({
 					content: [{ type: "text", text: displayText }],
 					details: compactOptional<Details>({ mode: "workflow", runId: _id, results: workflow.children.flatMap((child) => (child.results ?? []) as SingleResult[]), workflowChildren, totalChildUsage: sumResultsUsage(workflowResults), totalCost: sumResultsCost(workflowResults), usageBudget: usageBudgetState(workflowUsageBudget.budget, sumResultsCost(workflowResults)), workflow: { value: workflow.value, trace: workflow.trace, emits: workflow.emits, console: workflow.console, receipt }, chatProgress }),
-				}, workflowFanoutBudget));
+				}, workflowFanoutBudget)));
 			} catch (error) {
 				const partial = error instanceof WorkflowScriptError ? error.partial : { trace: [], emits: [], console: [], children: [] };
 				const text = workflowFailureMessage(error, _id, partial.children);
@@ -5169,11 +5202,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				const workflowChildren = workflowChildSummary({ parentToolCallId: _id, workflowRunId: _id, workflowState: "failed", inventoryComplete: true, trace: partial.trace, children: partial.children });
 				const terminalOutcome = workflowFailureTerminalOutcome(error, partial.children, usageBudgetState(workflowUsageBudget.budget, sumResultsCost(workflowResults)));
 				const receipt = terminalWorkflowReceipt(_id, "failed", partial.children, workflowChildren, terminalOutcome);
-				return attachWorkflowMission(withRunFanoutBudget({
+				return withSubagentUsage(attachWorkflowMission(withRunFanoutBudget({
 					content: [{ type: "text", text: displayText }],
 					isError: true,
 					details: compactOptional<Details>({ mode: "workflow", runId: _id, results: partial.children.flatMap((child) => (child.results ?? []) as SingleResult[]), workflowChildren, totalChildUsage: sumResultsUsage(workflowResults), totalCost: sumResultsCost(workflowResults), usageBudget: usageBudgetState(workflowUsageBudget.budget, sumResultsCost(workflowResults)), workflow: { trace: partial.trace, emits: partial.emits, console: partial.console, receipt }, chatProgress }),
-				}, workflowFanoutBudget));
+				}, workflowFanoutBudget)));
 			}
 		}
 		const directParams = requestParams;
@@ -6337,7 +6370,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			const asyncResult = await runAsyncPath(execData, deps);
 			if (asyncResult) {
 				asyncLaunchFailed = asyncResult.isError === true;
-				return attachMission(withRunFanoutBudget(withResolvedContext(withForkThinkingNotes(asyncResult, forkThinkingDowngrades), contextPolicy.contextSummary), runFanoutBudget));
+				return withSubagentUsage(attachMission(withRunFanoutBudget(withResolvedContext(withForkThinkingNotes(asyncResult, forkThinkingDowngrades), contextPolicy.contextSummary), runFanoutBudget)));
 			}
 			if (foregroundControl) {
 				writeNestedForegroundEvent("subagent.nested.started");
@@ -6347,13 +6380,13 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			if (hasSingle) {
 				const result = await runSinglePath(execData, deps);
 				writeNestedForegroundEvent("subagent.nested.completed", result);
-				return attachMission(withRunFanoutBudget(withResolvedContext(withForkThinkingNotes(result, forkThinkingDowngrades), contextPolicy.contextSummary), runFanoutBudget, { annotateContent: runFanoutAnnotateContent }));
+				return withSubagentUsage(attachMission(withRunFanoutBudget(withResolvedContext(withForkThinkingNotes(result, forkThinkingDowngrades), contextPolicy.contextSummary), runFanoutBudget, { annotateContent: runFanoutAnnotateContent })));
 			}
 		} catch (error) {
 			asyncLaunchFailed = effectiveAsync;
 			const errorResult = withForkThinkingNotes(toExecutionErrorResult(effectiveParams, error, contextPolicy.contextSummary), forkThinkingDowngrades);
 			if (nestedForegroundStarted) writeNestedForegroundEvent("subagent.nested.completed", errorResult);
-			return attachMission(errorResult);
+			return withSubagentUsage(attachMission(errorResult));
 		} finally {
 			if (effectiveAsync && (asyncLaunchFailed || (activeAsyncCapacity && !activeAsyncCapacity.owner.runnerStartedAt))) deps.state.liveAsyncSessionRoots?.delete(asyncRunId);
 			if (activeAsyncCapacity && !activeAsyncCapacity.owner.runnerStartedAt) activeAsyncCapacity.rollback();

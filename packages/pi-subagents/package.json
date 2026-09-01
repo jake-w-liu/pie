@@ -21,6 +21,7 @@
 	"files": [
 		"index.ts",
 		"src",
+		"agents",
 		"skills",
 		"prompts",
 		"LICENSE"

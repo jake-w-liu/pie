@@ -1,11 +1,13 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
-import { BoundedTerminalWriter, type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
+import { BoundedTerminalWriter, type Component, type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
 import { normalizeTerminalOutput, visibleWidth } from "./utils.ts";
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
 const LINE_RESET = "\x1b[0m\x1b]8;;\x07";
+const ENABLE_MOUSE = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const DISABLE_MOUSE = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
 interface KittyImageHeader {
 	ids: number[];
@@ -54,6 +56,27 @@ export interface TuiMainScreenRenderState {
 	previousViewportTop: number;
 }
 
+export interface TuiMainScreenOptions {
+	/**
+	 * Lazily-resolved component (e.g. the prompt editor) whose rendered region should
+	 * receive primary-button press/drag/release to position the cursor and select text.
+	 * Evaluated on each press. Must implement `positionCursorAtScreen`/selection methods.
+	 */
+	getClickTarget?: () => Component | undefined;
+	/** Invoked when a primary-button press lands inside the click target's region. */
+	onClickTargetPress?: (component: Component, boxX: number, boxY: number, boxWidth: number) => void;
+	/** Invoked while dragging after a press inside the click target's region. */
+	onClickTargetDrag?: (component: Component, boxX: number, boxY: number, boxWidth: number) => void;
+	/** Invoked when a drag is released. Return text to copy, or null to skip copying. */
+	onClickTargetRelease?: (component: Component, boxX: number, boxY: number, boxWidth: number) => string | null;
+	/**
+	 * Whether to capture the mouse for editor clicks when a `getClickTarget` is
+	 * provided (default: true). Ignored (no capture) when there is no click target,
+	 * so hosts without editor mouse support keep native terminal selection.
+	 */
+	mouse?: boolean;
+}
+
 /** TUI implementation that renders into the terminal's main screen and scrollback. */
 export class TuiMainScreen extends TuiBase implements TUI {
 	readonly mode = "regular" as const;
@@ -66,6 +89,130 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	private hardwareCursorRow = 0;
 	private maxLinesRendered = 0;
 	private previousViewportTop = 0;
+
+	private readonly getClickTarget?: () => Component | undefined;
+	private readonly onClickTargetPress?: (component: Component, boxX: number, boxY: number, boxWidth: number) => void;
+	private readonly onClickTargetDrag?: (component: Component, boxX: number, boxY: number, boxWidth: number) => void;
+	private readonly onClickTargetRelease?: (
+		component: Component,
+		boxX: number,
+		boxY: number,
+		boxWidth: number,
+	) => string | null;
+	private readonly mouseEnabled: boolean;
+	private clickTargetDragActive = false;
+	/** [start, end) line range the click target occupies in the most recent render. */
+	private clickTargetLines?: { start: number; end: number };
+
+	constructor(
+		terminal: import("./terminal.ts").Terminal,
+		showHardwareCursor?: boolean,
+		logDirectory?: string,
+		options: TuiMainScreenOptions = {},
+	) {
+		super(terminal, showHardwareCursor, logDirectory);
+		this.getClickTarget = options.getClickTarget;
+		this.onClickTargetPress = options.onClickTargetPress;
+		this.onClickTargetDrag = options.onClickTargetDrag;
+		this.onClickTargetRelease = options.onClickTargetRelease;
+		this.mouseEnabled = options.mouse ?? true;
+		this.addInputListener((data) => this.handleMouseInput(data));
+	}
+
+	protected override beforeTerminalStart(): void {
+		// Only capture the mouse when a click target is actually wired. Capturing it
+		// otherwise would disable the terminal's native selection/copy for no benefit.
+		if (this.mouseEnabled && this.getClickTarget?.()) this.terminal.write(ENABLE_MOUSE);
+	}
+
+	/**
+	 * Parse an SGR mouse event and route it to the click target. Every recognized
+	 * SGR mouse sequence is consumed so it never leaks to the focused editor as
+	 * garbled keypresses; events outside the editor region are dropped (the mouse
+	 * capture is terminal-wide, so nothing else can handle them in regular mode).
+	 */
+	private handleMouseInput(data: string): { consume?: boolean } | undefined {
+		if (!this.mouseEnabled || !this.getClickTarget?.()) return undefined;
+		const match = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/.exec(data);
+		if (!match) return undefined;
+
+		const button = Number.parseInt(match[1], 10);
+		const x = Number.parseInt(match[2], 10) - 1;
+		const y = Number.parseInt(match[3], 10) - 1;
+		const release = match[4] === "m";
+
+		const target = this.getClickTarget();
+		const box = this.clickTargetLines;
+		const isPrimary = (button & 3) === 0;
+		const isDrag = (button & 32) !== 0;
+
+		// Non-primary buttons (right/middle) are ignored but still consumed so the
+		// terminal's native paste/scroll actions aren't reloaded as keypresses.
+		if (!isPrimary && !release) return { consume: true };
+
+		if (target && box) {
+			// The visible viewport shows newLines[viewportTop .. viewportTop+rows].
+			const bufferLine = this.previousViewportTop + y;
+			const inEditor = bufferLine >= box.start && bufferLine < box.end;
+			// A drag that began in the editor keeps selecting even if it leaves the
+			// region (toward the viewport edge).
+			if (inEditor || this.clickTargetDragActive) {
+				const boxY = bufferLine - box.start;
+				const boxWidth = this.terminal.columns;
+
+				if (release) {
+					if (!this.clickTargetDragActive) return { consume: true };
+					this.clickTargetDragActive = false;
+					const selected = this.onClickTargetRelease?.(target, x, boxY, boxWidth);
+					if (selected) this.copyToClipboard(selected);
+					this.requestRender();
+					return { consume: true };
+				}
+				if (isDrag) {
+					if (!this.clickTargetDragActive || !this.onClickTargetDrag) return { consume: true };
+					this.onClickTargetDrag(target, x, boxY, boxWidth);
+					this.requestRender();
+					return { consume: true };
+				}
+
+				// Primary press: begin a selection / position the cursor.
+				this.onClickTargetPress?.(target, x, boxY, boxWidth);
+				this.clickTargetDragActive = true;
+				this.requestRender();
+				return { consume: true };
+			}
+		}
+
+		// Any other SGR mouse event (outside the editor region, or a non-primary/extra
+		// button) is consumed so it never leaks into the editor as key input.
+		return { consume: true };
+	}
+
+	private copyToClipboard(text: string): void {
+		this.terminal.write(`\x1b]52;c;${Buffer.from(text).toString("base64")}\x07`);
+	}
+
+	/**
+	 * Override render to record the [start, end) line range that the click-target
+	 * component occupies in the current line buffer, so mouse events can be routed
+	 * to the editor regardless of how content above it scrolls.
+	 */
+	override render(width: number): string[] {
+		const target = this.getClickTarget?.();
+		const lines: string[] = [];
+		let targetStart = -1;
+		for (const child of this.getMountedRoots()) {
+			if (child === target && targetStart === -1) {
+				targetStart = lines.length;
+			}
+			const childLines = child.render(width);
+			for (const line of childLines) {
+				lines.push(line);
+			}
+		}
+		this.clickTargetLines = targetStart === -1 ? undefined : { start: targetStart, end: lines.length };
+		return lines;
+	}
 
 	captureRenderState(): TuiMainScreenRenderState {
 		return {
@@ -103,6 +250,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	protected override beforeTerminalStop(options: TuiStopOptions): void {
+		if (!options.preserveScreen && this.mouseEnabled && this.getClickTarget?.()) this.terminal.write(DISABLE_MOUSE);
 		if (options.preserveScreen || this.previousLines.length === 0) return;
 		this.terminal.write(" ");
 		const targetRow = this.previousLines.length;

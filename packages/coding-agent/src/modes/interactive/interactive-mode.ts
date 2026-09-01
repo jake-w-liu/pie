@@ -422,7 +422,12 @@ export function createInteractiveTui(options: InteractiveTuiOptions): TuiMainScr
 			},
 		});
 	}
-	return new TuiMainScreen(terminal, options.showHardwareCursor, options.logDirectory);
+	return new TuiMainScreen(terminal, options.showHardwareCursor, options.logDirectory, {
+		getClickTarget: options.getClickTarget,
+		onClickTargetPress: options.onClickTargetPress,
+		onClickTargetDrag: options.onClickTargetDrag,
+		onClickTargetRelease: options.onClickTargetRelease,
+	});
 }
 
 /** Stable reference for components while InteractiveMode replaces the active renderer. */

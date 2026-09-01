@@ -9,6 +9,7 @@ import { ScrollView } from "./components/scroll-view.ts";
 import { getKeybindings } from "./keybindings.ts";
 import { isKeyRelease, matchesKey } from "./keys.ts";
 import {
+	getComponentBox,
 	getScrollbarGeometry,
 	getScrollViewBox,
 	getScrollViewsAt,
@@ -164,6 +165,19 @@ export interface TuiAltScreenOptions {
 	 * an error otherwise. When omitted, the selection is copied via an OSC 52 write.
 	 */
 	copySelection?: (text: string) => Promise<boolean>;
+	/**
+	 * Lazily-resolved component (e.g. the prompt editor) whose layout box should receive
+	 * primary-button press/drag/release to position the cursor and select a text range
+	 * instead of starting the terminal's screen selection. Evaluated on each press so it
+	 * stays correct across swaps and TUI rebuilds.
+	 */
+	getClickTarget?: () => Component | undefined;
+	/** Invoked when a primary-button press lands inside the click target's box. */
+	onClickTargetPress?: (component: Component, boxX: number, boxY: number, boxWidth: number) => void;
+	/** Invoked while dragging after a press that landed inside the click target's box. */
+	onClickTargetDrag?: (component: Component, boxX: number, boxY: number, boxWidth: number) => void;
+	/** Invoked when the drag is released. Return the text to copy, or null to skip copying. */
+	onClickTargetRelease?: (component: Component, boxX: number, boxY: number, boxWidth: number) => string | null;
 }
 
 /** Alternate-screen TUI with a scrollable, application-owned viewport. */
@@ -206,6 +220,16 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	private readonly onRightClickPaste?: () => void;
 	private copyOnSelect: boolean;
 	private readonly copySelection?: (text: string) => Promise<boolean>;
+	private readonly getClickTarget?: () => Component | undefined;
+	private readonly onClickTargetPress?: (component: Component, boxX: number, boxY: number, boxWidth: number) => void;
+	private readonly onClickTargetDrag?: (component: Component, boxX: number, boxY: number, boxWidth: number) => void;
+	private readonly onClickTargetRelease?: (
+		component: Component,
+		boxX: number,
+		boxY: number,
+		boxWidth: number,
+	) => string | null;
+	private clickTargetDragActive = false;
 
 	constructor(
 		terminal: Terminal,
@@ -230,6 +254,10 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.onRightClickPaste = options.onRightClickPaste;
 		this.copyOnSelect = options.copyOnSelect ?? true;
 		this.copySelection = options.copySelection;
+		this.getClickTarget = options.getClickTarget;
+		this.onClickTargetPress = options.onClickTargetPress;
+		this.onClickTargetDrag = options.onClickTargetDrag;
+		this.onClickTargetRelease = options.onClickTargetRelease;
 		this.addInputListener((data) => this.handleViewportInput(data));
 	}
 
@@ -1031,6 +1059,26 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		const anchorScrollView = this.selectionAnchor?.scrollView;
 		const point = this.getSelectionPoint(event, anchorScrollView);
 		if (event.release) {
+			// Release of an in-progress click-target (editor) drag: finalize the
+			// selection and copy it if configured, then consume the event.
+			if (this.clickTargetDragActive) {
+				this.clickTargetDragActive = false;
+				this.stopSelectionAutoScroll();
+				const clickTarget = this.getClickTarget?.();
+				const box =
+					clickTarget && this.currentLayout ? getComponentBox(this.currentLayout, clickTarget) : undefined;
+				if (clickTarget && box && this.onClickTargetRelease) {
+					const selected = this.onClickTargetRelease(
+						clickTarget,
+						event.x - box.rect.x,
+						event.y - box.rect.y,
+						box.rect.width,
+					);
+					if (selected && this.copyOnSelect) void this.copyTextToClipboard(selected);
+				}
+				this.requestRender();
+				return;
+			}
 			if (!this.selectionPressActive) return;
 			this.selectionPressActive = false;
 			this.stopSelectionAutoScroll();
@@ -1060,6 +1108,17 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			return;
 		}
 		if ((event.button & 32) !== 0) {
+			// Drag continuing an in-progress click-target (editor) selection.
+			if (this.clickTargetDragActive) {
+				const clickTarget = this.getClickTarget?.();
+				const box =
+					clickTarget && this.currentLayout ? getComponentBox(this.currentLayout, clickTarget) : undefined;
+				if (clickTarget && box && this.onClickTargetDrag) {
+					this.onClickTargetDrag(clickTarget, event.x - box.rect.x, event.y - box.rect.y, box.rect.width);
+					this.requestRender();
+				}
+				return;
+			}
 			if (!this.selectionPressActive || !this.selectionAnchor) return;
 			this.selectionDragged = true;
 			this.lastClick = undefined;
@@ -1070,6 +1129,33 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			return;
 		}
 		this.stopSelectionAutoScroll();
+
+		// If a click-target component (e.g. the prompt editor) owns the clicked cell,
+		// route the press to it so it can position its cursor. Consume the event so it
+		// doesn't also start a screen selection.
+		const clickTarget = this.getClickTarget?.();
+		if (clickTarget && this.onClickTargetPress && !this.hasOverlay() && this.currentLayout) {
+			const box = getComponentBox(this.currentLayout, clickTarget);
+			if (
+				box &&
+				event.x >= box.rect.x &&
+				event.x < box.rect.x + box.rect.width &&
+				event.y >= box.rect.y &&
+				event.y < box.rect.y + box.rect.height
+			) {
+				this.onClickTargetPress(clickTarget, event.x - box.rect.x, event.y - box.rect.y, box.rect.width);
+				this.clickTargetDragActive = true;
+				this.selectionPressActive = false;
+				this.selectionAnchor = undefined;
+				this.selectionFocus = undefined;
+				this.selectionInitialRange = undefined;
+				this.selectionDragged = false;
+				this.pressedUrl = undefined;
+				this.requestRender();
+				return;
+			}
+		}
+
 		this.selectionPressActive = true;
 		const scrollView =
 			!this.hasOverlay() && this.currentLayout

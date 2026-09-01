@@ -223,6 +223,10 @@ interface LayoutLine {
 	text: string;
 	hasCursor: boolean;
 	cursorPos?: number;
+	/** Index of the source logical line this visual (possibly wrapped) line renders. */
+	sourceLine?: number;
+	/** Char offset in the source logical line where this visual line starts. */
+	sourceStart?: number;
 }
 
 export interface EditorTheme {
@@ -286,6 +290,18 @@ export class Editor implements Component, Focusable {
 
 	// Vertical scrolling support
 	private scrollOffset: number = 0;
+
+	// Last render geometry, used to map a screen click inside this component's box
+	// (returned by the layout engine) back to a logical cursor position.
+	private lastRenderPaddingX = 0;
+	private lastRenderLayoutLines: LayoutLine[] = [];
+	private lastRenderScrollOffset = 0;
+	private lastRenderVisibleCount = 0;
+
+	// Mouse select-to-range. Stored in logical (line, col) coordinates. When both
+	// anchor and focus are set, the rendered text highlights the normalized range.
+	private mouseSelectionAnchor: { line: number; col: number } | null = null;
+	private mouseSelectionFocus: { line: number; col: number } | null = null;
 
 	// Border color (can be changed dynamically)
 	public borderColor: (str: string) => string;
@@ -518,6 +534,12 @@ export class Editor implements Component, Focusable {
 		// Get visible lines slice
 		const visibleLines = layoutLines.slice(this.scrollOffset, this.scrollOffset + maxVisibleLines);
 
+		// Record render geometry for mouse click-to-position mapping.
+		this.lastRenderPaddingX = paddingX;
+		this.lastRenderLayoutLines = layoutLines;
+		this.lastRenderScrollOffset = this.scrollOffset;
+		this.lastRenderVisibleCount = visibleLines.length;
+
 		const result: string[] = [];
 		const leftPadding = " ".repeat(paddingX);
 		const rightPadding = leftPadding;
@@ -537,38 +559,14 @@ export class Editor implements Component, Focusable {
 		const emitCursorMarker = this.focused;
 
 		for (const layoutLine of visibleLines) {
-			let displayText = layoutLine.text;
-			let lineVisibleWidth = visibleWidth(layoutLine.text);
-			let cursorInPadding = false;
-
-			// Add cursor if this line has it
-			if (layoutLine.hasCursor && layoutLine.cursorPos !== undefined) {
-				const before = displayText.slice(0, layoutLine.cursorPos);
-				const after = displayText.slice(layoutLine.cursorPos);
-
-				// Hardware cursor marker (zero-width, emitted before fake cursor for IME positioning)
-				const marker = emitCursorMarker ? CURSOR_MARKER : "";
-
-				if (after.length > 0) {
-					// Cursor is on a character (grapheme) - replace it with highlighted version
-					// Get the first grapheme from 'after'
-					const afterGraphemes = [...this.segment(after, "grapheme")];
-					const firstGrapheme = afterGraphemes[0]?.segment || "";
-					const restAfter = after.slice(firstGrapheme.length);
-					const cursor = `\x1b[7m${firstGrapheme}\x1b[0m`;
-					displayText = before + marker + cursor + restAfter;
-					// lineVisibleWidth stays the same - we're replacing, not adding
-				} else {
-					// Cursor is at the end - add highlighted space
-					const cursor = "\x1b[7m \x1b[0m";
-					displayText = before + marker + cursor;
-					lineVisibleWidth = lineVisibleWidth + 1;
-					// If cursor overflows content width into the padding, flag it
-					if (lineVisibleWidth > contentWidth && paddingX > 0) {
-						cursorInPadding = true;
-					}
-				}
-			}
+			// Build the display text grapheme-by-grapheme so the cursor and selection
+			// highlights can be applied together without raw-char-slice misalignment
+			// (escape codes in the selection styling would otherwise shift the cursor
+			// offset). When neither is active, output is identical to the plain text.
+			const styled = this.buildDisplayLine(layoutLine, emitCursorMarker, contentWidth, paddingX);
+			const displayText = styled.displayText;
+			const lineVisibleWidth = styled.lineVisibleWidth;
+			const cursorInPadding = styled.cursorInPadding;
 
 			// Calculate padding based on actual visible width
 			const padding = " ".repeat(Math.max(0, contentWidth - lineVisibleWidth));
@@ -602,6 +600,9 @@ export class Editor implements Component, Focusable {
 
 	handleInput(data: string): void {
 		const kb = getKeybindings();
+
+		// Keyboard input invalidates any active mouse selection (like a terminal).
+		this.clearMouseSelection();
 
 		// Handle character jump mode (awaiting next character to jump to)
 		if (this.jumpMode !== null) {
@@ -917,6 +918,8 @@ export class Editor implements Component, Focusable {
 				text: "",
 				hasCursor: true,
 				cursorPos: 0,
+				sourceLine: 0,
+				sourceStart: 0,
 			});
 			return layoutLines;
 		}
@@ -934,11 +937,15 @@ export class Editor implements Component, Focusable {
 						text: line,
 						hasCursor: true,
 						cursorPos: this.state.cursorCol,
+						sourceLine: i,
+						sourceStart: 0,
 					});
 				} else {
 					layoutLines.push({
 						text: line,
 						hasCursor: false,
+						sourceLine: i,
+						sourceStart: 0,
 					});
 				}
 			} else {
@@ -982,11 +989,15 @@ export class Editor implements Component, Focusable {
 							text: chunk.text,
 							hasCursor: true,
 							cursorPos: adjustedCursorPos,
+							sourceLine: i,
+							sourceStart: chunk.startIndex,
 						});
 					} else {
 						layoutLines.push({
 							text: chunk.text,
 							hasCursor: false,
+							sourceLine: i,
+							sourceStart: chunk.startIndex,
 						});
 					}
 				}
@@ -998,6 +1009,227 @@ export class Editor implements Component, Focusable {
 
 	getText(): string {
 		return this.state.lines.join("\n");
+	}
+
+	/**
+	 * Map a terminal screen coordinate relative to this component's layout box
+	 * top-left onto a logical (line, col) position. Returns undefined when the
+	 * click falls outside the content area (e.g. on a border or the padding).
+	 */
+	cursorAtScreen(boxX: number, boxY: number, boxWidth: number): { line: number; col: number } | undefined {
+		const layoutLines = this.lastRenderLayoutLines;
+		const scrollOffset = this.lastRenderScrollOffset;
+		const visibleCount = this.lastRenderVisibleCount;
+		const paddingX = this.lastRenderPaddingX;
+		if (layoutLines.length === 0 || visibleCount <= 0) return undefined;
+
+		// The editor renders: [top border][visible content rows][bottom border].
+		// Row 0 is the top border, so content rows are 1..visibleCount, and the
+		// bottom border is row visibleCount+1 (or an autocomplete row after that).
+		const contentRow = boxY - 1;
+		if (contentRow < 0 || contentRow >= visibleCount) return undefined;
+
+		const layoutIndex = scrollOffset + contentRow;
+		const layoutLine = layoutLines[layoutIndex];
+		if (!layoutLine || layoutLine.sourceLine === undefined) return undefined;
+		if (layoutLine.sourceStart === undefined) return undefined;
+
+		// Horizontal: content starts after paddingX columns. Click on the padding
+		// (or before the text) clamps to column 0; past the text clamps to the end.
+		const contentCol = Math.max(0, boxX - paddingX);
+		const contentWidth = Math.max(1, boxWidth - paddingX * 2);
+		const lineWidth = Math.min(visibleWidth(layoutLine.text), contentWidth);
+		const targetWidth = Math.min(contentCol, lineWidth);
+
+		// Convert the target display column to a char offset within the layout
+		// line's text, accounting for wide/combining graphemes.
+		const text = layoutLine.text;
+		let offset = 0;
+		let seenWidth = 0;
+		for (const segment of this.segment(text, "grapheme")) {
+			if (seenWidth >= targetWidth) break;
+			const charWidth = visibleWidth(segment.segment);
+			// If a wide grapheme straddles the target column, snap to its start.
+			if (seenWidth + charWidth > targetWidth) break;
+			seenWidth += charWidth;
+			offset += segment.segment.length;
+		}
+
+		const targetCol = layoutLine.sourceStart + offset;
+		const sourceLineText = this.state.lines[layoutLine.sourceLine] ?? "";
+		return { line: layoutLine.sourceLine, col: Math.min(targetCol, sourceLineText.length) };
+	}
+
+	/**
+	 * Position the editor cursor at a terminal screen coordinate relative to this
+	 * component's layout box top-left. Used for mouse click-to-position. Returns
+	 * false when the click falls outside the content area (e.g. on a border).
+	 */
+	positionCursorAtScreen(boxX: number, boxY: number, boxWidth: number): boolean {
+		const position = this.cursorAtScreen(boxX, boxY, boxWidth);
+		if (!position) return false;
+		this.state.cursorLine = position.line;
+		this.setCursorCol(position.col);
+		this.tui.requestRender();
+		return true;
+	}
+
+	/**
+	 * Begin a mouse selection at a screen coordinate. Establishes the anchor and
+	 * collapses the focus to the same position. Returns whether the position was
+	 * inside the content area.
+	 */
+	beginMouseSelection(boxX: number, boxY: number, boxWidth: number): boolean {
+		const position = this.cursorAtScreen(boxX, boxY, boxWidth);
+		if (!position) return false;
+		this.state.cursorLine = position.line;
+		this.setCursorCol(position.col);
+		this.mouseSelectionAnchor = { ...position };
+		this.mouseSelectionFocus = { ...position };
+		this.tui.requestRender();
+		return true;
+	}
+
+	/**
+	 * Extend an in-progress mouse selection to a new screen coordinate (drag).
+	 * Returns false if the position is outside the content area (drag past the
+	 * border is still accepted and clamped by the caller to the nearest row).
+	 */
+	extendMouseSelection(boxX: number, boxY: number, boxWidth: number): boolean {
+		const position = this.cursorAtScreen(boxX, boxY, boxWidth);
+		if (!position || !this.mouseSelectionAnchor) return false;
+		this.state.cursorLine = position.line;
+		this.setCursorCol(position.col);
+		this.mouseSelectionFocus = { ...position };
+		this.tui.requestRender();
+		return true;
+	}
+
+	/** Complete a mouse selection and return the selected text (or null if none). */
+	endMouseSelection(): string | null {
+		const text = this.getSelectedText();
+		// Keep the highlight visible after release (like a native terminal) so the
+		// user can copy it; clear only when content changes or a new selection starts.
+		return text;
+	}
+
+	/** The selected text, or null when there is no (non-empty) selection. */
+	getSelectedText(): string | null {
+		const anchor = this.mouseSelectionAnchor;
+		const focus = this.mouseSelectionFocus;
+		if (!anchor || !focus) return null;
+		const start =
+			anchor.line < focus.line || (anchor.line === focus.line && anchor.col <= focus.col) ? anchor : focus;
+		const end = start === anchor ? focus : anchor;
+
+		const lines: string[] = [];
+		for (let line = start.line; line <= end.line; line++) {
+			const text = this.state.lines[line] ?? "";
+			if (line === start.line && line === end.line) {
+				lines.push(text.slice(start.col, end.col));
+			} else if (line === start.line) {
+				lines.push(text.slice(start.col));
+			} else if (line === end.line) {
+				lines.push(text.slice(0, end.col));
+			} else {
+				lines.push(text);
+			}
+		}
+		const result = lines.join("\n").trim();
+		return result.length === 0 ? null : result;
+	}
+
+	/** Clear any active mouse selection. */
+	clearMouseSelection(): void {
+		if (this.mouseSelectionAnchor || this.mouseSelectionFocus) {
+			this.mouseSelectionAnchor = null;
+			this.mouseSelectionFocus = null;
+			this.tui.requestRender();
+		}
+	}
+
+	/**
+	 * Compute the (start, end) character offsets, in the given layout line's own
+	 * text, that fall within the active mouse selection. Returns undefined when the
+	 * layout line's source logical line is outside the selection range (or the
+	 * selection is empty/null).
+	 */
+	private getSelectionHighlightRange(layoutLine: LayoutLine): { start: number; end: number } | undefined {
+		if (!this.mouseSelectionAnchor || !this.mouseSelectionFocus) return undefined;
+		if (layoutLine.sourceLine === undefined || layoutLine.sourceStart === undefined) return undefined;
+		const anchor = this.mouseSelectionAnchor;
+		const focus = this.mouseSelectionFocus;
+		const selStart =
+			anchor.line < focus.line || (anchor.line === focus.line && anchor.col <= focus.col) ? anchor : focus;
+		const selEnd = selStart === anchor ? focus : anchor;
+
+		const sourceLine = layoutLine.sourceLine;
+		if (sourceLine < selStart.line || sourceLine > selEnd.line) return undefined;
+
+		// The layout line renders `sourceStart`.. + textLength of the source logical line.
+		const textLength = layoutLine.text.length;
+		const lineStart = layoutLine.sourceStart;
+		const lineEnd = lineStart + textLength;
+		const overlapStart = Math.max(lineStart, selStart.line === sourceLine ? selStart.col : lineStart);
+		const overlapEnd = Math.min(lineEnd, selEnd.line === sourceLine ? selEnd.col : lineEnd);
+		if (overlapEnd <= overlapStart) return undefined;
+		return { start: overlapStart - lineStart, end: overlapEnd - lineStart };
+	}
+
+	/**
+	 * Build the display text for a content line, applying the cursor (reverse video)
+	 * and any active mouse selection (underline) highlights to the appropriate
+	 * graphemes in a single pass. This avoids raw-character slicing that would be
+	 * thrown off by the escape codes each highlight inserts.
+	 */
+	private buildDisplayLine(
+		layoutLine: LayoutLine,
+		emitCursorMarker: boolean,
+		contentWidth: number,
+		paddingX: number,
+	): { displayText: string; lineVisibleWidth: number; cursorInPadding: boolean } {
+		const text = layoutLine.text;
+		const selectionRange = this.getSelectionHighlightRange(layoutLine);
+		const marker = emitCursorMarker ? CURSOR_MARKER : "";
+		const cursorPos = layoutLine.hasCursor && layoutLine.cursorPos !== undefined ? layoutLine.cursorPos : undefined;
+
+		let displayText = "";
+		let lineVisibleWidth = 0;
+		let cursorInPadding = false;
+
+		const segs = [...this.segment(text, "grapheme")];
+		for (const seg of segs) {
+			const segStart = seg.index;
+			const segEnd = segStart + seg.segment.length;
+			const isCursor = cursorPos !== undefined && cursorPos >= segStart && cursorPos < segEnd;
+			const isSelected =
+				selectionRange !== undefined && segStart < selectionRange.end && segEnd > selectionRange.start;
+
+			if (isCursor) {
+				// Cursor on a grapheme: reverse-video it after the hardware cursor marker.
+				// When the cursor also falls inside the selection, the reverse-video caret
+				// takes precedence (no re-opening of underline here, which would otherwise
+				// dangle and underline trailing content).
+				displayText += `${marker}\x1b[7m${seg.segment}\x1b[0m`;
+			} else if (isSelected) {
+				displayText += `\x1b[4m${seg.segment}\x1b[24m`;
+			} else {
+				displayText += seg.segment;
+			}
+			lineVisibleWidth += visibleWidth(seg.segment);
+		}
+
+		// Cursor at the end of the line (after any trailing content) renders as a
+		// highlighted space so the caret remains visible at the line end.
+		if (cursorPos !== undefined && cursorPos >= text.length) {
+			displayText += `${marker}\x1b[7m \x1b[0m`;
+			lineVisibleWidth += 1;
+			if (lineVisibleWidth > contentWidth && paddingX > 0) {
+				cursorInPadding = true;
+			}
+		}
+
+		return { displayText, lineVisibleWidth, cursorInPadding };
 	}
 
 	private expandPasteMarkers(text: string): string {

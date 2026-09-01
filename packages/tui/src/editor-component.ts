@@ -71,4 +71,37 @@ export interface EditorComponent extends Component {
 
 	/** Set max visible items in autocomplete dropdown */
 	setAutocompleteMaxVisible?(maxVisible: number): void;
+
+	// =========================================================================
+	// Mouse support (optional)
+	// =========================================================================
+
+	/**
+	 * Position the editor cursor at a terminal screen coordinate relative to this
+	 * component's layout box top-left. Used for mouse click-to-position. Returns
+	 * false when the click falls outside the editable content area.
+	 */
+	positionCursorAtScreen?(boxX: number, boxY: number, boxWidth: number): boolean;
+
+	/**
+	 * Begin a mouse selection at a terminal screen coordinate relative to this
+	 * component's layout box top-left. Used for click-and-drag range selection.
+	 * Returns whether the position was inside the content area.
+	 */
+	beginMouseSelection?(boxX: number, boxY: number, boxWidth: number): boolean;
+
+	/**
+	 * Extend an in-progress mouse selection to a new screen coordinate (drag),
+	 * relative to this component's layout box top-left.
+	 */
+	extendMouseSelection?(boxX: number, boxY: number, boxWidth: number): boolean;
+
+	/**
+	 * Complete a mouse selection and return the selected text, or null when there
+	 * is no non-empty selection.
+	 */
+	endMouseSelection?(): string | null;
+
+	/** Clear any active mouse selection highlight. */
+	clearMouseSelection?(): void;
 }

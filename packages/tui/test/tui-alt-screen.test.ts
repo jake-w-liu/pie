@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import { findAltScreenSearchMatches } from "../src/alt-screen-search.ts";
+import { Editor } from "../src/components/editor.ts";
 import { HStack } from "../src/components/h-stack.ts";
 import { Image } from "../src/components/image.ts";
 import { ScrollView } from "../src/components/scroll-view.ts";
@@ -1708,6 +1709,107 @@ describe("TuiAltScreen", () => {
 		await terminal.waitForRender();
 		assert.ok(tui.viewportTop < topBefore);
 		assert.ok(terminal.getViewport().some((line) => line.includes("Find transcript")));
+		tui.stop();
+	});
+
+	it("routes a click over the click-target to position the editor cursor", async () => {
+		const terminal = new RecordingTerminal(30, 6);
+		const theme = (text: string) => text;
+		let editorBox = new VStack([]);
+		const tui = new TuiAltScreen(terminal, false, undefined, {
+			getClickTarget: () => editorBox,
+			onClickTargetPress: (component, boxX, boxY, boxWidth) => {
+				const box = component as unknown as VStack;
+				(box.children[0] as Editor).beginMouseSelection(boxX, boxY, boxWidth);
+			},
+		});
+		const editor = new Editor(tui, { borderColor: theme, selectList: {} as never });
+		editor.setText("hello");
+		editorBox = new VStack([editor]);
+		tui.setLayoutRoot(
+			new VStack([
+				{
+					component: new ScrollView(new Text("line 0\nline 1\nline 2\nline 3", 0, 0), { primary: true }),
+					basis: 0,
+					grow: 1,
+					minSize: 1,
+				},
+				{ component: editorBox, basis: "auto", minSize: 3 },
+			]),
+		);
+		tui.start();
+		await terminal.waitForRender();
+
+		// A primary-button press at 1-based (x=3,y=5) maps to box (2,1) -> cursor column 2.
+		terminal.sendInput("\x1b[<0;3;5M");
+		await terminal.waitForRender();
+
+		assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 2 });
+
+		// A press with no drag must not trigger a text selection/copy (zero-length selection).
+		terminal.sendInput("\x1b[<0;3;5m");
+		await terminal.waitForRender();
+		assert.ok(
+			terminal.events.every((event) => event.type !== "write" || !event.data.includes("\x1b]52;c;")),
+			"click on editor should not copy a selection",
+		);
+		tui.stop();
+	});
+
+	it("drag-selects a range in the editor and copies it on release", async () => {
+		const terminal = new RecordingTerminal(30, 6);
+		const theme = (text: string) => text;
+		let editorBox = new VStack([]);
+		const tui = new TuiAltScreen(terminal, false, undefined, {
+			getClickTarget: () => editorBox,
+			onClickTargetPress: (component, boxX, boxY, boxWidth) => {
+				const box = component as unknown as VStack;
+				(box.children[0] as Editor).beginMouseSelection(boxX, boxY, boxWidth);
+			},
+			onClickTargetDrag: (component, boxX, boxY, boxWidth) => {
+				const box = component as unknown as VStack;
+				(box.children[0] as Editor).extendMouseSelection(boxX, boxY, boxWidth);
+			},
+			onClickTargetRelease: (component) => {
+				const box = component as unknown as VStack;
+				return (box.children[0] as Editor).endMouseSelection();
+			},
+		});
+		const editor = new Editor(tui, { borderColor: theme, selectList: {} as never });
+		editor.setText("hello world");
+		editorBox = new VStack([editor]);
+		tui.setLayoutRoot(
+			new VStack([
+				{
+					component: new ScrollView(new Text("line 0\nline 1", 0, 0), { primary: true }),
+					basis: 0,
+					grow: 1,
+					minSize: 1,
+				},
+				{ component: editorBox, basis: "auto", minSize: 3 },
+			]),
+		);
+		tui.start();
+		await terminal.waitForRender();
+
+		// Editor box occupies viewport rows 3,4,5 with one content row (box row 1).
+		// Press at 1-based (x=1,y=5) -> box (0,1) col 0; drag to (x=6,y=5) -> box (5,1) col 5.
+		// SGR motion events use button 32 (0x20) with the press's coordinates.
+		terminal.sendInput("\x1b[<0;1;5M");
+		await terminal.waitForRender();
+		terminal.sendInput("\x1b[<32;6;5M");
+		await terminal.waitForRender();
+		// Release (primary button up) at col 5.
+		terminal.sendInput("\x1b[<0;6;5m");
+		await terminal.waitForRender();
+
+		// Selected text is "hello" -> copied via OSC 52.
+		const expected = `\x1b]52;c;${Buffer.from("hello").toString("base64")}\x07`;
+		assert.ok(
+			terminal.events.some((event) => event.type === "write" && event.data.includes(expected)),
+			JSON.stringify(terminal.events.filter((event) => event.type === "write" && event.data.includes("\x1b]52;c;"))),
+		);
+		assert.strictEqual(editor.getSelectedText(), "hello");
 		tui.stop();
 	});
 });

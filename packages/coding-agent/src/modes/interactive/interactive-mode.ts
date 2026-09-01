@@ -485,6 +485,10 @@ export class InteractiveMode {
 
 	private lastSigintTime = 0;
 	private lastEscapeTime = 0;
+	// Double-escape with non-empty editor clears the input. Track the timestamp of
+	// the first escape separately so it never collides with the empty-editor
+	// double-escape (/tree, /fork) above.
+	private lastEscapeWithTextTime = 0;
 	private changelogMarkdown: string | undefined = undefined;
 	private startupNoticesShown = false;
 	private anthropicSubscriptionWarningShown = false;
@@ -2932,6 +2936,15 @@ export class InteractiveMode {
 					} else {
 						this.lastEscapeTime = now;
 					}
+				}
+			} else {
+				// Double-escape with non-empty editor clears the input.
+				const now = Date.now();
+				if (now - this.lastEscapeWithTextTime < 500) {
+					this.clearEditor();
+					this.lastEscapeWithTextTime = 0;
+				} else {
+					this.lastEscapeWithTextTime = now;
 				}
 			}
 		};

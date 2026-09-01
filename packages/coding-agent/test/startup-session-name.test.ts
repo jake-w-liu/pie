@@ -54,11 +54,15 @@ function createSessionFile(projectDir: string, sessionFile: string): void {
 	);
 }
 
-function readSessionInfoNames(sessionFile: string): string[] {
+function readSessionEntries(sessionFile: string): Array<{ type?: string; name?: string }> {
 	return readFileSync(sessionFile, "utf8")
 		.trim()
 		.split("\n")
-		.map((line) => JSON.parse(line) as { type?: string; name?: string })
+		.map((line) => JSON.parse(line) as { type?: string; name?: string });
+}
+
+function readSessionInfoNames(sessionFile: string): string[] {
+	return readSessionEntries(sessionFile)
 		.filter((entry) => entry.type === "session_info")
 		.map((entry) => entry.name ?? "");
 }
@@ -118,5 +122,10 @@ describe("startup session name", () => {
 		expect(result.code).toBe(1);
 		expect(result.signal).toBeNull();
 		expect(readSessionInfoNames(dirs.sessionFile)).toEqual(["CLI Named Session"]);
+		expect(readSessionEntries(dirs.sessionFile).map((entry) => entry.type)).toEqual([
+			"session",
+			"message",
+			"session_info",
+		]);
 	});
 });

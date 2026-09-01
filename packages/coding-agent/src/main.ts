@@ -5,6 +5,8 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
 import { setCapabilityOverrides } from "@earendil-works/pi-tui";
@@ -59,7 +61,7 @@ import {
 } from "./core/session-cwd.ts";
 import { assertValidSessionId, SessionManager } from "./core/session-manager.ts";
 import { collectSettingsDiagnostics, deduplicateDiagnostics } from "./core/settings-diagnostics.ts";
-import { SettingsManager } from "./core/settings-manager.ts";
+import { type PackageSource, type Settings, SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
 import { builtInExtensions } from "./extensions/index.ts";
@@ -126,6 +128,96 @@ function toPrintOutputMode(appMode: AppMode): Exclude<Mode, "rpc"> {
 
 function isPlainRuntimeMetadataCommand(parsed: Args): boolean {
 	return !parsed.print && parsed.mode === undefined && (parsed.help === true || parsed.listModels !== undefined);
+}
+
+function shouldFastPrintCoreHelp(parsed: Args): boolean {
+	return (
+		parsed.help === true &&
+		isPlainRuntimeMetadataCommand(parsed) &&
+		parsed.projectTrustOverride === undefined &&
+		(parsed.extensions?.length ?? 0) === 0 &&
+		parsed.unknownFlags.size === 0
+	);
+}
+
+const LOCAL_DYNAMIC_MODEL_PROVIDER_IDS = new Set(["llama.cpp", "mlx"]);
+const LOCAL_DYNAMIC_MODEL_PROVIDER_ENV_VARS = ["LLAMA_BASE_URL", "MLX_BASE_URL"] as const;
+
+function packageSourceMayRegisterModelProvider(source: PackageSource): boolean {
+	if (typeof source === "string") return true;
+	if (source.autoload === false) return (source.extensions?.length ?? 0) > 0;
+	return true;
+}
+
+function settingsMayRegisterModelProvider(settings: Settings): boolean {
+	return (
+		(settings.extensions?.length ?? 0) > 0 || settings.packages?.some(packageSourceMayRegisterModelProvider) === true
+	);
+}
+
+function hasStoredCredentialForProvider(agentDir: string, providerIds: ReadonlySet<string>): boolean {
+	const authPath = join(agentDir, "auth.json");
+	if (!existsSync(authPath)) return false;
+	try {
+		const raw = JSON.parse(readFileSync(authPath, "utf-8")) as unknown;
+		if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+		return [...providerIds].some((providerId) => Object.hasOwn(raw, providerId));
+	} catch {
+		return true;
+	}
+}
+
+function localDynamicModelProvidersMayAffectResolution(parsed: Args, agentDir: string): boolean {
+	if (parsed.provider && LOCAL_DYNAMIC_MODEL_PROVIDER_IDS.has(parsed.provider.toLowerCase())) return true;
+	if (parsed.provider) return false;
+	return (
+		LOCAL_DYNAMIC_MODEL_PROVIDER_ENV_VARS.some((name) => Boolean(process.env[name]?.trim())) ||
+		hasStoredCredentialForProvider(agentDir, LOCAL_DYNAMIC_MODEL_PROVIDER_IDS)
+	);
+}
+
+function canPreflightCliModelBeforeResourceLoad(
+	parsed: Args,
+	cwd: string,
+	agentDir: string,
+	settingsManager: SettingsManager,
+): boolean {
+	if (!parsed.model) return false;
+	if ((parsed.extensions?.length ?? 0) > 0 || parsed.unknownFlags.size > 0) return false;
+	if (settingsMayRegisterModelProvider(settingsManager.getGlobalSettings())) return false;
+	if (hasTrustRequiringProjectResources(cwd)) return false;
+	return !localDynamicModelProvidersMayAffectResolution(parsed, agentDir);
+}
+
+async function exitOnPreRuntimeCliModelError(
+	parsed: Args,
+	cwd: string,
+	agentDir: string,
+	settingsManager: SettingsManager,
+): Promise<void> {
+	if (!canPreflightCliModelBeforeResourceLoad(parsed, cwd, agentDir, settingsManager)) return;
+	let modelRuntime: ModelRuntime;
+	try {
+		modelRuntime = await ModelRuntime.create({
+			authPath: join(agentDir, "auth.json"),
+			modelsPath: join(agentDir, "models.json"),
+			signal: AbortSignal.timeout(15_000),
+		});
+	} catch {
+		return;
+	}
+	const resolved = resolveCliModel({
+		cliProvider: parsed.provider,
+		cliModel: parsed.model,
+		cliThinking: parsed.thinking,
+		modelRuntime,
+	});
+	if (!resolved.error) return;
+	reportDiagnostics([
+		...(resolved.warning ? [{ type: "warning" as const, message: resolved.warning }] : []),
+		{ type: "error", message: resolved.error },
+	]);
+	process.exit(1);
 }
 
 async function runAuthCommand(args: string[]): Promise<boolean> {
@@ -648,6 +740,12 @@ export async function main(args: string[], options?: MainOptions) {
 	const startupSettingsManager = SettingsManager.create(cwd, agentDir);
 	const startupSettingsDiagnostics = collectSettingsDiagnostics(startupSettingsManager);
 
+	if (shouldFastPrintCoreHelp(parsed)) {
+		reportDiagnostics(startupSettingsDiagnostics);
+		printHelp([]);
+		process.exit(0);
+	}
+
 	// Experimental first-time setup: theme choice and analytics opt-in.
 	// Runs before any runtime services are created so the chosen settings apply everywhere.
 	if (appMode === "interactive" && !parsed.help && parsed.listModels === undefined && shouldRunFirstTimeSetup()) {
@@ -691,6 +789,7 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 		sessionManager.appendSessionInfo(name);
 	}
+	await exitOnPreRuntimeCliModelError(parsed, sessionManager.getCwd(), agentDir, startupSettingsManager);
 	time("createSessionManager");
 
 	const trustStore = new ProjectTrustStore(agentDir);

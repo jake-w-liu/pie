@@ -175,22 +175,52 @@ describe("AssistantMessageComponent", () => {
 		expect(stripAnsi(component.render(80).join("\n"))).toContain("partial response");
 	});
 
-	test("collapses streaming thinking to a stable label instead of growing the transcript", () => {
+	test("streams thinking content live and reuses the block across updates", () => {
 		initTheme("dark");
 		const component = new AssistantMessageComponent();
 
-		// While thinking streams, the reasoning must NOT be rendered into the
-		// transcript (that used to grow the scroll view and repaint on every chunk).
+		// While thinking streams, the reasoning is rendered live (not collapsed to a
+		// static label) so the user sees it as it arrives. The same Markdown block is
+		// reused across deltas (setText), avoiding a full tree rebuild each chunk.
+		component.updateContent(createAssistantMessage([{ type: "thinking", thinking: "private" }]), true);
+		const contentContainer = Reflect.get(component, "contentContainer") as { children: unknown[] };
+		const thinkingComponent = contentContainer.children[1];
+		const streamingFirst = stripAnsi(component.render(80).join("\n"));
+		expect(streamingFirst).toContain("private");
+		expect(streamingFirst).not.toContain("Thinking...");
+
+		// Growing the thinking text reuses the same block (incremental setText).
+		component.updateContent(
+			createAssistantMessage([{ type: "thinking", thinking: "private reasoning continues" }]),
+			true,
+		);
+		expect(contentContainer.children[1]).toBe(thinkingComponent);
+		const streamingGrowth = stripAnsi(component.render(80).join("\n"));
+		expect(streamingGrowth).toContain("private reasoning continues");
+
+		// Once the message completes, the full reasoning is still shown.
+		component.updateContent(
+			createAssistantMessage([{ type: "thinking", thinking: "private reasoning continues" }]),
+			false,
+		);
+		expect(stripAnsi(component.render(80).join("\n"))).toContain("private reasoning continues");
+	});
+
+	test("still collapses thinking to a label when hideThinkingBlock is set", () => {
+		initTheme("dark");
+		const component = new AssistantMessageComponent(undefined, true);
+
+		// hideThinkingBlock keeps reasoning private: only the label is shown during
+		// streaming and after completion, never the actual content.
 		component.updateContent(createAssistantMessage([{ type: "thinking", thinking: "private reasoning" }]), true);
 		const streaming = stripAnsi(component.render(80).join("\n"));
 		expect(streaming).not.toContain("private reasoning");
 		expect(streaming).toContain("Thinking...");
 
-		// Once the message completes, the full reasoning is shown (hideThinkingBlock
-		// defaults to false).
 		component.updateContent(createAssistantMessage([{ type: "thinking", thinking: "private reasoning" }]), false);
 		const completed = stripAnsi(component.render(80).join("\n"));
-		expect(completed).toContain("private reasoning");
+		expect(completed).not.toContain("private reasoning");
+		expect(completed).toContain("Thinking...");
 	});
 
 	test("identifies partial assistant Markdown as streaming", () => {

@@ -385,18 +385,6 @@ function containsPoint(rect: LayoutRect, x: number, y: number): boolean {
 	return x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height;
 }
 
-export function getComponentBox(frame: LayoutFrame, component: Component): LayoutBox | undefined {
-	const visit = (box: LayoutBox): LayoutBox | undefined => {
-		if (box.component === component) return box;
-		for (const child of box.children) {
-			const match = visit(child);
-			if (match) return match;
-		}
-		return undefined;
-	};
-	return visit(frame.root);
-}
-
 export function getScrollViewBox(frame: LayoutFrame, scrollView: ScrollView): LayoutBox | undefined {
 	const visit = (box: LayoutBox): LayoutBox | undefined => {
 		if (box.scrollView === scrollView) return box;

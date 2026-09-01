@@ -486,6 +486,49 @@ export function findCutPoint(
 // Summarization
 // ============================================================================
 
+/**
+ * Cache-reusing compaction directive, delivered as the FINAL user message after
+ * the replayed conversation prefix. Mirrors DeepSeek Harness's compaction-basic
+ * `COMPACTION_INSTRUCTION`: keeping the conversation's own system prompt, tools,
+ * and messages in front of it makes the auxiliary summarization call a genuine
+ * prefix of the last routed request, so the provider's warm prefix cache is reused.
+ */
+const SUMMARIZATION_INSTRUCTION = `You are now acting as a compaction engine for this AI coding assistant. Condense the conversation ABOVE into a structured checkpoint that lets another model resume the work with no loss of essential context.
+
+Output EXACTLY the Markdown structure below: keep every section, in order. Use terse bullets, not prose paragraphs. Write "(none)" for an empty section — never drop a section.
+
+## Goal
+- [what the user is trying to accomplish; quote verbatim where the exact wording matters]
+
+## Constraints & Preferences
+- [constraints, preferences, or requirements the user mentioned; or "(none)"]
+
+## Progress
+### Done
+- [x] [completed tasks/changes]
+
+### In Progress
+- [ ] [current work]
+
+### Blocked
+- [issues preventing progress, if any]
+
+## Key Decisions
+- **[Decision]**: [brief rationale]
+
+## Next Steps
+1. [ordered list of what should happen next]
+
+## Critical Context
+- [data, examples, or references needed to continue; or "(none)"]
+
+Rules:
+- Write concise English engineering prose. Preserve exact file paths, function names, commands, error strings, identifiers, numeric values, and syntax fragments.
+- Capture user feedback and explicit instructions faithfully, especially corrections.
+- Do NOT mention this summarization request or that the context was compacted.
+- Output only the checkpoint text: do not call any tool or take any other action.
+- Do NOT continue the conversation or respond to any question in it; ONLY output the structured summary.`;
+
 const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
 
 Use this EXACT format:
@@ -699,6 +742,68 @@ function buildSummarizationContext(promptText: string): Context {
 	};
 }
 
+/**
+ * Build a cache-reusing summarization context, mirroring DeepSeek Harness's
+ * compaction-basic design. Instead of serializing the conversation to a flat
+ * text blob under a dedicated summarizer system prompt (which invalidates the
+ * provider's prefix cache), we replay the conversation's own system prompt and
+ * tool schemas verbatim, append the conversation messages as an LLM prefix, and
+ * deliver the compaction instruction as the FINAL user message.
+ *
+ * Because this request is a genuine prefix of the last routed request, the
+ * provider's warm prefix cache is reused instead of being invalidated; the
+ * compaction instruction is the only novel input.
+ *
+ * @param systemPrompt - The live conversation's system prompt (already set on the
+ *   agent state). When omitted, callers fall back to the serialized-text builder.
+ * @param tools - The live conversation's tool schemas, reused for prefix alignment.
+ * @param instruction - The finalized compaction instruction (final user message).
+ * @param messages - The conversation span to condense, as LLM messages.
+ */
+function buildCacheReusingSummarizationContext(
+	systemPrompt: string,
+	tools: readonly import("@earendil-works/pi-ai").Tool[] | undefined,
+	instruction: string,
+	messages: readonly import("@earendil-works/pi-ai").Message[],
+): Context {
+	const context: Context = {
+		systemPrompt,
+		messages: [
+			...messages,
+			{
+				role: "user",
+				content: [{ type: "text", text: instruction }],
+				timestamp: Date.now(),
+			},
+		],
+	};
+	if (tools !== undefined && tools.length > 0) {
+		context.tools = [...tools];
+	}
+	return context;
+}
+
+/**
+ * Build the compaction instruction that the cache-reusing summarization path
+ * delivers as the FINAL user message (replacing the standalone system-prompt
+ * approach). Keeps the structured-format directive plus any prior summary and
+ * custom focus, so a prior checkpoint is merged rather than copied verbatim.
+ */
+function buildCompactionInstruction(
+	previousSummary: string | undefined,
+	customInstructions: string | undefined,
+): string {
+	// Base directive: do NOT continue the conversation, only output the summary.
+	let instruction = SUMMARIZATION_INSTRUCTION;
+	if (previousSummary) {
+		instruction += `\n\n<previous-summary>\n${previousSummary}\n</previous-summary>\n\nIf the conversation already contained a prior checkpoint, do not copy it forward verbatim: preserve still-true facts, drop stale ones, and merge newer information into a single consolidated summary under the same structure.`;
+	}
+	if (customInstructions) {
+		instruction += `\n\nAdditional focus: ${customInstructions}`;
+	}
+	return instruction;
+}
+
 /** Generate or update a conversation summary and return its provider usage. */
 export async function generateSummaryWithUsage(
 	currentMessages: AgentMessage[],
@@ -715,18 +820,60 @@ export async function generateSummaryWithUsage(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	/** Live conversation system prompt; when provided, enables KV-cache reuse. */
+	systemPrompt?: string,
+	/** Live conversation tool schemas, for KV-cache prefix alignment. */
+	tools?: readonly import("@earendil-works/pi-ai").Tool[],
 ): Promise<{ text: string; usage: Usage }> {
 	const maxTokens = getSummarizationTokenBudget(reserveTokens, 0.8, model.maxTokens);
 
-	// Use update prompt if we have a previous summary, otherwise initial prompt
+	// Convert to LLM messages first (handles custom types like bashExecution, custom, etc.).
+	const llmMessages = convertToLlm(currentMessages);
+
+	// Cache-reusing path: replay the live system prompt + messages as a prefix and
+	// append the compaction instruction as the final user message, so the provider's
+	// warm prefix cache is reused instead of invalidated (DeepSeek Harness design).
+	if (systemPrompt !== undefined) {
+		const instruction = buildCompactionInstruction(previousSummary, customInstructions);
+		const completionOptions = createSummarizationOptions(
+			model,
+			maxTokens,
+			apiKey,
+			headers,
+			env,
+			signal,
+			thinkingLevel,
+			sessionId,
+		);
+		const response = await completeSummarization(
+			model,
+			buildCacheReusingSummarizationContext(systemPrompt, tools, instruction, llmMessages),
+			completionOptions,
+			streamFn,
+			retry,
+			callbacks,
+		);
+		const abortError = getSummarizationAbortError(response, "Summarization");
+		if (abortError) throw abortError;
+		const textContent = contentText(response.content);
+		const failure = getSummarizationFailure(response, "Summarization", textContent);
+		if (failure) {
+			throw new Error(failure);
+		}
+		if (response.content.some((block) => block.type === "toolCall")) {
+			throw new Error("Summarization attempted to call a tool");
+		}
+		return { text: textContent, usage: response.usage };
+	}
+
+	// Fallback (no live system prompt): serialize to text under a dedicated
+	// summarizer system prompt. Kept so external callers and branch summaries
+	// without a live session prompt continue to work.
 	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
 	if (customInstructions) {
 		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
 	}
 
-	// Serialize conversation to text so model doesn't try to continue it
-	// Convert to LLM messages first (handles custom types like bashExecution, custom, etc.)
-	const llmMessages = convertToLlm(currentMessages);
 	const conversationText = serializeConversation(llmMessages);
 
 	// Build the prompt with conversation wrapped in tags
@@ -913,6 +1060,10 @@ export async function compact(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	/** Live conversation system prompt; when provided, enables KV-cache reuse. */
+	systemPrompt?: string,
+	/** Live conversation tool schemas, for KV-cache prefix alignment. */
+	tools?: readonly import("@earendil-works/pi-ai").Tool[],
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -948,6 +1099,8 @@ export async function compact(
 				retry,
 				callbacks,
 				sessionId,
+				systemPrompt,
+				tools,
 			);
 			historyText = historyResult.text;
 			historyUsage = historyResult.usage;
@@ -965,6 +1118,8 @@ export async function compact(
 			retry,
 			callbacks,
 			sessionId,
+			systemPrompt,
+			tools,
 		);
 		// Merge into single summary
 		summary = `${historyText}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.text}`;
@@ -986,6 +1141,8 @@ export async function compact(
 			retry,
 			callbacks,
 			sessionId,
+			systemPrompt,
+			tools,
 		);
 		summary = result.text;
 		summaryUsage = result.usage;
@@ -1024,15 +1181,21 @@ async function generateTurnPrefixSummary(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
+	/** Live conversation system prompt; when provided, enables KV-cache reuse. */
+	systemPrompt?: string,
+	/** Live conversation tool schemas, for KV-cache prefix alignment. */
+	tools?: readonly import("@earendil-works/pi-ai").Tool[],
 ): Promise<{ text: string; usage: Usage }> {
 	const maxTokens = getSummarizationTokenBudget(reserveTokens, 0.5, model.maxTokens);
 	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
 
 	const response = await completeSummarization(
 		model,
-		buildSummarizationContext(promptText),
+		systemPrompt !== undefined
+			? buildCacheReusingSummarizationContext(systemPrompt, tools, TURN_PREFIX_SUMMARIZATION_PROMPT, llmMessages)
+			: buildSummarizationContext(
+					`<conversation>\n${serializeConversation(llmMessages)}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`,
+				),
 		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId),
 		streamFn,
 		retry,

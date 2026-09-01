@@ -89,13 +89,18 @@ export function formatFileOperations(readFiles: string[], modifiedFiles: string[
 const TOOL_RESULT_MAX_CHARS = 2000;
 
 /**
- * Truncate text to a maximum character length for summarization.
- * Keeps the beginning and appends a truncation marker.
+ * Truncate text to a maximum character length for summarization using a
+ * head/marker/tail splice (mirroring DeepSeek Harness's tool-result pruner).
+ * Keeps the leading portion and the trailing portion joined by a "middle
+ * pruned" marker, which is what the pruner's `headChars`/`tailChars` do.
  */
 function truncateForSummary(text: string, maxChars: number): string {
 	if (text.length <= maxChars) return text;
-	const truncatedChars = text.length - maxChars;
-	return `${text.slice(0, maxChars)}\n\n[... ${truncatedChars} more characters truncated]`;
+	// Default head/tail split: 80% head, 20% tail, keeping the full resource
+	// bounded by maxChars and always retaining a meaningful recent tail.
+	const headChars = Math.floor(maxChars * 0.8);
+	const tailChars = Math.max(0, maxChars - headChars);
+	return `${text.slice(0, headChars)}\n\n[... middle truncated (${text.length} chars -> ${maxChars})]\n\n${text.slice(text.length - tailChars)}`;
 }
 
 function boundedContentText(content: string | readonly { type: string; text?: string }[], maxChars: number): string {
@@ -104,6 +109,7 @@ function boundedContentText(content: string | readonly { type: string; text?: st
 	let totalChars = 0;
 	let remainingChars = maxChars;
 	const parts: string[] = [];
+	const trailingKeep = Math.floor(maxChars * 0.2);
 	for (const block of content) {
 		if (block.type !== "text" || block.text === undefined) continue;
 		totalChars += block.text.length;
@@ -115,7 +121,11 @@ function boundedContentText(content: string | readonly { type: string; text?: st
 
 	const text = parts.join("");
 	if (totalChars <= maxChars) return text;
-	return `${text}\n\n[... ${totalChars - maxChars} more characters truncated]`;
+	// Head/marker/tail: keep the leading portion, note the cut, then append the
+	// trailing part so later details survive; preserves DSH pruner semantics.
+	const head = text.slice(0, Math.max(0, maxChars - trailingKeep));
+	const tail = text.slice(text.length - trailingKeep);
+	return `${head}\n\n[... middle truncated (${totalChars} chars -> ${maxChars})]\n\n${tail}`;
 }
 
 /**

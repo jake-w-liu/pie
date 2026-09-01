@@ -1968,6 +1968,8 @@ export class AgentSession {
 			this.settingsManager.getRetrySettings(),
 			this._summarizationRetryCallbacks({ source: "compaction", reason }),
 			undefined, // sessionId
+			this.systemPrompt,
+			this.agent.state.tools,
 		);
 	}
 

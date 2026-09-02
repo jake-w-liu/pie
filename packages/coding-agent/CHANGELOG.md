@@ -50,6 +50,7 @@
 - Fixed compaction and branch summaries forcing `toolChoice: "none"` ([#8649](https://github.com/earendil-works/pi/issues/8649), [#8638](https://github.com/earendil-works/pi/issues/8638)).
 - Fixed Google Vertex requests failing with `HttpsProxyAgent is not a constructor` when the bundled Node.js runtime uses an HTTP(S) proxy ([#8610](https://github.com/earendil-works/pi/issues/8610)).
 - Fixed no-turn CLI startup paths loading heavyweight bundled extensions before printing plain help or reporting a model-selection error.
+- Fixed the MLX provider only listing the server's `/v1/models` catalog, which hides usable local checkouts in `~/models` (e.g. Ornith 35B, Qwen3.8 variants); local model directories are now discovered and merged into `/model`, with `MLX_MODELS_DIR` adding extra roots.
 
 ## [0.84.3] - 2026-08-24
 

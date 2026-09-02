@@ -1,3 +1,7 @@
+import type { Dirent } from "node:fs";
+import { readdir, readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { delimiter, join } from "node:path";
 import type {
 	ApiKeyCredential,
 	AuthContext,
@@ -50,10 +54,20 @@ function modelNameFromId(id: string): string {
 	// Local absolute path -> basename (e.g. /Users/jake/models/Ornith-9B -> Ornith-9B);
 	// HF repo id -> keep as-is (e.g. mlx-community/Qwen3-Coder-30B-4bit).
 	if (id.startsWith("/")) {
-		const parts = id.split("/");
-		return parts[parts.length - 1] || id;
+		const parts = id.split("/").filter((part) => part.length > 0);
+		const base = parts[parts.length - 1] || id;
+		// Nested variant dirs (e.g. .../Qwen3.8-27B-Uncensored-MLX/4-bit) have a
+		// generic leaf name; include the parent so entries stay distinguishable.
+		if (parts.length >= 2 && isGenericVariantDirName(base)) {
+			return `${parts[parts.length - 2]}/${base}`;
+		}
+		return base;
 	}
 	return id;
+}
+
+function isGenericVariantDirName(name: string): boolean {
+	return /^(?:\d+-bit|\d+bit|bf16|f16|mlx|mtp|text-only(?:-.*)?|vision(?:-.*)?)$/iu.test(name);
 }
 
 /**
@@ -64,15 +78,115 @@ function modelNameFromId(id: string): string {
 async function getContextWindowFromLocalConfig(modelId: string): Promise<number | undefined> {
 	if (!modelId.startsWith("/")) return undefined;
 	try {
-		const { readFile } = await import("node:fs/promises");
-		const { join } = await import("node:path");
 		const text = await readFile(join(modelId, "config.json"), "utf8");
 		const config = JSON.parse(text) as Record<string, unknown>;
-		const ctx = config.max_position_embeddings;
-		return typeof ctx === "number" && Number.isFinite(ctx) && ctx > 0 ? Math.floor(ctx) : undefined;
+		const direct = config.max_position_embeddings;
+		if (typeof direct === "number" && Number.isFinite(direct) && direct > 0) {
+			return Math.floor(direct);
+		}
+		const textConfig = config.text_config;
+		if (typeof textConfig === "object" && textConfig !== null) {
+			const nested = (textConfig as Record<string, unknown>).max_position_embeddings;
+			if (typeof nested === "number" && Number.isFinite(nested) && nested > 0) {
+				return Math.floor(nested);
+			}
+		}
+		return undefined;
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * Directories scanned for locally-downloaded MLX models. `~/models` is the
+ * default; `MLX_MODELS_DIR` (or `MLX_MODEL_DIRS`, delimiter-separated) adds
+ * extra roots. The MLX server's `/v1/models` only reports HF-cache entries
+ * plus the currently-loaded `--model`, so models kept in `~/models` (e.g.
+ * Ornith 35B, Qwen3.8 variants) would otherwise never appear in `/model`.
+ */
+function mlxLocalModelRoots(): string[] {
+	const roots: string[] = [];
+	const envValue = process.env.MLX_MODELS_DIR ?? process.env.MLX_MODEL_DIRS ?? process.env.MLX_MODEL_DIR;
+	if (typeof envValue === "string" && envValue.trim()) {
+		for (const part of envValue.split(delimiter)) {
+			const trimmed = part.trim();
+			if (trimmed) roots.push(trimmed);
+		}
+	}
+	roots.push(join(homedir(), "models"));
+	return [...new Set(roots)];
+}
+
+async function isMlxModelDir(dir: string): Promise<boolean> {
+	let entries: string[];
+	try {
+		entries = await readdir(dir);
+	} catch {
+		return false;
+	}
+	if (!entries.includes("config.json")) return false;
+	const hasWeights =
+		entries.includes("model.safetensors.index.json") || entries.some((entry) => entry.endsWith(".safetensors"));
+	if (!hasWeights) return false;
+	// Draft-only dirs (e.g. DFlash2) ship weights without a tokenizer and cannot
+	// serve chat completions; require a tokenizer so only usable models surface.
+	return entries.includes("tokenizer.json") || entries.includes("tokenizer_config.json");
+}
+
+function isSkippedModelDirName(name: string): boolean {
+	if (name.startsWith(".")) return true;
+	if (name === "assets" || name === ".cache") return true;
+	// Multi-token-prediction heads (e.g. `.../mtp`) are draft helpers, not
+	// standalone chat models.
+	if (name.toLowerCase() === "mtp") return true;
+	return name.includes(".partial-") || name.endsWith(".partial") || name.endsWith(".tmp");
+}
+
+/**
+ * Discover usable local MLX model directories (depth 1, plus one nested level
+ * for grouped layouts like `Qwen3.8-27B-Uncensored-MLX/4-bit`). Returns
+ * absolute paths suitable as MLX model ids; the server loads them on demand
+ * when the id is sent in a chat-completions request.
+ */
+export async function discoverLocalMlxModels(): Promise<string[]> {
+	const found: string[] = [];
+	const seen = new Set<string>();
+	const add = (path: string): void => {
+		if (!seen.has(path)) {
+			seen.add(path);
+			found.push(path);
+		}
+	};
+	for (const root of mlxLocalModelRoots()) {
+		let entries: Dirent[];
+		try {
+			entries = await readdir(root, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+			if (isSkippedModelDirName(entry.name)) continue;
+			const full = join(root, entry.name);
+			if (await isMlxModelDir(full)) {
+				add(full);
+				continue;
+			}
+			let nested: Dirent[];
+			try {
+				nested = await readdir(full, { withFileTypes: true });
+			} catch {
+				continue;
+			}
+			for (const sub of nested) {
+				if (!sub.isDirectory() && !sub.isSymbolicLink()) continue;
+				if (isSkippedModelDirName(sub.name)) continue;
+				const subFull = join(full, sub.name);
+				if (await isMlxModelDir(subFull)) add(subFull);
+			}
+		}
+	}
+	return found;
 }
 
 /**
@@ -190,31 +304,69 @@ export function createMlxProvider(): { provider: Provider<"openai-completions"> 
 				}
 			}
 
-			if (!context.allowNetwork || context.signal.aborted || context.credential?.type !== "api_key") return;
+			if (context.signal.aborted || context.credential?.type !== "api_key") return;
 			const serverUrl = credentialServerUrl(context.credential);
 			if (!serverUrl) return;
 
-			let data: MlxModelEntry[];
-			try {
-				const response = await fetch(`${serverUrl}/models`, { signal: context.signal });
-				if (!response.ok) {
-					throw new Error(`MLX server returned HTTP ${response.status}`);
+			// Server catalog (network) plus local `~/models` discovery (filesystem).
+			// `/v1/models` only reports HF-cache entries plus the currently-loaded
+			// `--model`, so local checkouts like Ornith 35B or Qwen3.8 variants
+			// would otherwise never appear in `/model`. The server loads any
+			// absolute-path id on demand, so merged entries are immediately usable.
+			let serverData: MlxModelEntry[] | undefined;
+			if (context.allowNetwork) {
+				try {
+					const response = await fetch(`${serverUrl}/models`, { signal: context.signal });
+					if (!response.ok) {
+						throw new Error(`MLX server returned HTTP ${response.status}`);
+					}
+					const json = (await response.json()) as MlxModelsResponse;
+					if (!Array.isArray(json?.data)) throw new Error("MLX server returned an invalid model list");
+					serverData = json.data.filter((e): e is MlxModelEntry => typeof e?.id === "string");
+				} catch {
+					serverData = undefined;
 				}
-				const json = (await response.json()) as MlxModelsResponse;
-				if (!Array.isArray(json?.data)) throw new Error("MLX server returned an invalid model list");
-				data = json.data.filter((e): e is MlxModelEntry => typeof e?.id === "string");
-			} catch {
-				// Leave the previous list in place; a failed refresh is not fatal.
-				return;
 			}
 			if (context.signal.aborted) return;
 
+			let localIds: string[] = [];
+			try {
+				localIds = await discoverLocalMlxModels();
+			} catch {
+				localIds = [];
+			}
+			if (context.signal.aborted) return;
+
+			let combined: MlxModelEntry[];
+			if (serverData !== undefined) {
+				combined = [...serverData];
+				const seen = new Set(combined.map((entry) => entry.id));
+				for (const id of localIds) {
+					if (!seen.has(id)) {
+						seen.add(id);
+						combined.push({ id, object: "model" });
+					}
+				}
+				if (combined.length === 0) return;
+			} else {
+				// Server unreachable: keep the restored catalog and only append
+				// newly-discovered local models so a failed refresh never drops
+				// previously-known HF-cache entries.
+				const seen = new Set(models.map((model) => model.id));
+				const additions = localIds.filter((id) => !seen.has(id));
+				if (additions.length === 0) return;
+				combined = [
+					...models.map((model) => ({ id: model.id, object: "model" })),
+					...additions.map((id) => ({ id, object: "model" })),
+				];
+			}
+
 			// Best-effort context windows for locally-served models.
 			const contextWindows = await Promise.all(
-				data.map(async (e) => ({ id: e.id, cw: await getContextWindowFromLocalConfig(e.id) })),
+				combined.map(async (e) => ({ id: e.id, cw: await getContextWindowFromLocalConfig(e.id) })),
 			);
 			const cwMap = new Map(contextWindows.map((r) => [r.id, r.cw]));
-			const refreshed = data.map((e) => toPiModel(e, serverUrl, cwMap.get(e.id)));
+			const refreshed = combined.map((e) => toPiModel(e, serverUrl, cwMap.get(e.id)));
 			await context.publish({
 				persist: { models: refreshed, checkedAt: Date.now() },
 				update: () => {

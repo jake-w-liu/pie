@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
-import { BoundedTerminalWriter, type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
+import { BoundedTerminalWriter, type Component, Container, type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
 import { normalizeTerminalOutput, visibleWidth } from "./utils.ts";
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
@@ -42,6 +42,25 @@ function extractKittyImageRows(line: string): number {
 
 function isTermuxSession(): boolean {
 	return Boolean(process.env.TERMUX_VERSION);
+}
+
+/**
+ * Rows rendered after `target` within `roots`, or undefined when `target` is
+ * not mounted under `roots`. Walks bottom-up so callers can stop before
+ * reaching (potentially huge) transcript content above the target.
+ */
+function measureRowsAfter(roots: readonly Component[], target: Component, width: number): number | undefined {
+	let after = 0;
+	for (let index = roots.length - 1; index >= 0; index--) {
+		const child = roots[index]!;
+		if (child === target) return after;
+		if (child instanceof Container) {
+			const inner = measureRowsAfter(child.children, target, width);
+			if (inner !== undefined) return after + inner;
+		}
+		after += child.render(width).length;
+	}
+	return undefined;
 }
 
 export interface TuiMainScreenRenderState {
@@ -100,6 +119,28 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.hardwareCursorRow = 0;
 		this.maxLinesRendered = 0;
 		this.previousViewportTop = 0;
+	}
+
+	override routeMousePress(x: number, y: number): void {
+		// Click coordinates are stale across a resize until the re-render lands.
+		if (this.terminal.columns !== this.previousWidth) return;
+		const total = this.previousLines.length;
+		if (total === 0) return;
+		// Overlays cover the base content, so base clicks have no valid target.
+		if (this.hasOverlay()) return;
+		const fromBottom = total - 1 - (this.previousViewportTop + y);
+		if (fromBottom < 0) return;
+		const focused = this.getFocusedComponent();
+		if (!focused || typeof focused.handleMousePress !== "function") return;
+		const width = this.terminal.columns;
+		const after = measureRowsAfter(this.children, focused, width);
+		if (after === undefined) return;
+		const targetHeight = focused.render(width).length;
+		const localFromBottom = fromBottom - after;
+		if (localFromBottom < 0 || localFromBottom >= targetHeight) return;
+		if (focused.handleMousePress(x, targetHeight - 1 - localFromBottom)) {
+			this.requestRender();
+		}
 	}
 
 	protected override beforeTerminalStop(options: TuiStopOptions): void {

@@ -237,6 +237,12 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return this.getPrimaryScrollView().scrollTop;
 	}
 
+	// Fullscreen mode enables its own motion-tracking mouse sequences around
+	// the alternate screen; the base class must not add button-only tracking.
+	protected override isMouseReportingEnabled(): boolean {
+		return false;
+	}
+
 	get isFollowingOutput(): boolean {
 		return this.getPrimaryScrollView().isFollowingEnd;
 	}

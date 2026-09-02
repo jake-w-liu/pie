@@ -223,6 +223,10 @@ interface LayoutLine {
 	text: string;
 	hasCursor: boolean;
 	cursorPos?: number;
+	/** Index of the source buffer line. */
+	bufferLine: number;
+	/** UTF-16 offset where this visual chunk starts in the buffer line. */
+	startIndex: number;
 }
 
 export interface EditorTheme {
@@ -286,6 +290,11 @@ export class Editor implements Component, Focusable {
 
 	// Vertical scrolling support
 	private scrollOffset: number = 0;
+
+	// Last rendered text rows for click-to-cursor mapping (excludes borders and popups).
+	private lastClickLayout:
+		| { paddingX: number; rows: Array<{ bufferLine: number; startIndex: number; text: string }> }
+		| undefined;
 
 	// Border color (can be changed dynamically)
 	public borderColor: (str: string) => string;
@@ -517,6 +526,16 @@ export class Editor implements Component, Focusable {
 
 		// Get visible lines slice
 		const visibleLines = layoutLines.slice(this.scrollOffset, this.scrollOffset + maxVisibleLines);
+
+		// Snapshot for click-to-cursor mapping (row 0 of the output is the top border).
+		this.lastClickLayout = {
+			paddingX,
+			rows: visibleLines.map((line) => ({
+				bufferLine: line.bufferLine,
+				startIndex: line.startIndex,
+				text: line.text,
+			})),
+		};
 
 		const result: string[] = [];
 		const leftPadding = " ".repeat(paddingX);
@@ -917,6 +936,8 @@ export class Editor implements Component, Focusable {
 				text: "",
 				hasCursor: true,
 				cursorPos: 0,
+				bufferLine: 0,
+				startIndex: 0,
 			});
 			return layoutLines;
 		}
@@ -934,11 +955,15 @@ export class Editor implements Component, Focusable {
 						text: line,
 						hasCursor: true,
 						cursorPos: this.state.cursorCol,
+						bufferLine: i,
+						startIndex: 0,
 					});
 				} else {
 					layoutLines.push({
 						text: line,
 						hasCursor: false,
+						bufferLine: i,
+						startIndex: 0,
 					});
 				}
 			} else {
@@ -982,11 +1007,15 @@ export class Editor implements Component, Focusable {
 							text: chunk.text,
 							hasCursor: true,
 							cursorPos: adjustedCursorPos,
+							bufferLine: i,
+							startIndex: chunk.startIndex,
 						});
 					} else {
 						layoutLines.push({
 							text: chunk.text,
 							hasCursor: false,
+							bufferLine: i,
+							startIndex: chunk.startIndex,
 						});
 					}
 				}
@@ -1023,6 +1052,55 @@ export class Editor implements Component, Focusable {
 
 	getCursor(): { line: number; col: number } {
 		return { line: this.state.cursorLine, col: this.state.cursorCol };
+	}
+
+	/**
+	 * Move the cursor to a click position inside the editor's last render output.
+	 * Coordinates are 0-based relative to the editor's own render origin, where
+	 * row 0 is the top border and row 1 is the first text row. Clicks on borders
+	 * or the autocomplete popup are ignored. Returns true when the cursor moved.
+	 */
+	handleMousePress(x: number, y: number): boolean {
+		const layout = this.lastClickLayout;
+		if (!layout) return false;
+		// Row 0 is the top border; text rows follow; anything below is the
+		// bottom border or the autocomplete popup.
+		if (y < 1 || y > layout.rows.length) return false;
+		const row = layout.rows[y - 1];
+		if (!row) return false;
+		const bufferLine = this.state.lines[row.bufferLine] ?? "";
+		const charIndex = this.columnToCharIndex(row.text, x - layout.paddingX);
+		// Word-wrap can trim trailing whitespace, so clamp into the buffer line.
+		const bufferCol = Math.min(row.startIndex + charIndex, bufferLine.length);
+		this.cancelAutocomplete();
+		this.jumpMode = null;
+		this.lastAction = null;
+		this.state.cursorLine = row.bufferLine;
+		this.setCursorCol(bufferCol);
+		return true;
+	}
+
+	/**
+	 * Map a 0-based visible column to the nearest grapheme boundary (UTF-16
+	 * offset) in `text`. Ties resolve to the earlier boundary, so clicking a
+	 * cell places the cursor before that cell's character. Segmentation is
+	 * paste-marker aware, so the cursor never lands inside an atomic marker.
+	 */
+	private columnToCharIndex(text: string, col: number): number {
+		if (col <= 0) return 0;
+		let pos = 0;
+		let bestIndex = 0;
+		let bestDist = col;
+		for (const seg of this.segment(text, "grapheme")) {
+			pos += visibleWidth(seg.segment);
+			const index = seg.index + seg.segment.length;
+			const dist = Math.abs(col - pos);
+			if (dist < bestDist) {
+				bestDist = dist;
+				bestIndex = index;
+			}
+		}
+		return bestIndex;
 	}
 
 	setText(text: string): void {

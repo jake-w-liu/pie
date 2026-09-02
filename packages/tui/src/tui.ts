@@ -34,6 +34,13 @@ export interface Component {
 	handleInput?(data: string): void;
 
 	/**
+	 * Optional handler for primary mouse button presses landing inside the
+	 * component's last render output. Coordinates are 0-based relative to the
+	 * component's own render origin (top-left). Return true when handled.
+	 */
+	handleMousePress?(x: number, y: number): boolean;
+
+	/**
 	 * If true, component receives key release events (Kitty protocol).
 	 * Default is false - release events are filtered out.
 	 */
@@ -79,6 +86,42 @@ export function isFocusable(component: Component | null): component is Component
  * TUI finds and strips this marker, then positions the hardware cursor there.
  */
 export const CURSOR_MARKER = "\x1b_pi:c\x07";
+
+/**
+ * Parsed SGR (1006) mouse event. x/y are 0-based terminal coordinates.
+ */
+export interface SgrMouseEvent {
+	/** Raw SGR button code, including modifier/motion bits. */
+	button: number;
+	/** 0-based column. */
+	x: number;
+	/** 0-based row. */
+	y: number;
+	/** True for press/drag ('M'), false for release ('m'). */
+	press: boolean;
+}
+
+/**
+ * Parse an SGR mouse sequence (`ESC[<Cb;Cx;CyM|m`).
+ * Returns undefined when the input is not exactly one mouse sequence.
+ */
+export function parseSgrMouseEvent(data: string): SgrMouseEvent | undefined {
+	const match = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/.exec(data);
+	if (!match) return undefined;
+	const button = Number(match[1]);
+	const x = Number(match[2]) - 1;
+	const y = Number(match[3]) - 1;
+	if (!Number.isInteger(button) || x < 0 || y < 0) return undefined;
+	return { button, x, y, press: match[4] === "M" };
+}
+
+/**
+ * True for a primary (left) button press. Modifier bits are ignored; wheel
+ * events (button bit 6) and motion are excluded.
+ */
+export function isPrimaryMousePress(event: SgrMouseEvent): boolean {
+	return event.press && (event.button & 3) === 0 && (event.button & 64) === 0;
+}
 
 export { visibleWidth };
 
@@ -252,6 +295,12 @@ export class Container implements Component {
 const SEGMENT_RESET = "\x1b[0m\x1b]8;;\x07";
 const MAX_RENDER_WRITE_CHARS = 1024 * 1024;
 
+// Button-press tracking plus SGR extended coordinates. Motion tracking is
+// intentionally off: clicks position the cursor, while text selection stays
+// with the terminal (Shift+drag in most emulators).
+const ENABLE_MAIN_SCREEN_MOUSE = "\x1b[?1000h\x1b[?1006h";
+const DISABLE_MAIN_SCREEN_MOUSE = "\x1b[?1000l\x1b[?1006l";
+
 /** Streams terminal output in bounded chunks without splitting UTF-16 surrogate pairs. */
 export class BoundedTerminalWriter {
 	private buffer = "";
@@ -405,6 +454,7 @@ export abstract class TuiBase extends Container implements TUI {
 	private terminalColorSchemeListeners = new Set<(scheme: TerminalColorScheme) => void>();
 	private terminalColorSchemeNotificationsEnabled = false;
 	protected readonly logDirectory: string;
+	private mouseReportingActive = false;
 
 	// Overlay stack for modal components rendered on top of base content
 	private focusOrderCounter = 0;
@@ -427,6 +477,19 @@ export abstract class TuiBase extends Container implements TUI {
 	protected abstract doRender(): void;
 
 	protected resetRenderState(): void {}
+
+	/**
+	 * Whether this TUI enables terminal mouse reporting for click support.
+	 * Fullscreen mode manages its own richer mouse sequences; the main screen
+	 * enables button-press tracking so clicks can position the text cursor.
+	 * Set PI_MOUSE=0 to keep mouse events with the terminal emulator.
+	 */
+	protected isMouseReportingEnabled(): boolean {
+		return process.env.PI_MOUSE !== "0";
+	}
+
+	/** Handle a primary mouse button press at 0-based terminal coordinates. */
+	protected routeMousePress(_x: number, _y: number): void {}
 
 	protected beforeTerminalStart(): void {}
 
@@ -759,6 +822,10 @@ export abstract class TuiBase extends Container implements TUI {
 		);
 		this.afterTerminalStart();
 		this.terminal.hideCursor();
+		this.mouseReportingActive = this.isMouseReportingEnabled();
+		if (this.mouseReportingActive) {
+			this.terminal.write(ENABLE_MAIN_SCREEN_MOUSE);
+		}
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031h");
 		}
@@ -816,6 +883,10 @@ export abstract class TuiBase extends Container implements TUI {
 		}
 		this.beforeTerminalStop(options);
 		this.terminal.showCursor();
+		if (this.mouseReportingActive) {
+			this.mouseReportingActive = false;
+			this.terminal.write(DISABLE_MAIN_SCREEN_MOUSE);
+		}
 		this.terminal.stop();
 		this.afterTerminalStop(options);
 	}
@@ -909,6 +980,18 @@ export abstract class TuiBase extends Container implements TUI {
 				return;
 			}
 			data = current;
+		}
+
+		// Primary presses owned by this TUI are routed to the focused component
+		// and consumed. Fullscreen mode consumes its own events earlier through
+		// its viewport input listener; anything it defers (e.g. wheel over a
+		// focused overlay) must keep flowing, so only routed presses stop here.
+		// Unhandled mouse bytes fall through to keyboard handling, where
+		// components ignore them as non-printable input.
+		const mouseEvent = parseSgrMouseEvent(data);
+		if (mouseEvent && this.mouseReportingActive && isPrimaryMousePress(mouseEvent)) {
+			this.routeMousePress(mouseEvent.x, mouseEvent.y);
+			return;
 		}
 
 		// Consume terminal cell size responses without blocking unrelated input.

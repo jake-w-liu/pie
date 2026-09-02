@@ -1,8 +1,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { getKeybindings } from "./keybindings.ts";
 import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
 import { BoundedTerminalWriter, type Component, Container, type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
 import { normalizeTerminalOutput, visibleWidth } from "./utils.ts";
+
+// Wheel notches per scroll step while reading back.
+const WHEEL_SCROLL_LINES = 3;
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
 const LINE_RESET = "\x1b[0m\x1b]8;;\x07";
@@ -72,7 +76,6 @@ export interface TuiMainScreenRenderState {
 	maxLinesRendered: number;
 	previousViewportTop: number;
 }
-
 /** TUI implementation that renders into the terminal's main screen and scrollback. */
 export class TuiMainScreen extends TuiBase implements TUI {
 	readonly mode = "regular" as const;
@@ -85,6 +88,11 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	private hardwareCursorRow = 0;
 	private maxLinesRendered = 0;
 	private previousViewportTop = 0;
+	// Reading mode: the user scrolled back, so freeze the frame until they
+	// return to the latest content. While held, renders are skipped entirely
+	// (no writes, no bookkeeping changes), so streaming output never yanks the
+	// view and resume diffs repaint everything missed in one pass.
+	private holdViewport = false;
 
 	captureRenderState(): TuiMainScreenRenderState {
 		return {
@@ -108,6 +116,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.hardwareCursorRow = state.hardwareCursorRow;
 		this.maxLinesRendered = state.maxLinesRendered;
 		this.previousViewportTop = state.previousViewportTop;
+		this.holdViewport = false;
 	}
 
 	protected override resetRenderState(): void {
@@ -119,6 +128,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.hardwareCursorRow = 0;
 		this.maxLinesRendered = 0;
 		this.previousViewportTop = 0;
+		this.holdViewport = false;
 	}
 
 	override routeMousePress(x: number, y: number): void {
@@ -141,6 +151,119 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		if (focused.handleMousePress(x, targetHeight - 1 - localFromBottom)) {
 			this.requestRender();
 		}
+	}
+
+	protected override routeMouseWheel(delta: number): boolean {
+		if (this.hasOverlay()) return false;
+		// Coordinates are stale across a resize until the re-render lands.
+		if (this.terminal.columns !== this.previousWidth) return true;
+		const maxTop = Math.max(0, this.previousLines.length - this.terminal.rows);
+		if (maxTop === 0) return true;
+		const base = this.holdViewport ? this.previousViewportTop : maxTop;
+		const next = Math.max(0, Math.min(maxTop, base + delta * WHEEL_SCROLL_LINES));
+		if (next >= maxTop) {
+			// At (or back to) the latest content: resume live follow.
+			if (!this.holdViewport) return true;
+			this.resumeViewport();
+			return true;
+		}
+		this.holdViewport = true;
+		this.displayViewport(next);
+		return true;
+	}
+
+	protected override consumeViewportKey(data: string): boolean {
+		// Overlays own their keys.
+		if (this.hasOverlay()) return false;
+		const kb = getKeybindings();
+		const isPageUp = kb.matches(data, "tui.editor.pageUp");
+		const isPageDown = kb.matches(data, "tui.editor.pageDown");
+		if (!this.holdViewport) {
+			// PageUp enters reading mode only when older rows exist to read;
+			// otherwise the editor keeps its paging behavior.
+			if (isPageUp && this.previousLines.length > this.terminal.rows) {
+				this.pageViewport(-1);
+				return true;
+			}
+			return false;
+		}
+		if (isPageUp) {
+			this.pageViewport(-1);
+			return true;
+		}
+		if (isPageDown) {
+			this.pageViewport(1);
+			return true;
+		}
+		// Any other key resumes live follow; the key still acts normally.
+		this.resumeViewport();
+		return false;
+	}
+
+	/**
+	 * Leave reading mode and repaint the latest viewport. A pure diff cannot
+	 * do this: frozen bookkeeping matches the stale screen, so nothing would
+	 * look changed. Snapping repaints first, then the follow-up render is a
+	 * no-op diff plus cursor positioning.
+	 */
+	private resumeViewport(): void {
+		if (!this.holdViewport) return;
+		this.holdViewport = false;
+		this.displayViewport(Math.max(0, this.previousLines.length - this.terminal.rows));
+		this.requestRender();
+	}
+
+	private pageViewport(direction: -1 | 1): void {
+		const height = this.terminal.rows;
+		const maxTop = Math.max(0, this.previousLines.length - height);
+		if (maxTop === 0) {
+			this.holdViewport = false;
+			return;
+		}
+		const step = direction * Math.max(1, height - 1);
+		const base = this.holdViewport ? this.previousViewportTop : maxTop;
+		const next = Math.max(0, Math.min(maxTop, base + step));
+		if (next >= maxTop) {
+			this.resumeViewport();
+			return;
+		}
+		this.holdViewport = true;
+		this.displayViewport(next);
+	}
+
+	/**
+	 * Repaint the visible viewport with older rows while held. Anchors to the
+	 * screen top (moving up clamps there) and writes exactly one viewport of
+	 * rows with no trailing newline, so the terminal never scrolls. Only the
+	 * viewport bookkeeping moves; content bookkeeping stays frozen.
+	 */
+	private displayViewport(top: number): void {
+		const height = this.terminal.rows;
+		const maxTop = Math.max(0, this.previousLines.length - height);
+		const clamped = Math.max(0, Math.min(maxTop, top));
+		if (clamped === this.previousViewportTop) return;
+		const cursorScreenRow = this.hardwareCursorRow - this.previousViewportTop;
+		if (cursorScreenRow < 0 || cursorScreenRow >= height) {
+			// Inconsistent cursor tracking: bail out to live follow instead of
+			// painting from a wrong origin.
+			this.holdViewport = false;
+			this.requestRender();
+			return;
+		}
+		const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
+		output.append("\x1b[?2026h");
+		if (cursorScreenRow > 0) output.append(`\x1b[${cursorScreenRow}A`);
+		output.append("\r");
+		const renderEnd = Math.min(clamped + height, this.previousLines.length);
+		for (let i = clamped; i < renderEnd; i++) {
+			if (i > clamped) output.append("\r\n");
+			output.append(this.previousLines[i] ?? "");
+			output.append("\x1b[K");
+		}
+		output.append("\x1b[?2026l");
+		output.flush();
+		this.previousViewportTop = clamped;
+		this.hardwareCursorRow = Math.max(clamped, renderEnd - 1);
 	}
 
 	protected override beforeTerminalStop(options: TuiStopOptions): void {
@@ -251,6 +374,20 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 	protected doRender(): void {
 		if (this.stopped) return;
+		// Held viewport (reading mode): freeze the frame so streaming output
+		// never yanks the view. Bookkeeping stays frozen too, so resuming
+		// diffs repaint everything missed in one pass. Resizes and overlays
+		// resume live follow instead of showing a stale layout.
+		if (this.holdViewport) {
+			if (this.terminal.columns !== this.previousWidth || this.terminal.rows !== this.previousHeight) {
+				// The coming full re-render repaints everything absolutely.
+				this.holdViewport = false;
+			} else if (this.hasOverlay()) {
+				this.resumeViewport();
+			} else {
+				return;
+			}
+		}
 		const width = this.terminal.columns;
 		const height = this.terminal.rows;
 		const widthChanged = this.previousWidth !== 0 && this.previousWidth !== width;

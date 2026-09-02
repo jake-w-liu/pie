@@ -491,6 +491,23 @@ export abstract class TuiBase extends Container implements TUI {
 	/** Handle a primary mouse button press at 0-based terminal coordinates. */
 	protected routeMousePress(_x: number, _y: number): void {}
 
+	/**
+	 * Handle a mouse wheel notch. `delta` is +1 toward newer content, -1 toward
+	 * older content. Return true when consumed.
+	 */
+	protected routeMouseWheel(_delta: number): boolean {
+		return false;
+	}
+
+	/**
+	 * Intercept a keyboard input for viewport control before it reaches the
+	 * focused component. Return true when consumed. Returning false resumes a
+	 * held viewport (if any) and lets the input through normally.
+	 */
+	protected consumeViewportKey(_data: string): boolean {
+		return false;
+	}
+
 	protected beforeTerminalStart(): void {}
 
 	protected afterTerminalStart(): void {}
@@ -989,10 +1006,19 @@ export abstract class TuiBase extends Container implements TUI {
 		// Unhandled mouse bytes fall through to keyboard handling, where
 		// components ignore them as non-printable input.
 		const mouseEvent = parseSgrMouseEvent(data);
-		if (mouseEvent && this.mouseReportingActive && isPrimaryMousePress(mouseEvent)) {
-			this.routeMousePress(mouseEvent.x, mouseEvent.y);
-			return;
+		if (mouseEvent && this.mouseReportingActive) {
+			if (isPrimaryMousePress(mouseEvent)) {
+				this.routeMousePress(mouseEvent.x, mouseEvent.y);
+				return;
+			}
+			if (mouseEvent.press && (mouseEvent.button & 64) !== 0) {
+				if (this.routeMouseWheel(mouseEvent.button & 1 ? 1 : -1)) return;
+			}
 		}
+
+		// Viewport hold navigation consumes its keys; resume actions clear the
+		// hold and fall through so the key still acts normally.
+		if (this.consumeViewportKey(data)) return;
 
 		// Consume terminal cell size responses without blocking unrelated input.
 		if (this.consumeCellSizeResponse(data)) {

@@ -8,6 +8,7 @@
 - Added environment and programmatic overrides for OSC 8 hyperlinks, inline image protocols, and truecolor terminal capabilities ([#8665](https://github.com/earendil-works/pi/issues/8665)).
 - Added a `TuiAltScreen` `copyOnSelect` option plus helpers to detect and copy the active fullscreen text selection programmatically ([#7720](https://github.com/earendil-works/pi/issues/7720)).
 - Added main-screen mouse click support: clicking inside the prompt editor moves the text cursor there. Use Shift+click/drag for native terminal selection while mouse reporting is on; set `PI_MOUSE=0` to disable.
+- Added main-screen hold-to-read: mouse wheel or PageUp scrolls back and freezes the frame so streaming output never yanks the view; wheel/PageDown back to the bottom or any other key resumes live follow.
 
 ### Changed
 

@@ -126,7 +126,19 @@ function resolveJitiCliPath(): string | undefined {
 	return undefined;
 }
 
-const jitiCliPath = resolveJitiCliPath();
+let jitiCliPath = resolveJitiCliPath();
+
+/**
+ * Resolve the jiti CLI, revalidating the cached path first. The active
+ * installation can be replaced under a running session (refresh:pie swaps the
+ * release and garbage-collects the old one), which would otherwise leave a
+ * stale path that fails at spawn with a bare "Cannot find module".
+ */
+function resolveLiveJitiCliPath(): string | undefined {
+	if (jitiCliPath && fs.existsSync(jitiCliPath)) return jitiCliPath;
+	jitiCliPath = resolveJitiCliPath();
+	return jitiCliPath;
+}
 
 interface AsyncExecutionContext {
 	pi: ExtensionAPI;
@@ -351,7 +363,7 @@ export function formatAsyncStartedMessage(headline: string, interactive: boolean
  * Check if jiti is available for async execution
  */
 export function isAsyncAvailable(): boolean {
-	return jitiCliPath !== undefined;
+	return resolveLiveJitiCliPath() !== undefined;
 }
 
 export function resolveAsyncRunnerLogPaths(cfg: object): { stdoutPath: string; stderrPath: string } | undefined {
@@ -518,7 +530,8 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 	const cwdError = preflightLaunchCwd(requestedCwd, cwd);
 	if (cwdError) return { error: cwdError };
 
-	if (!jitiCliPath) {
+	const liveJitiCliPath = resolveLiveJitiCliPath();
+	if (!liveJitiCliPath) {
 		return { error: "upstream jiti for TypeScript execution could not be found; ensure package dependencies are installed" };
 	}
 
@@ -530,6 +543,9 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 	const launchConfig = { ...cfg, runnerProcessInstanceId, ...(launchBarrierToken ? { launchBarrierToken } : {}) };
 	writePrivateAtomicJson(cfgPath, launchConfig);
 	const runner = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-runner.ts");
+	if (!fs.existsSync(runner)) {
+		return { error: "async runner entry could not be found; the active Pie installation may have changed (e.g. refresh:pie). Restart pie and retry." };
+	}
 	const nodeCommand = resolveNodeExecutable();
 	const launchForStartup = launchConfig as typeof launchConfig & { asyncDir?: unknown; id?: unknown; sessionId?: unknown; completionOwnerId?: unknown; revivalLease?: unknown };
 	const launchAsyncDir = typeof launchForStartup.asyncDir === "string" ? launchForStartup.asyncDir : undefined;
@@ -556,7 +572,7 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 			stdoutFd = fs.openSync(logPaths.stdoutPath, "a");
 			stderrFd = fs.openSync(logPaths.stderrPath, "a");
 		}
-		const proc = spawn(nodeCommand, [jitiCliPath, runner, cfgPath], {
+		const proc = spawn(nodeCommand, [liveJitiCliPath, runner, cfgPath], {
 			cwd,
 			detached: true,
 			stdio: ["ignore", stdoutFd ?? "ignore", stderrFd ?? "ignore"],

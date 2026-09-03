@@ -500,6 +500,14 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	/**
+	 * Handle a primary mouse button release at 0-based terminal coordinates.
+	 * Return true when consumed.
+	 */
+	protected routeMouseRelease(_x: number, _y: number): boolean {
+		return false;
+	}
+
+	/**
 	 * Intercept a keyboard input for viewport control before it reaches the
 	 * focused component. Return true when consumed. Returning false resumes a
 	 * held viewport (if any) and lets the input through normally.
@@ -1013,6 +1021,8 @@ export abstract class TuiBase extends Container implements TUI {
 			}
 			if (mouseEvent.press && (mouseEvent.button & 64) !== 0) {
 				if (this.routeMouseWheel(mouseEvent.button & 1 ? 1 : -1)) return;
+			} else if (!mouseEvent.press && (mouseEvent.button & 64) === 0) {
+				if (this.routeMouseRelease(mouseEvent.x, mouseEvent.y)) return;
 			}
 		}
 

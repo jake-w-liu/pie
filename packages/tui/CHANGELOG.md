@@ -9,6 +9,7 @@
 - Added a `TuiAltScreen` `copyOnSelect` option plus helpers to detect and copy the active fullscreen text selection programmatically ([#7720](https://github.com/earendil-works/pi/issues/7720)).
 - Added main-screen mouse click support: clicking inside the prompt editor moves the text cursor there. Use Shift+click/drag for native terminal selection while mouse reporting is on; set `PI_MOUSE=0` to disable.
 - Added main-screen hold-to-read: mouse wheel or PageUp scrolls back and freezes the frame so streaming output never yanks the view; wheel/PageDown back to the bottom or any other key resumes live follow.
+- Added main-screen transcript text selection: drag to select a range, double-click for words, triple-click for lines; the selection copies via OSC 52 and starting a drag holds the viewport so streaming cannot yank it mid-select.
 
 ### Changed
 

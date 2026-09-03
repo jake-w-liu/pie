@@ -3,10 +3,57 @@ import * as path from "node:path";
 import { getKeybindings } from "./keybindings.ts";
 import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
 import { BoundedTerminalWriter, type Component, Container, type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
-import { normalizeTerminalOutput, visibleWidth } from "./utils.ts";
+import {
+	getGraphemeCellRange,
+	getWordSegmenter,
+	normalizeTerminalOutput,
+	sliceByColumn,
+	stripTerminalSequences,
+	visibleWidth,
+} from "./utils.ts";
 
 // Wheel notches per scroll step while reading back.
 const WHEEL_SCROLL_LINES = 3;
+
+// Multi-press timing and word-join characters mirror fullscreen selection.
+const DOUBLE_CLICK_INTERVAL_MS = 500;
+const SELECTION_JOINERS = new Set(["/", "-"]);
+const wordSegmenter = getWordSegmenter();
+
+/** Selection endpoint: absolute content row with an exact visible column. */
+interface SelectionEndpoint {
+	row: number;
+	col: number;
+}
+
+interface PendingDrag {
+	row: number;
+	col: number;
+	pressX: number;
+	count: number;
+}
+
+/** Wrap visible text in inverse video, re-applying it after inner SGR codes. */
+function applyInverseVideo(text: string): string {
+	let result = "\x1b[7m";
+	for (const segment of text.split(/(\x1b\[[0-9;]*m)/g)) {
+		if (!segment) continue;
+		result += segment;
+		if (/^\x1b\[[0-9;]*m$/.test(segment)) result += "\x1b[7m";
+	}
+	return `${result}\x1b[27m`;
+}
+
+function highlightRange(line: string, startCol: number, endCol: number): string {
+	const width = visibleWidth(line);
+	const start = Math.max(0, Math.min(startCol, width));
+	const end = Math.max(0, Math.min(endCol, width));
+	if (end <= start) return line;
+	const before = sliceByColumn(line, 0, start, true);
+	const middle = sliceByColumn(line, start, end - start, true);
+	const after = sliceByColumn(line, end, Math.max(0, width - end), true);
+	return `${before}${applyInverseVideo(middle)}${after}`;
+}
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
 const LINE_RESET = "\x1b[0m\x1b]8;;\x07";
@@ -93,6 +140,12 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	// (no writes, no bookkeeping changes), so streaming output never yanks the
 	// view and resume diffs repaint everything missed in one pass.
 	private holdViewport = false;
+	// Text selection endpoints (absolute content rows, exact visible columns).
+	private selectionAnchor: SelectionEndpoint | undefined;
+	private selectionFocus: SelectionEndpoint | undefined;
+	// In-progress drag from the latest press; coordinates share the selection form.
+	private pendingDrag: PendingDrag | undefined;
+	private lastClick: { timestamp: number; count: number; row: number; wordStart: number; wordEnd: number } | undefined;
 
 	captureRenderState(): TuiMainScreenRenderState {
 		return {
@@ -138,19 +191,255 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		if (total === 0) return;
 		// Overlays cover the base content, so base clicks have no valid target.
 		if (this.hasOverlay()) return;
-		const fromBottom = total - 1 - (this.previousViewportTop + y);
-		if (fromBottom < 0) return;
+		const absoluteRow = this.previousViewportTop + y;
+		if (absoluteRow < 0 || absoluteRow >= total) return;
 		const focused = this.getFocusedComponent();
-		if (!focused || typeof focused.handleMousePress !== "function") return;
-		const width = this.terminal.columns;
-		const after = measureRowsAfter(this.children, focused, width);
-		if (after === undefined) return;
-		const targetHeight = focused.render(width).length;
-		const localFromBottom = fromBottom - after;
-		if (localFromBottom < 0 || localFromBottom >= targetHeight) return;
-		if (focused.handleMousePress(x, targetHeight - 1 - localFromBottom)) {
-			this.requestRender();
+		if (focused) {
+			const width = this.terminal.columns;
+			const after = measureRowsAfter(this.children, focused, width);
+			if (after !== undefined) {
+				const targetHeight = focused.render(width).length;
+				const localFromBottom = total - 1 - absoluteRow - after;
+				if (localFromBottom >= 0 && localFromBottom < targetHeight) {
+					// Inside the focused component: fresh interaction clears selection.
+					this.clearSelection();
+					if (
+						typeof focused.handleMousePress === "function" &&
+						focused.handleMousePress(x, targetHeight - 1 - localFromBottom)
+					) {
+						this.requestRender();
+					}
+					return;
+				}
+			}
 		}
+		this.handleTranscriptPress(x, absoluteRow);
+	}
+
+	override routeMouseRelease(x: number, y: number): boolean {
+		if (this.hasOverlay()) return true;
+		if (this.terminal.columns !== this.previousWidth) return true;
+		const total = this.previousLines.length;
+		if (total === 0) return true;
+		const pending = this.pendingDrag;
+		this.pendingDrag = undefined;
+		if (!pending) return true;
+		const row = Math.max(0, Math.min(total - 1, this.previousViewportTop + y));
+		if (row === pending.row && x === pending.pressX) {
+			// Press and release in the same cell: multi-press selections made
+			// on press stand; a single click clears any selection and resumes.
+			if (pending.count === 1) {
+				this.clearSelection();
+				if (this.holdViewport) {
+					this.holdViewport = false;
+					this.requestRender();
+				}
+			}
+			return true;
+		}
+		const line = this.previousLines[row] ?? "";
+		const focusCol = this.snapFocusCol(line, x);
+		this.setSelection({ row: pending.row, col: pending.col }, { row, col: focusCol });
+		this.holdViewport = true;
+		this.copySelectionToClipboard();
+		return true;
+	}
+
+	private handleTranscriptPress(x: number, absoluteRow: number): void {
+		const total = this.previousLines.length;
+		const row = Math.max(0, Math.min(total - 1, absoluteRow));
+		const clampedX = Math.max(0, Math.min(this.terminal.columns - 1, x));
+		const word = this.getWordAt(row, clampedX);
+		const count = this.countPress(row, word);
+		if (!word) {
+			this.clearSelection();
+			this.pendingDrag = { row, col: clampedX, pressX: clampedX, count };
+			this.holdViewport = true;
+			return;
+		}
+		if (count === 1) {
+			this.clearSelection();
+			this.pendingDrag = {
+				row,
+				col: this.snapAnchorCol(this.previousLines[row] ?? "", clampedX),
+				pressX: clampedX,
+				count,
+			};
+			this.holdViewport = true;
+			return;
+		}
+		if (count === 2) {
+			this.pendingDrag = { row, col: word.startCol, pressX: clampedX, count };
+			this.setSelection({ row, col: word.startCol }, { row, col: word.endCol });
+		} else {
+			const lineWidth = visibleWidth(stripTerminalSequences(this.previousLines[row] ?? ""));
+			this.pendingDrag = { row, col: 0, pressX: clampedX, count };
+			this.setSelection({ row, col: 0 }, { row, col: lineWidth });
+		}
+		this.holdViewport = true;
+		this.copySelectionToClipboard();
+	}
+
+	private countPress(row: number, word: { startCol: number; endCol: number } | undefined): number {
+		const now = Date.now();
+		const previous = this.lastClick;
+		const count =
+			word &&
+			previous &&
+			now - previous.timestamp <= DOUBLE_CLICK_INTERVAL_MS &&
+			previous.row === row &&
+			previous.wordStart === word.startCol &&
+			previous.wordEnd === word.endCol
+				? (previous.count % 3) + 1
+				: 1;
+		this.lastClick = word
+			? { timestamp: now, count, row, wordStart: word.startCol, wordEnd: word.endCol }
+			: undefined;
+		return count;
+	}
+
+	private getWordAt(row: number, col: number): { startCol: number; endCol: number } | undefined {
+		const plain = stripTerminalSequences(this.previousLines[row] ?? "");
+		const segments: Array<{ start: number; end: number; selectable: boolean; joiner: boolean }> = [];
+		let pos = 0;
+		for (const segment of wordSegmenter.segment(plain)) {
+			const end = pos + visibleWidth(segment.segment);
+			const joiner = SELECTION_JOINERS.has(segment.segment);
+			segments.push({ start: pos, end, selectable: segment.isWordLike === true || joiner, joiner });
+			pos = end;
+		}
+		const index = segments.findIndex((segment) => col >= segment.start && col < segment.end);
+		if (index < 0) return undefined;
+		const canJoin = (
+			left: { selectable: boolean; joiner: boolean },
+			right: { selectable: boolean; joiner: boolean },
+		): boolean => left.selectable && right.selectable && (left.joiner || right.joiner);
+		let startCol = segments[index]!.start;
+		let endCol = segments[index]!.end;
+		for (let i = index; i > 0 && canJoin(segments[i - 1]!, segments[i]!); i--) {
+			startCol = segments[i - 1]!.start;
+		}
+		for (let i = index; i < segments.length - 1 && canJoin(segments[i]!, segments[i + 1]!); i++) {
+			endCol = segments[i + 1]!.end;
+		}
+		return { startCol, endCol };
+	}
+
+	private snapAnchorCol(line: string, col: number): number {
+		return getGraphemeCellRange(line, col)?.start ?? Math.min(col, visibleWidth(line));
+	}
+
+	private snapFocusCol(line: string, col: number): number {
+		const range = getGraphemeCellRange(line, col);
+		return range ? range.end : Math.min(col + 1, visibleWidth(line));
+	}
+
+	private getOrderedSelection(): { startRow: number; startCol: number; endRow: number; endCol: number } | undefined {
+		const anchor = this.selectionAnchor;
+		const focus = this.selectionFocus;
+		if (!anchor || !focus) return undefined;
+		if (anchor.row === focus.row && anchor.col === focus.col) return undefined;
+		return anchor.row < focus.row || (anchor.row === focus.row && anchor.col <= focus.col)
+			? { startRow: anchor.row, startCol: anchor.col, endRow: focus.row, endCol: focus.col }
+			: { startRow: focus.row, startCol: focus.col, endRow: anchor.row, endCol: anchor.col };
+	}
+
+	private setSelection(anchor: SelectionEndpoint, focus: SelectionEndpoint): void {
+		const previous = this.getOrderedSelection();
+		this.selectionAnchor = anchor;
+		this.selectionFocus = focus;
+		// Selection is not part of the line-cache key; force recompute.
+		this.previousRawLines = [];
+		this.repaintSelectionRows(previous);
+		this.requestRender();
+	}
+
+	private clearSelection(): void {
+		if (!this.selectionAnchor) return;
+		const previous = this.getOrderedSelection();
+		this.selectionAnchor = undefined;
+		this.selectionFocus = undefined;
+		this.previousRawLines = [];
+		this.repaintSelectionRows(previous);
+		this.requestRender();
+	}
+
+	/** Layer inverse video over a row covered by the selection, if any. */
+	private withSelectionHighlight(
+		line: string,
+		row: number,
+		selection:
+			| { startRow: number; startCol: number; endRow: number; endCol: number }
+			| undefined = this.getOrderedSelection(),
+	): string {
+		if (!selection || row < selection.startRow || row > selection.endRow || isImageLine(line)) {
+			return line;
+		}
+		const start = row === selection.startRow ? selection.startCol : 0;
+		const end = row === selection.endRow ? selection.endCol : visibleWidth(line);
+		return highlightRange(line, start, end);
+	}
+
+	/**
+	 * Repaint rows directly (bypassing the render pipeline) so selection
+	 * changes paint even while the viewport is held. Covers the union of the
+	 * previous and current selection; content bookkeeping is untouched.
+	 */
+	private repaintSelectionRows(
+		previous: { startRow: number; startCol: number; endRow: number; endCol: number } | undefined,
+	): void {
+		const current = this.getOrderedSelection();
+		const minRow = Math.min(
+			previous?.startRow ?? Number.POSITIVE_INFINITY,
+			current?.startRow ?? Number.POSITIVE_INFINITY,
+		);
+		const maxRow = Math.max(
+			previous?.endRow ?? Number.NEGATIVE_INFINITY,
+			current?.endRow ?? Number.NEGATIVE_INFINITY,
+		);
+		if (!Number.isFinite(minRow) || !Number.isFinite(maxRow)) return;
+		const height = this.terminal.rows;
+		const start = Math.max(minRow, this.previousViewportTop);
+		const end = Math.min(maxRow, this.previousViewportTop + height - 1, this.previousLines.length - 1);
+		if (end < start) return;
+		const cursorScreenRow = this.hardwareCursorRow - this.previousViewportTop;
+		if (cursorScreenRow < 0 || cursorScreenRow >= height) return;
+		const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
+		output.append("\x1b[?2026h");
+		const firstScreenRow = start - this.previousViewportTop;
+		const move = firstScreenRow - cursorScreenRow;
+		if (move > 0) output.append(`\x1b[${move}B`);
+		else if (move < 0) output.append(`\x1b[${-move}A`);
+		output.append("\r");
+		for (let row = start; row <= end; row++) {
+			if (row > start) output.append("\r\n");
+			output.append(this.withSelectionHighlight(this.previousLines[row] ?? "", row, current));
+			output.append("\x1b[K");
+		}
+		output.append("\x1b[?2026l");
+		output.flush();
+		this.hardwareCursorRow = start + (end - start);
+	}
+
+	private getSelectionText(): string | undefined {
+		const selection = this.getOrderedSelection();
+		if (!selection) return undefined;
+		const lines: string[] = [];
+		for (let row = selection.startRow; row <= selection.endRow; row++) {
+			const line = this.previousLines[row] ?? "";
+			const start = row === selection.startRow ? selection.startCol : 0;
+			const end = row === selection.endRow ? selection.endCol : visibleWidth(line);
+			// The cache may carry highlight escapes; strip all sequences here.
+			lines.push(stripTerminalSequences(sliceByColumn(line, start, Math.max(0, end - start), true)).trimEnd());
+		}
+		const text = lines.join("\n");
+		return text.length > 0 ? text : undefined;
+	}
+
+	private copySelectionToClipboard(): void {
+		const text = this.getSelectionText();
+		if (!text) return;
+		this.terminal.write(`\x1b]52;c;${Buffer.from(text).toString("base64")}\x07`);
 	}
 
 	protected override routeMouseWheel(delta: number): boolean {
@@ -196,6 +485,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			return true;
 		}
 		// Any other key resumes live follow; the key still acts normally.
+		// A keyboard action also supersedes any in-progress drag.
+		this.pendingDrag = undefined;
 		this.resumeViewport();
 		return false;
 	}
@@ -257,7 +548,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const renderEnd = Math.min(clamped + height, this.previousLines.length);
 		for (let i = clamped; i < renderEnd; i++) {
 			if (i > clamped) output.append("\r\n");
-			output.append(this.previousLines[i] ?? "");
+			output.append(this.withSelectionHighlight(this.previousLines[i] ?? "", i));
 			output.append("\x1b[K");
 		}
 		output.append("\x1b[?2026l");
@@ -382,7 +673,9 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			if (this.terminal.columns !== this.previousWidth || this.terminal.rows !== this.previousHeight) {
 				// The coming full re-render repaints everything absolutely.
 				this.holdViewport = false;
+				this.pendingDrag = undefined;
 			} else if (this.hasOverlay()) {
+				this.pendingDrag = undefined;
 				this.resumeViewport();
 			} else {
 				return;
@@ -414,6 +707,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const cursorPos = this.extractCursorPosition(newRawLines, height);
 		const normalized = this.applyLineResetsWithCache(newRawLines);
 		const newLines = normalized.lines;
+		// Text selection highlight lives outside the line cache; the active
+		// selection object is threaded through every write site below.
 
 		// Helper to clear scrollback and viewport and render all new lines
 		const fullRender = (clear: boolean): void => {
@@ -439,7 +734,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 					i += imageReservedRows - 1;
 					continue;
 				}
-				output.append(line);
+				output.append(this.withSelectionHighlight(line, i));
 			}
 			output.append("\x1b[?2026l"); // End synchronized output
 			output.flush();
@@ -516,6 +811,13 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			const expandedRange = this.expandChangedRangeForKittyImages(firstChanged, lastChanged, newLines);
 			firstChanged = expandedRange.firstChanged;
 			lastChanged = expandedRange.lastChanged;
+		}
+		// Keep text selection painted: rows it covers must repaint even when
+		// only unrelated content changed (the highlight lives outside the cache).
+		const activeSelection = this.getOrderedSelection();
+		if (activeSelection && firstChanged !== -1) {
+			firstChanged = Math.min(firstChanged, activeSelection.startRow);
+			lastChanged = Math.max(lastChanged, activeSelection.endRow);
 		}
 		const appendStart = appendedLines && firstChanged === this.previousLines.length && firstChanged > 0;
 
@@ -679,7 +981,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				output.append("\x1b[2K");
 				output.append(line);
 			} else {
-				output.append(line);
+				output.append(this.withSelectionHighlight(line, i, activeSelection));
 				if (lineWidth < width) output.append("\x1b[K");
 			}
 		}

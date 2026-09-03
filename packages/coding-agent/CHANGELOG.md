@@ -51,6 +51,7 @@
 - Fixed Google Vertex requests failing with `HttpsProxyAgent is not a constructor` when the bundled Node.js runtime uses an HTTP(S) proxy ([#8610](https://github.com/earendil-works/pi/issues/8610)).
 - Fixed no-turn CLI startup paths loading heavyweight bundled extensions before printing plain help or reporting a model-selection error.
 - Fixed concurrent `fd`/`rg` binary downloads from separate processes deleting each other's in-flight archive, which made parallel test workers and simultaneous sessions fail provisioning with "not available and could not be downloaded".
+- Fixed transient model-catalog failures starting a fresh 4-hour refresh window on stale data; the next catalog refresh now retries immediately instead.
 - Fixed the MLX provider only listing the server's `/v1/models` catalog, which hides usable local checkouts in `~/models` (e.g. Ornith 35B, Qwen3.8 variants); local model directories are now discovered and merged into `/model`, with `MLX_MODELS_DIR` adding extra roots.
 
 ## [0.84.3] - 2026-08-24

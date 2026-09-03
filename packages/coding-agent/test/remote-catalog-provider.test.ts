@@ -9,7 +9,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { VERSION } from "../src/config.ts";
-import { withRemoteCatalog } from "../src/core/remote-catalog-provider.ts";
+import { REMOTE_CATALOG_REFRESH_INTERVAL_MS, withRemoteCatalog } from "../src/core/remote-catalog-provider.ts";
 
 const neverAbortedSignal = new AbortController().signal;
 
@@ -184,6 +184,40 @@ describe("remote catalog provider", () => {
 		await refreshProvider(provider, store, { force: true });
 		expect(fetchSpy.mock.calls[4]?.[1]?.headers).toMatchObject({ "if-none-match": '"catalog-1"' });
 		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "dynamic"]);
+	});
+
+	it("retries the catalog on the next refresh after a transient failure", async () => {
+		const responses = [
+			new Response(JSON.stringify({ dynamic: model("dynamic") }), {
+				headers: { "content-type": "application/json", etag: '"catalog-1"' },
+			}),
+			// Management fetch retries rate-limited responses, so exhaust all attempts.
+			new Response("rate limited", { status: 429 }),
+			new Response("rate limited", { status: 429 }),
+			new Response("rate limited", { status: 429 }),
+			new Response(JSON.stringify({ dynamic: model("dynamic"), extra: model("extra") }), {
+				headers: { "content-type": "application/json", etag: '"catalog-2"' },
+			}),
+		];
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => responses.shift() as Response);
+		const provider = testProvider();
+		const store = new InMemoryModelsStore();
+
+		await refreshProvider(provider, store);
+		// Age the stored check past the TTL so the next refresh revalidates,
+		// keeping the entry shape (lastModified/etag) a real refresh wrote.
+		const seeded = await store.read(provider.id);
+		await store.write(provider.id, {
+			...seeded,
+			models: seeded?.models ?? [],
+			checkedAt: Date.now() - REMOTE_CATALOG_REFRESH_INTERVAL_MS - 1000,
+		});
+
+		await expect(refreshProvider(provider, store)).rejects.toThrow(/429/);
+		// The failed check must not start a new TTL window on stale data.
+		await refreshProvider(provider, store);
+		expect(fetchSpy).toHaveBeenCalledTimes(5);
+		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "dynamic", "extra"]);
 	});
 
 	it("lets a newer catalog request bypass a stalled older request without stale publication", async () => {

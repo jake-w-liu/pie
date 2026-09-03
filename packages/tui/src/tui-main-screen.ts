@@ -245,6 +245,21 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		return true;
 	}
 
+	override routeMouseDrag(x: number, y: number): boolean {
+		const pending = this.pendingDrag;
+		if (!pending) return false;
+		if (this.hasOverlay()) return true;
+		if (this.terminal.columns !== this.previousWidth) return true;
+		const total = this.previousLines.length;
+		if (total === 0) return true;
+		const row = Math.max(0, Math.min(total - 1, this.previousViewportTop + y));
+		const focusCol = this.snapFocusCol(this.previousLines[row] ?? "", x);
+		const focus = this.selectionFocus;
+		if (focus && focus.row === row && focus.col === focusCol) return true;
+		this.setSelection({ row: pending.row, col: pending.col }, { row, col: focusCol });
+		return true;
+	}
+
 	private handleTranscriptPress(x: number, absoluteRow: number): void {
 		const total = this.previousLines.length;
 		const row = Math.max(0, Math.min(total - 1, absoluteRow));

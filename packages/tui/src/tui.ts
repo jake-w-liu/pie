@@ -117,10 +117,19 @@ export function parseSgrMouseEvent(data: string): SgrMouseEvent | undefined {
 
 /**
  * True for a primary (left) button press. Modifier bits are ignored; wheel
- * events (button bit 6) and motion are excluded.
+ * events (button bit 6) and drag motion (button bit 5) are excluded.
  */
 export function isPrimaryMousePress(event: SgrMouseEvent): boolean {
-	return event.press && (event.button & 3) === 0 && (event.button & 64) === 0;
+	return event.press && (event.button & 3) === 0 && (event.button & 96) === 0;
+}
+
+/**
+ * True for unmodified left-button drag motion (button-motion tracking reports
+ * these while the button is held). Modifier drags stay with the terminal so
+ * Shift+drag keeps driving native selection.
+ */
+export function isMouseDragMotion(event: SgrMouseEvent): boolean {
+	return event.press && event.button === 32;
 }
 
 export { visibleWidth };
@@ -295,11 +304,12 @@ export class Container implements Component {
 const SEGMENT_RESET = "\x1b[0m\x1b]8;;\x07";
 const MAX_RENDER_WRITE_CHARS = 1024 * 1024;
 
-// Button-press tracking plus SGR extended coordinates. Motion tracking is
-// intentionally off: clicks position the cursor, while text selection stays
-// with the terminal (Shift+drag in most emulators).
-const ENABLE_MAIN_SCREEN_MOUSE = "\x1b[?1000h\x1b[?1006h";
-const DISABLE_MAIN_SCREEN_MOUSE = "\x1b[?1000l\x1b[?1006l";
+// Button-press tracking for clicks, button-motion tracking for live drag
+// highlights, plus SGR extended coordinates. Full motion tracking is off:
+// clicks position the cursor, while text selection stays with the terminal
+// (Shift+drag in most emulators).
+const ENABLE_MAIN_SCREEN_MOUSE = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const DISABLE_MAIN_SCREEN_MOUSE = "\x1b[?1002l\x1b[?1000l\x1b[?1006l";
 
 /** Streams terminal output in bounded chunks without splitting UTF-16 surrogate pairs. */
 export class BoundedTerminalWriter {
@@ -504,6 +514,14 @@ export abstract class TuiBase extends Container implements TUI {
 	 * Return true when consumed.
 	 */
 	protected routeMouseRelease(_x: number, _y: number): boolean {
+		return false;
+	}
+
+	/**
+	 * Handle a left-button drag motion event at 0-based terminal coordinates.
+	 * Return true when consumed.
+	 */
+	protected routeMouseDrag(_x: number, _y: number): boolean {
 		return false;
 	}
 
@@ -1019,7 +1037,9 @@ export abstract class TuiBase extends Container implements TUI {
 				this.routeMousePress(mouseEvent.x, mouseEvent.y);
 				return;
 			}
-			if (mouseEvent.press && (mouseEvent.button & 64) !== 0) {
+			if (isMouseDragMotion(mouseEvent)) {
+				if (this.routeMouseDrag(mouseEvent.x, mouseEvent.y)) return;
+			} else if (mouseEvent.press && (mouseEvent.button & 64) !== 0) {
 				if (this.routeMouseWheel(mouseEvent.button & 1 ? 1 : -1)) return;
 			} else if (!mouseEvent.press && (mouseEvent.button & 64) === 0) {
 				if (this.routeMouseRelease(mouseEvent.x, mouseEvent.y)) return;

@@ -76,6 +76,33 @@ describe("Transcript text selection", () => {
 		tui.stop();
 	});
 
+	it("highlights live while dragging and copies once on release", async () => {
+		const { terminal, tui, editor } = await createSelectionTui();
+		terminal.sendInput(press(2, 2));
+		// Drag motion to column 5 of the same row: highlight must appear
+		// before release, with nothing copied yet.
+		terminal.sendInput("\x1b[<32;6;2M");
+		await terminal.waitForRender();
+		assert.ok(terminal.writes.join("").includes("\x1b[7mine 1"), "expected live highlight");
+		assert.deepStrictEqual(copiedTexts(terminal), []);
+
+		terminal.sendInput(release(6, 2));
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copiedTexts(terminal), ["ine 1"]);
+		assert.strictEqual(editor.getText(), "hello");
+		tui.stop();
+	});
+
+	it("ignores drag motion without a press", async () => {
+		const { terminal, tui, editor } = await createSelectionTui();
+		terminal.sendInput("\x1b[<32;6;2M");
+		await terminal.waitForRender();
+		assert.ok(!terminal.writes.join("").includes("\x1b[7mine 1"));
+		assert.deepStrictEqual(copiedTexts(terminal), []);
+		assert.strictEqual(editor.getText(), "hello");
+		tui.stop();
+	});
+
 	it("double-click selects a word and triple-click selects the line", async () => {
 		const { terminal, tui } = await createSelectionTui();
 		terminal.sendInput(press(2, 2));

@@ -2,7 +2,7 @@ import assert from "node:assert";
 import { describe, it } from "node:test";
 import { Editor } from "../src/components/editor.ts";
 import { Text } from "../src/components/text.ts";
-import { Container, isPrimaryMousePress, parseSgrMouseEvent } from "../src/tui.ts";
+import { Container, isMouseDragMotion, isPrimaryMousePress, parseSgrMouseEvent } from "../src/tui.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
 import { defaultEditorTheme } from "./test-themes.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
@@ -40,13 +40,23 @@ describe("SGR mouse parsing", () => {
 		assert.strictEqual(parseSgrMouseEvent("\x1b[<0;0;4M"), undefined);
 	});
 
-	it("accepts left presses (with modifiers) but not wheel or release", () => {
+	it("accepts left presses (with modifiers) but not wheel, motion, or release", () => {
 		assert.strictEqual(isPrimaryMousePress({ button: 0, x: 0, y: 0, press: true }), true);
 		assert.strictEqual(isPrimaryMousePress({ button: 4, x: 0, y: 0, press: true }), true);
 		assert.strictEqual(isPrimaryMousePress({ button: 0, x: 0, y: 0, press: false }), false);
 		assert.strictEqual(isPrimaryMousePress({ button: 1, x: 0, y: 0, press: true }), false);
 		assert.strictEqual(isPrimaryMousePress({ button: 2, x: 0, y: 0, press: true }), false);
 		assert.strictEqual(isPrimaryMousePress({ button: 64, x: 0, y: 0, press: true }), false);
+		assert.strictEqual(isPrimaryMousePress({ button: 32, x: 0, y: 0, press: true }), false);
+	});
+
+	it("detects unmodified left drag motion only", () => {
+		assert.strictEqual(isMouseDragMotion({ button: 32, x: 1, y: 1, press: true }), true);
+		assert.strictEqual(isMouseDragMotion({ button: 36, x: 1, y: 1, press: true }), false);
+		assert.strictEqual(isMouseDragMotion({ button: 33, x: 1, y: 1, press: true }), false);
+		assert.strictEqual(isMouseDragMotion({ button: 32, x: 1, y: 1, press: false }), false);
+		assert.strictEqual(isMouseDragMotion({ button: 0, x: 1, y: 1, press: true }), false);
+		assert.strictEqual(isMouseDragMotion({ button: 64, x: 1, y: 1, press: true }), false);
 	});
 });
 
@@ -181,12 +191,16 @@ describe("Main-screen click routing", () => {
 		tui.start();
 		await terminal.waitForRender();
 		assert.ok(
-			terminal.writes.some((data) => data.includes("\x1b[?1000h") && data.includes("\x1b[?1006h")),
-			"start should enable button tracking with SGR coordinates",
+			terminal.writes.some(
+				(data) => data.includes("\x1b[?1000h") && data.includes("\x1b[?1002h") && data.includes("\x1b[?1006h"),
+			),
+			"start should enable button and motion tracking with SGR coordinates",
 		);
 		tui.stop();
 		assert.ok(
-			terminal.writes.some((data) => data.includes("\x1b[?1000l") && data.includes("\x1b[?1006l")),
+			terminal.writes.some(
+				(data) => data.includes("\x1b[?1000l") && data.includes("\x1b[?1002l") && data.includes("\x1b[?1006l"),
+			),
 			"stop should disable mouse reporting",
 		);
 	});

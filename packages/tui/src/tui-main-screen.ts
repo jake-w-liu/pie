@@ -1,6 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getKeybindings } from "./keybindings.ts";
+import { matchesKey } from "./keys.ts";
+import type { Terminal } from "./terminal.ts";
 import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
 import { BoundedTerminalWriter, type Component, Container, type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
 import {
@@ -123,9 +125,19 @@ export interface TuiMainScreenRenderState {
 	maxLinesRendered: number;
 	previousViewportTop: number;
 }
+
+export interface TuiMainScreenOptions {
+	/**
+	 * Copy selected text to the system clipboard. Return `true` on success;
+	 * the caller falls back to an OSC 52 write otherwise. When omitted, the
+	 * selection is copied via an OSC 52 write.
+	 */
+	copySelection?: (text: string) => Promise<boolean>;
+}
 /** TUI implementation that renders into the terminal's main screen and scrollback. */
 export class TuiMainScreen extends TuiBase implements TUI {
 	readonly mode = "regular" as const;
+	private readonly copySelection?: (text: string) => Promise<boolean>;
 	private previousLines: string[] = [];
 	private previousRawLines: string[] = [];
 	private previousKittyImageIds = new Set<number>();
@@ -146,6 +158,16 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	// In-progress drag from the latest press; coordinates share the selection form.
 	private pendingDrag: PendingDrag | undefined;
 	private lastClick: { timestamp: number; count: number; row: number; wordStart: number; wordEnd: number } | undefined;
+
+	constructor(
+		terminal: Terminal,
+		showHardwareCursor?: boolean,
+		logDirectory?: string,
+		options: TuiMainScreenOptions = {},
+	) {
+		super(terminal, showHardwareCursor, logDirectory);
+		this.copySelection = options.copySelection;
+	}
 
 	captureRenderState(): TuiMainScreenRenderState {
 		return {
@@ -452,8 +474,21 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	private copySelectionToClipboard(): void {
+		// Best-effort: failures fall back to OSC 52 inside, and the highlight
+		// persists as the visible record either way.
+		void this.copySelectionText();
+	}
+
+	private async copySelectionText(): Promise<void> {
 		const text = this.getSelectionText();
 		if (!text) return;
+		if (this.copySelection) {
+			try {
+				if (await this.copySelection(text)) return;
+			} catch {
+				// Fall through to OSC 52.
+			}
+		}
 		this.terminal.write(`\x1b]52;c;${Buffer.from(text).toString("base64")}\x07`);
 	}
 
@@ -479,6 +514,12 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	protected override consumeViewportKey(data: string): boolean {
 		// Overlays own their keys.
 		if (this.hasOverlay()) return false;
+		// Explicit copy of the active transcript selection (Cmd+C where the
+		// terminal forwards it). Plain Ctrl+C is interrupt and is never hijacked.
+		if (matchesKey(data, "super+c") && this.getOrderedSelection()) {
+			this.copySelectionToClipboard();
+			return true;
+		}
 		const kb = getKeybindings();
 		const isPageUp = kb.matches(data, "tui.editor.pageUp");
 		const isPageDown = kb.matches(data, "tui.editor.pageDown");

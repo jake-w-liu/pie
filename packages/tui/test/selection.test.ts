@@ -177,4 +177,107 @@ describe("Transcript text selection", () => {
 			else process.env.PI_MOUSE = previous;
 		}
 	});
+
+	it("prefers the injected clipboard over OSC 52", async () => {
+		const copied: string[] = [];
+		const terminal = new RecordingTerminal(80, 24);
+		const tui = new TuiMainScreen(terminal, undefined, undefined, {
+			copySelection: async (text) => {
+				copied.push(text);
+				return true;
+			},
+		});
+		const editor = new Editor(tui, defaultEditorTheme);
+		editor.setText("hello");
+		tui.addChild(new Text(transcriptLines(30), 0, 0));
+		tui.addChild(editor);
+		tui.addChild(new Text("foot", 0, 0));
+		tui.setFocus(editor);
+		tui.start();
+		await terminal.waitForRender();
+
+		terminal.sendInput(press(2, 2));
+		terminal.sendInput(release(2, 3));
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copied, ["ine 12\nli"]);
+		assert.ok(!terminal.writes.join("").includes("\x1b]52;c;"));
+		tui.stop();
+	});
+
+	it("falls back to OSC 52 when the injected clipboard fails", async () => {
+		const terminal = new RecordingTerminal(80, 24);
+		const tui = new TuiMainScreen(terminal, undefined, undefined, {
+			copySelection: async () => false,
+		});
+		const editor = new Editor(tui, defaultEditorTheme);
+		editor.setText("hello");
+		tui.addChild(new Text(transcriptLines(30), 0, 0));
+		tui.addChild(editor);
+		tui.addChild(new Text("foot", 0, 0));
+		tui.setFocus(editor);
+		tui.start();
+		await terminal.waitForRender();
+
+		terminal.sendInput(press(2, 2));
+		terminal.sendInput(release(2, 3));
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copiedTexts(terminal), ["ine 12\nli"]);
+		tui.stop();
+	});
+
+	it("copies the active selection on Cmd+C and keeps it", async () => {
+		const copied: string[] = [];
+		const terminal = new RecordingTerminal(80, 24);
+		const tui = new TuiMainScreen(terminal, undefined, undefined, {
+			copySelection: async (text) => {
+				copied.push(text);
+				return true;
+			},
+		});
+		const editor = new Editor(tui, defaultEditorTheme);
+		editor.setText("hello");
+		tui.addChild(new Text(transcriptLines(30), 0, 0));
+		tui.addChild(editor);
+		tui.addChild(new Text("foot", 0, 0));
+		tui.setFocus(editor);
+		tui.start();
+		await terminal.waitForRender();
+
+		terminal.sendInput(press(2, 2));
+		terminal.sendInput(release(2, 3));
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copied, ["ine 12\nli"]);
+
+		// Cmd+C arrives as CSI-u with the super modifier under Kitty protocol.
+		terminal.sendInput("\x1b[99;9u");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copied, ["ine 12\nli", "ine 12\nli"]);
+		assert.strictEqual(editor.getText(), "hello");
+		assert.ok(terminal.writes.join("").includes("\x1b[7mine 12"));
+		tui.stop();
+	});
+
+	it("lets Cmd+C through without a selection", async () => {
+		const copied: string[] = [];
+		const terminal = new RecordingTerminal(80, 24);
+		const tui = new TuiMainScreen(terminal, undefined, undefined, {
+			copySelection: async (text) => {
+				copied.push(text);
+				return true;
+			},
+		});
+		const editor = new Editor(tui, defaultEditorTheme);
+		editor.setText("hello");
+		tui.addChild(new Text("line", 0, 0));
+		tui.addChild(editor);
+		tui.setFocus(editor);
+		tui.start();
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[99;9u");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copied, []);
+		assert.strictEqual(editor.getText(), "hello");
+		tui.stop();
+	});
 });

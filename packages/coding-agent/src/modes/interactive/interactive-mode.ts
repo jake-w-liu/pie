@@ -410,7 +410,16 @@ export function createInteractiveTui(options: InteractiveTuiOptions): TuiMainScr
 			},
 		});
 	}
-	return new TuiMainScreen(terminal, options.showHardwareCursor, options.logDirectory);
+	return new TuiMainScreen(terminal, options.showHardwareCursor, options.logDirectory, {
+		copySelection: async (text) => {
+			try {
+				await copyToClipboard(text);
+				return true;
+			} catch {
+				return false;
+			}
+		},
+	});
 }
 
 /** Stable reference for components while InteractiveMode replaces the active renderer. */

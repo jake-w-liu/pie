@@ -264,7 +264,15 @@ async function downloadTool(tool: "fd" | "rg"): Promise<string> {
 	mkdirSync(TOOLS_DIR, { recursive: true });
 
 	const downloadUrl = `https://github.com/${config.repo}/releases/download/${config.tagPrefix}${version}/${assetName}`;
-	const archivePath = join(TOOLS_DIR, assetName);
+	// Download to a process-unique temp path: concurrent pie processes (or test
+	// workers) sharing TOOLS_DIR must not share the archive file, otherwise one
+	// process's finally-cleanup deletes the other's in-flight download and tar
+	// fails with "No such file or directory". The final rename into binaryPath
+	// is atomic, so concurrent installs converge harmlessly.
+	const archivePath = join(
+		TOOLS_DIR,
+		`${assetName}.download_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+	);
 	const binaryExt = plat === "win32" ? ".exe" : "";
 	const binaryPath = join(TOOLS_DIR, config.binaryName + binaryExt);
 

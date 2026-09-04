@@ -124,14 +124,49 @@ function isPlainNonEmptyObject(value: unknown): boolean {
  *
  * - no prefix: `"<status>: <body>"`
  * - prefix:    `"<prefix> (<status>): <body>"`
+ *
+ * OpenCode workspace gates (data-policy consent, region opt-in, billing) get
+ * actionable guidance appended: those toggles live in the browser workspace,
+ * so no pie configuration can satisfy them.
  */
 export function formatProviderError(norm: NormalizedProviderError, prefix?: string): string {
+	let formatted: string;
 	if (norm.messageCarriesBody || norm.status === undefined || norm.body === undefined) {
-		return prefix !== undefined && norm.status !== undefined
-			? `${prefix} (${norm.status}): ${norm.message}`
-			: norm.message;
+		formatted =
+			prefix !== undefined && norm.status !== undefined
+				? `${prefix} (${norm.status}): ${norm.message}`
+				: norm.message;
+	} else {
+		formatted = prefix !== undefined ? `${prefix} (${norm.status}): ${norm.body}` : `${norm.status}: ${norm.body}`;
 	}
-	return prefix !== undefined ? `${prefix} (${norm.status}): ${norm.body}` : `${norm.status}: ${norm.body}`;
+	const gateUrl = opencodeWorkspaceGateUrl(`${norm.message}\n${norm.body ?? ""}`);
+	if (!gateUrl) return formatted;
+	return (
+		`${formatted}\n` +
+		`This model is gated by an OpenCode workspace setting: open ${gateUrl} in a browser ` +
+		`and enable the required toggle (data-collection consent, region opt-in, or billing). ` +
+		`No pie configuration can bypass this gate.`
+	);
+}
+
+/**
+ * OpenCode Zen/Go gate error types. Detected by type name plus an
+ * opencode.ai workspace URL; the URL check keeps unrelated errors that
+ * merely mention these words from matching.
+ */
+const OPENCODE_WORKSPACE_GATE_TYPES = new Set(["DataPolicyError", "RegionError", "CreditsError"]);
+const OPENCODE_WORKSPACE_URL_PATTERN = /https:\/\/opencode\.ai\/workspace\/[^\s"']+/;
+
+function opencodeWorkspaceGateUrl(text: string): string | undefined {
+	let gated = false;
+	for (const type of OPENCODE_WORKSPACE_GATE_TYPES) {
+		if (text.includes(type)) {
+			gated = true;
+			break;
+		}
+	}
+	if (!gated) return undefined;
+	return OPENCODE_WORKSPACE_URL_PATTERN.exec(text)?.[0];
 }
 
 export function truncateErrorText(text: string, maxChars: number): string {

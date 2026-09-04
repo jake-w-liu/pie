@@ -223,4 +223,39 @@ describe("formatProviderError", () => {
 
 		expect(formatProviderError(norm)).toBe('{"reason":"boom"}');
 	});
+
+	it("appends workspace opt-in guidance to OpenCode gate errors", () => {
+		const cases = [
+			["DataPolicyError", "This model collects data used to improve its quality and requires explicit opt in"],
+			[
+				"RegionError",
+				"The latest version of this model is only available hosted in China and requires explicit opt in",
+			],
+			["CreditsError", "No payment method. Add a payment method here"],
+		] as const;
+		for (const [type, message] of cases) {
+			const url = "https://opencode.ai/workspace/wrk_01KVDHJPGNZ0KD3SVYSA48881X/go";
+			const body = JSON.stringify({ type: "error", error: { type, message: `${message}: ${url}` } });
+			const norm = normalizeProviderError(Object.assign(new Error(body), { status: 403 }));
+
+			const formatted = formatProviderError(norm, "OpenAI API error");
+
+			expect(formatted).toContain(url);
+			expect(formatted).toContain("gated by an OpenCode workspace setting");
+			expect(formatted).toContain("No pie configuration can bypass this gate");
+		}
+	});
+
+	it("leaves gate-typed errors without a workspace URL unchanged", () => {
+		const norm = normalizeProviderError(
+			Object.assign(new Error("quota exceeded"), {
+				status: 429,
+				error: { type: "CreditsError", message: "quota exceeded" },
+			}),
+		);
+
+		expect(formatProviderError(norm, "OpenAI API error")).toBe(
+			'OpenAI API error (429): {"type":"CreditsError","message":"quota exceeded"}',
+		);
+	});
 });

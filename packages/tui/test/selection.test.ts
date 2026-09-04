@@ -1,4 +1,7 @@
 import assert from "node:assert";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 import { Editor } from "../src/components/editor.ts";
 import { Text } from "../src/components/text.ts";
@@ -307,5 +310,62 @@ describe("Transcript text selection", () => {
 		assert.deepStrictEqual(copied, []);
 		assert.strictEqual(editor.getText(), "hello");
 		tui.stop();
+	});
+
+	it("recovers live follow when wheel arrives with stale geometry", async () => {
+		const { terminal, tui } = await createSelectionTui();
+		terminal.sendInput("\x1b[<64;40;2M");
+		await terminal.waitForRender();
+
+		// Resize faster than the render pipeline, then wheel immediately with
+		// stale bookkeeping: must resume instead of wedging.
+		terminal.resize(100, 24);
+		terminal.sendInput("\x1b[<64;40;2M");
+		await terminal.waitForRender();
+		const view = (await terminal.flushAndGetViewport()).map((line) => line.trimEnd());
+		assert.ok(
+			view.some((line) => line.includes("foot")),
+			"expected recovery to latest",
+		);
+
+		// Wheel works normally afterward.
+		terminal.sendInput("\x1b[<64;40;2M");
+		await terminal.waitForRender();
+		const moved = (await terminal.flushAndGetViewport()).map((line) => line.trimEnd());
+		assert.ok(!moved.some((line) => line.includes("foot")), "expected scroll-up to move");
+		tui.stop();
+	});
+
+	it("writes mouse diagnostics to pi-mouse.log when enabled", async () => {
+		const previous = process.env.PI_DEBUG_MOUSE;
+		const logDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-mouse-test-"));
+		process.env.PI_DEBUG_MOUSE = "1";
+		try {
+			const terminal = new RecordingTerminal(80, 24);
+			const tui = new TuiMainScreen(terminal, undefined, logDirectory);
+			const editor = new Editor(tui, defaultEditorTheme);
+			editor.setText("hello");
+			tui.addChild(new Text(transcriptLines(30), 0, 0));
+			tui.addChild(editor);
+			tui.addChild(new Text("foot", 0, 0));
+			tui.setFocus(editor);
+			tui.start();
+			await terminal.waitForRender();
+
+			terminal.sendInput(press(2, 2));
+			terminal.sendInput(release(2, 3));
+			terminal.sendInput("\x1b[<64;40;2M");
+			await terminal.waitForRender();
+			tui.stop();
+
+			const log = await fs.readFile(path.join(logDirectory, "pi-mouse.log"), "utf8");
+			assert.ok(log.includes("press"), "expected press entry");
+			assert.ok(log.includes("release"), "expected release entry");
+			assert.ok(log.includes("wheel"), "expected wheel entry");
+		} finally {
+			if (previous === undefined) delete process.env.PI_DEBUG_MOUSE;
+			else process.env.PI_DEBUG_MOUSE = previous;
+			await fs.rm(logDirectory, { recursive: true, force: true });
+		}
 	});
 });

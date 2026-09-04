@@ -169,6 +169,28 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.copySelection = options.copySelection;
 	}
 
+	/**
+	 * Append a mouse/viewport diagnostics line when PI_DEBUG_MOUSE=1.
+	 * Never throws: diagnostics must not break input handling.
+	 */
+	private logMouse(event: string, detail = ""): void {
+		if (process.env.PI_DEBUG_MOUSE !== "1") return;
+		try {
+			const logPath = path.join(this.logDirectory, "pi-mouse.log");
+			fs.mkdirSync(path.dirname(logPath), { recursive: true });
+			const anchor = this.selectionAnchor ? `${this.selectionAnchor.row},${this.selectionAnchor.col}` : "-";
+			const focus = this.selectionFocus ? `${this.selectionFocus.row},${this.selectionFocus.col}` : "-";
+			const pending = this.pendingDrag ? `${this.pendingDrag.row},${this.pendingDrag.col}` : "-";
+			const state =
+				`prevTop=${this.previousViewportTop} hwRow=${this.hardwareCursorRow} ` +
+				`hold=${this.holdViewport} lines=${this.previousLines.length} ` +
+				`sel=${anchor}:${focus} pending=${pending}`;
+			fs.appendFileSync(logPath, `[${new Date().toISOString()}] ${event}${detail ? ` ${detail}` : ""} | ${state}\n`);
+		} catch {
+			// Diagnostics must never break input handling.
+		}
+	}
+
 	captureRenderState(): TuiMainScreenRenderState {
 		return {
 			previousLines: [...this.previousLines],
@@ -208,13 +230,19 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 	override routeMousePress(x: number, y: number): void {
 		// Click coordinates are stale across a resize until the re-render lands.
-		if (this.terminal.columns !== this.previousWidth) return;
+		// Request it (coalesced, harmless if already pending) so a missed
+		// resize can never wedge mouse handling permanently.
+		if (this.terminal.columns !== this.previousWidth) {
+			this.requestRender();
+			return;
+		}
 		const total = this.previousLines.length;
 		if (total === 0) return;
 		// Overlays cover the base content, so base clicks have no valid target.
 		if (this.hasOverlay()) return;
 		const absoluteRow = this.previousViewportTop + y;
 		if (absoluteRow < 0 || absoluteRow >= total) return;
+		this.logMouse("press", `x=${x} y=${y} abs=${absoluteRow}`);
 		const focused = this.getFocusedComponent();
 		if (focused) {
 			const width = this.terminal.columns;
@@ -231,22 +259,28 @@ export class TuiMainScreen extends TuiBase implements TUI {
 					) {
 						this.requestRender();
 					}
+					this.logMouse("press-editor");
 					return;
 				}
 			}
 		}
 		this.handleTranscriptPress(x, absoluteRow);
+		this.logMouse("press-transcript");
 	}
 
 	override routeMouseRelease(x: number, y: number): boolean {
 		if (this.hasOverlay()) return true;
-		if (this.terminal.columns !== this.previousWidth) return true;
+		if (this.terminal.columns !== this.previousWidth) {
+			this.requestRender();
+			return true;
+		}
 		const total = this.previousLines.length;
 		if (total === 0) return true;
 		const pending = this.pendingDrag;
 		this.pendingDrag = undefined;
 		if (!pending) return true;
 		const row = Math.max(0, Math.min(total - 1, this.previousViewportTop + y));
+		this.logMouse("release", `x=${x} y=${y} row=${row} count=${pending.count}`);
 		if (row === pending.row && x === pending.pressX) {
 			// Press and release in the same cell: multi-press selections made
 			// on press stand; a single click clears any selection and resumes.
@@ -271,13 +305,17 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const pending = this.pendingDrag;
 		if (!pending) return false;
 		if (this.hasOverlay()) return true;
-		if (this.terminal.columns !== this.previousWidth) return true;
+		if (this.terminal.columns !== this.previousWidth) {
+			this.requestRender();
+			return true;
+		}
 		const total = this.previousLines.length;
 		if (total === 0) return true;
 		const row = Math.max(0, Math.min(total - 1, this.previousViewportTop + y));
 		const focusCol = this.snapFocusCol(this.previousLines[row] ?? "", x);
 		const focus = this.selectionFocus;
 		if (focus && focus.row === row && focus.col === focusCol) return true;
+		this.logMouse("drag", `x=${x} y=${y} row=${row}`);
 		this.setSelection({ row: pending.row, col: pending.col }, { row, col: focusCol });
 		return true;
 	}
@@ -387,6 +425,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.selectionFocus = focus;
 		// Selection is not part of the line-cache key; force recompute.
 		this.previousRawLines = [];
+		this.logMouse("setSelection", `anchor=${anchor.row},${anchor.col} focus=${focus.row},${focus.col}`);
 		this.repaintSelectionRows(previous);
 		this.requestRender();
 	}
@@ -397,6 +436,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.selectionAnchor = undefined;
 		this.selectionFocus = undefined;
 		this.previousRawLines = [];
+		this.logMouse("clearSelection");
 		this.repaintSelectionRows(previous);
 		this.requestRender();
 	}
@@ -495,11 +535,16 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	protected override routeMouseWheel(delta: number): boolean {
 		if (this.hasOverlay()) return false;
 		// Coordinates are stale across a resize until the re-render lands.
-		if (this.terminal.columns !== this.previousWidth) return true;
+		// Request it so a missed resize can never wedge wheel handling.
+		if (this.terminal.columns !== this.previousWidth) {
+			this.requestRender();
+			return true;
+		}
 		const maxTop = Math.max(0, this.previousLines.length - this.terminal.rows);
 		if (maxTop === 0) return true;
 		const base = this.holdViewport ? this.previousViewportTop : maxTop;
 		const next = Math.max(0, Math.min(maxTop, base + delta * WHEEL_SCROLL_LINES));
+		this.logMouse("wheel", `delta=${delta} base=${base} next=${next} maxTop=${maxTop}`);
 		if (next >= maxTop) {
 			// At (or back to) the latest content: resume live follow.
 			if (!this.holdViewport) return true;
@@ -555,6 +600,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	 */
 	private resumeViewport(): void {
 		if (!this.holdViewport) return;
+		this.logMouse("resume");
 		this.holdViewport = false;
 		this.displayViewport(Math.max(0, this.previousLines.length - this.terminal.rows));
 		this.requestRender();
@@ -589,6 +635,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const maxTop = Math.max(0, this.previousLines.length - height);
 		const clamped = Math.max(0, Math.min(maxTop, top));
 		if (clamped === this.previousViewportTop) return;
+		this.logMouse("displayViewport", `top=${clamped}`);
 		const cursorScreenRow = this.hardwareCursorRow - this.previousViewportTop;
 		if (cursorScreenRow < 0 || cursorScreenRow >= height) {
 			// Inconsistent cursor tracking: bail out to live follow instead of

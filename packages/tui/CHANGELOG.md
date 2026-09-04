@@ -11,6 +11,7 @@
 - Added main-screen hold-to-read: mouse wheel or PageUp scrolls back and freezes the frame so streaming output never yanks the view; wheel/PageDown back to the bottom or any other key resumes live follow.
 - Added main-screen transcript text selection: drag to select a range with live highlight, double-click for words, triple-click for lines; selections copy through the native clipboard with OSC 52 fallback, Cmd+C re-copies the active selection, and starting a drag holds the viewport so streaming cannot yank it mid-select.
 - Fixed main-screen clicks and selections misaligning on short transcripts: short first frames now bottom-anchor with leading blank rows (shell history stays in the scrollback) so every click maps exactly.
+- Fixed main-screen mouse input wedging on stale geometry: wheel, press, release, and drag now request a re-render and recover to live follow instead of silently swallowing input. Set `PI_DEBUG_MOUSE=1` to capture mouse/viewport diagnostics in `pi-mouse.log`.
 
 ### Changed
 

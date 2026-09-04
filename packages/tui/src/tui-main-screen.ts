@@ -226,6 +226,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.maxLinesRendered = 0;
 		this.previousViewportTop = 0;
 		this.holdViewport = false;
+		// An input sequence cannot span a state reset; drop any half-open drag.
+		this.pendingDrag = undefined;
 	}
 
 	override routeMousePress(x: number, y: number): void {
@@ -661,6 +663,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	protected override beforeTerminalStop(options: TuiStopOptions): void {
+		// An input sequence cannot span a stop/start boundary.
+		this.pendingDrag = undefined;
 		if (options.preserveScreen || this.previousLines.length === 0) return;
 		this.terminal.write(" ");
 		const targetRow = this.previousLines.length;

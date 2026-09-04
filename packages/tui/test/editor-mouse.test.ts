@@ -134,9 +134,10 @@ describe("Main-screen click routing", () => {
 		tui.start();
 		await terminal.waitForRender();
 
-		// Total rows: 2 transcript + 3 editor (border, text, border) + 1 footer.
-		// The editor text row is absolute row 3, i.e. 1-based terminal row 4.
-		terminal.sendInput(click(4, 4));
+		// Padded first frame (24 rows): 18 blanks + 2 transcript + 3 editor
+		// (border, text, border) + 1 footer. The editor text row is absolute
+		// row 21, i.e. 1-based terminal row 22.
+		terminal.sendInput(click(4, 22));
 		assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 3 });
 		// The release event must not leak into the text either.
 		terminal.sendInput("\x1b[<0;4;4m");
@@ -160,7 +161,7 @@ describe("Main-screen click routing", () => {
 		tui.start();
 		await terminal.waitForRender();
 
-		terminal.sendInput(click(2, 4));
+		terminal.sendInput(click(2, 22));
 		assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 1 });
 
 		tui.stop();
@@ -177,7 +178,7 @@ describe("Main-screen click routing", () => {
 		tui.start();
 		await terminal.waitForRender();
 
-		terminal.sendInput(click(3, 1));
+		terminal.sendInput(click(3, 19));
 		assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 5 });
 		assert.strictEqual(editor.getText(), "hello");
 

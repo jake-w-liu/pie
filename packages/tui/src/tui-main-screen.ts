@@ -759,6 +759,16 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			newRawLines = this.compositeOverlays(newRawLines, width, height);
 		}
 
+		// First frame with short content: pad with leading blank rows so the
+		// frame is exactly viewport-height and content is bottom-anchored.
+		// Otherwise short content inherits the cursor row in used terminals
+		// while hit-testing assumes row 0, offsetting every click. Writing a
+		// full viewport from any cursor row always lands bottom-anchored, so
+		// the padding doubles as real screen rows from here on.
+		if (this.previousLines.length === 0 && !widthChanged && !heightChanged && newRawLines.length < height) {
+			newRawLines = [...new Array<string>(height - newRawLines.length).fill(""), ...newRawLines];
+		}
+
 		// Extract cursor position before applying line resets (marker must be found first).
 		const cursorPos = this.extractCursorPosition(newRawLines, height);
 		const normalized = this.applyLineResetsWithCache(newRawLines);

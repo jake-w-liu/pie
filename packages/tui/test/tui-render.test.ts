@@ -150,7 +150,7 @@ describe("TUI render scheduling", () => {
 		tui.stop();
 		tui.start();
 		await terminal.waitForRender();
-		assert.ok(terminal.getViewport()[0]?.includes("restarted content"));
+		assert.ok(terminal.getViewport().some((line) => line.includes("restarted content")));
 		tui.stop();
 	});
 
@@ -213,9 +213,11 @@ describe("TUI bounded render output", () => {
 			terminal.writes.every((write) => write.length <= MAX_RENDER_WRITE_CHARS),
 			"each terminal write should stay below the configured limit",
 		);
+		// Short first frames are bottom-anchored with leading blank rows.
+		const blankRow = "\x1b[0m\x1b]8;;\x07";
 		assert.strictEqual(
 			terminal.writes.join(""),
-			`\x1b[?2026h${kittyLine}\r\n${kittyLine}\x1b[?2026l`,
+			`\x1b[?2026h${`${blankRow}\r\n`.repeat(22)}${kittyLine}\r\n${kittyLine}\x1b[?2026l`,
 			"chunking must preserve the synchronized render output",
 		);
 	});
@@ -746,7 +748,8 @@ describe("TUI differential rendering", () => {
 		const update = terminal.getWrites();
 		assert.ok(update.indexOf("short") >= 0);
 		assert.ok(update.indexOf("short") < update.indexOf("\x1b[K"));
-		assert.ok(!update.includes("\x1b[2K"));
+		// The padded blank rows and the stale content row are cleared.
+		assert.ok(update.includes("\x1b[2K"));
 		assert.strictEqual(terminal.getViewport()[0]?.trimEnd(), "short");
 
 		terminal.clearWrites();
@@ -857,7 +860,9 @@ describe("TUI differential rendering", () => {
 		await terminal.waitForRender();
 
 		let viewport = terminal.getViewport();
-		assert.ok(viewport[0]?.includes("Line 0"), "Initial content rendered");
+		// Short first frames are bottom-anchored with leading blank rows.
+		assert.ok(viewport[7]?.includes("Line 0"), "Initial content rendered");
+		assert.ok(viewport[9]?.includes("Line 2"), "Initial content rendered");
 
 		// Clear to empty
 		component.lines = [];
@@ -870,8 +875,9 @@ describe("TUI differential rendering", () => {
 		await terminal.waitForRender();
 
 		viewport = terminal.getViewport();
-		assert.ok(viewport[0]?.includes("New Line 0"), `New content rendered: ${viewport[0]}`);
-		assert.ok(viewport[1]?.includes("New Line 1"), `New content line 1: ${viewport[1]}`);
+		// Re-added short content bottom-anchors like a fresh frame.
+		assert.ok(viewport[8]?.includes("New Line 0"), `New content rendered: ${viewport[8]}`);
+		assert.ok(viewport[9]?.includes("New Line 1"), `New content line 1: ${viewport[9]}`);
 
 		tui.stop();
 	});

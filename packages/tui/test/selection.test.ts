@@ -178,6 +178,34 @@ describe("Transcript text selection", () => {
 		}
 	});
 
+	it("maps clicks onto short content in a used terminal", async () => {
+		const terminal = new RecordingTerminal(80, 24);
+		// Simulate a used terminal: shell history above, cursor partway down.
+		// The first frame bottom-anchors (shell scrolls into scrollback), so
+		// the 2 transcript rows land on screen rows 19-20 and the editor text
+		// row on screen row 22 (1-based row 23).
+		for (let index = 1; index <= 10; index++) terminal.write(`shell ${index}\r\n`);
+		await terminal.flush();
+		const tui = new TuiMainScreen(terminal);
+		const editor = new Editor(tui, defaultEditorTheme);
+		editor.setText("hello");
+		tui.addChild(new Text("line1\nline2", 0, 0));
+		tui.addChild(editor);
+		tui.setFocus(editor);
+		tui.start();
+		await terminal.waitForRender();
+
+		// Clicking column 3 of the editor text row must land at char 3, and
+		// the shell history must survive in the scrollback above.
+		terminal.sendInput(press(4, 23));
+		terminal.sendInput(release(4, 23));
+		await terminal.waitForRender();
+		assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 3 });
+		assert.strictEqual(editor.getText(), "hello");
+		assert.ok(terminal.getScrollBuffer().some((line) => line.includes("shell 1")));
+		tui.stop();
+	});
+
 	it("prefers the injected clipboard over OSC 52", async () => {
 		const copied: string[] = [];
 		const terminal = new RecordingTerminal(80, 24);

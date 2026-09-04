@@ -110,13 +110,13 @@ export function withRemoteCatalog(
 				});
 				return;
 			}
-		if (!response.ok) {
-			// Transient failure: leave the stored entry untouched so the next
-			// refresh retries instead of starting a fresh TTL window on stale
-			// data. Bumping checkedAt here could delay recovery by a full
-			// interval after a single failed revalidation.
-			throw new Error(`Model catalog request failed for ${provider.id}: ${response.status}`);
-		}
+			if (!response.ok) {
+				// Transient failure: leave the stored entry untouched so the next
+				// refresh retries instead of starting a fresh TTL window on stale
+				// data. Bumping checkedAt here could delay recovery by a full
+				// interval after a single failed revalidation.
+				throw new Error(`Model catalog request failed for ${provider.id}: ${response.status}`);
+			}
 			const refreshed = parseCatalog(provider.id, await response.json());
 			const lastModified = Date.parse(response.headers.get("last-modified") ?? "");
 			if (context.signal.aborted) return;

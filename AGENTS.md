@@ -50,7 +50,7 @@
 
 ## Git
 
-Multiple pi sessions may be running in this cwd at the same time, each modifying different files. Git operations that touch unstaged, staged, or untracked files outside your own changes will stomp on other sessions' work. Follow these rules:
+Multiple pie sessions may be running in this cwd at the same time, each modifying different files. Git operations that touch unstaged, staged, or untracked files outside your own changes will stomp on other sessions' work. Follow these rules:
 
 Committing:
 
@@ -94,17 +94,17 @@ When closing issues via commit:
 
 - Include `fixes #<number>` or `closes #<number>` in the message so merging auto-closes the issue. For multiple issues, repeat the keyword per issue (`closes #1, closes #2`); a shared keyword (`closes #1, #2`) only closes the first.
 
-## Testing pi Interactive Mode with tmux
+## Testing pie Interactive Mode with tmux
 
 Run the TUI in a controlled terminal (from the repo root):
 
 ```bash
-tmux new-session -d -s pi-test -x 80 -y 24
-tmux send-keys -t pi-test "./pi-test.sh" Enter
-sleep 3 && tmux capture-pane -t pi-test -p     # capture after startup
-tmux send-keys -t pi-test "your prompt here" Enter
-tmux send-keys -t pi-test Escape               # special keys (also C-o for ctrl+o, etc.)
-tmux kill-session -t pi-test
+tmux new-session -d -s pie-test -x 80 -y 24
+tmux send-keys -t pie-test "./pie-test.sh" Enter
+sleep 3 && tmux capture-pane -t pie-test -p     # capture after startup
+tmux send-keys -t pie-test "your prompt here" Enter
+tmux send-keys -t pie-test Escape               # special keys (also C-o for ctrl+o, etc.)
+tmux kill-session -t pie-test
 ```
 
 ## Changelog
@@ -121,8 +121,8 @@ Rules:
 
 Attribution:
 
-- Internal (from issues): `Fixed foo bar ([#123](https://github.com/earendil-works/pi-mono/issues/123))`
-- External contributions: `Added feature X ([#456](https://github.com/earendil-works/pi-mono/pull/456) by [@username](https://github.com/username))`
+- Internal (from issues): `Fixed foo bar ([#123](https://github.com/jake-w-liu/pie/issues/123))`
+- External contributions: `Added feature X ([#456](https://github.com/jake-w-liu/pie/pull/456) by [@username](https://github.com/username))`
 
 ## Releasing
 

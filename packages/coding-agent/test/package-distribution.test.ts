@@ -3,7 +3,7 @@ import { describe, expect, test } from "vitest";
 
 interface CodingAgentPackageJson {
 	version: string;
-	bin: { pi: string; pie: string };
+	bin: { pie: string };
 	piConfig: { configDir: string; defaultPackages: string[] };
 	main: string;
 	exports: {
@@ -20,8 +20,7 @@ const packageJson = JSON.parse(
 describe("package distribution entrypoints", () => {
 	test("uses the bundle for executables and modular output for libraries", () => {
 		expect(packageJson.version).toBe("0.1.0");
-		expect(packageJson.bin.pi).toBe("dist/bundle/cli.js");
-		expect(packageJson.bin.pie).toBe("dist/bundle/pie-cli.js");
+		expect(packageJson.bin).toEqual({ pie: "dist/bundle/pie-cli.js" });
 		expect(packageJson.piConfig).toEqual({
 			configDir: ".pi",
 			// The pi-fff / pi-web-access / pi-subagents extensions are now vendored into

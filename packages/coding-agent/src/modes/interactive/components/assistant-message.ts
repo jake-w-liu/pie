@@ -24,8 +24,8 @@ export class AssistantMessageComponent extends Container {
 	private lastMessage?: AssistantMessage;
 	private hasToolCalls = false;
 	private isStreaming = false;
-	private streamingSignature?: string;
 	private streamingBlocks: StreamingRenderedBlock[] = [];
+	private streamingHasToolCalls = false;
 
 	constructor(
 		message?: AssistantMessage,
@@ -54,8 +54,8 @@ export class AssistantMessageComponent extends Container {
 
 	override invalidate(): void {
 		super.invalidate();
-		this.streamingSignature = undefined;
 		this.streamingBlocks = [];
+		this.streamingHasToolCalls = false;
 		if (this.lastMessage) {
 			this.updateContent(this.lastMessage);
 		}
@@ -63,8 +63,8 @@ export class AssistantMessageComponent extends Container {
 
 	setHideThinkingBlock(hide: boolean): void {
 		this.hideThinkingBlock = hide;
-		this.streamingSignature = undefined;
 		this.streamingBlocks = [];
+		this.streamingHasToolCalls = false;
 		if (this.lastMessage) {
 			this.updateContent(this.lastMessage);
 		}
@@ -72,8 +72,8 @@ export class AssistantMessageComponent extends Container {
 
 	setHiddenThinkingLabel(label: string): void {
 		this.hiddenThinkingLabel = label;
-		this.streamingSignature = undefined;
 		this.streamingBlocks = [];
+		this.streamingHasToolCalls = false;
 		if (this.lastMessage) {
 			this.updateContent(this.lastMessage);
 		}
@@ -81,8 +81,8 @@ export class AssistantMessageComponent extends Container {
 
 	setOutputPad(padding: number): void {
 		this.outputPad = padding;
-		this.streamingSignature = undefined;
 		this.streamingBlocks = [];
+		this.streamingHasToolCalls = false;
 		if (this.lastMessage) {
 			this.updateContent(this.lastMessage);
 		}
@@ -100,44 +100,45 @@ export class AssistantMessageComponent extends Container {
 	}
 
 	private getStreamingLayout(message: AssistantMessage): {
-		signature: string;
 		groups: StreamingGroup[];
 		hasToolCalls: boolean;
 	} {
-		const signature: string[] = [];
 		const groups: StreamingGroup[] = [];
 		let hasToolCalls = false;
 		for (let index = 0; index < message.content.length; index++) {
 			const content = message.content[index]!;
 			if (content.type === "text") {
 				const text = content.text.trim();
-				signature.push(`text:${text ? 1 : 0}`);
 				if (text) groups.push({ kind: "text", text });
 				continue;
 			}
 			if (content.type === "thinking") {
 				const blocks: string[] = [];
-				let runLength = 0;
 				for (; index < message.content.length && message.content[index]?.type === "thinking"; index++) {
-					runLength++;
 					const thinking = message.content[index];
 					if (thinking?.type === "thinking" && thinking.thinking.trim()) blocks.push(thinking.thinking.trim());
 				}
 				index--;
 				const text = blocks.join("\n\n");
-				signature.push(`thinking:${runLength}:${text ? 1 : 0}`);
 				if (text) groups.push({ kind: "thinking", text });
 				continue;
 			}
 			hasToolCalls = true;
-			signature.push(`tool:${content.id}`);
 		}
-		return { signature: signature.join("|"), groups, hasToolCalls };
+		return { groups, hasToolCalls };
 	}
 
 	private updateStreamingContent(message: AssistantMessage): void {
 		const layout = this.getStreamingLayout(message);
-		if (this.streamingSignature === layout.signature && this.streamingBlocks.length === layout.groups.length) {
+		// Incremental path: only the tail content changed (e.g. a thinking run
+		// grew by another block). Comparing group kinds plus the toolcall flag
+		// keeps tail growth cheap instead of rebuilding the whole message
+		// container per delta.
+		if (
+			this.streamingBlocks.length === layout.groups.length &&
+			this.streamingHasToolCalls === layout.hasToolCalls &&
+			this.streamingBlocks.every((rendered, index) => rendered.kind === layout.groups[index]!.kind)
+		) {
 			for (let index = 0; index < layout.groups.length; index++) {
 				const group = layout.groups[index]!;
 				const rendered = this.streamingBlocks[index]!;
@@ -188,7 +189,7 @@ export class AssistantMessageComponent extends Container {
 				this.contentContainer.addChild(new Spacer(1));
 			}
 		}
-		this.streamingSignature = layout.signature;
+		this.streamingHasToolCalls = layout.hasToolCalls;
 		this.hasToolCalls = layout.hasToolCalls;
 	}
 
@@ -200,8 +201,8 @@ export class AssistantMessageComponent extends Container {
 			return;
 		}
 
-		this.streamingSignature = undefined;
 		this.streamingBlocks = [];
+		this.streamingHasToolCalls = false;
 		// Clear content container
 		this.contentContainer.clear();
 

@@ -1,5 +1,8 @@
 $ErrorActionPreference = "Stop"
 
+# Brand dev runs as Pie (direct src invocation has no pie entrypoint to detect).
+$env:PIE_DISTRIBUTION = "1"
+
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $noEnv = $false
 $forwardArgs = New-Object System.Collections.Generic.List[string]
@@ -63,7 +66,7 @@ if (-not (Test-Path -LiteralPath $tsxBin)) {
 	throw "tsx not found at $tsxBin. Run npm install from the repo root first."
 }
 
-$cliPath = Join-Path $scriptDir "packages/coding-agent/src/cli.ts"
+$cliPath = Join-Path $scriptDir "packages/coding-agent/src/pie-cli.ts"
 & $tsxBin $cliPath @forwardArgs
 $exitCode = $LASTEXITCODE
 if ($exitCode -ne 0) {

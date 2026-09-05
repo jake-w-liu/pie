@@ -136,7 +136,6 @@ function outputBytes(metafiles) {
 }
 
 for (const entry of [
-	join(codingAgentDistDir, "cli.js"),
 	join(codingAgentDistDir, "pie-cli.js"),
 	join(codingAgentDistDir, "index.js"),
 	join(codingAgentDistDir, "rpc-entry.js"),
@@ -157,7 +156,6 @@ const mainResult = await build({
 	...commonBuildOptions(),
 	entryNames: "[name]",
 	entryPoints: {
-		cli: join(codingAgentDistDir, "cli.js"),
 		"pie-cli": join(codingAgentDistDir, "pie-cli.js"),
 		client: join(codingAgentDistDir, "client", "index.js"),
 		index: join(codingAgentDistDir, "index.js"),
@@ -202,7 +200,6 @@ if (dirname(imageResizeOutput) !== dirname(imageResizeWorkerOutput)) {
 }
 
 validateExternalImports([mainResult.metafile, lazyResult.metafile]);
-chmodSync(join(bundleDir, "cli.js"), 0o755);
 chmodSync(join(bundleDir, "pie-cli.js"), 0o755);
 chmodSync(join(bundleDir, "rpc-entry.js"), 0o755);
 

@@ -8,7 +8,6 @@
 		"defaultPackages": []
 	},
 	"bin": {
-		"pi": "dist/bundle/cli.js",
 		"pie": "dist/bundle/pie-cli.js"
 	},
 	"main": "./dist/index.js",

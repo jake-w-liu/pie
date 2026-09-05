@@ -111,8 +111,8 @@ Restart pi, or run `/reload`, after changing context files.
 Type `@` in the editor to fuzzy-search files, or pass files on the command line:
 
 ```bash
-pi @README.md "Summarize this"
-pi @src/app.ts @src/app.test.ts "Review these together"
+pie @README.md "Summarize this"
+pie @src/app.ts @src/app.test.ts "Review these together"
 ```
 
 Images or text can be pasted with Ctrl+V (Alt+V on Windows); images can also be dragged into supported terminals.
@@ -136,10 +136,10 @@ Use `/model` or Ctrl+L to choose a model for the current session. Press Ctrl+S i
 Sessions are saved automatically:
 
 ```bash
-pi -c                  # Continue most recent session
-pi -r                  # Browse previous sessions
-pi --name "my task"    # Set session display name at startup
-pi --session <path|id> # Open a specific session
+pie -c                  # Continue most recent session
+pie -r                  # Browse previous sessions
+pie --name "my task"    # Set session display name at startup
+pie --session <path|id> # Open a specific session
 ```
 
 Inside pi, use `/resume`, `/new`, `/tree`, `/fork`, and `/clone` to manage sessions.
@@ -149,9 +149,9 @@ Inside pi, use `/resume`, `/new`, `/tree`, `/fork`, and `/clone` to manage sessi
 For one-shot prompts:
 
 ```bash
-pi -p "Summarize this codebase"
-cat README.md | pi -p "Summarize this text"
-pi -p @screenshot.png "What's in this image?"
+pie -p "Summarize this codebase"
+cat README.md | pie -p "Summarize this text"
+pie -p @screenshot.png "What's in this image?"
 ```
 
 Use `--mode json` for JSON event output or `--mode rpc` for process integration.

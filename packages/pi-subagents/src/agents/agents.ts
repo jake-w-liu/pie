@@ -2426,7 +2426,11 @@ export function discoverAgentsAll(cwd: string): {
 		...projectAgentDiagnostics,
 	];
 
-	const userDir = process.env.PI_CODING_AGENT_DIR ? userDirOld : fs.existsSync(userDirNew) ? userDirNew : userDirOld;
+	const userDir = (process.env.PIE_CODING_AGENT_DIR ?? process.env.PI_CODING_AGENT_DIR)
+		? userDirOld
+		: fs.existsSync(userDirNew)
+			? userDirNew
+			: userDirOld;
 
 	return {
 		builtin: applySubagentMaxThinking(builtin, maxThinking),

@@ -8,9 +8,9 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..");
 const packageDir = join(repoRoot, "packages", "coding-agent");
-const distCliPath = join(packageDir, "dist", "cli.js");
-const bundledDistCliPath = join(packageDir, "dist", "bundle", "cli.js");
-const srcCliPath = join(packageDir, "src", "cli.ts");
+const distCliPath = join(packageDir, "dist", "pie-cli.js");
+const bundledDistCliPath = join(packageDir, "dist", "bundle", "pie-cli.js");
+const srcCliPath = join(packageDir, "src", "pie-cli.ts");
 const defaultNodeProfileDir = join(repoRoot, "profiles-node");
 const defaultBunProfileDir = join(repoRoot, "profiles-bun");
 const agentDirEnvName = "PI_CODING_AGENT_DIR";
@@ -23,8 +23,8 @@ function printHelp() {
 Profiles coding-agent startup with the runtime selected below:
 - npm run profile:tui     -> builds packages/coding-agent and profiles TUI startup with Node
 - npm run profile:rpc     -> builds packages/coding-agent and profiles RPC startup with Node
-- bun run profile:tui     -> profiles TUI startup from src/cli.ts directly with Bun
-- bun run profile:rpc     -> profiles RPC startup from src/cli.ts directly with Bun
+- bun run profile:tui     -> profiles TUI startup from src/pie-cli.ts directly with Bun
+- bun run profile:rpc     -> profiles RPC startup from src/pie-cli.ts directly with Bun
 
 Options:
   --mode <name>          tui or rpc (default: tui)
@@ -580,7 +580,7 @@ async function main() {
 	}
 	if (runtime === "bun") {
 		process.stdout.write(
-			`Using Bun runtime with ${options.mode === "rpc" ? "packages/coding-agent/src/cli.ts --mode rpc" : "packages/coding-agent/src/cli.ts"}\n`,
+			`Using Bun runtime with ${options.mode === "rpc" ? "packages/coding-agent/src/pie-cli.ts --mode rpc" : "packages/coding-agent/src/pie-cli.ts"}\n`,
 		);
 	}
 
@@ -590,9 +590,9 @@ async function main() {
 		!options.bundle &&
 		!options.build &&
 		existsSync(distCliPath) &&
-		readFileSync(distCliPath, "utf8").includes('import "./bundle/cli.js";')
+		readFileSync(distCliPath, "utf8").includes('import "./bundle/pie-cli.js";')
 	) {
-		throw new Error("dist/cli.js is a bundled facade; rerun without --skip-build for an unbundled profile");
+		throw new Error("dist/pie-cli.js is a bundled facade; rerun without --skip-build for an unbundled profile");
 	}
 	if (!existsSync(entryPath)) {
 		throw new Error(`CLI entrypoint not found: ${entryPath}`);

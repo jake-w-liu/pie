@@ -32,6 +32,38 @@ function createAssistantMessage(
 	};
 }
 
+describe("streaming incremental updates", () => {
+	test("growing thinking runs render identically with or without container rebuilds", () => {
+		initTheme("dark");
+		const thinking = (n: number) => `thinking block ${n} with enough words to exercise wrapping`;
+		const contentFor = (count: number) =>
+			Array.from({ length: count }, (_, i) => ({ type: "thinking" as const, thinking: thinking(i) }));
+		// Incrementally streamed: one update per added thinking block.
+		const streamed = new AssistantMessageComponent(undefined, false);
+		for (let count = 1; count <= 8; count++) {
+			streamed.updateContent(createAssistantMessage(contentFor(count)), true);
+		}
+		// Rebuilt from scratch with only the final message.
+		const rebuilt = new AssistantMessageComponent(undefined, false);
+		rebuilt.updateContent(createAssistantMessage(contentFor(8)), true);
+		expect(streamed.render(80)).toEqual(rebuilt.render(80));
+	});
+
+	test("a thinking group replaced by text rebuilds with text styling", () => {
+		initTheme("dark");
+		const first = new AssistantMessageComponent(undefined, false);
+		first.updateContent(createAssistantMessage([{ type: "thinking", thinking: "hmm" }]), true);
+		const thinkingRender = first.render(80).join("\n");
+		first.updateContent(createAssistantMessage([{ type: "text", text: "hmm" }]), true);
+		const swappedRender = first.render(80).join("\n");
+		const fresh = new AssistantMessageComponent(undefined, false);
+		fresh.updateContent(createAssistantMessage([{ type: "text", text: "hmm" }]), true);
+		// Same group count but different kinds must rebuild, not restyle in place.
+		expect(swappedRender).toEqual(fresh.render(80).join("\n"));
+		expect(swappedRender).not.toEqual(thinkingRender);
+	});
+});
+
 describe("AssistantMessageComponent", () => {
 	test("adds OSC 133 zone markers to assistant messages without tool calls", () => {
 		initTheme("dark");

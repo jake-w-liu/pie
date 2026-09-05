@@ -255,7 +255,11 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				const localFromBottom = total - 1 - absoluteRow - after;
 				if (localFromBottom >= 0 && localFromBottom < targetHeight) {
 					// Inside the focused component: fresh interaction clears selection.
+					// A new press also ends any half-open drag: without a release
+					// (pointer left the window), the stale anchor would otherwise
+					// turn this press/release into a phantom selection and copy.
 					this.clearSelection();
+					this.pendingDrag = undefined;
 					if (
 						typeof focused.handleMousePress === "function" &&
 						focused.handleMousePress(x, targetHeight - 1 - localFromBottom)

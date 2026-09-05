@@ -80,19 +80,19 @@ Pie enables [Headroom](headroom.md) by default. It replaces large historical too
 
 The `pie` executable maps the built-in `dark` and `light` selections to complete `pie-nippon-dark` and `pie-nippon-light` palettes. Every UI, message, tool, Markdown, diff, syntax, thinking-level, search, and export color comes from the [NIPPON COLORS traditional Japanese catalog](https://nipponcolors.com/). Semantic text and message combinations maintain a WCAG contrast ratio of at least 4.5:1; intentionally subdued borders and tertiary text are excluded from that threshold.
 
-The normal `pi` executable keeps its original dark and light palettes. In Pie, select the named Nippon variants directly or use `--use-theme pie-nippon-dark` or `--use-theme pie-nippon-light`.
+Upstream Pi keeps its original dark and light palettes. In Pie, select the named Nippon variants directly or use `--use-theme pie-nippon-dark` or `--use-theme pie-nippon-light`.
 
 ## Sessions
 
 Sessions are saved automatically to `~/.pi/agent/sessions/`, organized by working directory.
 
 ```bash
-pi -c                  # Continue most recent session
-pi -r                  # Browse and select a session
-pi --no-session        # Ephemeral mode; do not save
-pi --name "my task"    # Set session display name at startup
-pi --session <path|id> # Use a specific session file or session ID
-pi --fork <path|id>    # Fork a session into a new session file
+pie -c                  # Continue most recent session
+pie -r                  # Browse and select a session
+pie --no-session        # Ephemeral mode; do not save
+pie --name "my task"    # Set session display name at startup
+pie --session <path|id> # Use a specific session file or session ID
+pie --fork <path|id>    # Fork a session into a new session file
 ```
 
 Useful session commands:
@@ -136,7 +136,7 @@ Non-interactive modes (`-p`, `--mode json`, and `--mode rpc`) do not show a trus
 
 If no extension or saved decision applies, `defaultProjectTrust` controls the fallback behavior. Set it to `"ask"`, `"always"`, or `"never"` in `~/.pi/agent/settings.json`, or change it with `/settings`.
 
-`pi config` and package commands use the same project trust flow, except `pi update` never prompts. Pass `--approve` to trust project-local settings for one command or `--no-approve` to ignore them.
+`pie config` and package commands use the same project trust flow, except `pie update` never prompts. Pass `--approve` to trust project-local settings for one command or `--no-approve` to ignore them.
 
 Use `/trust` in interactive mode to save a project trust decision for future sessions, including trust for the immediate parent folder. It writes `~/.pi/agent/trust.json` only; the current session is not reloaded, so restart pi for changes to take effect.
 
@@ -152,25 +152,25 @@ If you use pi for open source work and want to publish sessions for model, promp
 ## CLI Reference
 
 ```bash
-pi [options] [--] [@files...] [messages...]
+pie [options] [--] [@files...] [messages...]
 ```
 
 ### Package Commands
 
 ```bash
-pi install <source> [-l]     # Install package, -l for project-local
-pi remove <source> [-l]      # Remove package
-pi uninstall <source> [-l]   # Alias for remove
-pi update                    # Update packages; reconcile pinned git refs
-pi update --extensions       # Explicit form of pi update
-pi update --models           # Refresh model catalogs only
-pi update <source>           # Update one package
-pi update --extension <src>  # Update one package
-pi list                      # List installed packages
-pi config                    # Enable/disable package resources
+pie install <source> [-l]     # Install package, -l for project-local
+pie remove <source> [-l]      # Remove package
+pie uninstall <source> [-l]   # Alias for remove
+pie update                    # Update packages; reconcile pinned git refs
+pie update --extensions       # Explicit form of pie update
+pie update --models           # Refresh model catalogs only
+pie update <source>           # Update one package
+pie update --extension <src>  # Update one package
+pie list                      # List installed packages
+pie config                    # Enable/disable package resources
 ```
 
-These commands manage packages and model catalogs. Pie itself is source-managed; `pi update` does not replace the CLI installation. `pi config` and project package commands accept `--approve`/`--no-approve` to trust or ignore project-local settings for one command. `pi update` never prompts for project trust.
+These commands manage packages and model catalogs. Pie itself is source-managed; `pie update` does not replace the CLI installation. `pie config` and project package commands accept `--approve`/`--no-approve` to trust or ignore project-local settings for one command. `pie update` never prompts for project trust.
 
 See [Pi Packages](packages.md) for package sources and security notes.
 
@@ -187,7 +187,7 @@ See [Pi Packages](packages.md) for package sources and security notes.
 In print mode, pi also reads piped stdin and merges it into the initial prompt:
 
 ```bash
-cat README.md | pi -p "Summarize this text"
+cat README.md | pie -p "Summarize this text"
 ```
 
 ### Model Options
@@ -241,7 +241,7 @@ Built-in tools: `read`, `bash`, `powershell` (Windows), `edit`, `write`, `grep`,
 Combine `--no-*` with explicit flags to load exactly what you need, ignoring settings. Example:
 
 ```bash
-pi --no-extensions -e ./my-extension.ts
+pie --no-extensions -e ./my-extension.ts
 ```
 
 ### Other Options
@@ -259,7 +259,7 @@ pi --no-extensions -e ./my-extension.ts
 | `-h`, `--help` | Show help |
 | `-v`, `--version` | Show version |
 
-In `fullscreen` mode, the transcript scrolls inside the terminal viewport while queued messages, working status, extension widgets, editor, and footer remain fixed at the bottom. Mouse/trackpad input scrolls the region under the pointer; keyboard viewport actions always remain available. Inline images work in terminals that support the Kitty graphics protocol, including Kitty and Ghostty. In iTerm2 they render as text placeholders because its inline-image protocol cannot delete or crop placements during application-owned scrolling. In `regular` mode, pi uses the main screen and terminal-owned scrollback, and iTerm2 inline images continue to render normally. See [Terminal setup](terminal-setup.md) for terminal-specific settings and workarounds.
+In `fullscreen` mode, the transcript scrolls inside the terminal viewport while queued messages, working status, extension widgets, editor, and footer remain fixed at the bottom. Mouse/trackpad input scrolls the region under the pointer; keyboard viewport actions always remain available. Inline images work in terminals that support the Kitty graphics protocol, including Kitty and Ghostty. In iTerm2 they render as text placeholders because its inline-image protocol cannot delete or crop placements during application-owned scrolling. In `regular` mode, pie uses the main screen and terminal-owned scrollback, and iTerm2 inline images continue to render normally. See [Terminal setup](terminal-setup.md) for terminal-specific settings and workarounds.
 
 Set **TUI mode** in `/settings` to switch between `regular` and `fullscreen` immediately and choose the default for future sessions. **Fullscreen exit output** controls whether exiting fullscreen prints the final transcript or restores the previous screen and prints only the session resume hint.
 
@@ -268,46 +268,46 @@ Set **TUI mode** in `/settings` to switch between `regular` and `fullscreen` imm
 Prefix files with `@` to include them in the message:
 
 ```bash
-pi @prompt.md "Answer this"
-pi -p @screenshot.png "What's in this image?"
-pi @code.ts @test.ts "Review these files"
+pie @prompt.md "Answer this"
+pie -p @screenshot.png "What's in this image?"
+pie @code.ts @test.ts "Review these files"
 ```
 
 ### Examples
 
 ```bash
 # Interactive with initial prompt
-pi "List all .ts files in src/"
+pie "List all .ts files in src/"
 
 # Non-interactive
-pi -p "Summarize this codebase"
+pie -p "Summarize this codebase"
 
 # Prompt beginning with a dash
-pi -p -- "- Summarize these points"
+pie -p -- "- Summarize these points"
 
 # Non-interactive with piped stdin
-cat README.md | pi -p "Summarize this text"
+cat README.md | pie -p "Summarize this text"
 
 # Named one-shot session
-pi --name "release audit" -p "Audit this repository"
+pie --name "release audit" -p "Audit this repository"
 
 # Different model
-pi --provider openai --model gpt-4o "Help me refactor"
+pie --provider openai --model gpt-4o "Help me refactor"
 
 # Model with provider prefix
-pi --model openai/gpt-4o "Help me refactor"
+pie --model openai/gpt-4o "Help me refactor"
 
 # Model with thinking level shorthand
-pi --model sonnet:high "Solve this complex problem"
+pie --model sonnet:high "Solve this complex problem"
 
 # Limit model cycling
-pi --models "claude-*,gpt-4o"
+pie --models "claude-*,gpt-4o"
 
 # Read-only mode
-pi --tools read,grep,find,ls -p "Review the code"
+pie --tools read,grep,find,ls -p "Review the code"
 
 # Disable one extension or built-in tool while keeping the rest available
-pi --exclude-tools ask_question
+pie --exclude-tools ask_question
 ```
 
 ## Design Principles

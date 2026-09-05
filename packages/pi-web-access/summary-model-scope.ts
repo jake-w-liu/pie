@@ -46,7 +46,7 @@ export function findModelWithProviderRouting<T extends ModelLike>(
 }
 
 function getAgentDir(): string {
-	return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+	return process.env.PIE_CODING_AGENT_DIR || process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
 }
 
 function readSettings(path: string): Record<string, unknown> {

@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { execFileSync, execSync, spawn } from "child_process";
 import { platform } from "os";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -93,6 +94,93 @@ afterEach(() => {
 	vi.unstubAllEnvs();
 });
 
+interface FakeStdio extends EventEmitter {
+	write(chunk: string): boolean;
+	end(): void;
+}
+
+interface FakeProcess extends EventEmitter {
+	stdin: FakeStdio;
+	stdout: EventEmitter;
+	kill(): boolean;
+}
+
+function makeFakeProcess(): FakeProcess {
+	const proc = new EventEmitter() as FakeProcess;
+	const stdin = new EventEmitter() as FakeStdio;
+	stdin.write = () => true;
+	stdin.end = () => {};
+	proc.stdin = stdin;
+	proc.stdout = new EventEmitter();
+	proc.kill = () => true;
+	return proc;
+}
+
+function installSpawnStub(behavior: (proc: FakeProcess) => void): void {
+	mockedSpawn.mockImplementation((() => {
+		const proc = makeFakeProcess();
+		behavior(proc);
+		return proc;
+	}) as unknown as typeof spawn);
+}
+
+/** Tool exits 0 as soon as stdin closes, like a healthy pbcopy. */
+function stubSpawnWriteSuccess(): void {
+	installSpawnStub((proc) => {
+		proc.stdin.end = () => {
+			queueMicrotask(() => proc.emit("close", 0, null));
+		};
+	});
+}
+
+/** Tool exits nonzero, like a failing pbcopy. */
+function stubSpawnFailing(): void {
+	installSpawnStub((proc) => {
+		proc.stdin.end = () => {
+			queueMicrotask(() => proc.emit("close", 1, null));
+		};
+	});
+}
+
+/** Tool binary is missing (spawn ENOENT), like wl-paste without Wayland tools. */
+function stubSpawnMissing(): void {
+	installSpawnStub((proc) => {
+		queueMicrotask(() => proc.emit("error", new Error("spawn ENOENT")));
+	});
+}
+
+/** wl-paste prints text then exits 0. */
+function stubSpawnReadSuccess(text: string): void {
+	installSpawnStub((proc) => {
+		queueMicrotask(() => {
+			if (text.length > 0) proc.stdout.emit("data", Buffer.from(text));
+			proc.emit("close", 0, null);
+		});
+	});
+}
+
+/** Tool never exits and never errors, like a wedged clipboard daemon. */
+function stubSpawnHanging(): void {
+	installSpawnStub(() => {});
+}
+
+/** Max event-loop stall in ms while awaiting `work`. */
+async function measureEventLoopLag(work: Promise<unknown>): Promise<number> {
+	let maxLag = 0;
+	let last = Date.now();
+	const watchdog = setInterval(() => {
+		const now = Date.now();
+		maxLag = Math.max(maxLag, now - last - 5);
+		last = now;
+	}, 5);
+	try {
+		await work;
+	} finally {
+		clearInterval(watchdog);
+	}
+	return maxLag;
+}
+
 describe("readClipboardText", () => {
 	test("returns native clipboard text", async () => {
 		mocks.clipboard.getText.mockResolvedValue("clipboard text");
@@ -105,15 +193,15 @@ describe("readClipboardText", () => {
 		mockedPlatform.mockReturnValue("linux");
 		mocks.isWaylandSession.mockReturnValue(true);
 		vi.stubEnv("WAYLAND_DISPLAY", "wayland-0");
-		mockedExecFileSync.mockReturnValue("Wayland text");
+		stubSpawnReadSuccess("Wayland text");
 		mocks.clipboard.getText.mockResolvedValue("stale X11 text");
 
 		await expect(readClipboardText()).resolves.toBe("Wayland text");
-		expect(mockedExecFileSync).toHaveBeenCalledWith("wl-paste", ["--no-newline", "--type", "text"], {
-			encoding: "utf8",
-			maxBuffer: 50 * 1024 * 1024,
-			timeout: 5000,
-		});
+		expect(mockedSpawn).toHaveBeenCalledWith(
+			"wl-paste",
+			["--no-newline", "--type", "text"],
+			expect.objectContaining({ stdio: ["ignore", "pipe", "ignore"] }),
+		);
 		expect(mocks.clipboard.getText).not.toHaveBeenCalled();
 	});
 
@@ -121,7 +209,7 @@ describe("readClipboardText", () => {
 		mockedPlatform.mockReturnValue("linux");
 		mocks.isWaylandSession.mockReturnValue(true);
 		vi.stubEnv("WAYLAND_DISPLAY", "wayland-0");
-		mockedExecFileSync.mockReturnValue("");
+		stubSpawnReadSuccess("");
 		mocks.clipboard.getText.mockResolvedValue("stale X11 text");
 
 		await expect(readClipboardText()).resolves.toBeNull();
@@ -132,9 +220,7 @@ describe("readClipboardText", () => {
 		mockedPlatform.mockReturnValue("linux");
 		mocks.isWaylandSession.mockReturnValue(true);
 		vi.stubEnv("WAYLAND_DISPLAY", "wayland-0");
-		mockedExecFileSync.mockImplementation(() => {
-			throw new Error("wl-paste unavailable");
-		});
+		stubSpawnMissing();
 		mocks.clipboard.getText.mockResolvedValue("X11 fallback text");
 
 		await expect(readClipboardText()).resolves.toBe("X11 fallback text");
@@ -146,6 +232,22 @@ describe("readClipboardText", () => {
 		mocks.clipboard.getText.mockRejectedValue(new Error("clipboard unavailable"));
 		await expect(readClipboardText()).resolves.toBeNull();
 	});
+
+	test("never blocks the event loop on synchronous child_process calls", async () => {
+		// The read path must stay async: a hung wl-paste used to freeze the
+		// whole TUI via execFileSync.
+		mockedPlatform.mockReturnValue("linux");
+		mocks.isWaylandSession.mockReturnValue(true);
+		vi.stubEnv("WAYLAND_DISPLAY", "wayland-0");
+		stubSpawnHanging();
+		mocks.clipboard.getText.mockResolvedValue("fallback");
+
+		const pending = readClipboardText();
+		const lag = await measureEventLoopLag(pending);
+		await expect(pending).resolves.toBe("fallback");
+		expect(lag).toBeLessThan(1000);
+		expect(mockedExecFileSync).not.toHaveBeenCalled();
+	}, 15_000);
 });
 
 describe("copyToClipboard", () => {
@@ -175,36 +277,48 @@ describe("copyToClipboard", () => {
 
 	test("local shell fallback success skips OSC 52", async () => {
 		mocks.clipboard.setText.mockRejectedValue(new Error("native failed"));
-		mockedExecSync.mockReturnValue(Buffer.alloc(0));
+		stubSpawnWriteSuccess();
 
 		await copyToClipboard("hello");
 
-		expect(mockedExecSync).toHaveBeenCalledWith("pbcopy", {
-			input: "hello",
-			stdio: ["pipe", "ignore", "ignore"],
-			timeout: 5000,
-		});
+		expect(mockedSpawn).toHaveBeenCalledWith(
+			"pbcopy",
+			[],
+			expect.objectContaining({ stdio: ["pipe", "ignore", "ignore"] }),
+		);
+		expect(mockedExecSync).not.toHaveBeenCalled();
 		expect(osc52Writes()).toHaveLength(0);
 	});
 
 	test("uses OSC 52 fallback when native and shell tools fail", async () => {
 		mocks.clipboard.setText.mockRejectedValue(new Error("native failed"));
-		mockedExecSync.mockImplementation(() => {
-			throw new Error("pbcopy failed");
-		});
+		stubSpawnFailing();
 
 		await copyToClipboard("hello");
 
 		expect(osc52Writes()).toHaveLength(1);
+		expect(mockedExecSync).not.toHaveBeenCalled();
 	});
 
 	test("does not emit oversized OSC 52 payloads", async () => {
 		mocks.clipboard.setText.mockRejectedValue(new Error("native failed"));
-		mockedExecSync.mockImplementation(() => {
-			throw new Error("pbcopy failed");
-		});
+		stubSpawnFailing();
 
 		await expect(copyToClipboard("x".repeat(80_000))).rejects.toThrow("Failed to copy to clipboard");
 		expect(osc52Writes()).toHaveLength(0);
 	});
+
+	test("never blocks the event loop while a clipboard tool hangs", async () => {
+		// Regression test: pbcopy/xclip used to run via execSync, freezing the
+		// whole TUI until the tool exited or its timeout fired.
+		mocks.clipboard.setText.mockRejectedValue(new Error("native failed"));
+		stubSpawnHanging();
+
+		const lag = await measureEventLoopLag(copyToClipboard("hello").catch(() => undefined));
+		// The hung tool must not stall input/rendering; the kill timeout
+		// rejects in the background instead.
+		expect(lag).toBeLessThan(1000);
+		expect(mockedExecSync).not.toHaveBeenCalled();
+		expect(mockedExecFileSync).not.toHaveBeenCalled();
+	}, 15_000);
 });

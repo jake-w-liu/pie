@@ -87,7 +87,7 @@ export function getProjectConfigDir(projectRoot: string): string {
 }
 
 export function getAgentDir(): string {
-	const configured = process.env.PI_CODING_AGENT_DIR;
+	const configured = process.env.PIE_CODING_AGENT_DIR ?? process.env.PI_CODING_AGENT_DIR;
 	const home = process.env.HOME || process.env.USERPROFILE || os.homedir();
 	if (configured === "~") return home;
 	if (configured?.startsWith("~/") || configured?.startsWith("~\\")) return path.join(home, configured.slice(2));

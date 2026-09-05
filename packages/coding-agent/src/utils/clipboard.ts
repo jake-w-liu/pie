@@ -1,19 +1,66 @@
-import { type ExecFileSyncOptionsWithStringEncoding, execFileSync, execSync, spawn } from "child_process";
+import { spawn } from "child_process";
 import { platform } from "os";
 import { isWaylandSession } from "./clipboard-image.ts";
 import { clipboard } from "./clipboard-native.ts";
 
-type NativeClipboardExecOptions = {
-	input: string;
-	timeout: number;
-	stdio: ["pipe", "ignore", "ignore"];
-};
+/** Per-tool timeout: clipboard helpers must never wedge the TUI event loop. */
+const CLIPBOARD_TOOL_TIMEOUT_MS = 5000;
+const CLIPBOARD_MAX_READ_BYTES = 50 * 1024 * 1024;
 
-function copyToX11Clipboard(options: NativeClipboardExecOptions): void {
+/**
+ * Run a clipboard tool with stdin input, asynchronously. execSync variants of
+ * these calls block the event loop for the whole child lifetime (a hung
+ * pbcopy/xclip visibly freezes the terminal on every select), so every tool
+ * here goes through spawn with a kill timeout instead.
+ */
+function runClipboardWriter(command: string, args: readonly string[], text: string): Promise<void> {
+	return new Promise<void>((resolve, reject) => {
+		let settled = false;
+		const done = (error?: Error): void => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			if (error) reject(error);
+			else resolve();
+		};
+		let proc: ReturnType<typeof spawn>;
+		try {
+			proc = spawn(command, [...args], { stdio: ["pipe", "ignore", "ignore"] });
+		} catch (error) {
+			reject(error instanceof Error ? error : new Error(String(error)));
+			return;
+		}
+		const timer = setTimeout(() => {
+			try {
+				proc.kill("SIGKILL");
+			} catch {
+				// Already exited; the close handler below settles the promise.
+			}
+			done(new Error(`${command} timed out`));
+		}, CLIPBOARD_TOOL_TIMEOUT_MS);
+		proc.on("error", (error) => done(error));
+		proc.on("close", (code) => {
+			if (code === 0) done();
+			else done(new Error(`${command} exited with code ${code ?? "unknown"}`));
+		});
+		const stdin = proc.stdin;
+		if (!stdin) {
+			done(new Error(`${command} has no stdin pipe`));
+			return;
+		}
+		stdin.on("error", () => {
+			// EPIPE when the tool exits early; the close handler reports it.
+		});
+		stdin.write(text);
+		stdin.end();
+	});
+}
+
+async function copyToX11Clipboard(text: string): Promise<void> {
 	try {
-		execSync("xclip -selection clipboard", options);
+		await runClipboardWriter("xclip", ["-selection", "clipboard"], text);
 	} catch {
-		execSync("xsel --clipboard --input", options);
+		await runClipboardWriter("xsel", ["--clipboard", "--input"], text);
 	}
 }
 
@@ -34,25 +81,71 @@ function emitOsc52(text: string): boolean {
 
 type ClipboardReadResult = { ok: true; text: string | null } | { ok: false };
 
-const READ_CLIPBOARD_OPTIONS: ExecFileSyncOptionsWithStringEncoding = {
-	encoding: "utf8",
-	maxBuffer: 50 * 1024 * 1024,
-	timeout: 5000,
-};
-
-function readWaylandClipboardText(): ClipboardReadResult {
-	try {
-		const text = execFileSync("wl-paste", ["--no-newline", "--type", "text"], READ_CLIPBOARD_OPTIONS);
-		return { ok: true, text: text || null };
-	} catch {
-		return { ok: false };
-	}
+async function readWaylandClipboardText(): Promise<ClipboardReadResult> {
+	return new Promise<ClipboardReadResult>((resolve) => {
+		let settled = false;
+		let proc: ReturnType<typeof spawn>;
+		try {
+			proc = spawn("wl-paste", ["--no-newline", "--type", "text"], {
+				stdio: ["ignore", "pipe", "ignore"],
+			});
+		} catch {
+			resolve({ ok: false });
+			return;
+		}
+		const chunks: Buffer[] = [];
+		let bytes = 0;
+		let overflowed = false;
+		const timer = setTimeout(() => {
+			try {
+				proc.kill("SIGKILL");
+			} catch {
+				// Already exited; close handler below settles the promise.
+			}
+			finish({ ok: false });
+		}, CLIPBOARD_TOOL_TIMEOUT_MS);
+		const finish = (result: ClipboardReadResult): void => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			resolve(result);
+		};
+		proc.on("error", () => finish({ ok: false }));
+		const stdout = proc.stdout;
+		if (!stdout) {
+			finish({ ok: false });
+			return;
+		}
+		stdout.on("data", (chunk: Buffer) => {
+			if (overflowed) return;
+			bytes += chunk.length;
+			if (bytes > CLIPBOARD_MAX_READ_BYTES) {
+				overflowed = true;
+				try {
+					proc.kill("SIGKILL");
+				} catch {
+					// Close handler settles below.
+				}
+				finish({ ok: false });
+				return;
+			}
+			chunks.push(chunk);
+		});
+		proc.on("close", (code) => {
+			if (code !== 0) {
+				finish({ ok: false });
+				return;
+			}
+			const text = Buffer.concat(chunks).toString("utf8");
+			finish({ ok: true, text: text || null });
+		});
+	});
 }
 
 /** Read plain text from the system clipboard. */
 export async function readClipboardText(): Promise<string | null> {
 	if (platform() === "linux" && isWaylandSession() && process.env.WAYLAND_DISPLAY) {
-		const result = readWaylandClipboardText();
+		const result = await readWaylandClipboardText();
 		if (result.ok) {
 			return result.text;
 		}
@@ -99,21 +192,19 @@ export async function copyToClipboard(text: string): Promise<void> {
 		return;
 	}
 
-	const options: NativeClipboardExecOptions = { input: text, timeout: 5000, stdio: ["pipe", "ignore", "ignore"] };
-
 	if (!copied) {
 		try {
 			if (p === "darwin") {
-				execSync("pbcopy", options);
+				await runClipboardWriter("pbcopy", [], text);
 				copied = true;
 			} else if (p === "win32") {
-				execSync("clip", options);
+				await runClipboardWriter("clip", [], text);
 				copied = true;
 			} else {
 				// Linux. Try Termux, Wayland, or X11 clipboard tools.
 				if (process.env.TERMUX_VERSION) {
 					try {
-						execSync("termux-clipboard-set", options);
+						await runClipboardWriter("termux-clipboard-set", [], text);
 						copied = true;
 					} catch {
 						// Fall back to Wayland or X11 tools.
@@ -126,35 +217,20 @@ export async function copyToClipboard(text: string): Promise<void> {
 					const isWayland = isWaylandSession();
 					if (isWayland && hasWaylandDisplay) {
 						try {
-							// Verify wl-copy exists (spawn errors are async and won't be caught)
-							execSync("which wl-copy", { stdio: "ignore" });
-							// wl-copy with execSync hangs due to fork behavior; use spawn instead.
-							// Await the exit code and only claim success on a clean exit, so a
-							// failed wl-copy falls through to the xclip/OSC 52 fallbacks.
-							const wlCopyExit = await new Promise<number>((resolve) => {
-								const proc = spawn("wl-copy", [], { stdio: ["pipe", "ignore", "ignore"] });
-								proc.on("error", () => resolve(1));
-								proc.on("close", (code) => resolve(code ?? 1));
-								proc.stdin.on("error", () => {
-									// Ignore EPIPE errors if wl-copy exits early
-								});
-								proc.stdin.write(text);
-								proc.stdin.end();
-							});
-							if (wlCopyExit === 0) {
-								copied = true;
-							} else if (hasX11Display) {
-								copyToX11Clipboard(options);
-								copied = true;
-							}
+							// A missing wl-copy rejects (spawn ENOENT) and falls
+							// through to the xclip/OSC 52 fallbacks below. Only a
+							// clean exit claims success, so a failed wl-copy keeps
+							// the fallbacks alive.
+							await runClipboardWriter("wl-copy", [], text);
+							copied = true;
 						} catch {
 							if (hasX11Display) {
-								copyToX11Clipboard(options);
+								await copyToX11Clipboard(text);
 								copied = true;
 							}
 						}
 					} else if (hasX11Display) {
-						copyToX11Clipboard(options);
+						await copyToX11Clipboard(text);
 						copied = true;
 					}
 				}

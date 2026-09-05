@@ -835,7 +835,47 @@ function splitIntoTokensWithAnsi(text: string): string[] {
  * @param width - Maximum visible width per line
  * @returns Array of wrapped lines (NOT padded to width)
  */
+// Memoized wrapping for streaming re-renders. wrapTextWithAnsi is a pure
+// function of (text, width), and growing documents re-wrap every unchanged
+// line on every frame; without this, per-frame render cost grows with the
+// document and long streams visibly churn. Results are frozen: callers must
+// treat them as read-only (all current callers only iterate or spread).
+const WRAP_CACHE_MAX_ENTRIES = 1024;
+const WRAP_CACHE_MAX_TEXT_LENGTH = 32 * 1024;
+const WRAP_CACHE_MAX_CHARS = 4 * 1024 * 1024;
+const wrapCache = new Map<string, readonly string[]>();
+let wrapCacheChars = 0;
+
+function wrapCacheEvict(): void {
+	const oldest = wrapCache.keys().next();
+	if (!oldest.done) {
+		const lines = wrapCache.get(oldest.value);
+		if (lines) {
+			for (const line of lines) wrapCacheChars -= line.length;
+		}
+		wrapCache.delete(oldest.value);
+	}
+}
+
 export function wrapTextWithAnsi(text: string, width: number): string[] {
+	if (!text) {
+		return [""];
+	}
+	if (text.length <= WRAP_CACHE_MAX_TEXT_LENGTH) {
+		const key = `${width}\n${text}`;
+		const cached = wrapCache.get(key);
+		if (cached) return cached as string[];
+		const result = Object.freeze(wrapTextWithAnsiUncached(text, width));
+		while (wrapCache.size >= WRAP_CACHE_MAX_ENTRIES) wrapCacheEvict();
+		for (const line of result) wrapCacheChars += line.length;
+		while (wrapCacheChars > WRAP_CACHE_MAX_CHARS) wrapCacheEvict();
+		wrapCache.set(key, result);
+		return result as string[];
+	}
+	return wrapTextWithAnsiUncached(text, width);
+}
+
+function wrapTextWithAnsiUncached(text: string, width: number): string[] {
 	if (!text) {
 		return [""];
 	}

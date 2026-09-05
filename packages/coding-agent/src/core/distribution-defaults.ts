@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { DEFAULT_PACKAGE_SOURCES, getSettingsPath } from "../config.ts";
+import { DEFAULT_PACKAGE_SOURCES, ENV_AGENT_DIR, getSettingsPath } from "../config.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 
 /**
@@ -22,9 +22,13 @@ export async function seedDistributionDefaultPackages(
 /**
  * Resolve the pi-web-access config path using the same precedence as the extension
  * (packages/coding-agent ships `npm:pi-web-access`, which reads this file per call).
+ * The Pie override is checked first; the Pi paths stay shared with upstream on purpose.
  */
 export function getWebSearchConfigPath(): string {
-	if (process.env.PI_CODING_AGENT_DIR) return join(process.env.PI_CODING_AGENT_DIR, "web-search.json");
+	// ENV_AGENT_DIR is PIE_CODING_AGENT_DIR for the Pie distribution; keep the
+	// Pi variable as a shared-with-upstream fallback.
+	const agentDir = process.env[ENV_AGENT_DIR] ?? process.env.PI_CODING_AGENT_DIR;
+	if (agentDir) return join(agentDir, "web-search.json");
 	if (process.env.XDG_CONFIG_HOME) return join(process.env.XDG_CONFIG_HOME, "pi", "web-search.json");
 	return join(homedir(), ".pi", "web-search.json");
 }

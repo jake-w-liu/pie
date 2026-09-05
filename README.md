@@ -2,7 +2,7 @@
 
 Pie is a terminal coding agent and a maintained fork of [Pi Agent](https://github.com/earendil-works/pi).
 
-Pie keeps Pi's provider support, sessions, SDK, and extension system while shipping an opinionated local setup under the `pie` command. The original `pi` command can remain installed for comparison or rollback.
+Pie keeps Pi's provider support, sessions, SDK, and extension system while shipping an opinionated local setup under the `pie` command. Only the `pie` executable is shipped; the Pi ecosystem (packages, extensions, sessions, credentials in `~/.pi`) stays fully accessible.
 
 - **Pie version:** `0.1.0`
 - **Upstream base:** Pi commit [`56f3f33`](https://github.com/earendil-works/pi/commit/56f3f33a9a675ef2a2c30cf2e35a6a385cdf2ed4)
@@ -16,7 +16,7 @@ Pie keeps Pi's provider support, sessions, SDK, and extension system while shipp
 - Starts automatic context compaction at the earlier of 87% usage or the configured response-token reserve.
 - Optimizes long-session terminal rendering, streaming Markdown and Bash previews, narrow selectors, and masked authentication input.
 - Uses complete dark and light palettes from the [NIPPON COLORS](https://nipponcolors.com/) catalog.
-- Provides a separate `pie` executable without replacing the upstream `pi` executable.
+- Ships only the `pie` executable (no `pi` binary) while keeping full access to the Pi ecosystem: providers, sessions, extensions, and `~/.pi` credentials.
 
 Pie intentionally shares `~/.pi/agent` with Pi, so existing credentials, sessions, settings, and packages remain available.
 

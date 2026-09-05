@@ -1,5 +1,7 @@
 # Pi Documentation
 
+> **Pie fork note:** this repo ships the `pie` command, so run every `pi <...>` example below as `pie <...>`. Package names (`@earendil-works/pi-*`), `~/.pi` paths, and `PI_*` environment variables are unchanged and shared with upstream Pi, so the full Pi extension ecosystem stays available.
+
 Pi is a minimal terminal coding harness. It is designed to stay small at the core while being extended through TypeScript extensions, skills, prompt templates, themes, and pi packages.
 
 ## Quick start

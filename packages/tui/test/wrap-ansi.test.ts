@@ -2,6 +2,38 @@ import assert from "node:assert";
 import { describe, it } from "node:test";
 import { visibleWidth, wrapTextWithAnsi } from "../src/utils.ts";
 
+describe("wrapTextWithAnsi memoization", () => {
+	it("returns identical output for repeated inputs without recomputing", () => {
+		const text = "the quick brown fox jumps over the lazy dog near the riverbank";
+		const first = wrapTextWithAnsi(text, 20);
+		const second = wrapTextWithAnsi(text, 20);
+		assert.deepStrictEqual(second, first);
+		assert.strictEqual(second, first, "expected cached instance to be reused");
+	});
+
+	it("keys the cache on width as well as text", () => {
+		const text = "the quick brown fox jumps over the lazy dog";
+		assert.notDeepStrictEqual(wrapTextWithAnsi(text, 10), wrapTextWithAnsi(text, 40));
+	});
+
+	it("stays correct after cache eviction pressure", () => {
+		const probe = "eviction probe alpha beta gamma delta";
+		const expected = [...wrapTextWithAnsi(probe, 14)];
+		for (let i = 0; i < 3000; i++) {
+			wrapTextWithAnsi(`distinct filler line number ${i} with padding words`, 14);
+		}
+		assert.deepStrictEqual(wrapTextWithAnsi(probe, 14), expected);
+	});
+	it("does not let callers corrupt later results through the shared instance", () => {
+		const text = "alpha beta gamma delta epsilon zeta eta theta";
+		const before = [...wrapTextWithAnsi(text, 12)];
+		assert.throws(() => {
+			(wrapTextWithAnsi(text, 12) as string[]).push("corrupt");
+		}, "expected frozen cached instance");
+		assert.deepStrictEqual(wrapTextWithAnsi(text, 12), before);
+	});
+});
+
 describe("wrapTextWithAnsi", () => {
 	describe("underline styling", () => {
 		it("should not apply underline style before the styled text", () => {

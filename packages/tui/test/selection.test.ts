@@ -96,6 +96,23 @@ describe("Transcript text selection", () => {
 		tui.stop();
 	});
 
+	it("a press in the editor clears a half-open drag from a lost release", async () => {
+		const { terminal, tui, editor } = await createSelectionTui();
+		// Press in the transcript arms a drag, then the release is lost
+		// (pointer left the window): pendingDrag stays armed.
+		terminal.sendInput(press(2, 2));
+		// A fresh press inside the editor (absolute rows 30-32, terminal rows
+		// 21-23) must end the half-open drag instead of leaving it armed.
+		terminal.sendInput(press(40, 23));
+		// Releasing in the editor must not complete a phantom selection from
+		// the stale transcript anchor, so nothing is copied.
+		terminal.sendInput(release(40, 23));
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copiedTexts(terminal), []);
+		assert.strictEqual(editor.getText(), "hello");
+		tui.stop();
+	});
+
 	it("ignores drag motion without a press", async () => {
 		const { terminal, tui, editor } = await createSelectionTui();
 		terminal.sendInput("\x1b[<32;6;2M");

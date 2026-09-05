@@ -6,6 +6,7 @@ import { homedir, hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 
 export function getWebSearchConfigDir(): string {
+	if (process.env.PIE_CODING_AGENT_DIR) return process.env.PIE_CODING_AGENT_DIR;
 	if (process.env.PI_CODING_AGENT_DIR) return process.env.PI_CODING_AGENT_DIR;
 	if (process.env.XDG_CONFIG_HOME) return join(process.env.XDG_CONFIG_HOME, "pi");
 	return join(homedir(), ".pi");

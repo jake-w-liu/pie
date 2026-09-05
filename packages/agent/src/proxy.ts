@@ -119,11 +119,6 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 	const stream = new ProxyMessageEventStream();
 
 	(async () => {
-		if (!options.authToken) {
-			throw new Error("Proxy auth token is required");
-		}
-		// Normalize so a trailing slash cannot produce "//api/stream".
-		const proxyUrl = options.proxyUrl.replace(/\/+$/, "");
 		// Initialize the partial message that we'll build up from events
 		const partial: AssistantMessage = {
 			role: "assistant",
@@ -157,6 +152,11 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 		}
 
 		try {
+			if (!options.authToken) {
+				throw new Error("Proxy auth token is required");
+			}
+			// Normalize so a trailing slash cannot produce "//api/stream".
+			const proxyUrl = options.proxyUrl.replace(/\/+$/, "");
 			const response = await fetch(`${proxyUrl}/api/stream`, {
 				method: "POST",
 				headers: {

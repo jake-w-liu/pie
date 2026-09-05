@@ -105,4 +105,23 @@ describe("streamProxy", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain("without a terminal event");
 	});
+
+	it("surfaces a missing auth token as a stream error instead of throwing", async () => {
+		// streamProxy must never throw synchronously or reject without a terminal
+		// event: failures belong in the returned stream.
+		const stream = streamProxy(
+			model,
+			{ systemPrompt: "", messages: [] },
+			{
+				authToken: "",
+				proxyUrl: "https://proxy.example.com",
+			},
+		);
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("Proxy auth token is required");
+		expect(events.some((event) => event.type === "error")).toBe(true);
+	});
 });

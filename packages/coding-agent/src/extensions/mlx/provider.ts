@@ -280,7 +280,15 @@ export function createMlxProvider(): { provider: Provider<"openai-completions"> 
 					};
 				},
 				check: async ({ ctx, credential }) => {
-					const serverUrl = await resolveServerUrl(ctx, credential);
+					let serverUrl: string | undefined;
+					try {
+						serverUrl = await resolveServerUrl(ctx, credential);
+					} catch {
+						// Misconfigured URL: report unavailable instead of throwing,
+						// so one bad URL cannot reject availability for all providers.
+						// Login validates loudly instead.
+						return undefined;
+					}
 					return serverUrl
 						? { type: "api_key", source: credential ? "stored credential" : "MLX_BASE_URL" }
 						: undefined;

@@ -56,12 +56,16 @@ export {
 	prepareBranchEntries,
 } from "./harness/compaction/branch-summarization.ts";
 export {
+	buildCacheReusingSummarizationContext,
+	buildCompactionInstruction,
+	buildSummarizationContext,
 	type CompactionPreparation,
 	type CompactionSettings,
 	type CompactResult,
 	calculateContextTokens,
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
+	DEFAULT_COMPACTION_TRIGGER_RATIO,
 	estimateContextTokens,
 	estimateTokens,
 	findCutPoint,
@@ -69,10 +73,15 @@ export {
 	generateSummary,
 	generateSummaryWithUsage,
 	getLastAssistantUsage,
+	getSummarizationFailure,
+	getSummarizationTokenBudget,
 	prepareCompaction,
+	SUMMARIZATION_INSTRUCTION,
+	type SummarizationCacheReuse,
 	serializeConversation,
 	shouldCompact,
 } from "./harness/compaction/compaction.ts";
+export { safeJsonStringify } from "./harness/compaction/utils.ts";
 export * from "./harness/messages.ts";
 export * from "./harness/prompt-templates.ts";
 // Harness

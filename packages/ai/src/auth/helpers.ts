@@ -13,6 +13,9 @@ export function envApiKeyAuth(name: string, envVars: readonly string[]): ApiKeyA
 			interaction.signal.throwIfAborted();
 			const key = await interaction.prompt({ type: "secret", message: `Enter ${name}` });
 			interaction.signal.throwIfAborted();
+			if (!key.trim()) {
+				throw new Error(`No ${name} provided`);
+			}
 			return { type: "api_key", key };
 		},
 		resolve: async ({ ctx, credential, signal }) => {

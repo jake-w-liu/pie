@@ -230,6 +230,9 @@ function applyExtension(
 			provider: providerId,
 			baseUrl,
 			headers: undefined,
+			// Preserve provider-level compat like modelFromJson does; the
+			// definition spread alone would drop it for extension models.
+			compat: mergeCompat(defaults?.compat, definition.compat),
 		};
 	});
 }

@@ -157,6 +157,10 @@ export function llamaInferenceUrl(serverUrl: string): string {
 	return `${normalizeLlamaServerUrl(serverUrl)}/v1`;
 }
 
+// Bound on a single SSE frame: legitimate model-status events are small JSON
+// payloads, so anything larger means the server is malfunctioning.
+const MAX_SSE_BUFFER_CHARS = 4 * 1024 * 1024;
+
 export class LlamaClient {
 	readonly serverUrl: string;
 	private readonly apiKey: string | undefined;
@@ -233,6 +237,11 @@ export class LlamaClient {
 			const chunk = await reader.read();
 			if (chunk.done) break;
 			buffer += decoder.decode(chunk.value, { stream: true }).replaceAll("\r\n", "\n");
+			// A frame boundary must arrive eventually; a server streaming an
+			// endless line without one is malfunctioning, not slow.
+			if (buffer.length > MAX_SSE_BUFFER_CHARS) {
+				throw new Error("llama.cpp sent an over-long SSE frame");
+			}
 			let boundary = buffer.indexOf("\n\n");
 			while (boundary >= 0) {
 				const frame = buffer.slice(0, boundary);

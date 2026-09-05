@@ -184,13 +184,13 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
 								currentBlock = null;
 							}
 
-							// Generate unique ID if not provided or if it's a duplicate
+							// Generate unique ID if not provided or if it's a duplicate.
+							// The module counter alone keeps ids unique; no wall-clock
+							// component, so identical streams replay identically.
 							const providedId = part.functionCall.id;
 							const needsNewId =
 								!providedId || output.content.some((b) => b.type === "toolCall" && b.id === providedId);
-							const toolCallId = needsNewId
-								? `${part.functionCall.name}_${Date.now()}_${++toolCallCounter}`
-								: providedId;
+							const toolCallId = needsNewId ? `${part.functionCall.name}_${++toolCallCounter}` : providedId;
 
 							const toolCall: ToolCall = {
 								type: "toolCall",

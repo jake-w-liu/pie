@@ -111,13 +111,19 @@ async function resolveProviderAuthWithSignal(
 
 function overlayEnvAuthContext(base: AuthContext, env: ProviderEnv): AuthContext {
 	return {
-		env: async (name) => env[name] || (await base.env(name)),
+		env: async (name) => env[name] ?? (await base.env(name)),
 		fileExists: (path) => base.fileExists(path),
 	};
 }
 
 const DEFAULT_OAUTH_MINIMUM_VALIDITY_MS = 5 * 60 * 1000;
 const DEFAULT_OAUTH_REFRESH_TIMEOUT_MS = 15_000;
+
+/** Shared OAuth freshness policy, also used by the catalog-refresh path. */
+export const OAUTH_FRESHNESS_POLICY = {
+	minimumValidityMs: DEFAULT_OAUTH_MINIMUM_VALIDITY_MS,
+	refreshTimeoutMs: DEFAULT_OAUTH_REFRESH_TIMEOUT_MS,
+} as const;
 
 /**
  * OAuth resolution with double-checked locking: tokens with less than five
@@ -164,9 +170,9 @@ async function resolveStoredOAuth(
 		if (post?.type !== "oauth") return undefined; // logged out meanwhile
 		credential = post;
 		// The normal five-minute window triggers a refresh but does not impose a
-		// provider contract. Explicit callers (such as bearer-token export) do
+		// provider contract. Explicit callers (such as bearer-token export) only
 		// require the requested minimum after the refresh.
-		if (minOAuthValidityMs !== undefined && expiresSoon(credential)) {
+		if (minOAuthValidityMs !== undefined && Date.now() + minOAuthValidityMs >= credential.expires) {
 			throw new ModelsError("oauth", `OAuth refresh returned a token that expires too soon for ${providerId}`);
 		}
 	}

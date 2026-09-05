@@ -117,7 +117,18 @@ function regularFileExists(filePath: string): boolean {
 function readResultRepairData(resultPath: string): ResultRepairData | undefined {
 	try {
 		const data = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as { success?: boolean; state?: string; exitCode?: number; results?: unknown };
-		const state = data.success ? "complete" : data.state === "stopped" ? "stopped" : data.state === "rejected" ? "rejected" : data.state === "paused" || data.exitCode === 0 ? "paused" : "failed";
+		// Only an explicit paused state means paused: a failed run whose
+		// process happened to exit 0 must fail, not wait for a resume that
+		// never comes.
+		const state = data.success
+			? "complete"
+			: data.state === "stopped"
+				? "stopped"
+				: data.state === "rejected"
+					? "rejected"
+					: data.state === "paused"
+						? "paused"
+						: "failed";
 		const results = Array.isArray(data.results)
 			? data.results.map((entry, index) => {
 				if (!entry || typeof entry !== "object" || Array.isArray(entry)) return {};

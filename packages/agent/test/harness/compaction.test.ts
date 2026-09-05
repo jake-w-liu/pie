@@ -176,9 +176,29 @@ describe("harness compaction", () => {
 			reserveTokens: 10000,
 			keepRecentTokens: 20000,
 		};
+		// Unified trigger: min(0.87 * window, window - reserve), so 89k/100k compacts.
 		expect(shouldCompact(95000, 100000, settings)).toBe(true);
-		expect(shouldCompact(89000, 100000, settings)).toBe(false);
+		expect(shouldCompact(89000, 100000, settings)).toBe(true);
+		expect(shouldCompact(86000, 100000, settings)).toBe(false);
 		expect(shouldCompact(95000, 100000, { ...settings, enabled: false })).toBe(false);
+	});
+
+	it("caps the trigger by ratio on large context windows", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			reserveTokens: 16384,
+			keepRecentTokens: 20000,
+		};
+		// 1M window: ratio boundary (870k) governs, not window - reserve (~984k).
+		expect(shouldCompact(880000, 1000000, settings)).toBe(true);
+		expect(shouldCompact(860000, 1000000, settings)).toBe(false);
+		// Small window: reserve boundary governs when stricter than the ratio.
+		expect(shouldCompact(16000, 32768, settings)).toBe(false);
+		expect(shouldCompact(17000, 32768, settings)).toBe(true);
+		// Guards: degenerate inputs never trigger.
+		expect(shouldCompact(0, 100000, settings)).toBe(false);
+		expect(shouldCompact(95000, Number.NaN, settings)).toBe(false);
+		expect(shouldCompact(95000, 0, settings)).toBe(false);
 	});
 
 	it("finds a cut point based on token differences", () => {
@@ -453,7 +473,26 @@ describe("harness compaction", () => {
 		]);
 		const result = serializeConversation(messages);
 		expect(result).toContain("[Tool result]:");
-		expect(result).toContain("[... 3000 more characters truncated]");
+		// Head/tail splice: bounded output keeps the tail and marks the cut.
+		expect(result).toContain("[... middle truncated (5000 chars -> 2000)]");
+		expect(result.length).toBeLessThan(longContent.length);
+	});
+
+	it("preserves the tail of truncated text for summarization", () => {
+		const head = "h".repeat(1900);
+		const tail = `UNIQUE-TAIL-MARKER-${"t".repeat(100)}`;
+		const messages = convertMessages([
+			{
+				role: "toolResult",
+				toolCallId: "tc1",
+				toolName: "read",
+				content: [{ type: "text", text: `${head}${"m".repeat(3000)}${tail}` }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+		]);
+		const result = serializeConversation(messages);
+		expect(result).toContain("UNIQUE-TAIL-MARKER");
 	});
 
 	it("passes reasoning through generateSummary only for reasoning models with thinking enabled", async () => {
@@ -519,6 +558,54 @@ describe("harness compaction", () => {
 		);
 		expect(promptText).toContain("<previous-summary>\nold summary\n</previous-summary>");
 		expect(promptText).toContain("Additional focus: focus");
+	});
+
+	it("reuses the live prefix when cache-reuse options are provided", async () => {
+		const messages: AgentMessage[] = [createUserMessage("Check the foo module.")];
+		let capturedContext:
+			| { systemPrompt?: unknown; messages: Array<{ role: unknown; content: unknown }>; tools?: unknown }
+			| undefined;
+		let capturedOptions: Record<string, unknown> | undefined;
+		const { faux, model } = createFauxModel(false);
+		faux.setResponses([
+			(context, options) => {
+				capturedContext = context as typeof capturedContext;
+				capturedOptions = (options ?? {}) as Record<string, unknown>;
+				return fauxAssistantMessage("## Goal\nCache test summary");
+			},
+		]);
+
+		const summary = getOrThrow(
+			await generateSummaryWithUsage(
+				messages,
+				models,
+				model,
+				2000,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				{
+					systemPrompt: "live system prompt",
+				},
+			),
+		);
+
+		expect(summary.text).toBe("## Goal\nCache test summary");
+		// Cache-reuse path: live system prompt replayed, conversation kept as messages,
+		// compaction instruction appended as the final user message.
+		expect(capturedContext?.systemPrompt).toBe("live system prompt");
+		expect(capturedContext?.messages.length).toBe(2);
+		expect(capturedContext?.messages[0]).toMatchObject({ role: "user" });
+		const finalMessage = capturedContext?.messages[1] as { role: unknown; content: unknown };
+		expect(finalMessage.role).toBe("user");
+		expect(JSON.stringify(finalMessage.content)).not.toContain("<conversation>");
+		expect(JSON.stringify(finalMessage.content)).toContain("compaction engine");
+		// Summarization must never write a cache entry and must isolate routing.
+		expect(capturedOptions?.cacheRetention).toBe("none");
+		expect(typeof capturedOptions?.sessionId).toBe("string");
 	});
 
 	it("preserves the string result from generateSummary", async () => {

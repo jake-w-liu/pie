@@ -740,7 +740,10 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.completed" || event.type === "response.incomplete") {
 			finalizeResponse(event.response);
 		} else if (event.type === "error") {
-			throw new Error(`Error Code ${event.code}: ${event.message}` || "Unknown error");
+			const details = [event.code, event.message]
+				.filter((part) => part !== undefined && part !== null && `${part}`.length > 0)
+				.join(": ");
+			throw new Error(details || "Unknown error");
 		} else if (event.type === "response.failed") {
 			sawTerminalResponseEvent = true;
 			output.rawStopReason = event.response?.status;
@@ -786,7 +789,7 @@ function mapStopReason(
 			return { stopReason: "stop" };
 		default: {
 			const _exhaustive: never = status;
-			throw new Error(`Unhandled stop reason: ${_exhaustive}`);
+			return { stopReason: "error", errorMessage: `Unhandled response status: ${String(_exhaustive)}` };
 		}
 	}
 }

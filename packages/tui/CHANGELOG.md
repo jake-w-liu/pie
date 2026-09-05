@@ -22,6 +22,13 @@
 
 ### Fixed
 
+- Fixed over-wide rendered lines crashing the session; they are now truncated to the terminal width with the incident recorded in `pi-crash.log`.
+- Fixed CSI escape parsing to accept the full final-byte range so cursor moves, erases, and mode sequences are no longer miscounted as visible width.
+- Fixed Kitty keyboard dedup dropping genuine keypresses after shifted keys by tracking the effective inserted code point.
+- Fixed timed-out terminal background queries inflating the reply counter and swallowing later input; late replies are still absorbed.
+- Fixed diagnostic file writes in the render path crashing rendering on read-only or full disks.
+- Fixed hardware-cursor column emission past the last column on full-width lines in both screen modes.
+- Fixed unhandled mouse sequences (modified drags, extra buttons) leaking into keyboard input.
 - Fixed fullscreen manual scrolling resuming follow mode after transient content or layout shrink reached the current offset.
 - Fixed animated text rows being erased before their replacements were drawn, which could expose a blank flashing row on terminals without synchronized output.
 - Fixed component timers requesting a frame while stopped from suppressing the first render after a later restart.

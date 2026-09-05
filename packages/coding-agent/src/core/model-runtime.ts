@@ -39,6 +39,7 @@ import {
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import { getAgentDir } from "../config.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
+import { isOfflineModeEnabled } from "../utils/env.ts";
 import { AuthStorage as DefaultAuthStorage } from "./auth-storage.ts";
 import { ModelConfig } from "./model-config.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.ts";
@@ -193,7 +194,7 @@ export class ModelRuntime implements Models {
 			modelsPath,
 			modelsStore,
 			providers,
-			process.env.PI_OFFLINE === undefined,
+			!isOfflineModeEnabled(),
 		);
 		runtime.configureRadiusProviders();
 		runtime.rebuildProviders();
@@ -403,17 +404,10 @@ export class ModelRuntime implements Models {
 
 	async getAvailable(providerId?: string, options?: AuthOperationOptions): Promise<readonly Model<Api>[]> {
 		if (providerId) {
-			const errorSeq = ++this.availabilityErrorSeq;
-			try {
-				const available = await this.models.getAvailable(providerId, options);
-				if (errorSeq === this.availabilityErrorSeq) this.availabilityError = undefined;
-				return available;
-			} catch (error) {
-				if (errorSeq === this.availabilityErrorSeq && !options?.signal?.aborted) {
-					this.availabilityError = error instanceof Error ? error.message : String(error);
-				}
-				throw error;
-			}
+			// Scoped lookups stay pure: a single provider's failure must neither
+			// masquerade as a global models.json error nor clear one. Global
+			// availability state belongs to full refresh passes only.
+			return this.models.getAvailable(providerId, options);
 		}
 		await this.queueAvailabilityRefresh(options?.signal);
 		return this.snapshot.available;
@@ -529,6 +523,10 @@ export class ModelRuntime implements Models {
 			this.updateModelSnapshot();
 			await this.refreshProviderAvailability(providerId, signal);
 		} catch (cause) {
+			// Cancellation is not a synchronization failure: rethrow unwrapped
+			// so callers see the abort instead of a bogus "committed but
+			// local synchronization failed" error.
+			if (signal.aborted) throw cause;
 			throw new CredentialSynchronizationError(providerId, operation, credential, { cause });
 		}
 	}

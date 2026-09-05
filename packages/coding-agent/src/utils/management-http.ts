@@ -1,6 +1,27 @@
+import { sleep } from "./sleep.ts";
+
 type FetchInput = Parameters<typeof fetch>[0];
 
 const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+/** Upper bound for honoring server-sent Retry-After delays. */
+const MAX_RETRY_AFTER_MS = 10_000;
+
+/**
+ * Parse a Retry-After value (delta-seconds or HTTP-date) into milliseconds,
+ * capped so a malicious clock never stalls management requests for long.
+ */
+function retryAfterMs(response: Response): number | undefined {
+	const raw = response.headers.get("retry-after");
+	if (!raw) return undefined;
+	const seconds = Number(raw.trim());
+	if (Number.isFinite(seconds)) {
+		return Math.max(0, Math.min(seconds * 1000, MAX_RETRY_AFTER_MS));
+	}
+	const date = Date.parse(raw);
+	if (Number.isNaN(date)) return undefined;
+	return Math.max(0, Math.min(date - Date.now(), MAX_RETRY_AFTER_MS));
+}
 
 export interface FetchRetryOptions {
 	/** Number of additional attempts after the initial request. Defaults to two. */
@@ -58,6 +79,20 @@ export async function fetchWithRetry(
 			} catch {
 				// The response is being discarded before a retry. There is nothing useful to
 				// do if cancelling its body also fails.
+			}
+			// Honor server-sent backoff on rate limiting / overload instead of
+			// hammering immediately. Other statuses retry at once, as before.
+			const backoffMs = response.status === 429 || response.status === 503 ? (retryAfterMs(response) ?? 0) : 0;
+			if (backoffMs > 0) {
+				const abortSignals = [parentSignal, timeoutSignal].filter(
+					(candidate): candidate is AbortSignal => candidate !== undefined,
+				);
+				await sleep(backoffMs, abortSignals.length > 1 ? AbortSignal.any(abortSignals) : abortSignals[0]).catch(
+					() => {
+						parentSignal?.throwIfAborted();
+						timeoutSignal?.throwIfAborted();
+					},
+				);
 			}
 		} catch (error) {
 			const attemptTimedOut =

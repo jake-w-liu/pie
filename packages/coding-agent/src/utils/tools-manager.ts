@@ -5,17 +5,12 @@ import { join } from "path";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import { APP_NAME, getBinDir } from "../config.ts";
+import { isOfflineModeEnabled } from "./env.ts";
 import { fetchWithRetry } from "./management-http.ts";
 
 const TOOLS_DIR = getBinDir();
 const NETWORK_TIMEOUT_MS = 10_000;
 const DOWNLOAD_TIMEOUT_MS = 120_000;
-
-function isOfflineModeEnabled(): boolean {
-	const value = process.env.PI_OFFLINE;
-	if (!value) return false;
-	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
-}
 
 interface ToolConfig {
 	name: string;
@@ -118,7 +113,14 @@ async function getLatestVersion(repo: string): Promise<string> {
 	}
 
 	const data = (await response.json()) as { tag_name: string };
-	return data.tag_name.replace(/^v/, "");
+	const version = data.tag_name.replace(/^v/, "");
+	// The version flows into the download URL and the local archive path.
+	// Reject anything that is not a plain version so a malicious or malformed
+	// tag cannot escape into a path traversal or URL injection.
+	if (!/^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]*)?$/.test(version)) {
+		throw new Error(`Invalid release version: ${version}`);
+	}
+	return version;
 }
 
 // Download a file from URL

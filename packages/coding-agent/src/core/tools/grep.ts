@@ -305,10 +305,14 @@ export function createGrepToolDefinition(
 								matchCount++;
 								const filePath = event.data?.path?.text;
 								const lineNumber = event.data?.line_number;
-								const lineText = event.data?.lines?.text;
 								if (filePath && typeof lineNumber === "number") {
-									matches.push({ filePath, lineNumber, lineText });
 									matchedFiles.add(filePath);
+									// Retain full records only when formatting needs them
+									// (content mode). Other modes keep just the file set so
+									// giant result sets cannot OOM the agent.
+									if (stopAtLimit) {
+										matches.push({ filePath, lineNumber, lineText: event.data?.lines?.text });
+									}
 								}
 								if (matchCount >= effectiveLimit) {
 									matchLimitReached = true;

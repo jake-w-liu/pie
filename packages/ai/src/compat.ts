@@ -33,6 +33,7 @@ import { azureOpenAIResponsesApi } from "./api/azure-openai-responses.lazy.ts";
 import { bedrockConverseStreamApi } from "./api/bedrock-converse-stream.lazy.ts";
 import { googleGenerativeAIApi } from "./api/google-generative-ai.lazy.ts";
 import { googleVertexApi } from "./api/google-vertex.lazy.ts";
+import { lazyStream } from "./api/lazy.ts";
 import { mistralConversationsApi } from "./api/mistral-conversations.lazy.ts";
 import { openAICodexResponsesApi } from "./api/openai-codex-responses.lazy.ts";
 import { openAICompletionsApi } from "./api/openai-completions.lazy.ts";
@@ -259,8 +260,15 @@ export function stream<TApi extends Api>(
 		}
 		return builtinProvider.stream(model, context, withEnvApiKey(model, options) as ApiStreamOptions<TApi>);
 	}
-	const provider = resolveApiProvider(model.api);
-	return provider.stream(model, context, withEnvApiKey(model, options) as StreamOptions);
+	try {
+		const provider = resolveApiProvider(model.api);
+		return provider.stream(model, context, withEnvApiKey(model, options) as StreamOptions);
+	} catch (error) {
+		// Failures belong in the returned stream, never thrown synchronously.
+		return lazyStream(model, async () => {
+			throw error;
+		});
+	}
 }
 
 export async function complete<TApi extends Api>(
@@ -284,8 +292,15 @@ export function streamSimple<TApi extends Api>(
 		}
 		return builtinProvider.streamSimple(model, context, withEnvApiKey(model, options));
 	}
-	const provider = resolveApiProvider(model.api);
-	return provider.streamSimple(model, context, withEnvApiKey(model, options));
+	try {
+		const provider = resolveApiProvider(model.api);
+		return provider.streamSimple(model, context, withEnvApiKey(model, options));
+	} catch (error) {
+		// Failures belong in the returned stream, never thrown synchronously.
+		return lazyStream(model, async () => {
+			throw error;
+		});
+	}
 }
 
 export async function completeSimple<TApi extends Api>(

@@ -42,6 +42,13 @@ export const findToolSystemPromptContribution = {
 export type FindToolInput = Static<typeof findSchema>;
 
 const DEFAULT_LIMIT = 1000;
+// Upper bound so a garbage limit cannot turn a listing into an unbounded scan.
+const MAX_LIMIT = 100_000;
+
+function sanitizeLimit(limit: number | undefined): number {
+	if (limit === undefined || !Number.isFinite(limit)) return DEFAULT_LIMIT;
+	return Math.max(1, Math.min(MAX_LIMIT, Math.floor(limit)));
+}
 
 export interface FindToolDetails {
 	truncation?: TruncationResult;
@@ -162,7 +169,7 @@ export function createFindToolDefinition(
 				(async () => {
 					try {
 						const searchPath = resolveToCwd(searchDir || ".", cwd);
-						const effectiveLimit = limit ?? DEFAULT_LIMIT;
+						const effectiveLimit = sanitizeLimit(limit);
 						const ops = customOps ?? defaultFindOperations;
 
 						// If custom operations provide glob(), use that instead of fd.

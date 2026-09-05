@@ -1390,7 +1390,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			}
 		}
 		const cursorSequence = cursorPos
-			? `\x1b[${cursorPos.row + 1};${Math.min(width, cursorPos.col) + 1}H${this.getShowHardwareCursor() ? "\x1b[?25h" : "\x1b[?25l"}`
+			? `\x1b[${cursorPos.row + 1};${Math.min(width, cursorPos.col + 1)}H${this.getShowHardwareCursor() ? "\x1b[?25h" : "\x1b[?25l"}`
 			: "\x1b[?25l";
 		if (!screenChanged && cursorSequence === this.previousCursorSequence) {
 			this.previousRawScreen = rawScreen;

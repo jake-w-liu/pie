@@ -24,6 +24,13 @@ export const lsToolSystemPromptContribution = {
 export type LsToolInput = Static<typeof lsSchema>;
 
 const DEFAULT_LIMIT = 500;
+// Upper bound so a garbage limit cannot turn a listing into an unbounded scan.
+const MAX_LIMIT = 100_000;
+
+function sanitizeLimit(limit: number | undefined): number {
+	if (limit === undefined || !Number.isFinite(limit)) return DEFAULT_LIMIT;
+	return Math.max(1, Math.min(MAX_LIMIT, Math.floor(limit)));
+}
 
 export interface LsToolDetails {
 	truncation?: TruncationResult;
@@ -127,7 +134,7 @@ export function createLsToolDefinition(
 				(async () => {
 					try {
 						const dirPath = resolveToCwd(path || ".", cwd);
-						const effectiveLimit = limit ?? DEFAULT_LIMIT;
+						const effectiveLimit = sanitizeLimit(limit);
 
 						// Check if path exists.
 						if (!(await ops.exists(dirPath))) {

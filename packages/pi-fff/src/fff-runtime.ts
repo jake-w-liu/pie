@@ -264,6 +264,9 @@ export class FffRuntime {
 		});
 		this.finder = this.options.finder ?? null;
 		this.initPromise = null;
+		// A disposed runtime must re-initialize from scratch; retaining the
+		// old failure would replay it forever without retrying.
+		this.loadError = null;
 		this.grepContinuations.clear();
 	}
 
@@ -739,11 +742,16 @@ export class FffRuntime {
 		};
 		takeFromRemaining();
 
-		while (items.length < request.limit) {
+		// Bound engine fetches: a misbehaving engine returning empty pages
+		// with ever-new cursors must page, not spin forever.
+		let fetches = 0;
+		const maxFetches = request.limit + 10;
+		while (items.length < request.limit && fetches < maxFetches) {
 			if (items.length > 0 && engineCursor === null && remainingItems.length === 0) break;
 			if (continuation && engineCursor === null && remainingItems.length === 0) break;
 
 			const result = this.runFinderGrep(finder, request, constraintQuery, engineCursor);
+			fetches++;
 			if (result.isErr()) return propagateError(result);
 
 			regexFallbackError = result.value.regexFallbackError ?? regexFallbackError;

@@ -23,6 +23,15 @@ export const DEFAULT_MLX_SERVER_URL = "http://127.0.0.1:8080/v1";
  */
 export function normalizeMlxServerUrl(url: string): string {
 	const trimmed = url.trim().replace(/\/+$/, "");
+	let protocol: string;
+	try {
+		protocol = new URL(trimmed).protocol;
+	} catch {
+		throw new Error(`Invalid MLX server URL: ${trimmed || url}`);
+	}
+	if (protocol !== "http:" && protocol !== "https:") {
+		throw new Error(`MLX server URL must use http or https: ${trimmed}`);
+	}
 	return trimmed.endsWith("/v1") ? trimmed : `${trimmed}/v1`;
 }
 
@@ -255,7 +264,9 @@ export function createMlxProvider(): { provider: Provider<"openai-completions"> 
 						})
 					).trim();
 					// Verify connectivity before storing the credential.
-					const checkResponse = await fetch(`${serverUrl}/models`, { signal: interaction.signal });
+					const checkResponse = await fetch(`${serverUrl}/models`, {
+						signal: AbortSignal.any([interaction.signal, AbortSignal.timeout(15_000)]),
+					});
 					if (!checkResponse.ok) {
 						throw new Error(
 							`Could not reach MLX server at ${serverUrl}: ${checkResponse.status} ${checkResponse.statusText}`,
@@ -305,7 +316,14 @@ export function createMlxProvider(): { provider: Provider<"openai-completions"> 
 			}
 
 			if (context.signal.aborted || context.credential?.type !== "api_key") return;
-			const serverUrl = credentialServerUrl(context.credential);
+			let serverUrl: string | undefined;
+			try {
+				serverUrl = credentialServerUrl(context.credential);
+			} catch {
+				// Misconfigured URL: leave the previous list in place, like a
+				// failed fetch below. Login validates loudly instead.
+				return;
+			}
 			if (!serverUrl) return;
 
 			// Server catalog (network) plus local `~/models` discovery (filesystem).
@@ -316,7 +334,9 @@ export function createMlxProvider(): { provider: Provider<"openai-completions"> 
 			let serverData: MlxModelEntry[] | undefined;
 			if (context.allowNetwork) {
 				try {
-					const response = await fetch(`${serverUrl}/models`, { signal: context.signal });
+					const response = await fetch(`${serverUrl}/models`, {
+						signal: AbortSignal.any([context.signal, AbortSignal.timeout(15_000)]),
+					});
 					if (!response.ok) {
 						throw new Error(`MLX server returned HTTP ${response.status}`);
 					}

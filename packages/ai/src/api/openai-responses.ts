@@ -331,9 +331,13 @@ function buildParams(
 			};
 			params.include = ["reasoning.encrypted_content"];
 		} else if (model.provider !== "github-copilot" && model.thinkingLevelMap?.off !== null) {
-			params.reasoning = {
-				effort: (model.thinkingLevelMap?.off ?? "none") as NonNullable<typeof params.reasoning>["effort"],
-			};
+			// "Off" means omitting the object: "none" is not a valid effort value.
+			const offEffort = model.thinkingLevelMap?.off;
+			if (offEffort && offEffort !== "none") {
+				params.reasoning = {
+					effort: offEffort as NonNullable<typeof params.reasoning>["effort"],
+				};
+			}
 		}
 		if (model.provider === "xai") params.include = ["reasoning.encrypted_content"];
 	}

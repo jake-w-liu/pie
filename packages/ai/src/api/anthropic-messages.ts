@@ -457,6 +457,30 @@ async function* iterateSseMessages(
 	}
 }
 
+/**
+ * Extract a readable message from an Anthropic SSE `error` event payload,
+ * falling back to the raw payload so no detail is ever lost.
+ */
+function anthropicStreamErrorMessage(data: string): string {
+	try {
+		const parsed: unknown = JSON.parse(data);
+		if (typeof parsed === "object" && parsed !== null) {
+			const record = parsed as Record<string, unknown>;
+			const nested = record.error;
+			const message =
+				(typeof nested === "object" && nested !== null
+					? ((nested as Record<string, unknown>).message ?? (nested as Record<string, unknown>).error)
+					: undefined) ?? record.message;
+			if (typeof message === "string" && message.length > 0) {
+				return `Anthropic stream error: ${message}`;
+			}
+		}
+	} catch {
+		// Fall through to the raw payload below.
+	}
+	return `Anthropic stream error: ${data}`;
+}
+
 async function* iterateAnthropicEvents(
 	response: Response,
 	signal?: AbortSignal,
@@ -470,7 +494,7 @@ async function* iterateAnthropicEvents(
 
 	for await (const sse of iterateSseMessages(response.body, signal)) {
 		if (sse.event === "error") {
-			throw new Error(sse.data);
+			throw new Error(anthropicStreamErrorMessage(sse.data));
 		}
 
 		if (!ANTHROPIC_MESSAGE_EVENTS.has(sse.event ?? "")) {
@@ -751,6 +775,16 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 						}
 						if (event.usage.cache_creation_input_tokens != null) {
 							output.usage.cacheWrite = event.usage.cache_creation_input_tokens;
+						}
+						// `cache_creation` 1h breakdown is present on the live API but missing
+						// from MessageDeltaUsage in SDK 0.91.1, so read it through a narrow cast.
+						const cacheWrite1h = (
+							event.usage as {
+								cache_creation?: { ephemeral_1h_input_tokens?: number } | null;
+							}
+						).cache_creation?.ephemeral_1h_input_tokens;
+						if (cacheWrite1h != null) {
+							output.usage.cacheWrite1h = cacheWrite1h;
 						}
 						// Anthropic reports reasoning tokens in `output_tokens_details.thinking_tokens` on the
 						// final message_delta usage (a subset of output_tokens). SDK 0.91.1 omits the field from
@@ -1386,6 +1420,6 @@ function mapStopReason(
 			return { stopReason: "error", errorMessage: "Provider stopped with: sensitive" };
 		default:
 			// Handle unknown stop reasons gracefully (API may add new values)
-			throw new Error(`Unhandled stop reason: ${reason}`);
+			return { stopReason: "error", errorMessage: `Unhandled stop reason: ${reason}` };
 	}
 }

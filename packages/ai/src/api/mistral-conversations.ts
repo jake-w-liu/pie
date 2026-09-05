@@ -294,8 +294,13 @@ async function requestMistralStream(
 	baseUrl.pathname = `${baseUrl.pathname.replace(/\/+$/u, "")}/`;
 	const url = new URL("v1/chat/completions", baseUrl);
 	const headers = buildMistralHeaders(model, apiKey, options);
-	const timeoutSignal = AbortSignal.timeout(options?.timeoutMs ?? 60_000);
-	const signal = options?.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
+	// Only arm a deadline when the caller sets one: an unconditional default
+	// kills legitimate long reasoning/tool streams, unlike every other provider.
+	const timeoutSignal = options?.timeoutMs !== undefined ? AbortSignal.timeout(options.timeoutMs) : undefined;
+	const signal =
+		options?.signal && timeoutSignal
+			? AbortSignal.any([options.signal, timeoutSignal])
+			: (options?.signal ?? timeoutSignal);
 	const response = await (options?.fetch ?? globalThis.fetch)(url, {
 		method: "POST",
 		headers,
@@ -434,7 +439,7 @@ const MISTRAL_STREAM_DONE = Symbol("mistral-stream-done");
 
 async function* readMistralEvents(
 	body: ReadableStream<Uint8Array>,
-	signal: AbortSignal,
+	signal?: AbortSignal,
 ): AsyncGenerator<MistralCompletionEvent> {
 	const reader = body.getReader();
 	const decoder = new TextDecoder();
@@ -442,13 +447,13 @@ async function* readMistralEvents(
 	const onAbort = () => {
 		void reader.cancel().catch(() => {});
 	};
-	signal.addEventListener("abort", onAbort, { once: true });
+	signal?.addEventListener("abort", onAbort, { once: true });
 
 	try {
 		while (true) {
-			if (signal.aborted) throw signal.reason;
+			if (signal?.aborted) throw signal.reason;
 			const { done, value } = await reader.read();
-			if (signal.aborted) throw signal.reason;
+			if (signal?.aborted) throw signal.reason;
 			buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
 
 			let boundary = findMistralEventBoundary(buffer);
@@ -468,7 +473,7 @@ async function* readMistralEvents(
 			if (event !== MISTRAL_STREAM_DONE && event) yield event;
 		}
 	} finally {
-		signal.removeEventListener("abort", onAbort);
+		signal?.removeEventListener("abort", onAbort);
 		try {
 			await reader.cancel();
 		} catch {}

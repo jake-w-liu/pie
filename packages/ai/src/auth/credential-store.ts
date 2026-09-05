@@ -29,7 +29,9 @@ export class InMemoryCredentialStore implements CredentialStore {
 
 	async read(providerId: string, options?: AuthOperationOptions): Promise<Credential | undefined> {
 		options?.signal?.throwIfAborted();
-		return this.credentials.get(providerId);
+		const credential = this.credentials.get(providerId);
+		// Hand out a copy: callers must not be able to mutate stored auth state.
+		return credential === undefined ? undefined : structuredClone(credential);
 	}
 
 	async list(options?: AuthOperationOptions): Promise<readonly CredentialInfo[]> {
@@ -46,10 +48,13 @@ export class InMemoryCredentialStore implements CredentialStore {
 			providerId,
 			async () => {
 				const current = this.credentials.get(providerId);
-				const next = await fn(current);
+				const next = await fn(current === undefined ? undefined : structuredClone(current));
 				options?.signal?.throwIfAborted();
-				if (next !== undefined) this.credentials.set(providerId, next);
-				return next ?? current;
+				if (next !== undefined) {
+					this.credentials.set(providerId, structuredClone(next));
+					return next;
+				}
+				return current === undefined ? undefined : structuredClone(current);
 			},
 			options,
 		);

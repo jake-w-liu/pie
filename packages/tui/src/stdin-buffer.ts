@@ -18,6 +18,7 @@
  */
 
 import { EventEmitter } from "events";
+import { decodeKittyPrintable } from "./keys.ts";
 
 const ESC = "\x1b";
 const DEFAULT_SEQUENCE_TIMEOUT_MS = 50;
@@ -184,11 +185,12 @@ function isCompleteApcSequence(data: string): "complete" | "incomplete" {
  * Split accumulated buffer into complete sequences
  */
 function parseUnmodifiedKittyPrintableCodepoint(sequence: string): number | undefined {
-	const match = sequence.match(/^\x1b\[(\d+)(?::\d*)?(?::\d+)?u$/);
-	if (!match) return undefined;
-
-	const codepoint = parseInt(match[1]!, 10);
-	return codepoint >= 32 ? codepoint : undefined;
+	// Mirror insertion exactly: the pending value must be the code point the
+	// consumer will insert (shift-preferred, functional-normalized), not the
+	// raw CSI-u base code point, or a following genuine keypress gets eaten.
+	const printable = decodeKittyPrintable(sequence);
+	if (printable === undefined) return undefined;
+	return printable.codePointAt(0);
 }
 
 function extractCompleteSequences(buffer: string): { sequences: string[]; remainder: string } {

@@ -81,30 +81,39 @@ function safeJsonStringify(value: unknown): string {
 	}
 }
 
+/** Safe JSON serialization shared by compaction and branch summarization. */
+export { safeJsonStringify };
+
+/**
+ * Truncate text to a maximum character length for summarization.
+ * Keeps an 80% head and 20% tail joined by a marker so trailing details survive.
+ */
 function truncateForSummary(text: string, maxChars: number): string {
 	if (text.length <= maxChars) return text;
-	const truncatedChars = text.length - maxChars;
-	return `${text.slice(0, maxChars)}\n\n[... ${truncatedChars} more characters truncated]`;
+	const headChars = Math.floor(maxChars * 0.8);
+	const tailChars = Math.max(0, maxChars - headChars);
+	return `${text.slice(0, headChars)}\n\n[... middle truncated (${text.length} chars -> ${maxChars})]\n\n${text.slice(text.length - tailChars)}`;
 }
 
 function boundedContentText(content: string | readonly { type: string; text?: string }[], maxChars: number): string {
 	if (typeof content === "string") return truncateForSummary(content, maxChars);
 
 	let totalChars = 0;
-	let remainingChars = maxChars;
-	const parts: string[] = [];
+	let fullText = "";
 	for (const block of content) {
 		if (block.type !== "text" || block.text === undefined) continue;
 		totalChars += block.text.length;
-		if (remainingChars <= 0) continue;
-		const part = block.text.slice(0, remainingChars);
-		parts.push(part);
-		remainingChars -= part.length;
+		fullText += block.text;
 	}
 
-	const text = parts.join("");
-	if (totalChars <= maxChars) return text;
-	return `${text}\n\n[... ${totalChars - maxChars} more characters truncated]`;
+	if (totalChars <= maxChars) return fullText;
+	// Head/tail splice over the FULL content so the trailing details survive even
+	// when a single block far exceeds the budget (pre-truncating per block would
+	// keep only the head and silently drop the true tail).
+	const trailingKeep = Math.floor(maxChars * 0.2);
+	const head = fullText.slice(0, Math.max(0, maxChars - trailingKeep));
+	const tail = fullText.slice(fullText.length - trailingKeep);
+	return `${head}\n\n[... middle truncated (${totalChars} chars -> ${maxChars})]\n\n${tail}`;
 }
 
 /** Serialize LLM messages to plain text for summarization prompts. */

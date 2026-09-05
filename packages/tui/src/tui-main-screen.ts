@@ -11,6 +11,7 @@ import {
 	normalizeTerminalOutput,
 	sliceByColumn,
 	stripTerminalSequences,
+	truncateToWidth,
 	visibleWidth,
 } from "./utils.ts";
 
@@ -876,10 +877,14 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const debugRedraw = process.env.PI_DEBUG_REDRAW === "1";
 		const logRedraw = (reason: string): void => {
 			if (!debugRedraw) return;
-			const logPath = path.join(this.logDirectory, "pi-debug.log");
-			const msg = `[${new Date().toISOString()}] fullRender: ${reason} (prev=${this.previousLines.length}, new=${newLines.length}, height=${height})\n`;
-			fs.mkdirSync(path.dirname(logPath), { recursive: true });
-			fs.appendFileSync(logPath, msg);
+			try {
+				const logPath = path.join(this.logDirectory, "pi-debug.log");
+				const msg = `[${new Date().toISOString()}] fullRender: ${reason} (prev=${this.previousLines.length}, new=${newLines.length}, height=${height})\n`;
+				fs.mkdirSync(path.dirname(logPath), { recursive: true });
+				fs.appendFileSync(logPath, msg);
+			} catch {
+				// Diagnostics must never break rendering.
+			}
 		};
 
 		// First render - just output everything without clearing (assumes clean screen)
@@ -1041,7 +1046,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const renderEnd = Math.min(lastChanged, newLines.length - 1);
 		for (let i = firstChanged; i <= renderEnd; i++) {
 			if (i > firstChanged) output.append("\r\n");
-			const line = newLines[i];
+			let line = newLines[i]!;
 			const isImage = isImageLine(line);
 			const imageReservedRows = isImage ? this.getKittyImageReservedRows(newLines, i, renderEnd) : 1;
 			if (imageReservedRows > 1) {
@@ -1065,34 +1070,29 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				continue;
 			}
 
-			const lineWidth = isImage ? 0 : visibleWidth(line);
+			let lineWidth = isImage ? 0 : visibleWidth(line);
 			if (!isImage && lineWidth > width) {
-				// Log all lines to crash file for debugging
-				const crashLogPath = path.join(this.logDirectory, "pi-crash.log");
-				const crashData = [
-					`Crash at ${new Date().toISOString()}`,
-					`Terminal width: ${width}`,
-					`Line ${i} visible width: ${lineWidth}`,
-					"",
-					"=== All rendered lines ===",
-					...newLines.map((l, idx) => `[${idx}] (w=${visibleWidth(l)}) ${l}`),
-					"",
-				].join("\n");
-				fs.mkdirSync(path.dirname(crashLogPath), { recursive: true });
-				fs.writeFileSync(crashLogPath, crashData);
-
-				// Clean up terminal state before throwing
-				this.stop();
-
-				const errorMsg = [
-					`Rendered line ${i} exceeds terminal width (${lineWidth} > ${width}).`,
-					"",
-					"This is likely caused by a custom TUI component not truncating its output.",
-					"Use visibleWidth() to measure and truncateToWidth() to truncate lines.",
-					"",
-					`Debug log written to: ${crashLogPath}`,
-				].join("\n");
-				throw new Error(errorMsg);
+				// An over-wide line must never kill the session: a 1-column
+				// width disagreement (new emoji, custom component bug) would
+				// otherwise crash the agent mid-run. Truncate, record, and
+				// fall through to the normal write path below.
+				try {
+					const crashLogPath = path.join(this.logDirectory, "pi-crash.log");
+					const crashData = [
+						`Truncated over-wide line at ${new Date().toISOString()}`,
+						`Terminal width: ${width}`,
+						`Line ${i} visible width: ${lineWidth}`,
+						`Line content: ${line.slice(0, 500)}`,
+						"",
+					].join("\n");
+					fs.mkdirSync(path.dirname(crashLogPath), { recursive: true });
+					fs.appendFileSync(crashLogPath, `${crashData}\n`);
+				} catch {
+					// Diagnostics must never break rendering.
+				}
+				line = truncateToWidth(line, width);
+				newLines[i] = line;
+				lineWidth = visibleWidth(line);
 			}
 			if (isImage) {
 				output.append("\x1b[2K");
@@ -1125,32 +1125,36 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		output.append("\x1b[?2026l"); // End synchronized output
 
 		if (process.env.PI_TUI_DEBUG === "1") {
-			const debugDir = "/tmp/tui";
-			fs.mkdirSync(debugDir, { recursive: true });
-			const debugPath = path.join(debugDir, `render-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
-			const debugData = [
-				`firstChanged: ${firstChanged}`,
-				`viewportTop: ${viewportTop}`,
-				`cursorRow: ${this.cursorRow}`,
-				`height: ${height}`,
-				`lineDiff: ${lineDiff}`,
-				`hardwareCursorRow: ${hardwareCursorRow}`,
-				`renderEnd: ${renderEnd}`,
-				`finalCursorRow: ${finalCursorRow}`,
-				`cursorPos: ${JSON.stringify(cursorPos)}`,
-				`newLines.length: ${newLines.length}`,
-				`previousLines.length: ${this.previousLines.length}`,
-				"",
-				"=== newLines ===",
-				JSON.stringify(newLines, null, 2),
-				"",
-				"=== previousLines ===",
-				JSON.stringify(this.previousLines, null, 2),
-				"",
-				"=== buffer ===",
-				`[${output.length} chars written in bounded chunks]`,
-			].join("\n");
-			fs.writeFileSync(debugPath, debugData);
+			try {
+				const debugDir = "/tmp/tui";
+				fs.mkdirSync(debugDir, { recursive: true });
+				const debugPath = path.join(debugDir, `render-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+				const debugData = [
+					`firstChanged: ${firstChanged}`,
+					`viewportTop: ${viewportTop}`,
+					`cursorRow: ${this.cursorRow}`,
+					`height: ${height}`,
+					`lineDiff: ${lineDiff}`,
+					`hardwareCursorRow: ${hardwareCursorRow}`,
+					`renderEnd: ${renderEnd}`,
+					`finalCursorRow: ${finalCursorRow}`,
+					`cursorPos: ${JSON.stringify(cursorPos)}`,
+					`newLines.length: ${newLines.length}`,
+					`previousLines.length: ${this.previousLines.length}`,
+					"",
+					"=== newLines ===",
+					JSON.stringify(newLines, null, 2),
+					"",
+					"=== previousLines ===",
+					JSON.stringify(this.previousLines, null, 2),
+					"",
+					"=== buffer ===",
+					`[${output.length} chars written in bounded chunks]`,
+				].join("\n");
+				fs.writeFileSync(debugPath, debugData);
+			} catch {
+				// Diagnostics must never break rendering.
+			}
 		}
 
 		output.flush();
@@ -1197,8 +1201,9 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		} else if (rowDelta < 0) {
 			buffer += `\x1b[${-rowDelta}A`; // Move up
 		}
-		// Move to absolute column (1-indexed)
-		buffer += `\x1b[${targetCol + 1}G`;
+		// Move to absolute column (1-indexed, clamped to the last column so a
+		// cursor past end-of-line never wraps onto the next row).
+		buffer += `\x1b[${Math.min(this.terminal.columns, targetCol + 1)}G`;
 
 		if (buffer) {
 			this.terminal.write(buffer);

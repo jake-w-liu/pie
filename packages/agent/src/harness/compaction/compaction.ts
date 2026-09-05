@@ -3,12 +3,14 @@ import {
 	type AssistantMessage,
 	type Context,
 	contentText,
+	type Message,
 	type Model,
 	type Models,
 	type RetryCallbacks,
 	type RetryPolicy,
 	retryAssistantCall,
 	type SimpleStreamOptions,
+	type Tool,
 	type Usage,
 	uuidv7,
 } from "@earendil-works/pi-ai";
@@ -161,7 +163,15 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	keepRecentTokens: 20000,
 };
 
-function getSummarizationTokenBudget(reserveTokens: number, ratio: number, modelMaxTokens: number): number {
+/**
+ * Fractional context-window ceiling for the compaction trigger.
+ * Prevents large-context models from waiting until nearly full: the trigger is
+ * `min(ratio * contextWindow, contextWindow - reserveTokens)`.
+ */
+export const DEFAULT_COMPACTION_TRIGGER_RATIO = 0.87;
+
+/** Token budget for a summarization request, shared by compaction and branch summaries. */
+export function getSummarizationTokenBudget(reserveTokens: number, ratio: number, modelMaxTokens: number): number {
 	const effectiveReserve =
 		Number.isFinite(reserveTokens) && reserveTokens > 0 ? reserveTokens : DEFAULT_COMPACTION_SETTINGS.reserveTokens;
 	const reserveBudget = Math.max(1, Math.floor(effectiveReserve * ratio));
@@ -172,29 +182,39 @@ function getSummarizationTokenBudget(reserveTokens: number, ratio: number, model
 	return Math.min(reserveBudget, modelBudget);
 }
 
+/**
+ * Returns an error message when a summarization response cannot be persisted.
+ * A length stop contains partial text and must not become a session checkpoint.
+ * Shared by compaction and branch summarization; Result-throwing wrappers differ per caller.
+ */
+export function getSummarizationFailure(
+	response: AssistantMessage,
+	label: string,
+	summaryText = contentText(response.content),
+): string | undefined {
+	if (response.stopReason === "error") {
+		return `${label} failed: ${response.errorMessage || "Unknown error"}`;
+	}
+	if (response.stopReason === "length") {
+		return `${label} failed: generation hit the token cap and the summary is incomplete`;
+	}
+	if (!response.content.some((block) => block.type === "toolCall") && summaryText.trim().length === 0) {
+		return `${label} failed: response contained no summary text`;
+	}
+	return undefined;
+}
+
 function extractSummaryText(response: AssistantMessage, label: string): Result<string, CompactionError> {
 	if (response.stopReason === "aborted") {
 		return err(new CompactionError("aborted", response.errorMessage || `${label} aborted`));
-	}
-	if (response.stopReason === "error") {
-		return err(
-			new CompactionError("summarization_failed", `${label} failed: ${response.errorMessage || "Unknown error"}`),
-		);
-	}
-	if (response.stopReason === "length") {
-		return err(
-			new CompactionError(
-				"summarization_failed",
-				`${label} failed: generation hit the token cap and the summary is incomplete`,
-			),
-		);
 	}
 	if (response.content.some((block) => block.type === "toolCall")) {
 		return err(new CompactionError("summarization_failed", `${label} attempted to call a tool`));
 	}
 	const text = contentText(response.content);
-	if (text.trim().length === 0) {
-		return err(new CompactionError("summarization_failed", `${label} failed: response contained no summary text`));
+	const failure = getSummarizationFailure(response, label, text);
+	if (failure) {
+		return err(new CompactionError("summarization_failed", failure));
 	}
 	return ok(text);
 }
@@ -281,10 +301,20 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 	};
 }
 
-/** Return whether context usage exceeds the configured compaction threshold. */
+/**
+ * Return whether context usage exceeds the configured compaction threshold.
+ *
+ * The ratio boundary prevents large-context models from waiting until nearly
+ * full, while the reserve boundary remains authoritative when it is stricter.
+ */
 export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
-	if (!settings.enabled) return false;
-	return contextTokens > contextWindow - settings.reserveTokens;
+	if (!settings.enabled || !Number.isFinite(contextWindow) || contextWindow <= 0 || contextTokens <= 0) return false;
+
+	const reserveTokens = Number.isFinite(settings.reserveTokens) ? Math.max(0, settings.reserveTokens) : 0;
+	const ratioBoundary = Math.floor(contextWindow * DEFAULT_COMPACTION_TRIGGER_RATIO);
+	const reserveBoundary = contextWindow - reserveTokens;
+	const triggerBoundary = Math.max(1, Math.min(ratioBoundary, reserveBoundary));
+	return contextTokens >= triggerBoundary;
 }
 
 const ESTIMATED_IMAGE_CHARS = 4800;
@@ -390,7 +420,13 @@ export function findTurnStartIndex(entries: Entry[], entryIndex: number, startIn
 		}
 		if (entry.type === "message") {
 			const role = entry.message.role;
-			if (role === "user" || role === "bashExecution") {
+			if (
+				role === "user" ||
+				role === "bashExecution" ||
+				role === "custom" ||
+				role === "branchSummary" ||
+				role === "compactionSummary"
+			) {
 				return i;
 			}
 		}
@@ -427,12 +463,26 @@ export function findCutPoint(
 		const entry = entries[i];
 		if (entry.type !== "message") continue;
 		const messageTokens = estimateTokens(entry.message as AgentMessage);
+		if (messageTokens === 0) continue;
 		accumulatedTokens += messageTokens;
 		if (accumulatedTokens >= keepRecentTokens) {
+			// Prefer the closest valid cut point at or after this entry. When the
+			// budget is crossed by a trailing tool result, keep its preceding
+			// assistant tool call too so the pair remains valid.
+			let foundCutPoint = false;
 			for (let c = 0; c < cutPoints.length; c++) {
 				if (cutPoints[c] >= i) {
 					cutIndex = cutPoints[c];
+					foundCutPoint = true;
 					break;
+				}
+			}
+			if (!foundCutPoint) {
+				for (let c = cutPoints.length - 1; c >= 0; c--) {
+					if (cutPoints[c] <= i) {
+						cutIndex = cutPoints[c];
+						break;
+					}
 				}
 			}
 			break;
@@ -440,28 +490,144 @@ export function findCutPoint(
 	}
 	while (cutIndex > startIndex) {
 		const prevEntry = entries[cutIndex - 1];
-		if (prevEntry.type === "compaction") {
-			break;
-		}
-		if (prevEntry.type === "message") {
+		// Stop at compaction boundaries or context-visible entries; absorb adjacent
+		// metadata entries that do not affect context.
+		if (prevEntry.type === "compaction" || prevEntry.type === "message") {
 			break;
 		}
 		cutIndex--;
 	}
 	const cutEntry = entries[cutIndex];
-	const isUserMessage = cutEntry.type === "message" && cutEntry.message.role === "user";
-	const turnStartIndex = isUserMessage ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
+	const startsTurn =
+		cutEntry.type === "branch_summary" ||
+		(cutEntry.type === "message" &&
+			(cutEntry.message.role === "user" ||
+				cutEntry.message.role === "bashExecution" ||
+				cutEntry.message.role === "custom" ||
+				cutEntry.message.role === "branchSummary" ||
+				cutEntry.message.role === "compactionSummary"));
+	const turnStartIndex = startsTurn ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
 
 	return {
 		firstKeptEntryIndex: cutIndex,
 		turnStartIndex,
-		isSplitTurn: !isUserMessage && turnStartIndex !== -1,
+		isSplitTurn: !startsTurn && turnStartIndex !== -1,
 	};
 }
 
 export const SUMMARIZATION_SYSTEM_PROMPT = `You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
 
 Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.`;
+
+/**
+ * Cache-reusing compaction directive, delivered as the FINAL user message after
+ * the replayed conversation prefix. Keeping the conversation's own system prompt,
+ * tools, and messages in front of it makes the summarization call a genuine prefix
+ * of the last routed request, so the provider's warm prefix cache is reused.
+ */
+export const SUMMARIZATION_INSTRUCTION = `You are now acting as a compaction engine for this AI coding assistant. Condense the conversation ABOVE into a structured checkpoint that lets another model resume the work with no loss of essential context.
+
+Output EXACTLY the Markdown structure below: keep every section, in order. Use terse bullets, not prose paragraphs. Write "(none)" for an empty section — never drop a section.
+
+## Goal
+- [what the user is trying to accomplish; quote verbatim where the exact wording matters]
+
+## Constraints & Preferences
+- [constraints, preferences, or requirements the user mentioned; or "(none)"]
+
+## Progress
+### Done
+- [x] [completed tasks/changes]
+
+### In Progress
+- [ ] [current work]
+
+### Blocked
+- [issues preventing progress, if any]
+
+## Key Decisions
+- **[Decision]**: [brief rationale]
+
+## Next Steps
+1. [ordered list of what should happen next]
+
+## Critical Context
+- [data, examples, or references needed to continue; or "(none)"]
+
+Rules:
+- Write concise English engineering prose. Preserve exact file paths, function names, commands, error strings, identifiers, numeric values, and syntax fragments.
+- Capture user feedback and explicit instructions faithfully, especially corrections.
+- Do NOT mention this summarization request or that the context was compacted.
+- Output only the checkpoint text: do not call any tool or take any other action.
+- Do NOT continue the conversation or respond to any question in it; ONLY output the structured summary.`;
+
+/** Live-conversation prefix for cache-reusing summarization. Omit to use the serialized-text fallback. */
+export interface SummarizationCacheReuse {
+	/** Live conversation system prompt, replayed verbatim for prefix alignment. */
+	systemPrompt?: string;
+	/** Live conversation tool schemas, replayed for prefix alignment. */
+	tools?: readonly Tool[];
+}
+
+/** Build the provider context for a standalone serialized-text summary request. */
+export function buildSummarizationContext(promptText: string): Context {
+	return {
+		systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
+		messages: [
+			{
+				role: "user",
+				content: [{ type: "text", text: promptText }],
+				timestamp: Date.now(),
+			},
+		],
+	};
+}
+
+/**
+ * Build a cache-reusing summarization context: replay the live system prompt and
+ * tool schemas verbatim, append the conversation messages as a prefix, and deliver
+ * the compaction instruction as the FINAL user message.
+ */
+export function buildCacheReusingSummarizationContext(
+	systemPrompt: string,
+	tools: readonly Tool[] | undefined,
+	instruction: string,
+	messages: readonly Message[],
+): Context {
+	const context: Context = {
+		systemPrompt,
+		messages: [
+			...messages,
+			{
+				role: "user",
+				content: [{ type: "text", text: instruction }],
+				timestamp: Date.now(),
+			},
+		],
+	};
+	if (tools !== undefined && tools.length > 0) {
+		context.tools = [...tools];
+	}
+	return context;
+}
+
+/**
+ * Build the compaction instruction for the cache-reusing path, merging any prior
+ * summary and custom focus instead of copying a prior checkpoint verbatim.
+ */
+export function buildCompactionInstruction(
+	previousSummary: string | undefined,
+	customInstructions: string | undefined,
+): string {
+	let instruction = SUMMARIZATION_INSTRUCTION;
+	if (previousSummary) {
+		instruction += `\n\n<previous-summary>\n${previousSummary}\n</previous-summary>\n\nIf the conversation already contained a prior checkpoint, do not copy it forward verbatim: preserve still-true facts, drop stale ones, and merge newer information into a single consolidated summary under the same structure.`;
+	}
+	if (customInstructions) {
+		instruction += `\n\nAdditional focus: ${customInstructions}`;
+	}
+	return instruction;
+}
 
 const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
 
@@ -547,6 +713,7 @@ export async function generateSummary(
 	thinkingLevel?: ThinkingLevel,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	cacheReuse?: SummarizationCacheReuse,
 ): Promise<Result<string, CompactionError>> {
 	const result = await generateSummaryWithUsage(
 		currentMessages,
@@ -559,6 +726,7 @@ export async function generateSummary(
 		thinkingLevel,
 		retry,
 		callbacks,
+		cacheReuse,
 	);
 	return result.ok ? ok(result.value.text) : err(result.error);
 }
@@ -575,27 +743,41 @@ export async function generateSummaryWithUsage(
 	thinkingLevel?: ThinkingLevel,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	cacheReuse?: SummarizationCacheReuse,
 ): Promise<Result<{ text: string; usage: Usage }, CompactionError>> {
 	const maxTokens = getSummarizationTokenBudget(reserveTokens, 0.8, model.maxTokens);
+	const llmMessages = convertToLlm(currentMessages);
+
+	// Cache-reusing path: replay the live system prompt + messages as a prefix and
+	// append the compaction instruction as the final user message.
+	if (cacheReuse?.systemPrompt !== undefined) {
+		const instruction = buildCompactionInstruction(previousSummary, customInstructions);
+		const completionOptions =
+			model.reasoning && thinkingLevel && thinkingLevel !== "off"
+				? { maxTokens, signal, reasoning: thinkingLevel }
+				: { maxTokens, signal };
+		const response = await completeSimpleWithRetries(
+			models,
+			model,
+			buildCacheReusingSummarizationContext(cacheReuse.systemPrompt, cacheReuse.tools, instruction, llmMessages),
+			completionOptions,
+			retry,
+			callbacks,
+		);
+		const text = extractSummaryText(response, "Summarization");
+		return text.ok ? ok({ text: text.value, usage: response.usage }) : err(text.error);
+	}
+
 	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
 	if (customInstructions) {
 		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
 	}
-	const llmMessages = convertToLlm(currentMessages);
 	const conversationText = serializeConversation(llmMessages);
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
 	if (previousSummary) {
 		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
 	}
 	promptText += basePrompt;
-
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
 
 	const completionOptions =
 		model.reasoning && thinkingLevel && thinkingLevel !== "off"
@@ -605,7 +787,7 @@ export async function generateSummaryWithUsage(
 	const response = await completeSimpleWithRetries(
 		models,
 		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
+		buildSummarizationContext(promptText),
 		completionOptions,
 		retry,
 		callbacks,

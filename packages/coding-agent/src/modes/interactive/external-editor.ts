@@ -11,12 +11,68 @@ export interface ExternalEditorOptions {
 
 export type ExternalEditorResult = { status: "complete"; content: string } | { status: "failed" };
 
+/**
+ * Split an editor command into argv with shell-like quoting: single quotes
+ * are literal, double quotes honor `\"` and `\\` escapes, and a backslash
+ * outside quotes escapes the next character. Keeps quoted install paths
+ * (notably Windows `C:\...` paths) intact.
+ */
+export function splitEditorCommand(command: string): string[] {
+	const args: string[] = [];
+	let current = "";
+	let quote: string | undefined;
+	let hasToken = false;
+	const pushToken = (): void => {
+		if (hasToken) {
+			args.push(current);
+			current = "";
+			hasToken = false;
+		}
+	};
+	for (let i = 0; i < command.length; i++) {
+		const char = command[i]!;
+		if (quote === "'") {
+			// Single quotes: everything literal until the closing quote.
+			if (char === "'") {
+				quote = undefined;
+			} else {
+				current += char;
+				hasToken = true;
+			}
+		} else if (quote === '"') {
+			if (char === '"') {
+				quote = undefined;
+			} else if (char === "\\" && i + 1 < command.length && '"\\'.includes(command[i + 1]!)) {
+				current += command[++i]!;
+				hasToken = true;
+			} else {
+				current += char;
+				hasToken = true;
+			}
+		} else if (char === '"' || char === "'") {
+			quote = char;
+			hasToken = true;
+		} else if (char === "\\" && i + 1 < command.length) {
+			current += command[++i]!;
+			hasToken = true;
+		} else if (/\s/.test(char)) {
+			pushToken();
+		} else {
+			current += char;
+			hasToken = true;
+		}
+	}
+	pushToken();
+	return args;
+}
+
 export async function editInExternalEditor(options: ExternalEditorOptions): Promise<ExternalEditorResult> {
 	const directory = mkdtempSync(join(tmpdir(), "pi-editor-"));
 	const filePath = join(directory, "prompt.md");
 	try {
 		writeFileSync(filePath, options.content, "utf-8");
-		const [editor, ...editorArgs] = options.command.split(" ");
+		const [editor, ...editorArgs] = splitEditorCommand(options.command);
+		if (!editor) return { status: "failed" };
 		process.stdout.write(`Launching external editor: ${options.command}\nPi will resume when the editor exits.\n`);
 
 		// Do not use spawnSync here. On Windows, synchronous child_process calls can keep

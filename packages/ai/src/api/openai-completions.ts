@@ -839,8 +839,10 @@ function buildParams(
 			(params as any).tool_stream = true;
 		}
 	} else if (hasToolHistory(context.messages)) {
-		// Anthropic (via LiteLLM/proxy) requires tools param when conversation has tool_calls/tool_results
-		params.tools = [];
+		// Anthropic (via LiteLLM/proxy) requires tools param when conversation has tool_calls/tool_results.
+		// Strict OpenAI-compatible endpoints (Together/NVIDIA-class) reject an
+		// empty array, so only send it for Anthropic-shaped requests.
+		if (cacheControl) params.tools = [];
 	}
 
 	if (cacheControl) {

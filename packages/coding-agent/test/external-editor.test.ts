@@ -3,7 +3,11 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { type ExternalEditorResult, editInExternalEditor } from "../src/modes/interactive/external-editor.ts";
+import {
+	type ExternalEditorResult,
+	editInExternalEditor,
+	splitEditorCommand,
+} from "../src/modes/interactive/external-editor.ts";
 
 const editorFixturePath = fileURLToPath(new URL("./fixtures/fake-external-editor.mjs", import.meta.url));
 
@@ -59,5 +63,24 @@ describe("editInExternalEditor", () => {
 		const { result } = await runExternalEditor("--empty");
 
 		expect(result).toEqual({ status: "complete", content: "" });
+	});
+});
+
+describe("splitEditorCommand", () => {
+	it("splits plain commands on whitespace", () => {
+		expect(splitEditorCommand("code --wait")).toEqual(["code", "--wait"]);
+		expect(splitEditorCommand("  code   --wait  ")).toEqual(["code", "--wait"]);
+		expect(splitEditorCommand("")).toEqual([]);
+	});
+
+	it("keeps quoted install paths intact", () => {
+		expect(splitEditorCommand('"/Applications/My Editor.app" --wait')).toEqual([
+			"/Applications/My Editor.app",
+			"--wait",
+		]);
+		expect(splitEditorCommand("'C:\\My Tools\\editor.exe' --wait")).toEqual(["C:\\My Tools\\editor.exe", "--wait"]);
+		expect(splitEditorCommand('cmd "a b" c\\ d')).toEqual(["cmd", "a b", "c d"]);
+		expect(splitEditorCommand('"C:\\new\\test.exe" --wait')).toEqual(["C:\\new\\test.exe", "--wait"]);
+		expect(splitEditorCommand("'a\\b'")).toEqual(["a\\b"]);
 	});
 });

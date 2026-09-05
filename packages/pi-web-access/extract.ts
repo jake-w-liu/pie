@@ -319,16 +319,25 @@ async function extractWithJinaReader(
 			domainPolicy,
 			...(lookup ? { lookup } : {}),
 		});
-		const res = await fetch(jinaUrl, {
-			headers: {
-				"Accept": "text/markdown",
-				"X-No-Cache": "true",
+		const res = await fetchRemoteUrl(
+			jinaUrl,
+			{
+				headers: {
+					"Accept": "text/markdown",
+					"X-No-Cache": "true",
+				},
+				signal: AbortSignal.any([
+					AbortSignal.timeout(JINA_TIMEOUT_MS),
+					...(signal ? [signal] : []),
+				]),
 			},
-			signal: AbortSignal.any([
-				AbortSignal.timeout(JINA_TIMEOUT_MS),
-				...(signal ? [signal] : []),
-			]),
-		});
+			{
+				allowRanges: ssrf.allowRanges,
+				trustEnvProxy: ssrf.trustEnvProxy,
+				domainPolicy,
+				...(lookup ? { lookup } : {}),
+			},
+		);
 
 		if (!res.ok) {
 			activityMonitor.logComplete(activityId, res.status);

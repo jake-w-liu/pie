@@ -100,12 +100,17 @@ export function withRemoteCatalog(
 				return;
 			}
 			if (response.status === 404 || response.status === 501) {
+				// No remote catalog for this provider: clear the overlay in memory
+				// as well as in storage so stale models stop listing immediately.
 				await context.publish({
 					persist: {
 						...(stored ?? { models: [] }),
 						checkedAt,
 						lastModified: 0,
 						etag: undefined,
+					},
+					update: () => {
+						dynamicModels = [];
 					},
 				});
 				return;

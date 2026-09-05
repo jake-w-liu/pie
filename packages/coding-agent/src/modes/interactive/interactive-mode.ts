@@ -547,6 +547,29 @@ export class InteractiveMode {
 	// Auto-retry state
 	private retryEscapeHandler?: () => void;
 
+	// Stack of temporarily installed editor escape handlers (compaction,
+	// retry, ...). Save slots race when those operations overlap; a stack
+	// keeps each end paired with its own install in any order.
+	private escapeHandlerStack: Array<() => void> = [];
+
+	private pushEscapeHandler(handler: () => void): void {
+		const current = this.defaultEditor.onEscape;
+		if (current) this.escapeHandlerStack.push(current);
+		this.defaultEditor.onEscape = handler;
+	}
+
+	private popEscapeHandler(handler: () => void): void {
+		if (this.defaultEditor.onEscape === handler) {
+			this.defaultEditor.onEscape = this.escapeHandlerStack.pop();
+		} else {
+			// Another feature installed on top while this one was running; drop
+			// our frame and leave the active handler (it belongs to whoever is
+			// still running).
+			const index = this.escapeHandlerStack.lastIndexOf(handler);
+			if (index >= 0) this.escapeHandlerStack.splice(index, 1);
+		}
+	}
+
 	// Messages queued while compaction is running
 	private compactionQueuedMessages: CompactionQueuedMessage[] = [];
 
@@ -2101,6 +2124,11 @@ export class InteractiveMode {
 		this.loadedResourcesContainer.clear();
 		this.chatContainer.clear();
 		this.pendingMessagesContainer.clear();
+		// Drop pending bash UI with the containers above: those components
+		// belong to the previous binding, and flushing them later would move
+		// stale executions into the new session's chat.
+		this.pendingBashComponents = [];
+		this.bashComponent = undefined;
 		this.compactionQueuedMessages = [];
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
@@ -3257,7 +3285,7 @@ export class InteractiveMode {
 				// Restore main escape handler if retry handler is still active
 				// (retry success event fires later, but we need main handler now)
 				if (this.retryEscapeHandler) {
-					this.defaultEditor.onEscape = this.retryEscapeHandler;
+					this.popEscapeHandler(this.retryEscapeHandler);
 					this.retryEscapeHandler = undefined;
 				}
 				break;
@@ -3469,10 +3497,10 @@ export class InteractiveMode {
 					this.ui.terminal.setProgress(true);
 				}
 				// Keep editor active; submissions are queued during compaction.
-				this.autoCompactionEscapeHandler = this.defaultEditor.onEscape;
-				this.defaultEditor.onEscape = () => {
+				this.autoCompactionEscapeHandler = () => {
 					this.session.abortCompaction();
 				};
+				this.pushEscapeHandler(this.autoCompactionEscapeHandler);
 				this.showStatusIndicator(new CompactionStatusIndicator(this.ui, event.reason));
 				this.ui.requestRender();
 				break;
@@ -3483,7 +3511,7 @@ export class InteractiveMode {
 					this.ui.terminal.setProgress(false);
 				}
 				if (this.autoCompactionEscapeHandler) {
-					this.defaultEditor.onEscape = this.autoCompactionEscapeHandler;
+					this.popEscapeHandler(this.autoCompactionEscapeHandler);
 					this.autoCompactionEscapeHandler = undefined;
 				}
 				this.clearStatusIndicator("compaction");
@@ -3539,10 +3567,10 @@ export class InteractiveMode {
 
 			case "auto_retry_start": {
 				// Set up escape to abort retry
-				this.retryEscapeHandler = this.defaultEditor.onEscape;
-				this.defaultEditor.onEscape = () => {
+				this.retryEscapeHandler = () => {
 					this.session.abortRetry();
 				};
+				this.pushEscapeHandler(this.retryEscapeHandler);
 				this.showStatusIndicator(
 					new RetryStatusIndicator(this.ui, event.attempt, event.maxAttempts, event.delayMs),
 				);
@@ -3553,7 +3581,7 @@ export class InteractiveMode {
 			case "auto_retry_end": {
 				// Restore escape handler
 				if (this.retryEscapeHandler) {
-					this.defaultEditor.onEscape = this.retryEscapeHandler;
+					this.popEscapeHandler(this.retryEscapeHandler);
 					this.retryEscapeHandler = undefined;
 				}
 				this.clearStatusIndicator("retry");
@@ -6087,7 +6115,11 @@ export class InteractiveMode {
 	}
 
 	private async handleExportCommand(text: string): Promise<void> {
-		const outputPath = this.getPathCommandArgument(text, "/export");
+		const { path: outputPath, unterminatedQuote } = this.getPathCommandArgument(text, "/export");
+		if (unterminatedQuote) {
+			this.showError("Usage: /export [path] (unterminated quote)");
+			return;
+		}
 
 		try {
 			if (outputPath?.endsWith(".jsonl")) {
@@ -6104,37 +6136,44 @@ export class InteractiveMode {
 		}
 	}
 
-	private getPathCommandArgument(text: string, command: "/export" | "/import"): string | undefined {
+	private getPathCommandArgument(
+		text: string,
+		command: "/export" | "/import",
+	): { path?: string; unterminatedQuote: boolean } {
 		if (text === command) {
-			return undefined;
+			return { unterminatedQuote: false };
 		}
 		if (!text.startsWith(`${command} `)) {
-			return undefined;
+			return { unterminatedQuote: false };
 		}
 
 		const argsString = text.slice(command.length + 1).trimStart();
 		if (!argsString) {
-			return undefined;
+			return { unterminatedQuote: false };
 		}
 
 		const firstChar = argsString[0];
 		if (firstChar === '"' || firstChar === "'") {
 			const closingQuoteIndex = argsString.indexOf(firstChar, 1);
 			if (closingQuoteIndex < 0) {
-				return undefined;
+				return { unterminatedQuote: true };
 			}
-			return argsString.slice(1, closingQuoteIndex);
+			return { path: argsString.slice(1, closingQuoteIndex), unterminatedQuote: false };
 		}
 
 		const firstWhitespaceIndex = argsString.search(/\s/);
 		if (firstWhitespaceIndex < 0) {
-			return argsString;
+			return { path: argsString, unterminatedQuote: false };
 		}
-		return argsString.slice(0, firstWhitespaceIndex);
+		return { path: argsString.slice(0, firstWhitespaceIndex), unterminatedQuote: false };
 	}
 
 	private async handleImportCommand(text: string): Promise<void> {
-		const inputPath = this.getPathCommandArgument(text, "/import");
+		const { path: inputPath, unterminatedQuote } = this.getPathCommandArgument(text, "/import");
+		if (unterminatedQuote) {
+			this.showError("Usage: /import <path.jsonl> (unterminated quote)");
+			return;
+		}
 		if (!inputPath) {
 			this.showError("Usage: /import <path.jsonl>");
 			return;
@@ -6618,8 +6657,12 @@ export class InteractiveMode {
 
 		try {
 			await this.session.compact(customInstructions);
-		} catch {
-			// Ignore, will be emitted as an event
+		} catch (error: unknown) {
+			// Async failures surface via compaction_end; only synchronous
+			// rejections (nothing will emit) need direct feedback.
+			if (!this.session.isCompacting) {
+				this.showError(error instanceof Error ? error.message : String(error));
+			}
 		}
 	}
 
@@ -6633,6 +6676,10 @@ export class InteractiveMode {
 		this.clearExtensionTerminalInputListeners();
 		this.footer.dispose();
 		this.footerDataProvider.dispose();
+		this.customFooter?.dispose?.();
+		this.customFooter = undefined;
+		this.customHeader?.dispose?.();
+		this.customHeader = undefined;
 		if (this.unsubscribe) {
 			this.unsubscribe();
 		}

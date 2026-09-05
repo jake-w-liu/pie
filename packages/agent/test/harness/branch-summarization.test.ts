@@ -97,7 +97,7 @@ describe("v4 branch summarization", () => {
 
 		const prompt = JSON.stringify(requestContext?.messages);
 		expect(prompt).toContain("[Tool result]: critical result");
-		expect(prompt).toContain("more characters truncated");
+		expect(prompt).toContain("[... middle truncated (");
 	});
 
 	it("carries file tracking forward from compaction details", async () => {

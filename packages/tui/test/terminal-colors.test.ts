@@ -265,4 +265,26 @@ describe("TUI.queryTerminalBackgroundColor", () => {
 			tui.stop();
 		}
 	});
+
+	it("releases timed-out queries from the reply counter", async () => {
+		const terminal = new TestTerminal();
+		const tui: TUI = new TuiMainScreen(terminal);
+		tui.start();
+		try {
+			const queries = Array.from({ length: 5 }, () => tui.queryTerminalBackgroundColor({ timeoutMs: 1 }));
+			assert.deepStrictEqual(await Promise.all(queries), new Array(5).fill(undefined));
+			assert.strictEqual(Reflect.get(tui, "pendingOsc11BackgroundReplies"), 0);
+
+			// Late replies for timed-out queries are still absorbed, not leaked.
+			const component = new InputRecorder();
+			tui.addChild(component);
+			tui.setFocus(component);
+			terminal.sendInput("\x1b]11;#ffffff\x07");
+			await wait(5);
+			assert.deepStrictEqual(component.inputs, []);
+			assert.strictEqual(Reflect.get(tui, "pendingOsc11BackgroundReplies"), 0);
+		} finally {
+			tui.stop();
+		}
+	});
 });

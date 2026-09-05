@@ -158,6 +158,7 @@ describe("remote catalog provider", () => {
 		await refreshProvider(provider, store, { force: true });
 
 		expect((await store.read(provider.id))?.etag).toBeUndefined();
+		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static"]);
 	});
 
 	it("keeps the etag and overlay after a transient failure", async () => {

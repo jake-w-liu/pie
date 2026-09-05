@@ -8,6 +8,19 @@
 
 ### Fixed
 
+- Fixed OAuth catalog refreshes accepting nearly-expired tokens and hanging on unresponsive identity providers; the refresh path now shares the request path's five-minute freshness floor and 15-second refresh timeout.
+- Fixed bearer-token export rejecting freshly refreshed tokens that satisfy the requested minimum but not the five-minute trigger window.
+- Fixed in-memory credential reads and writes sharing live references, letting any caller mutation corrupt stored auth state; credentials are now cloned across the store boundary.
+- Fixed empty API keys being accepted at login and then silently falling through to ambient environment variables.
+- Fixed explicit empty-string environment overrides falling through to ambient values.
+- Fixed malformed provider usage producing negative cache-write charges.
+- Fixed unregistered-API stream calls throwing synchronously instead of encoding the failure in the returned stream.
+- Fixed Anthropic 1-hour cache writes reported only in usage deltas being billed at 5-minute rates.
+- Fixed Responses API sending the invalid `reasoning.effort: "none"` instead of omitting the object when thinking is off.
+- Fixed Responses stream error events rendering as `Error Code undefined: undefined`.
+- Fixed unknown Anthropic stop reasons and response statuses throwing away already-streamed content; they now surface as stream errors.
+- Fixed Anthropic SSE error events surfacing raw JSON instead of the provider message.
+- Fixed Google tool-call IDs embedding wall-clock time, breaking replay determinism.
 - Fixed OpenAI-compatible Chat Completions ignoring an explicitly requested `toolChoice` when no tools are defined.
 - Fixed thinking signature serialization to run once after the signature is complete ([#8671](https://github.com/earendil-works/pi/pull/8671)).
 - Fixed fragmented Mistral tool calls splitting when continuation chunks omit the tool-call ID ([#8387](https://github.com/earendil-works/pi/issues/8387)).

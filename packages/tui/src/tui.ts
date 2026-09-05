@@ -1025,12 +1025,11 @@ export abstract class TuiBase extends Container implements TUI {
 			data = current;
 		}
 
-		// Primary presses owned by this TUI are routed to the focused component
-		// and consumed. Fullscreen mode consumes its own events earlier through
-		// its viewport input listener; anything it defers (e.g. wheel over a
-		// focused overlay) must keep flowing, so only routed presses stop here.
-		// Unhandled mouse bytes fall through to keyboard handling, where
-		// components ignore them as non-printable input.
+		// Mouse input owned by this TUI is routed and consumed here. Fullscreen
+		// mode consumes its own events earlier through its viewport input
+		// listener; anything it defers (wheel over a focused overlay) must keep
+		// flowing, so a declined wheel is the only mouse sequence that falls
+		// through to keyboard handling (where components ignore the bytes).
 		const mouseEvent = parseSgrMouseEvent(data);
 		if (mouseEvent && this.mouseReportingActive) {
 			if (isPrimaryMousePress(mouseEvent)) {
@@ -1038,11 +1037,16 @@ export abstract class TuiBase extends Container implements TUI {
 				return;
 			}
 			if (isMouseDragMotion(mouseEvent)) {
-				if (this.routeMouseDrag(mouseEvent.x, mouseEvent.y)) return;
-			} else if (mouseEvent.press && (mouseEvent.button & 64) !== 0) {
+				this.routeMouseDrag(mouseEvent.x, mouseEvent.y);
+				return;
+			}
+			if (mouseEvent.press && (mouseEvent.button & 64) !== 0) {
 				if (this.routeMouseWheel(mouseEvent.button & 1 ? 1 : -1)) return;
 			} else if (!mouseEvent.press && (mouseEvent.button & 64) === 0) {
-				if (this.routeMouseRelease(mouseEvent.x, mouseEvent.y)) return;
+				this.routeMouseRelease(mouseEvent.x, mouseEvent.y);
+				return;
+			} else {
+				return;
 			}
 		}
 
@@ -1104,7 +1108,21 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	private consumeOsc11BackgroundResponse(data: string): boolean {
-		if (this.pendingOsc11BackgroundReplies <= 0 || !isOsc11BackgroundColorResponse(data)) {
+		if (!isOsc11BackgroundColorResponse(data)) {
+			return false;
+		}
+
+		// Absorb late replies for already-timed-out queries first: their
+		// counter share was released at timeout, but the bytes must still not
+		// leak into keyboard input.
+		const head = this.pendingOsc11BackgroundQueries[0];
+		if (head && "timedOut" in head) {
+			if (head.count > 1) head.count--;
+			else this.pendingOsc11BackgroundQueries.shift();
+			return true;
+		}
+
+		if (this.pendingOsc11BackgroundReplies <= 0) {
 			return false;
 		}
 
@@ -1133,6 +1151,10 @@ export abstract class TuiBase extends Container implements TUI {
 	private markOsc11BackgroundQueryTimedOut(query: PendingOsc11BackgroundQuery): void {
 		const index = this.pendingOsc11BackgroundQueries.indexOf(query);
 		if (index < 0) return;
+		// Release this query's reply expectation so timed-out queries cannot
+		// inflate the counter and widen the swallow window indefinitely. A late
+		// reply is still absorbed by the marker left below.
+		this.pendingOsc11BackgroundReplies -= 1;
 		const previous = this.pendingOsc11BackgroundQueries[index - 1];
 		const next = this.pendingOsc11BackgroundQueries[index + 1];
 		if (previous && "timedOut" in previous) {

@@ -138,7 +138,8 @@ export function resolveCuratorNetworkConfig(): CuratorNetworkConfig {
 		return {
 			enabled: true,
 			host: trimmedString(obj.host) ?? hostname(),
-			bind: trimmedString(obj.bind) ?? "0.0.0.0",
+			// Default to loopback: LAN exposure requires an explicit bind.
+			bind: trimmedString(obj.bind) ?? "127.0.0.1",
 		};
 	}
 

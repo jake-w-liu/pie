@@ -28,6 +28,22 @@
 
 ### Fixed
 
+- Fixed the model catalog overlay keeping stale models in memory after the remote catalog reports a provider as unavailable (404/501).
+- Fixed `PI_OFFLINE=0/false/no` disabling model networking while the package manager stayed online; all layers now share one offline check.
+- Fixed single-provider availability failures polluting the global models error, and credential operations reporting cancellation as synchronization failure.
+- Fixed extension-defined models dropping models.json provider-level compat routing.
+- Fixed non-content grep modes retaining every match in memory; only file paths are kept now.
+- Fixed `find`/`ls` accepting non-finite, negative, or absurd limits.
+- Fixed the read tool suggesting a shell fallback with an unquoted path.
+- Fixed management HTTP retries hammering immediately on rate limiting; server-sent `Retry-After` is now honored within a cap.
+- Fixed release tag values flowing unsanitized into tool download URLs and archive paths.
+- Fixed MLX server URLs without `http(s)` being accepted and MLX catalog fetches hanging without a timeout.
+- Fixed llama.cpp SSE watching buffering unbounded input on malfunctioning servers (4MB frame cap).
+- Fixed `/export` and `/import` silently misbehaving on unterminated quoted paths; they now report usage instead.
+- Fixed external editor commands with quoted install paths being split mid-token; splitting is now shell-quote aware.
+- Fixed `/compact` failures that emit no event leaving the user with no feedback.
+- Fixed stalled compaction/retry escape handlers clobbering each other; nested operations now use a handler stack.
+- Fixed pending bash UI leaking into the next session on rebind, and custom footers/headers leaking on stop.
 - Fixed model catalogs with output limits near or equal to their context windows triggering immediate auto-compaction and false context-limit stops during valid tool runs.
 - Fixed zero response-token reserves producing invalid summary request limits, and rejected empty compaction or branch summaries instead of persisting checkpoints without usable context.
 - Fixed branch summaries dropping tool results, including large results that fit after the summary serializer's bounded truncation.

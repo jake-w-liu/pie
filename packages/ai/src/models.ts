@@ -1,7 +1,12 @@
 import { lazyStream } from "./api/lazy.ts";
 import { defaultProviderAuthContext as defaultAuthContext } from "./auth/context.ts";
 import { InMemoryCredentialStore } from "./auth/credential-store.ts";
-import { type AuthResolutionOverrides, ModelsError, resolveProviderAuth } from "./auth/resolve.ts";
+import {
+	type AuthResolutionOverrides,
+	ModelsError,
+	OAUTH_FRESHNESS_POLICY,
+	resolveProviderAuth,
+} from "./auth/resolve.ts";
 import type {
 	AuthCheck,
 	AuthContext,
@@ -454,13 +459,20 @@ class ModelsImpl implements MutableModels {
 		if (stored?.type === "oauth") {
 			const oauth = provider.auth.oauth;
 			if (!oauth) return undefined;
-			if (Date.now() < stored.expires) return stored;
+			// Same freshness floor as the request path: never hand out a token
+			// that dies inside the refresh window.
+			if (Date.now() + OAUTH_FRESHNESS_POLICY.minimumValidityMs < stored.expires) return stored;
 			if (signal.aborted) return undefined;
 			const post = await this.credentials.modify(
 				provider.id,
 				async (current) => {
-					if (current?.type !== "oauth" || Date.now() < current.expires) return undefined;
-					return oauth.refresh(current, signal);
+					if (current?.type !== "oauth") return undefined;
+					if (Date.now() + OAUTH_FRESHNESS_POLICY.minimumValidityMs < current.expires) return undefined;
+					const refreshSignal = AbortSignal.any([
+						signal,
+						AbortSignal.timeout(OAUTH_FRESHNESS_POLICY.refreshTimeoutMs),
+					]);
+					return oauth.refresh(current, refreshSignal);
 				},
 				{ signal },
 			);
@@ -535,8 +547,19 @@ class ModelsImpl implements MutableModels {
 			);
 			return checks.flatMap(({ provider, credential, auth }) => {
 				if (!auth) return [];
-				const models = provider.getModels();
-				return provider.filterModels?.(models, credential) ?? models;
+				// Best-effort like getModels(): one throwing provider must not
+				// reject availability for all providers. Fail closed so a
+				// broken filter cannot expose models it should restrict.
+				try {
+					const models = provider.getModels();
+					try {
+						return provider.filterModels?.(models, credential) ?? models;
+					} catch {
+						return [];
+					}
+				} catch {
+					return [];
+				}
 			});
 		})();
 		return raceWithAbortSignal(available, signal);
@@ -925,9 +948,11 @@ export function calculateCost<TApi extends Api>(
 		}
 	}
 
-	// Anthropic charges 2x base input for 1h cache writes.
-	const longWrite = usage.cacheWrite1h ?? 0;
-	const shortWrite = usage.cacheWrite - longWrite;
+	// Anthropic charges 2x base input for 1h cache writes. Clamp defensively:
+	// malformed usage reporting more 1h writes than total writes must not
+	// produce negative charges.
+	const longWrite = Math.max(0, Math.min(usage.cacheWrite1h ?? 0, usage.cacheWrite));
+	const shortWrite = Math.max(0, usage.cacheWrite - longWrite);
 	usage.cost.input = (rates.input / 1000000) * usage.input;
 	usage.cost.output = (rates.output / 1000000) * usage.output;
 	usage.cost.cacheRead = (rates.cacheRead / 1000000) * usage.cacheRead;

@@ -10,7 +10,10 @@
 			"@earendil-works/pi-client": ["../client/dist/index.d.ts"],
 			"@earendil-works/pi-protocol": ["../protocol/dist/index.d.ts"],
 			"@earendil-works/pi-tui": ["../tui/dist/index.d.ts"],
-			"@earendil-works/pi-tui/*": ["../tui/dist/*.d.ts", "../tui/dist/components/*.d.ts"]
+		"@earendil-works/pi-tui/*": ["../tui/dist/*.d.ts", "../tui/dist/components/*.d.ts"],
+			"@earendil-works/pi-ext-fff": ["./src/extensions/vendored/vendored.d.ts"],
+			"@earendil-works/pi-ext-subagents": ["./src/extensions/vendored/vendored.d.ts"],
+			"@earendil-works/pi-ext-web-access": ["./src/extensions/vendored/vendored.d.ts"]
 		},
 		"rootDir": "./src"
 	},

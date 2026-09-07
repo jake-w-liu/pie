@@ -16,7 +16,10 @@ const banner = {
 	js: 'import { createRequire as __piCreateRequire } from "node:module"; const require = __piCreateRequire(import.meta.url);',
 };
 const allowedExternalPackages = new Set([
+	"@ff-labs/fff-node",
 	"@silvia-odwyer/photon-node",
+	"canvas",
+	"ffi-rs",
 	"jiti",
 	// Optional native accelerators. Their callers fall back to JavaScript when absent.
 	"bufferutil",
@@ -79,7 +82,7 @@ function commonBuildOptions() {
 		banner,
 		bundle: true,
 		define: { PI_BUNDLED_NODE: "true" },
-		external: ["@silvia-odwyer/photon-node"],
+		external: ["@ff-labs/fff-node", "@silvia-odwyer/photon-node", "canvas", "ffi-rs"],
 		format: "esm",
 		legalComments: "none",
 		logLevel: "warning",
@@ -107,6 +110,14 @@ function validateExternalImports(metafiles) {
 		for (const input of Object.values(metafile.inputs)) {
 			for (const imported of input.imports) {
 				if (!imported.external || isBuiltin(imported.path) || allowedExternalPackages.has(imported.path)) {
+					continue;
+			}
+				// Relative externals are either rewritten inter-chunk references
+				// (./chunk-*.js) or type-only imports erased during bundling.
+				// A genuinely unresolvable static relative import fails the
+				// build outright, so surviving ones cannot be missing runtime
+				// dependencies. Only bare specifiers are checked here.
+				if (imported.path.startsWith(".")) {
 					continue;
 				}
 				unexpected.add(imported.path);

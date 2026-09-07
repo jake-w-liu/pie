@@ -146,6 +146,10 @@ export function normalizePublicSubagentExecution<T extends PublicSubagentExecuti
 		};
 	}
 	if (!hasValidWorkflowInput) {
+		const waitOnly = params as { all?: unknown; nonBlocking?: unknown; stopOnAttention?: unknown };
+		if (waitOnly.all !== undefined || waitOnly.nonBlocking !== undefined || waitOnly.stopOnAttention !== undefined) {
+			return { ok: false, error: "Parameters { all, nonBlocking, stopOnAttention } belong to the subagent_wait tool, not subagent. Call subagent_wait to block until background runs finish.", mode: "workflow" };
+		}
 		return { ok: false, error: "Execution requires either { agent, task? } for one child or a non-empty workflowScript or workflowScriptPath for orchestration.", mode: "workflow" };
 	}
 	return { ok: true, params };

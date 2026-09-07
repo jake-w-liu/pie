@@ -925,6 +925,22 @@ export abstract class TuiBase extends Container implements TUI {
 		// requestRender() coalesces against this flag.
 		this.renderRequested = false;
 		this.cancelRenderTimer();
+		// Settle pending OSC11 background queries: their replies can never arrive
+		// after stop, and leaving timed-out markers behind would permanently widen
+		// the input-absorb window for the next session.
+		for (const slot of this.pendingOsc11BackgroundQueries) {
+			if (!("timedOut" in slot) && !slot.settled) {
+				slot.settled = true;
+				if (slot.timer) {
+					clearTimeout(slot.timer);
+					slot.timer = undefined;
+				}
+				slot.resolve?.(undefined);
+				slot.resolve = undefined;
+			}
+		}
+		this.pendingOsc11BackgroundQueries = [];
+		this.pendingOsc11BackgroundReplies = 0;
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031l");
 		}
@@ -1131,13 +1147,9 @@ export abstract class TuiBase extends Container implements TUI {
 		}
 
 		this.pendingOsc11BackgroundReplies -= 1;
-		const slot = this.pendingOsc11BackgroundQueries[0];
-		if (slot && "timedOut" in slot) {
-			if (slot.count > 1) slot.count--;
-			else this.pendingOsc11BackgroundQueries.shift();
-			return true;
-		}
-
+		// Note: the head cannot be a timedOut marker here; markers at the head are
+		// absorbed by the check above (this runs synchronously, so the head
+		// cannot change in between).
 		const rgb = parseOsc11BackgroundColor(data);
 		const query = this.pendingOsc11BackgroundQueries.shift();
 		if (query && !("timedOut" in query) && !query.settled) {

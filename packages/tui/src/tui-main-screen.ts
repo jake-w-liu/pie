@@ -1007,11 +1007,76 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			return;
 		}
 
-		// Differential rendering can only touch what was actually visible.
-		// If the first changed line is above the previous viewport, we need a full redraw.
+		// A change above the previous viewport (e.g. a tall streaming message
+		// restyling its earlier lines) must never blank the screen: repaint the
+		// visible window in place instead of clearing. A full clear flashes on
+		// every such frame while the message streams and wipes scrollback.
 		if (firstChanged < prevViewportTop) {
-			logRedraw(`firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
-			fullRender(true);
+			if (newLines.some((line) => isImageLine(line)) || this.previousLines.some((line) => isImageLine(line))) {
+				logRedraw(`firstChanged < viewportTop with images (${firstChanged} < ${prevViewportTop})`);
+				fullRender(true);
+				return;
+			}
+			logRedraw(`repaint viewport for above-viewport change (${firstChanged} < ${prevViewportTop})`);
+			this.fullRedrawCount += 1;
+			viewportTop = Math.max(0, newLines.length - height);
+			const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
+			output.append("\x1b[?2026h"); // Begin synchronized output
+			// Move to the first visible row. CUD/CUU never scroll, unlike "\r\n".
+			const currentScreenRow = hardwareCursorRow - prevViewportTop;
+			if (currentScreenRow > 0) output.append(`\x1b[${currentScreenRow}A`);
+			else if (currentScreenRow < 0) output.append(`\x1b[${-currentScreenRow}B`);
+			hardwareCursorRow = viewportTop;
+			output.append("\r");
+			const visibleEnd = Math.min(newLines.length, viewportTop + height);
+			for (let i = viewportTop; i < visibleEnd; i++) {
+				if (i > viewportTop) output.append("\x1b[1B\r");
+				let line = newLines[i]!;
+				let lineWidth = visibleWidth(line);
+				if (lineWidth > width) {
+					// Same guard as the differential path: a width disagreement must
+					// never kill the session. Truncate, record, and fall through.
+					try {
+						const crashLogPath = path.join(this.logDirectory, "pi-crash.log");
+						const crashData = [
+							`Truncated over-wide line at ${new Date().toISOString()}`,
+							`Terminal width: ${width}`,
+							`Line ${i} visible width: ${lineWidth}`,
+							`Line content: ${line.slice(0, 500)}`,
+							"",
+						].join("\n");
+						fs.mkdirSync(path.dirname(crashLogPath), { recursive: true });
+						fs.appendFileSync(crashLogPath, `${crashData}\n`);
+					} catch {
+						// Diagnostics must never break rendering.
+					}
+					line = truncateToWidth(line, width);
+					newLines[i] = line;
+					lineWidth = visibleWidth(line);
+				}
+				output.append(this.withSelectionHighlight(line, i, activeSelection));
+				if (lineWidth < width) output.append("\x1b[K");
+			}
+			// Clear rows left over when content is shorter than the viewport,
+			// then return to the last content row.
+			const leftoverRows = height - (visibleEnd - viewportTop);
+			for (let i = 0; i < leftoverRows; i++) {
+				output.append("\x1b[1B\r\x1b[2K");
+			}
+			if (leftoverRows > 0) output.append(`\x1b[${leftoverRows}A`);
+			output.append("\x1b[?2026l"); // End synchronized output
+			output.flush();
+			const finalCursorRow = Math.max(viewportTop, visibleEnd - 1);
+			this.cursorRow = Math.max(0, newLines.length - 1);
+			this.hardwareCursorRow = finalCursorRow;
+			this.maxLinesRendered = Math.max(this.maxLinesRendered, newLines.length);
+			this.previousViewportTop = viewportTop;
+			this.positionHardwareCursor(cursorPos, newLines.length);
+			this.previousLines = newLines;
+			this.previousRawLines = newRawLines;
+			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+			this.previousWidth = width;
+			this.previousHeight = height;
 			return;
 		}
 

@@ -1,5 +1,5 @@
 import { getKeybindings } from "../keybindings.ts";
-import { decodeKittyPrintable } from "../keys.ts";
+import { decodePrintableKey } from "../keys.ts";
 import { KillRing } from "../kill-ring.ts";
 import { type Component, CURSOR_MARKER, type Focusable } from "../tui.ts";
 import { UndoStack } from "../undo-stack.ts";
@@ -101,6 +101,12 @@ export class Input implements Component, Focusable {
 		}
 
 		const kb = getKeybindings();
+
+		// Ctrl+C - let parent handle (interrupt/clear), like Editor does.
+		// (tui.select.cancel below also matches ctrl+c; it must not swallow it.)
+		if (kb.matches(data, "tui.input.copy")) {
+			return;
+		}
 
 		// Escape/Cancel
 		if (kb.matches(data, "tui.select.cancel")) {
@@ -206,11 +212,12 @@ export class Input implements Component, Focusable {
 			return;
 		}
 
-		// Kitty CSI-u printable character (e.g. \x1b[97u for 'a').
+		// Kitty CSI-u / modifyOtherKeys printable character (e.g. \x1b[97u for 'a').
 		// Terminals with Kitty protocol flag 1 (disambiguate) send CSI-u for all keys,
-		// including plain printable characters. Decode before the control-char check
-		// since CSI-u sequences contain \x1b which would be rejected.
-		const kittyPrintable = decodeKittyPrintable(data);
+		// including plain printable characters. Terminals in modifyOtherKeys fallback
+		// mode send ESC[27;<mod>;<code>~ instead. Decode before the control-char
+		// check since both sequences contain \x1b which would be rejected.
+		const kittyPrintable = decodePrintableKey(data);
 		if (kittyPrintable !== undefined) {
 			this.insertCharacter(kittyPrintable);
 			return;

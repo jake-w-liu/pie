@@ -2253,6 +2253,79 @@ describe("Editor component", () => {
 			assert.strictEqual(editor.isShowingAutocomplete(), false);
 		});
 
+		it("recovers autocomplete after a provider failure", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			let calls = 0;
+
+			const mockProvider: AutocompleteProvider = {
+				getSuggestions: async (lines, _cursorLine, cursorCol) => {
+					calls += 1;
+					if (calls === 1) throw new Error("provider boom");
+					const text = lines[0] || "";
+					const prefix = text.slice(0, cursorCol);
+					if (prefix === "di") {
+						return { items: [{ value: "dist/", label: "dist/" }], prefix: "di" };
+					}
+					return null;
+				},
+				applyCompletion,
+			};
+
+			editor.setAutocompleteProvider(mockProvider);
+
+			// Type a prefix without triggering autocomplete.
+			editor.handleInput("d");
+			editor.handleInput("i");
+			assert.strictEqual(editor.getText(), "di");
+
+			// The first Tab request fails; it must degrade to "no suggestions".
+			editor.handleInput("\t");
+			await flushAutocomplete();
+			assert.strictEqual(editor.getText(), "di");
+			assert.strictEqual(editor.isShowingAutocomplete(), false);
+
+			// A second Tab triggers a fresh request that succeeds and auto-applies.
+			editor.handleInput("\t");
+			await flushAutocomplete();
+			assert.strictEqual(editor.getText(), "dist/");
+			assert.strictEqual(editor.isShowingAutocomplete(), false);
+			assert.ok(calls >= 2, `expected follow-up requests after failure, got ${calls}`);
+		});
+
+		it("survives a throwing applyCompletion on Tab", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+
+			const mockProvider: AutocompleteProvider = {
+				getSuggestions: async () => ({
+					items: [
+						{ value: "x1", label: "x1" },
+						{ value: "x2", label: "x2" },
+					],
+					prefix: "",
+				}),
+				applyCompletion: () => {
+					throw new Error("completion boom");
+				},
+			};
+
+			editor.setAutocompleteProvider(mockProvider);
+
+			// Open the menu, then Tab to accept (the provider throws).
+			editor.handleInput("\t");
+			await flushAutocomplete();
+			assert.strictEqual(editor.isShowingAutocomplete(), true);
+			editor.handleInput("\t");
+			await flushAutocomplete();
+
+			// No crash, text untouched, menu closed.
+			assert.strictEqual(editor.getText(), "");
+			assert.strictEqual(editor.isShowingAutocomplete(), false);
+
+			// The editor still works afterwards.
+			editor.handleInput("a");
+			assert.strictEqual(editor.getText(), "a");
+		});
+
 		it("debounces @ autocomplete while typing", async () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
 			let suggestionCalls = 0;
@@ -2952,6 +3025,17 @@ describe("Editor component", () => {
 			editor.handleInput("o"); // Jump to first 'o'
 
 			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 4 }); // 'o' in "hello"
+		});
+
+		it("consumes one grapheme from a batched chunk", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+
+			editor.setText("axayxy");
+			editor.handleInput("\x01"); // Ctrl+A - go to start
+			editor.handleInput("\x1d"); // Ctrl+] - arm jump mode
+			editor.handleInput("xy"); // Batched chunk must not become a substring jump
+
+			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 1 }); // first 'x', not "xy"
 		});
 
 		it("jumps forward to next occurrence after cursor", () => {

@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import type { Component, TUI } from "../src/tui.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
+import { extractSegments, sliceByColumn } from "../src/utils.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
 class StaticLines implements Component {
@@ -77,5 +78,29 @@ describe("TUI overlay compositing", () => {
 
 		assert.strictEqual(getCellItalic(terminal, 1, 0), 0);
 		tui.stop();
+	});
+});
+
+describe("slice style-reset boundaries", () => {
+	it("preserves a reset exactly at the slice end", () => {
+		assert.strictEqual(sliceByColumn("\x1b[31mhello\x1b[0m", 0, 5, true), "\x1b[31mhello\x1b[0m");
+		assert.strictEqual(sliceByColumn("\x1b[31mhello\x1b[39m", 0, 5, true), "\x1b[31mhello\x1b[39m");
+		assert.strictEqual(
+			sliceByColumn("\x1b]8;;http://x\x07link\x1b]8;;\x07", 0, 4, true),
+			"\x1b]8;;http://x\x07link\x1b]8;;\x07",
+		);
+	});
+
+	it("still drops opening sequences at the slice end", () => {
+		assert.strictEqual(sliceByColumn("hello\x1b[32mworld", 0, 5, true), "hello");
+	});
+
+	it("a reset clears opens seen before the slice starts", () => {
+		assert.strictEqual(sliceByColumn("\x1b[31mab\x1b[0mcd", 2, 2, true), "\x1b[0mcd");
+	});
+
+	it("closes the after segment at its end", () => {
+		const segments = extractSegments("\x1b[31mHelloWorld\x1b[0m!!", 0, 0, 5);
+		assert.strictEqual(segments.after, "\x1b[31mHello\x1b[0m");
 	});
 });

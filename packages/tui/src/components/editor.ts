@@ -630,7 +630,16 @@ export class Editor implements Component, Focusable {
 				return;
 			}
 
-			const printable = decodePrintableKey(data) ?? (data.charCodeAt(0) >= 32 ? data : undefined);
+			const rawPrintable = decodePrintableKey(data) ?? (data.charCodeAt(0) >= 32 ? data : undefined);
+			// Jump consumes a single character: a batched chunk (e.g. a paste landing
+			// while jump mode is armed) must not become a substring search.
+			let printable = rawPrintable;
+			if (printable !== undefined) {
+				for (const { segment } of getGraphemeSegmenter().segment(printable)) {
+					printable = segment;
+					break;
+				}
+			}
 			if (printable !== undefined) {
 				// Printable character - perform the jump
 				const direction = this.jumpMode;
@@ -695,18 +704,20 @@ export class Editor implements Component, Focusable {
 			if (kb.matches(data, "tui.input.tab")) {
 				const selected = this.autocompleteList.getSelectedItem();
 				if (selected && this.autocompleteProvider) {
-					this.pushUndoSnapshot();
-					this.lastAction = null;
-					const result = this.autocompleteProvider.applyCompletion(
-						this.state.lines,
-						this.state.cursorLine,
-						this.state.cursorCol,
-						selected,
-						this.autocompletePrefix,
-					);
-					this.state.lines = result.lines;
-					this.state.cursorLine = result.cursorLine;
-					this.setCursorCol(result.cursorCol);
+					const provider = this.autocompleteProvider;
+					const prefix = this.autocompletePrefix;
+					if (
+						!this.tryApplyCompletion(() =>
+							provider.applyCompletion(
+								this.state.lines,
+								this.state.cursorLine,
+								this.state.cursorCol,
+								selected,
+								prefix,
+							),
+						)
+					)
+						return;
 					this.cancelAutocomplete();
 					if (this.onChange) this.onChange(this.getText());
 				}
@@ -722,18 +733,20 @@ export class Editor implements Component, Focusable {
 					const currentLine = this.state.lines[this.state.cursorLine] || "";
 					const textBeforePrefix = currentLine.slice(0, this.state.cursorCol - this.autocompletePrefix.length);
 					const submitSlashCommand = this.autocompletePrefix.startsWith("/") && textBeforePrefix.trim() === "";
-					this.pushUndoSnapshot();
-					this.lastAction = null;
-					const result = this.autocompleteProvider.applyCompletion(
-						this.state.lines,
-						this.state.cursorLine,
-						this.state.cursorCol,
-						selected,
-						this.autocompletePrefix,
-					);
-					this.state.lines = result.lines;
-					this.state.cursorLine = result.cursorLine;
-					this.setCursorCol(result.cursorCol);
+					const provider = this.autocompleteProvider;
+					const prefix = this.autocompletePrefix;
+					if (
+						!this.tryApplyCompletion(() =>
+							provider.applyCompletion(
+								this.state.lines,
+								this.state.cursorLine,
+								this.state.cursorCol,
+								selected,
+								prefix,
+							),
+						)
+					)
+						return;
 
 					if (submitSlashCommand) {
 						this.cancelAutocomplete();
@@ -2314,7 +2327,11 @@ export class Editor implements Component, Focusable {
 	): Promise<void> {
 		const previousTask = this.autocompleteRequestTask;
 		this.autocompleteRequestTask = (async () => {
-			await previousTask;
+			try {
+				await previousTask;
+			} catch {
+				// A previous request failed; the chain must stay alive for new input.
+			}
 			if (startToken !== this.autocompleteStartToken || !this.autocompleteProvider) {
 				return;
 			}
@@ -2364,12 +2381,23 @@ export class Editor implements Component, Focusable {
 	): Promise<void> {
 		if (!this.autocompleteProvider) return;
 
-		const suggestions = await this.autocompleteProvider.getSuggestions(
-			this.state.lines,
-			this.state.cursorLine,
-			this.state.cursorCol,
-			{ signal: controller.signal, force: options.force },
-		);
+		let suggestions: AutocompleteSuggestions | null | undefined;
+		try {
+			suggestions = await this.autocompleteProvider.getSuggestions(
+				this.state.lines,
+				this.state.cursorLine,
+				this.state.cursorCol,
+				{ signal: controller.signal, force: options.force },
+			);
+		} catch {
+			// Provider failures (or aborts racing completion) degrade to "no
+			// suggestions" so one bad request cannot kill future autocomplete.
+			if (this.isAutocompleteRequestCurrent(requestId, controller, snapshotText, snapshotLine, snapshotCol)) {
+				this.cancelAutocomplete();
+				this.tui.requestRender();
+			}
+			return;
+		}
 
 		if (!this.isAutocompleteRequestCurrent(requestId, controller, snapshotText, snapshotLine, snapshotCol)) {
 			return;
@@ -2385,18 +2413,15 @@ export class Editor implements Component, Focusable {
 
 		if (options.force && options.explicitTab && suggestions.items.length === 1) {
 			const item = suggestions.items[0]!;
-			this.pushUndoSnapshot();
-			this.lastAction = null;
-			const result = this.autocompleteProvider.applyCompletion(
-				this.state.lines,
-				this.state.cursorLine,
-				this.state.cursorCol,
-				item,
-				suggestions.prefix,
-			);
-			this.state.lines = result.lines;
-			this.state.cursorLine = result.cursorLine;
-			this.setCursorCol(result.cursorCol);
+			const provider = this.autocompleteProvider;
+			const prefix = suggestions.prefix;
+			if (
+				!provider ||
+				!this.tryApplyCompletion(() =>
+					provider.applyCompletion(this.state.lines, this.state.cursorLine, this.state.cursorCol, item, prefix),
+				)
+			)
+				return;
 			if (this.onChange) this.onChange(this.getText());
 			this.tui.requestRender();
 			return;
@@ -2420,6 +2445,41 @@ export class Editor implements Component, Focusable {
 			this.state.cursorLine === snapshotLine &&
 			this.state.cursorCol === snapshotCol
 		);
+	}
+
+	/**
+	 * Run a provider completion and commit its result, restoring the editor
+	 * state when the provider throws or returns garbage. Provider code runs on
+	 * every Tab/Enter and must never be able to kill the input loop.
+	 */
+	private tryApplyCompletion(
+		apply: () => {
+			lines: string[];
+			cursorLine: number;
+			cursorCol: number;
+		},
+	): boolean {
+		const savedLines = this.state.lines;
+		const savedLine = this.state.cursorLine;
+		const savedCol = this.state.cursorCol;
+		this.pushUndoSnapshot();
+		this.lastAction = null;
+		try {
+			const result = apply();
+			if (!result || !Array.isArray(result.lines)) throw new Error("applyCompletion returned no lines");
+			this.state.lines = result.lines;
+			this.state.cursorLine = result.cursorLine;
+			this.setCursorCol(result.cursorCol);
+		} catch {
+			this.state.lines = savedLines;
+			this.state.cursorLine = savedLine;
+			this.setCursorCol(savedCol);
+			this.undoStack.pop();
+			this.cancelAutocomplete();
+			this.tui.requestRender();
+			return false;
+		}
+		return true;
 	}
 
 	private applyAutocompleteSuggestions(suggestions: AutocompleteSuggestions, state: "regular" | "force"): void {

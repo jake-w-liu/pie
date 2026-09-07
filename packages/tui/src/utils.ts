@@ -919,7 +919,9 @@ function wrapSingleLine(line: string, width: number): string[] {
 
 	for (const token of tokens) {
 		const tokenVisibleLength = visibleWidth(token);
-		const isWhitespace = token.trim() === "";
+		// Strip ANSI first: a whitespace run carrying style codes (e.g. colorized
+		// indentation) is still whitespace and must not start a wrapped line.
+		const isWhitespace = stripTerminalSequences(token).trim() === "";
 
 		// Token itself is too long - break it character by character
 		if (tokenVisibleLength > width && !isWhitespace) {
@@ -956,9 +958,12 @@ function wrapSingleLine(line: string, width: number): string[] {
 			}
 			wrapped.push(lineToWrap);
 			if (isWhitespace) {
-				// Don't start new line with whitespace
+				// Don't start new line with whitespace (drop the spaces but keep
+				// any style codes the token carries for the following content).
+				updateTrackerFromText(token, tracker);
 				currentLine = tracker.getActiveCodes();
 				currentVisibleLength = 0;
+				continue;
 			} else {
 				currentLine = tracker.getActiveCodes() + token;
 				currentVisibleLength = tokenVisibleLength;
@@ -1242,6 +1247,42 @@ export function sliceByColumn(line: string, startCol: number, length: number, st
 	return sliceWithWidth(line, startCol, length, strict).text;
 }
 
+const SGR_OFF_PARAMETERS = new Set(["22", "23", "24", "25", "27", "28", "29", "39", "49"]);
+
+function parseSgrParameters(code: string): string[] | undefined {
+	const match = /^\x1b\[([\d;]*)m$/.exec(code);
+	if (!match) return undefined;
+	return match[1] === "" ? ["0"] : match[1].split(";");
+}
+
+function sgrOpensStyle(params: string[]): boolean {
+	return params.some((param) => param !== "0" && param !== "" && !SGR_OFF_PARAMETERS.has(param));
+}
+
+/** Full resets (`\x1b[0m`) cancel every pending open, including ones seen before a slice starts. */
+function isFullStyleReset(code: string): boolean {
+	const params = parseSgrParameters(code);
+	if (params === undefined) return false;
+	return params.includes("0") && !sgrOpensStyle(params);
+}
+
+/**
+ * Closing sequences (SGR resets/attribute-offs, OSC 8 hyperlink closes) that must
+ * be preserved at a slice end so captured styles cannot bleed into what follows.
+ */
+export function isStyleCloseSequence(code: string): boolean {
+	const params = parseSgrParameters(code);
+	if (params !== undefined) return !sgrOpensStyle(params);
+	// OSC 8 hyperlink close: ESC ] 8 ; ; ST/BEL (empty params and URI).
+	if (code.startsWith("\x1b]8;")) {
+		const terminatorLength = code.endsWith("\x07") ? 1 : 2;
+		const body = code.slice(4, code.length - terminatorLength);
+		const separator = body.indexOf(";");
+		return separator >= 0 && body.slice(0, separator) === "" && body.slice(separator + 1) === "";
+	}
+	return false;
+}
+
 /** Like sliceByColumn but also returns the actual visible width of the result. */
 export function sliceWithWidth(
 	line: string,
@@ -1260,8 +1301,19 @@ export function sliceWithWidth(
 	while (i < line.length) {
 		const ansi = extractAnsiCode(line, i);
 		if (ansi) {
-			if (currentCol >= startCol && currentCol < endCol) result += ansi.code;
-			else if (currentCol < startCol) pendingAnsi += ansi.code;
+			if (currentCol >= startCol && currentCol < endCol) {
+				result += ansi.code;
+				// A reset cancels opens seen before the slice started; drop them so
+				// they cannot leak back onto later content via pendingAnsi.
+				if (isFullStyleReset(ansi.code)) pendingAnsi = "";
+			} else if (currentCol < startCol) pendingAnsi += ansi.code;
+			else if (currentCol === endCol && resultWidth > 0 && isStyleCloseSequence(ansi.code)) {
+				// A reset exactly at the slice end still terminates styles opened
+				// inside the slice. Without it the style bleeds into padding and
+				// neighboring cells.
+				result += ansi.code;
+				if (isFullStyleReset(ansi.code)) pendingAnsi = "";
+			}
 			i += ansi.length;
 			continue;
 		}
@@ -1285,7 +1337,18 @@ export function sliceWithWidth(
 			if (currentCol >= endCol) break;
 		}
 		i = textEnd;
-		if (currentCol >= endCol) break;
+		if (currentCol >= endCol) {
+			// The break above would skip closing sequences exactly at the slice
+			// end; honor them so captured styles cannot bleed into what follows.
+			while (resultWidth > 0 && i < line.length) {
+				const trailing = extractAnsiCode(line, i);
+				if (!trailing || !isStyleCloseSequence(trailing.code)) break;
+				result += trailing.code;
+				if (isFullStyleReset(trailing.code)) pendingAnsi = "";
+				i += trailing.length;
+			}
+			break;
+		}
 	}
 	return { text: result, width: resultWidth };
 }
@@ -1325,9 +1388,20 @@ export function extractSegments(
 			pooledStyleTracker.process(ansi.code);
 			// Include ANSI codes in their respective segments
 			if (currentCol < beforeEnd) {
-				pendingAnsiBefore += ansi.code;
+				if (isFullStyleReset(ansi.code)) {
+					// A reset cancels opens seen before the overlay; drop them so
+					// they cannot leak back, and close "before" when it has content.
+					pendingAnsiBefore = "";
+					if (before.length > 0) before += ansi.code;
+				} else {
+					pendingAnsiBefore += ansi.code;
+				}
 			} else if (currentCol >= afterStart && currentCol < afterEnd && afterStarted) {
 				// Only include after we've started "after" (styling already prepended)
+				after += ansi.code;
+			} else if (currentCol === afterEnd && afterStarted && isStyleCloseSequence(ansi.code)) {
+				// A reset exactly at the "after" end still terminates styles opened
+				// inside it so they cannot bleed past the overlay.
 				after += ansi.code;
 			}
 			i += ansi.length;
@@ -1365,7 +1439,24 @@ export function extractSegments(
 			if (afterLen <= 0 ? currentCol >= beforeEnd : currentCol >= afterEnd) break;
 		}
 		i = textEnd;
-		if (afterLen <= 0 ? currentCol >= beforeEnd : currentCol >= afterEnd) break;
+		const segmentDone = afterLen <= 0 ? currentCol >= beforeEnd : currentCol >= afterEnd;
+		if (segmentDone) {
+			// The break would skip closing sequences exactly at the segment end;
+			// honor them so captured styles cannot bleed past the overlay.
+			while (i < line.length) {
+				const trailing = extractAnsiCode(line, i);
+				if (!trailing || !isStyleCloseSequence(trailing.code)) break;
+				if (afterLen <= 0) {
+					if (before.length === 0) break;
+					before += trailing.code;
+				} else {
+					if (!afterStarted) break;
+					after += trailing.code;
+				}
+				i += trailing.length;
+			}
+			break;
+		}
 	}
 
 	return { before, beforeWidth, after, afterWidth };

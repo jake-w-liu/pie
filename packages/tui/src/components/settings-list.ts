@@ -79,12 +79,20 @@ export class SettingsList implements Component {
 		}
 	}
 
-	/** Move selection to the item with the given id (no-op if not found). */
+	/**
+	 * Move selection to the item with the given id (no-op if not found).
+	 * Used to navigate to a specific item after a submenu close; the target must
+	 * become selected AND visible regardless of the active search filter, so the
+	 * caller's follow-up activateItem() opens the right submenu.
+	 */
 	selectItem(id: string): void {
-		const items = this.searchEnabled ? this.filteredItems : this.items;
-		const index = items.findIndex((i) => i.id === id);
-		if (index !== -1) {
-			this.selectedIndex = index;
+		const index = this.items.findIndex((i) => i.id === id);
+		if (index === -1) return;
+		this.selectedIndex = index;
+		if (this.searchEnabled) {
+			// Clear the filter so the selected index points at a visible row.
+			this.filteredItems = this.items;
+			this.searchInput?.reset();
 		}
 	}
 

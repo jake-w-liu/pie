@@ -56,6 +56,11 @@ export class Loader extends Text {
 		}
 	}
 
+	/** Release the animation timer; safe to call more than once. */
+	dispose(): void {
+		this.stop();
+	}
+
 	setMessage(message: string): void {
 		this.message = message;
 		this.updateDisplay();
@@ -78,6 +83,8 @@ export class Loader extends Text {
 			this.currentFrame = (this.currentFrame + 1) % this.frames.length;
 			this.updateDisplay();
 		}, this.intervalMs);
+		// A forgotten stop()/dispose() must not hold the event loop open.
+		this.intervalId.unref?.();
 	}
 
 	private updateDisplay(): void {

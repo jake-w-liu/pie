@@ -30,6 +30,8 @@ export class CancellableLoader extends Loader {
 		const kb = getKeybindings();
 		if (kb.matches(data, "tui.select.cancel")) {
 			this.abortController.abort();
+			// Freeze the animation: whoever removes the loader may never dispose it.
+			this.stop();
 			this.onAbort?.();
 		}
 	}

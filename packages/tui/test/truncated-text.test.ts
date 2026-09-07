@@ -126,4 +126,19 @@ describe("TruncatedText component", () => {
 		assert.ok(stripped.includes("..."));
 		assert.ok(!stripped.includes("Second line"));
 	});
+
+	it("clamps horizontal padding to fit narrow viewports", () => {
+		const text = new TruncatedText("hello", 3, 0);
+		for (const line of text.render(5)) {
+			assert.ok(visibleWidth(line) <= 5, `line exceeds viewport: ${JSON.stringify(line)}`);
+		}
+	});
+
+	it("stops at carriage returns without emitting them", () => {
+		const text = new TruncatedText("a\r\nb", 0, 0);
+		const lines = text.render(10);
+		assert.strictEqual(lines.length, 1);
+		assert.ok(!lines[0].includes("\r"), `retained CR: ${JSON.stringify(lines[0])}`);
+		assert.ok(lines[0].startsWith("a"));
+	});
 });

@@ -933,6 +933,48 @@ describe("TUI differential rendering", () => {
 		tui.stop();
 	});
 
+	it("repaints above-viewport changes in place without clearing the screen", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		const tui: TUI = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+
+		component.lines = Array.from({ length: 30 }, (_, i) => `msg line ${i}`);
+		tui.start();
+		await terminal.waitForRender();
+		const scrollbackBefore = terminal.getScrollBuffer().length;
+
+		// Restyle a line above the viewport, as a tall streaming message does
+		// when a code fence opens mid-stream. This must not blank the screen.
+		terminal.clearWrites();
+		component.lines = component.lines.map((line, i) => (i === 2 ? "```code block opened" : line));
+		tui.requestRender();
+		await terminal.waitForRender();
+
+		const writes = terminal.getWrites();
+		assert.ok(!writes.includes("\x1b[2J"), "above-viewport change should not clear the screen");
+		assert.ok(!writes.includes("\x1b[3J"), "above-viewport change should preserve scrollback");
+		assert.strictEqual(terminal.getScrollBuffer().length, scrollbackBefore, "repaint must not scroll the terminal");
+		assert.deepStrictEqual(
+			terminal.getViewport(),
+			Array.from({ length: 10 }, (_, i) => `msg line ${20 + i}`),
+			"viewport stays bottom-anchored on the latest content",
+		);
+
+		// Follow-up frames must keep working: cursor bookkeeping stays exact.
+		terminal.clearWrites();
+		component.lines = [...component.lines, "stream 30"];
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.deepStrictEqual(
+			terminal.getViewport(),
+			[...Array.from({ length: 9 }, (_, i) => `msg line ${21 + i}`), "stream 30"],
+			"append after in-place repaint stays differential",
+		);
+
+		tui.stop();
+	});
+
 	it("clears stale content when maxLinesRendered was inflated by a transient component", async () => {
 		const terminal = new VirtualTerminal(40, 10);
 		const tui: TUI = new TuiMainScreen(terminal);

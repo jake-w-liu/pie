@@ -2,7 +2,8 @@ import { Marked, type Token, Tokenizer, type TokenizerExtension, type Tokens } f
 import { renderLatex } from "../latex.ts";
 import { getCapabilities, hyperlink, isImageLine } from "../terminal-image.ts";
 import type { Component } from "../tui.ts";
-import { applyBackgroundToLine, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
+import { applyBackgroundToLine, isStyleCloseSequence, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
+import { normalizeCount } from "./stack.ts";
 
 const STRICT_STRIKETHROUGH_REGEX = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
 
@@ -264,8 +265,8 @@ export class Markdown implements Component {
 		options?: MarkdownOptions,
 	) {
 		this.text = text;
-		this.paddingX = paddingX;
-		this.paddingY = paddingY;
+		this.paddingX = normalizeCount(paddingX, 0);
+		this.paddingY = normalizeCount(paddingY, 0);
 		this.theme = theme;
 		this.defaultTextStyle = defaultTextStyle;
 		this.options = options ? { ...options } : {};
@@ -289,8 +290,11 @@ export class Markdown implements Component {
 			return this.cachedLines;
 		}
 
+		// Reduce margins when necessary so content and padding fit within the
+		// available width (mirrors Text's padding clamp).
+		const paddingX = Math.min(this.paddingX, Math.max(0, Math.floor((width - 1) / 2)));
 		// Calculate available width for content (subtract horizontal padding)
-		const contentWidth = Math.max(1, width - this.paddingX * 2);
+		const contentWidth = Math.max(1, width - paddingX * 2);
 		const text = this.options.transform?.(this.text, contentWidth) ?? this.text;
 
 		// Don't render anything if there's no actual text
@@ -308,7 +312,7 @@ export class Markdown implements Component {
 
 		const renderedLines: string[] = [];
 		if (isPlainMarkdown(normalizedText)) {
-			for (const line of normalizedText.split("\n")) renderedLines.push(this.applyDefaultStyle(line));
+			for (const line of normalizedText.split(/\r\n|\r|\n/)) renderedLines.push(this.applyDefaultStyle(line));
 		} else {
 			// Parse markdown to HTML-like tokens only when Markdown syntax is present.
 			const tokens = markdownParser.lexer(normalizedText);
@@ -334,8 +338,8 @@ export class Markdown implements Component {
 		}
 
 		// Add margins and background to each wrapped line
-		const leftMargin = " ".repeat(this.paddingX);
-		const rightMargin = " ".repeat(this.paddingX);
+		const leftMargin = " ".repeat(paddingX);
+		const rightMargin = " ".repeat(paddingX);
 		const bgFn = this.defaultTextStyle?.bgColor;
 		const contentLines: string[] = [];
 
@@ -568,7 +572,13 @@ export class Markdown implements Component {
 					if (!quoteStylePrefix) {
 						return quoteStyle(line);
 					}
-					const lineWithReappliedStyle = line.replace(/\x1b\[0m/g, `\x1b[0m${quoteStylePrefix}`);
+					// Reapply the quote style after any reset/attribute-off (not only
+					// SGR 0): inner styles closed with specific offs (Chalk's 22/39/49m)
+					// would otherwise clear the quote color for the rest of the line.
+					// Opening sequences are left alone so inner colors keep precedence.
+					const lineWithReappliedStyle = line.replace(/\x1b\[[0-9;]*m/g, (code) =>
+						isStyleCloseSequence(code) ? `${code}${quoteStylePrefix}` : code,
+					);
 					return quoteStyle(lineWithReappliedStyle);
 				};
 

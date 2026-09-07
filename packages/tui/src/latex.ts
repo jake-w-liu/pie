@@ -1369,9 +1369,8 @@ export function renderLatex(source: string, options: RenderLatexOptions = {}): s
 		return rendered.replaceAll(PROTECTED_SPACE, " ");
 	}
 	const lines = renderLayout(rendered, layoutNodes).lines;
-	const indentation = Math.min(
-		...lines.filter((line) => line.trim()).map((line) => line.length - line.trimStart().length),
-	);
+	const indents = lines.filter((line) => line.trim()).map((line) => line.length - line.trimStart().length);
+	const indentation = indents.length > 0 ? Math.min(...indents) : 0;
 	return lines
 		.map((line) => line.slice(indentation).trimEnd())
 		.join("\n")

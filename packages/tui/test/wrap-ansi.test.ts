@@ -296,3 +296,9 @@ describe("wrapTextWithAnsi with OSC 8 hyperlinks", () => {
 		assert.strictEqual(closeCount, 1);
 	});
 });
+
+describe("wrapTextWithAnsi styled whitespace", () => {
+	it("does not start a wrapped line with styled whitespace", () => {
+		assert.deepStrictEqual(wrapTextWithAnsi("12345678 \x1b[31m   AB", 10), ["12345678", "\x1b[31mAB"]);
+	});
+});

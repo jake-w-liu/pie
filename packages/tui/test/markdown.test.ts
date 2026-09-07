@@ -6,6 +6,7 @@ import { Markdown, type MarkdownTheme } from "../src/components/markdown.ts";
 import { resetCapabilitiesCache, setCapabilities } from "../src/terminal-image.ts";
 import type { Component, TUI } from "../src/tui.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
+import { visibleWidth } from "../src/utils.ts";
 import { defaultMarkdownTheme } from "./test-themes.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
 
@@ -1756,5 +1757,37 @@ bar`,
 
 			assert.strictEqual(partial.render(80).length, complete.render(80).length);
 		});
+	});
+
+	describe("Plain-text robustness", () => {
+		it("splits CRLF without phantom blank lines", () => {
+			const markdown = new Markdown("a\r\nb", 0, 0, defaultMarkdownTheme);
+			assert.deepStrictEqual(
+				markdown.render(20).map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd()),
+				["a", "b"],
+			);
+		});
+
+		it("clamps horizontal padding to fit narrow viewports", () => {
+			const markdown = new Markdown("hello", 3, 0, defaultMarkdownTheme);
+			for (const line of markdown.render(5)) {
+				assert.ok(visibleWidth(line) <= 5, `line exceeds viewport: ${JSON.stringify(line)}`);
+			}
+		});
+	});
+});
+
+describe("Markdown blockquote style restoration", () => {
+	it("reapplies the quote style after specific SGR offs", () => {
+		const markdown = new Markdown("> hi \x1b[36mcode\x1b[39m tail", 0, 0, defaultMarkdownTheme);
+		const line = markdown.render(40)[0] ?? "";
+		const closeIndex = line.indexOf("\x1b[39m");
+		assert.ok(closeIndex !== -1, "expected the inner close in the output");
+		const tailIndex = line.indexOf("tail", closeIndex);
+		assert.ok(tailIndex !== -1, "expected the tail text in the output");
+		assert.ok(
+			line.slice(closeIndex, tailIndex).includes("\x1b[3m"),
+			`quote italic not restored after inner close: ${JSON.stringify(line)}`,
+		);
 	});
 });

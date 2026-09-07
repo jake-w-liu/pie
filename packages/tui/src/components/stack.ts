@@ -29,6 +29,12 @@ function normalizeSize(value: number | undefined, fallback: number): number {
 	return value === undefined || !Number.isFinite(value) ? fallback : Math.max(0, Math.floor(value));
 }
 
+export { normalizeSize };
+
+export function normalizeCount(value: number | undefined, fallback: number): number {
+	return typeof value !== "number" ? fallback : normalizeSize(value, fallback);
+}
+
 export abstract class Stack extends Container {
 	protected readonly entries: StackLayoutEntry[] = [];
 	protected readonly gap: number;
@@ -47,9 +53,12 @@ export abstract class Stack extends Container {
 
 	override addChild(component: Component, options: StackEntryOptions = {}): void {
 		super.addChild(component);
+		// A non-finite numeric basis (NaN/Infinity) would poison every downstream
+		// size computation (NaN comparisons are always false); fall back to auto.
+		const basis = typeof options.basis === "number" && !Number.isFinite(options.basis) ? "auto" : options.basis;
 		this.entries.push({
 			component,
-			...(options.basis === undefined ? {} : { basis: options.basis }),
+			...(basis === undefined ? {} : { basis }),
 			...(options.grow === undefined ? {} : { grow: normalizeSize(options.grow, 0) }),
 			...(options.shrink === undefined ? {} : { shrink: normalizeSize(options.shrink, 1) }),
 			...(options.minSize === undefined ? {} : { minSize: normalizeSize(options.minSize, 0) }),

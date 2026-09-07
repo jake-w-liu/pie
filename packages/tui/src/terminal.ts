@@ -158,7 +158,15 @@ export class ProcessTerminal implements Terminal {
 		return this._modifyOtherKeysActive;
 	}
 
+	private started = false;
+
 	start(onInput: (data: string) => void, onResize: () => void): void {
+		// start() must be idempotent: without this, a second start() orphans the
+		// previous stdin/resize listeners (setupStdinBuffer overwrites the handler
+		// reference, so stop() could never remove the old closures) and input is
+		// processed twice.
+		if (this.started) this.stop();
+		this.started = true;
 		this.inputHandler = onInput;
 		this.resizeHandler = onResize;
 
@@ -471,6 +479,7 @@ export class ProcessTerminal implements Terminal {
 		if (process.stdin.setRawMode) {
 			process.stdin.setRawMode(this.wasRaw);
 		}
+		this.started = false;
 	}
 
 	write(data: string): void {
@@ -536,6 +545,8 @@ export class ProcessTerminal implements Terminal {
 				this.progressInterval = setInterval(() => {
 					process.stdout.write(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);
 				}, TERMINAL_PROGRESS_KEEPALIVE_MS);
+				// A missed setProgress(false)/stop() must not hold the event loop open.
+				this.progressInterval.unref();
 			}
 		} else {
 			this.clearProgressInterval();

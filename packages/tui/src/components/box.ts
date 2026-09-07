@@ -1,5 +1,6 @@
 import type { Component } from "../tui.ts";
 import { applyBackgroundToLine, visibleWidth } from "../utils.ts";
+import { normalizeCount } from "./stack.ts";
 
 type RenderCache = {
 	childLines: string[];
@@ -20,8 +21,8 @@ export class Box implements Component {
 	private cache?: RenderCache;
 
 	constructor(paddingX = 1, paddingY = 1, bgFn?: (text: string) => string) {
-		this.paddingX = paddingX;
-		this.paddingY = paddingY;
+		this.paddingX = normalizeCount(paddingX, 1);
+		this.paddingY = normalizeCount(paddingY, 1);
 		this.bgFn = bgFn;
 	}
 

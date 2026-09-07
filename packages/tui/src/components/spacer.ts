@@ -1,4 +1,5 @@
 import type { Component } from "../tui.ts";
+import { normalizeCount } from "./stack.ts";
 
 /**
  * Spacer component that renders empty lines
@@ -7,11 +8,11 @@ export class Spacer implements Component {
 	private lines: number;
 
 	constructor(lines: number = 1) {
-		this.lines = lines;
+		this.lines = normalizeCount(lines, 1);
 	}
 
 	setLines(lines: number): void {
-		this.lines = lines;
+		this.lines = normalizeCount(lines, 1);
 	}
 
 	invalidate(): void {

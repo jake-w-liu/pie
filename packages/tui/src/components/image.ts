@@ -32,6 +32,7 @@ export class Image implements Component {
 
 	private cachedLines?: string[];
 	private cachedWidth?: number;
+	private cachedCapsKey?: string;
 
 	constructor(
 		base64Data: string,
@@ -56,10 +57,19 @@ export class Image implements Component {
 	invalidate(): void {
 		this.cachedLines = undefined;
 		this.cachedWidth = undefined;
+		this.cachedCapsKey = undefined;
+	}
+
+	/** Terminal state the rendered lines depend on, beyond the width. */
+	private capabilityKey(): string {
+		const caps = getCapabilities();
+		const cell = getCellDimensions();
+		return `${caps.images ?? "none"}:${caps.trueColor}:${caps.hyperlinks}:${cell.widthPx}x${cell.heightPx}`;
 	}
 
 	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) {
+		const capsKey = this.capabilityKey();
+		if (this.cachedLines && this.cachedWidth === width && this.cachedCapsKey === capsKey) {
 			return this.cachedLines;
 		}
 
@@ -121,6 +131,7 @@ export class Image implements Component {
 
 		this.cachedLines = lines;
 		this.cachedWidth = width;
+		this.cachedCapsKey = capsKey;
 
 		return lines;
 	}

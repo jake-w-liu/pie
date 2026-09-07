@@ -201,7 +201,7 @@ function layoutComponent(
 	const allocatedHeight =
 		height === undefined
 			? intrinsicHeights.reduce((max, childHeight) => Math.max(max, childHeight), 0)
-			: Math.max(0, height);
+			: Math.max(0, Math.floor(height));
 	const rect = { x, y, width: safeWidth, height: allocatedHeight };
 	const box: LayoutBox = {
 		component,
@@ -267,6 +267,7 @@ export function getScrollbarGeometry(box: LayoutBox): ScrollbarGeometry | undefi
 	if (!box.scrollView?.isScrollbarVisible || box.rect.width <= 0 || box.rect.height <= 0) return undefined;
 
 	const contentHeight = box.children[0]?.rect.height ?? box.scrollContentLines?.length ?? 0;
+	if (contentHeight <= 0) return undefined;
 	const trackHeight = box.rect.height;
 
 	const minThumbHeight = Math.min(2, trackHeight);
@@ -321,10 +322,27 @@ function paintBox(box: LayoutBox, screen: string[], totalWidth: number): void {
 			// string through ANSI/grapheme segmentation every frame; padding is
 			// unnecessary because rows are written with erase-line and the final
 			// width clamp still truncates over-wide lines.
-			if (box.rect.x === 0 && box.rect.width >= totalWidth && (isImageLine(line) || !screen[row])) {
+			const paintStart = Math.max(box.rect.x, box.clip.x);
+			const paintEnd = Math.min(box.rect.x + box.rect.width, box.clip.x + box.clip.width);
+			if (paintEnd <= paintStart) continue;
+			if (!imageMetadata && (paintStart !== box.rect.x || paintEnd !== box.rect.x + box.rect.width)) {
+				// The box overflows its clip horizontally (e.g. minSize-forced HStack
+				// overflow). Restrict painting to the clipped span so content cannot
+				// bleed into neighboring columns. Image lines are never sliced.
+				line = sliceByColumn(line, paintStart - box.rect.x, paintEnd - paintStart, true);
+			}
+			const paintWidth = imageMetadata ? box.rect.width : paintEnd - paintStart;
+			const paintX = imageMetadata ? box.rect.x : paintStart;
+			if (
+				paintX === 0 &&
+				paintWidth >= totalWidth &&
+				box.clip.x <= 0 &&
+				box.clip.x + box.clip.width >= totalWidth &&
+				(isImageLine(line) || !screen[row])
+			) {
 				screen[row] = line;
 			} else {
-				screen[row] = compositeTuiLine(screen[row] ?? "", line, box.rect.x, box.rect.width, totalWidth);
+				screen[row] = compositeTuiLine(screen[row] ?? "", line, paintX, paintWidth, totalWidth);
 			}
 		}
 	}

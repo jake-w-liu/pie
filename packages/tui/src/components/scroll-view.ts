@@ -180,6 +180,10 @@ export class ScrollView extends Container {
 		} else if (this.contentHeight < prevContentHeight) {
 			// Content actually shrank: re-clamp so we never show beyond the content.
 			this.currentScrollTop = Math.max(0, Math.min(this.currentScrollTop, maxScrollTop));
+		} else if (this.currentViewportHeight >= this.contentHeight) {
+			// The whole content fits in the viewport: any offset would hide its
+			// start behind blank rows, so reset to the top.
+			this.currentScrollTop = 0;
 		} else {
 			// The content did not shrink; only the viewport changed (e.g. the dock,
 			// a status indicator, or the editor/autocomplete resized the transcript's

@@ -55,4 +55,40 @@ describe("SettingsList", () => {
 
 		assert.deepStrictEqual(changes, [{ id: "tui-mode", value: "fullscreen" }]);
 	});
+
+	it("navigates to a filtered-out item when a submenu closes with navigateTo", () => {
+		const opened: string[] = [];
+		let alphaDone: ((v?: string, o?: { navigateTo?: string }) => void) | undefined;
+		const makeItem = (id: string) => ({
+			id,
+			label: id === "alpha" ? "Alpha setting" : "Beta setting",
+			currentValue: "",
+			submenu: (_value: string, done: (v?: string, o?: { navigateTo?: string }) => void) => {
+				opened.push(id);
+				if (id === "alpha") alphaDone = done;
+				return { render: () => [id], invalidate: () => {} };
+			},
+		});
+		const list = new SettingsList(
+			[makeItem("alpha"), makeItem("beta")],
+			10,
+			testTheme,
+			() => {},
+			() => {},
+			{ enableSearch: true },
+		);
+
+		// Search to filter out "beta".
+		for (const character of "Alph") list.handleInput(character);
+		assert.strictEqual(list.render(80).filter((l) => l.includes("Beta")).length, 0, "beta should be filtered out");
+
+		// Open alpha's submenu.
+		list.handleInput("\r");
+		assert.deepStrictEqual(opened, ["alpha"]);
+		assert.ok(alphaDone, "alpha submenu should capture its done callback");
+
+		// Close it navigating to the filtered-out beta: beta's submenu must open.
+		alphaDone(undefined, { navigateTo: "beta" });
+		assert.deepStrictEqual(opened, ["alpha", "beta"]);
+	});
 });

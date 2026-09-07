@@ -671,3 +671,33 @@ describe("Input component", () => {
 		});
 	});
 });
+
+describe("Input key handling", () => {
+	it("ignores Ctrl+C instead of treating it as escape", () => {
+		const input = new Input();
+		let escaped = false;
+		input.onEscape = () => {
+			escaped = true;
+		};
+		input.handleInput("a");
+		input.handleInput("\x03"); // Ctrl+C
+		assert.strictEqual(escaped, false);
+		assert.strictEqual(input.getValue(), "a");
+	});
+
+	it("still triggers onEscape on Escape", () => {
+		const input = new Input();
+		let escaped = false;
+		input.onEscape = () => {
+			escaped = true;
+		};
+		input.handleInput("\x1b");
+		assert.strictEqual(escaped, true);
+	});
+
+	it("inserts modifyOtherKeys printable characters", () => {
+		const input = new Input();
+		input.handleInput("\x1b[27;2;65~"); // Shift+A in modifyOtherKeys mode
+		assert.strictEqual(input.getValue(), "A");
+	});
+});

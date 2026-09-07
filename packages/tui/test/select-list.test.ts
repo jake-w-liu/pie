@@ -113,4 +113,12 @@ describe("SelectList", () => {
 		assert.ok(rendered[0].includes("…"));
 		assert.equal(visibleIndexOf(rendered[0], "first"), visibleIndexOf(rendered[1], "second"));
 	});
+
+	it("ignores arrow keys when the list is empty", () => {
+		const list = new SelectList([], 5, testTheme);
+		list.handleInput("\x1b[A");
+		list.handleInput("\x1b[B");
+		assert.strictEqual(list.getSelectedItem(), null);
+		assert.deepStrictEqual(list.render(40), ["  No matching commands"]);
+	});
 });

@@ -8,6 +8,9 @@
 
 ### Fixed
 
+- Preserved dequeued steering and follow-up input when next-turn preparation compacts context or stops the run.
+- Preserved earlier checkpoints and branch file tracking during compaction, rejected stale pre-checkpoint usage, and bounded summary inputs and visible file tags without dropping structured file metadata.
+- Included failed retry attempts in summary usage and retained tool names and call IDs in serialized results.
 - Fixed proxy streaming accepting an empty auth token and building `//api/stream` URLs from trailing-slash proxy URLs; both are now validated up front.
 - Fixed harness compaction accepting truncated, tool-call-only, or empty summaries and producing invalid summary request limits when the configured response reserve is zero.
 - Fixed harness branch summaries dropping tool results and cumulative file tracking from earlier compactions; large tool results are now budgeted at their bounded serialized size.

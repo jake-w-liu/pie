@@ -164,7 +164,7 @@ and user/project agents override builtins with the same name.
 |-------|---------|-------|------------------------|
 | `scout` | Fast codebase recon | inherits default | Writes `context.md` handoff material |
 | `worker` | Implementation and approved oracle handoffs | inherits default | Single-writer implementation with decision escalation |
-| `reviewer` | Review specialist | inherits default | Default recipes are review-only; tools include edit/write when a fix pass is explicit |
+| `reviewer` | Review specialist | inherits default | Read-only findings; the parent or a writer agent runs verification and applies fixes |
 | `researcher` | Web research brief generator | inherits default | Writes `research.md` |
 | `delegate` | Lightweight generic delegate | inherits default | No fixed output; generic delegated work |
 | `oracle` | Decision-consistency advisory review | inherits default | Advisory review, intercom coordination |

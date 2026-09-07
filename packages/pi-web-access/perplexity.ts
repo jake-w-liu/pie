@@ -173,7 +173,11 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
 
 	let data: Record<string, unknown>;
 	try {
-		data = await response.json();
+		const parsed: unknown = await response.json();
+		if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+			throw new Error("expected a JSON object");
+		}
+		data = parsed as Record<string, unknown>;
 	} catch (err) {
 		activityMonitor.logComplete(activityId, response.status);
 		const message = err instanceof Error ? err.message : String(err);

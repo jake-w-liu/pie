@@ -1,6 +1,6 @@
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { SessionShutdownEvent } from "../src/index.ts";
+import type { AgentSessionEvent, SessionShutdownEvent } from "../src/index.ts";
 import { runPrintMode } from "../src/modes/print-mode.ts";
 
 type EmitEvent = SessionShutdownEvent;
@@ -91,6 +91,25 @@ afterEach(() => {
 });
 
 describe("runPrintMode", () => {
+	it.each(["text", "json"] as const)("reports a context-limit stop as failure in %s mode", async (mode) => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "incomplete work" }));
+		let listener: ((event: AgentSessionEvent) => void) | undefined;
+		runtimeHost.session.subscribe.mockImplementation((callback: (event: AgentSessionEvent) => void) => {
+			listener = callback;
+			return () => {};
+		});
+		runtimeHost.session.prompt.mockImplementation(async () => {
+			listener?.({ type: "context_limit", tokens: 32000, contextWindow: 32000 });
+		});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode,
+			initialMessage: "finish the task",
+		});
+		expect(exitCode).toBe(1);
+		if (mode === "text") expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("context"));
+	});
+
 	it("emits session_shutdown in text mode", async () => {
 		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
 		const { session } = runtimeHost;

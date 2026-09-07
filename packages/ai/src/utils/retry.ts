@@ -105,6 +105,8 @@ export interface RetryPolicy {
 
 /** Optional callbacks emitted by {@link retryAssistantCall} around each retry. */
 export interface RetryCallbacks {
+	/** Emitted for every provider response, including failed and aborted attempts. */
+	onResponse?: (response: AssistantMessage) => void | Promise<void>;
 	/** Emitted before the backoff sleep of each retry attempt (1-indexed). */
 	onRetryScheduled?: (
 		attempt: number,
@@ -172,6 +174,7 @@ export async function retryAssistantCall(
 	let lastRetry: { attempt: number; errorMessage: string } | undefined;
 	for (;;) {
 		const response = await produce();
+		await callbacks?.onResponse?.(response);
 
 		// Abort: terminal but not successful. Never retry an aborted message.
 		if (response.stopReason === "aborted") {

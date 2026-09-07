@@ -118,6 +118,13 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
 		unsubscribe = session.subscribe((event) => {
+			if (event.type === "context_limit") {
+				exitCode = 1;
+				if (mode === "text")
+					console.error(
+						`Stopped at the context limit (${event.tokens}/${event.contextWindow} tokens). Compact the session or use a larger-context model.`,
+					);
+			}
 			if (mode === "json") {
 				writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`);
 			}

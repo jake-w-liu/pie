@@ -22,6 +22,7 @@
 
 ### Fixed
 
+- Fixed rapid main-screen text selection overwhelming terminal output or clipboard handlers and leaving live rendering frozen after release, focus loss, overlay changes, interrupted gestures, or stale resize geometry.
 - Fixed over-wide rendered lines crashing the session; they are now truncated to the terminal width with the incident recorded in `pi-crash.log`.
 - Fixed CSI escape parsing to accept the full final-byte range so cursor moves, erases, and mode sequences are no longer miscounted as visible width.
 - Fixed Kitty keyboard dedup dropping genuine keypresses after shifted keys by tracking the effective inserted code point.
@@ -41,6 +42,11 @@
 - Fixed main-screen rendering crashing when image-heavy output exceeded V8's string length limit ([#8028](https://github.com/earendil-works/pi/issues/8028)).
 - Fixed autocomplete ordering for nested results ([#8669](https://github.com/earendil-works/pi/pull/8669)).
 - Fixed fullscreen double-click word selection splitting paths and kebab-case tokens on `/` and `-` ([#7746](https://github.com/earendil-works/pi/issues/7746)).
+- Fixed repeated slash completion after skill references, cancelled providers blocking later suggestions, and stale suggestions replacing newly typed text.
+- Fixed horizontal trackpad events holding main-screen output and overlay/restart transitions leaving an unchanged viewport scrolled back.
+- Fixed backward selections dropping endpoint characters and repeated drags becoming double-click selections.
+- Fixed fullscreen selection auto-scroll surviving keyboard input, overlay changes, resize, redraw resets, and non-primary releases.
+- Fixed interrupted CSI mouse reports swallowing subsequent mouse, focus, and keyboard input.
 
 ## [0.84.3] - 2026-08-24
 

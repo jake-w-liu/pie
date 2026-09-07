@@ -307,10 +307,10 @@ export class Editor implements Component, Focusable {
 	private autocompleteList?: SelectList;
 	private autocompleteState: "regular" | "force" | null = null;
 	private autocompletePrefix: string = "";
+	private autocompleteSnapshot?: { text: string; line: number; col: number };
 	private autocompleteMaxVisible: number = 5;
 	private autocompleteAbort?: AbortController;
 	private autocompleteDebounceTimer?: ReturnType<typeof setTimeout>;
-	private autocompleteRequestTask: Promise<void> = Promise.resolve();
 	private autocompleteStartToken: number = 0;
 	private autocompleteRequestId: number = 0;
 
@@ -698,6 +698,20 @@ export class Editor implements Component, Focusable {
 
 			if (kb.matches(data, "tui.select.up") || kb.matches(data, "tui.select.down")) {
 				this.autocompleteList.handleInput(data);
+				return;
+			}
+
+			const snapshot = this.autocompleteSnapshot;
+			if (
+				snapshot &&
+				(kb.matches(data, "tui.input.tab") || kb.matches(data, "tui.select.confirm")) &&
+				(snapshot.text !== this.getText() ||
+					snapshot.line !== this.state.cursorLine ||
+					snapshot.col !== this.state.cursorCol)
+			) {
+				// A refresh may still be pending after typing or cursor movement.
+				// Applying its predecessor would replace the wrong text range.
+				this.updateAutocomplete();
 				return;
 			}
 
@@ -2325,27 +2339,21 @@ export class Editor implements Component, Focusable {
 		startToken: number,
 		options: { force: boolean; explicitTab: boolean },
 	): Promise<void> {
-		const previousTask = this.autocompleteRequestTask;
-		this.autocompleteRequestTask = (async () => {
-			try {
-				await previousTask;
-			} catch {
-				// A previous request failed; the chain must stay alive for new input.
-			}
-			if (startToken !== this.autocompleteStartToken || !this.autocompleteProvider) {
-				return;
-			}
+		// Coalesce input from the same turn, but never wait for an obsolete
+		// provider: cancellation is cooperative and extensions may ignore it.
+		await Promise.resolve();
+		if (startToken !== this.autocompleteStartToken || !this.autocompleteProvider) {
+			return;
+		}
 
-			const controller = new AbortController();
-			this.autocompleteAbort = controller;
-			const requestId = ++this.autocompleteRequestId;
-			const snapshotText = this.getText();
-			const snapshotLine = this.state.cursorLine;
-			const snapshotCol = this.state.cursorCol;
+		const controller = new AbortController();
+		this.autocompleteAbort = controller;
+		const requestId = ++this.autocompleteRequestId;
+		const snapshotText = this.getText();
+		const snapshotLine = this.state.cursorLine;
+		const snapshotCol = this.state.cursorCol;
 
-			await this.runAutocompleteRequest(requestId, controller, snapshotText, snapshotLine, snapshotCol, options);
-		})();
-		await this.autocompleteRequestTask;
+		await this.runAutocompleteRequest(requestId, controller, snapshotText, snapshotLine, snapshotCol, options);
 	}
 
 	private setAutocompleteTriggerCharacters(triggerCharacters: string[]): void {
@@ -2384,9 +2392,9 @@ export class Editor implements Component, Focusable {
 		let suggestions: AutocompleteSuggestions | null | undefined;
 		try {
 			suggestions = await this.autocompleteProvider.getSuggestions(
-				this.state.lines,
-				this.state.cursorLine,
-				this.state.cursorCol,
+				snapshotText.split("\n"),
+				snapshotLine,
+				snapshotCol,
 				{ signal: controller.signal, force: options.force },
 			);
 		} catch {
@@ -2484,6 +2492,11 @@ export class Editor implements Component, Focusable {
 
 	private applyAutocompleteSuggestions(suggestions: AutocompleteSuggestions, state: "regular" | "force"): void {
 		this.autocompletePrefix = suggestions.prefix;
+		this.autocompleteSnapshot = {
+			text: this.getText(),
+			line: this.state.cursorLine,
+			col: this.state.cursorCol,
+		};
 		this.autocompleteList = this.createAutocompleteList(suggestions.prefix, suggestions.items);
 
 		const bestMatchIndex = this.getBestAutocompleteMatchIndex(suggestions.items, suggestions.prefix);
@@ -2508,6 +2521,7 @@ export class Editor implements Component, Focusable {
 		this.autocompleteState = null;
 		this.autocompleteList = undefined;
 		this.autocompletePrefix = "";
+		this.autocompleteSnapshot = undefined;
 	}
 
 	private cancelAutocomplete(): void {

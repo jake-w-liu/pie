@@ -101,6 +101,27 @@ describe("findCutPoint", () => {
 });
 
 describe("estimateContextTokens", () => {
+	it("does not reuse usage from before a newer checkpoint", () => {
+		const messages: AgentMessage[] = [
+			{ role: "compactionSummary", summary: "checkpoint", tokensBefore: 19000, timestamp: 100 },
+			{
+				...assistantMsg("retained answer"),
+				usage: {
+					input: 19000,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 19000,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+			} as AgentMessage,
+			userMsg("new request"),
+		];
+		const estimate = estimateContextTokens(messages);
+		expect(estimate.lastUsageIndex).toBeNull();
+		expect(estimate.tokens).toBe(messages.reduce((sum, message) => sum + estimateTokens(message), 0));
+	});
+
 	it("uses the last assistant usage plus trailing estimate", () => {
 		const lastUsage = {
 			input: 100,

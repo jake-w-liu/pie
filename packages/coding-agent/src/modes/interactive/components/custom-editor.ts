@@ -41,9 +41,19 @@ export class CustomEditor extends Editor {
 
 		// Check app keybindings first
 
-		// Escape/interrupt - only if autocomplete is NOT active
+		// Input clearing is separate from interrupt handlers installed by active
+		// turns, compaction, and retry. Escape closes a visible menu first.
+		if (this.keybindings.matches(data, "app.editor.clear")) {
+			if (this.isShowingAutocomplete() && this.keybindings.matches(data, "tui.select.cancel")) {
+				super.handleInput(data);
+			} else {
+				this.setText("");
+			}
+			return;
+		}
+
 		if (this.keybindings.matches(data, "app.interrupt")) {
-			if (!this.isShowingAutocomplete()) {
+			if (!this.isShowingAutocomplete() || !this.keybindings.matches(data, "tui.select.cancel")) {
 				// Use dynamic onEscape if set, otherwise registered handler
 				const handler = this.onEscape ?? this.actionHandlers.get("app.interrupt");
 				if (handler) {

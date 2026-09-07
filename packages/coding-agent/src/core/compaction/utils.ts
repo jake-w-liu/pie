@@ -69,16 +69,44 @@ export function computeFileLists(fileOps: FileOperations): { readFiles: string[]
 /**
  * Format file operations as XML tags for summary.
  */
-export function formatFileOperations(readFiles: string[], modifiedFiles: string[]): string {
+export function formatFileOperations(
+	readFiles: string[],
+	modifiedFiles: string[],
+	maxChars = Number.POSITIVE_INFINITY,
+): string {
+	if (!(maxChars > 0)) return "";
+	const groups = [
+		["read-files", readFiles],
+		["modified-files", modifiedFiles],
+	] as const;
+	const fullLength = groups.reduce(
+		(total, [tag, files]) =>
+			total +
+			(files.length ? `\n\n<${tag}>\n\n</${tag}>`.length + files.reduce((n, file) => n + file.length + 1, -1) : 0),
+		0,
+	);
+	const omitted = "\n\n[Additional tracked files omitted here; full lists are in summary metadata.]";
+	const truncated = fullLength > maxChars;
+	let remaining = maxChars - (truncated ? omitted.length : 0);
 	const sections: string[] = [];
-	if (readFiles.length > 0) {
-		sections.push(`<read-files>\n${readFiles.join("\n")}\n</read-files>`);
+	for (const [tag, files] of groups) {
+		const open = `\n\n<${tag}>\n`;
+		const close = `\n</${tag}>`;
+		const kept: string[] = [];
+		let size = open.length + close.length;
+		for (const file of files) {
+			const added = file.length + (kept.length ? 1 : 0);
+			if (size + added > remaining) break;
+			kept.push(file);
+			size += added;
+		}
+		if (kept.length) {
+			sections.push(open, kept.join("\n"), close);
+			remaining -= size;
+		}
 	}
-	if (modifiedFiles.length > 0) {
-		sections.push(`<modified-files>\n${modifiedFiles.join("\n")}\n</modified-files>`);
-	}
-	if (sections.length === 0) return "";
-	return `\n\n${sections.join("\n\n")}`;
+	if (truncated && maxChars >= omitted.length) sections.push(omitted);
+	return sections.join("");
 }
 
 // ============================================================================
@@ -110,9 +138,12 @@ function boundedContentText(content: string | readonly { type: string; text?: st
 	let remainingChars = maxChars;
 	const parts: string[] = [];
 	const trailingKeep = Math.floor(maxChars * 0.2);
+	let tail = "";
 	for (const block of content) {
 		if (block.type !== "text" || block.text === undefined) continue;
 		totalChars += block.text.length;
+		// Retain the true suffix without joining potentially huge tool-result blocks.
+		tail = (tail + block.text.slice(-trailingKeep)).slice(-trailingKeep);
 		if (remainingChars <= 0) continue;
 		const part = block.text.slice(0, remainingChars);
 		parts.push(part);
@@ -124,7 +155,6 @@ function boundedContentText(content: string | readonly { type: string; text?: st
 	// Head/marker/tail: keep the leading portion, note the cut, then append the
 	// trailing part so later details survive; preserves DSH pruner semantics.
 	const head = text.slice(0, Math.max(0, maxChars - trailingKeep));
-	const tail = text.slice(text.length - trailingKeep);
 	return `${head}\n\n[... middle truncated (${totalChars} chars -> ${maxChars})]\n\n${tail}`;
 }
 
@@ -171,7 +201,7 @@ export function serializeConversation(messages: Message[]): string {
 		} else if (msg.role === "toolResult") {
 			const content = boundedContentText(msg.content, TOOL_RESULT_MAX_CHARS);
 			if (content) {
-				parts.push(`[Tool result]: ${content}`);
+				parts.push(`[Tool result]: ${msg.toolName} (call ${msg.toolCallId})\n${content}`);
 			}
 		}
 	}

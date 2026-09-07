@@ -123,6 +123,13 @@ export function isPrimaryMousePress(event: SgrMouseEvent): boolean {
 	return event.press && (event.button & 3) === 0 && (event.button & 96) === 0;
 }
 
+/** True for a primary-button release, including SGR's generic release code. */
+export function isPrimaryMouseRelease(event: SgrMouseEvent): boolean {
+	if (event.press || (event.button & 96) !== 0) return false;
+	const button = event.button & 3;
+	return button === 0 || button === 3;
+}
+
 /**
  * True for unmodified left-button drag motion (button-motion tracking reports
  * these while the button is held). Modifier drags stay with the terminal so
@@ -308,8 +315,10 @@ const MAX_RENDER_WRITE_CHARS = 1024 * 1024;
 // highlights, plus SGR extended coordinates. Full motion tracking is off:
 // clicks position the cursor, while text selection stays with the terminal
 // (Shift+drag in most emulators).
-const ENABLE_MAIN_SCREEN_MOUSE = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
-const DISABLE_MAIN_SCREEN_MOUSE = "\x1b[?1002l\x1b[?1000l\x1b[?1006l";
+const ENABLE_MAIN_SCREEN_MOUSE = "\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h";
+const DISABLE_MAIN_SCREEN_MOUSE = "\x1b[?1006l\x1b[?1004l\x1b[?1002l\x1b[?1000l";
+const TERMINAL_FOCUS_IN = "\x1b[I";
+const TERMINAL_FOCUS_OUT = "\x1b[O";
 
 /** Streams terminal output in bounded chunks without splitting UTF-16 surrogate pairs. */
 export class BoundedTerminalWriter {
@@ -514,10 +523,10 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	/**
-	 * Handle a primary mouse button release at 0-based terminal coordinates.
-	 * Return true when consumed.
+	 * Handle a mouse button release at 0-based terminal coordinates. `button`
+	 * retains SGR button and modifier bits. Return true when consumed.
 	 */
-	protected routeMouseRelease(_x: number, _y: number): boolean {
+	protected routeMouseRelease(_x: number, _y: number, _button = 0): boolean {
 		return false;
 	}
 
@@ -528,6 +537,20 @@ export abstract class TuiBase extends Container implements TUI {
 	protected routeMouseDrag(_x: number, _y: number): boolean {
 		return false;
 	}
+
+	/** Cancel a gesture when an input listener takes ownership of its mouse events. */
+	protected routeMouseCancel(): void {}
+
+	/** Handle focus reports used to terminate mouse gestures whose release was lost. */
+	protected routeTerminalFocusChange(_focused: boolean): void {}
+
+	/** Handle a terminal resize before the resulting frame is rendered. */
+	protected routeTerminalResize(): void {
+		this.requestRender();
+	}
+
+	/** Handle a change that can move an overlay between the pointer and base frame. */
+	protected routeOverlayChange(): void {}
 
 	/**
 	 * Intercept a keyboard input for viewport control before it reaches the
@@ -720,6 +743,7 @@ export abstract class TuiBase extends Container implements TUI {
 			focusOrder: ++this.focusOrderCounter,
 		};
 		this.overlayStack.push(entry);
+		this.routeOverlayChange();
 		// Only focus if overlay is actually visible
 		if (!options?.nonCapturing && this.isOverlayVisible(entry)) {
 			this.setFocus(component);
@@ -735,6 +759,7 @@ export abstract class TuiBase extends Container implements TUI {
 					this.clearOverlayFocusRestoreFor(entry);
 					this.retargetOverlayPreFocus(entry);
 					this.overlayStack.splice(index, 1);
+					this.routeOverlayChange();
 					// Restore focus if this overlay had focus
 					if (this.focusedComponent === component) {
 						const topVisible = this.getTopmostVisibleOverlay();
@@ -747,6 +772,7 @@ export abstract class TuiBase extends Container implements TUI {
 			setHidden: (hidden: boolean) => {
 				if (entry.hidden === hidden) return;
 				entry.hidden = hidden;
+				this.routeOverlayChange();
 				// Update focus when hiding/showing
 				if (hidden) {
 					this.clearOverlayFocusRestoreFor(entry);
@@ -813,6 +839,7 @@ export abstract class TuiBase extends Container implements TUI {
 		this.clearOverlayFocusRestoreFor(overlay);
 		this.retargetOverlayPreFocus(overlay);
 		this.overlayStack.pop();
+		this.routeOverlayChange();
 		if (this.focusedComponent === overlay.component) {
 			// Find topmost visible overlay, or fall back to preFocus
 			const topVisible = this.getTopmostVisibleOverlay();
@@ -865,7 +892,7 @@ export abstract class TuiBase extends Container implements TUI {
 		this.beforeTerminalStart();
 		this.terminal.start(
 			(data) => this.handleTerminalInput(data),
-			() => this.requestRender(),
+			() => this.routeTerminalResize(),
 		);
 		this.afterTerminalStart();
 		this.terminal.hideCursor();
@@ -1028,14 +1055,25 @@ export abstract class TuiBase extends Container implements TUI {
 			return;
 		}
 
+		// Focus reporting is enabled with main-screen mouse tracking. Consume it
+		// before extension listeners so a lost mouse release cannot strand a
+		// selection gesture or leak focus bytes into the editor.
+		if (this.mouseReportingActive && (data === TERMINAL_FOCUS_IN || data === TERMINAL_FOCUS_OUT)) {
+			this.routeTerminalFocusChange(data === TERMINAL_FOCUS_IN);
+			return;
+		}
+
 		if (this.inputListeners.size > 0) {
+			const ownedMouseInput = this.mouseReportingActive && parseSgrMouseEvent(data) !== undefined;
 			let current = data;
 			for (const listener of this.inputListeners) {
 				const result = listener(current);
 				if (result?.consume) {
+					if (ownedMouseInput) this.routeMouseCancel();
 					return;
 				}
 				if (result?.data !== undefined) {
+					if (ownedMouseInput && result.data !== current) this.routeMouseCancel();
 					current = result.data;
 				}
 			}
@@ -1061,9 +1099,12 @@ export abstract class TuiBase extends Container implements TUI {
 				return;
 			}
 			if (mouseEvent.press && (mouseEvent.button & 64) !== 0) {
-				if (this.routeMouseWheel(mouseEvent.button & 1 ? 1 : -1)) return;
+				const direction = mouseEvent.button & 3;
+				// Horizontal trackpad reports must not enter vertical reading mode.
+				if (direction > 1) return;
+				if (this.routeMouseWheel(direction === 1 ? 1 : -1)) return;
 			} else if (!mouseEvent.press && (mouseEvent.button & 64) === 0) {
-				this.routeMouseRelease(mouseEvent.x, mouseEvent.y);
+				this.routeMouseRelease(mouseEvent.x, mouseEvent.y, mouseEvent.button);
 				return;
 			} else {
 				return;

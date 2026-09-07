@@ -173,6 +173,16 @@ async function runLoop(
 
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
+			// Dequeued input belongs to the transcript before preparation can replace
+			// context or stop the run. This also includes it in compaction accounting.
+			for (const message of pendingMessages) {
+				await emit({ type: "message_start", message });
+				await emit({ type: "message_end", message });
+				currentContext.messages.push(message);
+				newMessages.push(message);
+			}
+			const hadPendingMessages = pendingMessages.length > 0;
+			pendingMessages = [];
 			if (lastCompletedTurn) {
 				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
 				if (nextTurnSnapshot) {
@@ -188,12 +198,6 @@ async function runLoop(
 									: nextTurnSnapshot.thinkingLevel,
 					};
 				}
-				// Preparation can be long-running (for example, compaction). Pick up steering
-				// queued while it ran. Only poll again if the earlier poll returned nothing;
-				// otherwise one-at-a-time mode would deliver two messages in this turn.
-				if (pendingMessages.length === 0) {
-					pendingMessages = (await config.getSteeringMessages?.()) || [];
-				}
 				// Preparation (for example, compaction) can decide the run must stop before the
 				// next provider request, e.g. when required compaction is cancelled or context
 				// still overflows. Re-check the stop condition so no request is made in that case.
@@ -202,6 +206,9 @@ async function runLoop(
 					return;
 				}
 				await emit({ type: "turn_start" });
+				// Do not dequeue input while stopping. Keep one-at-a-time delivery even
+				// if more steering arrived during a long-running preparation.
+				if (!hadPendingMessages) pendingMessages = (await config.getSteeringMessages?.()) || [];
 			}
 
 			// Process pending messages (inject before next assistant response)

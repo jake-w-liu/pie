@@ -14,6 +14,7 @@ import { stripBom } from "../utils/text.ts";
 export interface AppKeybindings {
 	"app.interrupt": true;
 	"app.clear": true;
+	"app.editor.clear": true;
 	"app.exit": true;
 	"app.suspend": true;
 	"app.thinking.cycle": true;
@@ -89,8 +90,9 @@ export const KEYBINDINGS = {
 		...TUI_KEYBINDINGS["tui.altScreen.search"],
 		defaultKeys: windowsKeybindings ? "ctrl+f" : "ctrl+shift+f",
 	},
-	"app.interrupt": { defaultKeys: "escape", description: "Cancel or abort" },
+	"app.interrupt": { defaultKeys: "ctrl+alt+c", description: "Cancel or abort" },
 	"app.clear": { defaultKeys: "ctrl+c", description: "Clear editor" },
+	"app.editor.clear": { defaultKeys: "escape", description: "Clear all input without interrupting" },
 	"app.exit": { defaultKeys: "ctrl+d", description: "Exit when editor is empty" },
 	"app.suspend": {
 		defaultKeys: process.platform === "win32" ? [] : "ctrl+z",

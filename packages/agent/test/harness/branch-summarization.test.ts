@@ -96,7 +96,7 @@ describe("v4 branch summarization", () => {
 		);
 
 		const prompt = JSON.stringify(requestContext?.messages);
-		expect(prompt).toContain("[Tool result]: critical result");
+		expect(prompt).toContain("[Tool result]: read (call branch-tool)\\ncritical result");
 		expect(prompt).toContain("[... middle truncated (");
 	});
 

@@ -4,7 +4,7 @@ import { serializeConversation } from "../src/core/compaction/utils.ts";
 
 describe("serializeConversation", () => {
 	it("should truncate long tool results with a head/marker/tail splice", () => {
-		const longContent = "x".repeat(5000);
+		const longContent = "x".repeat(4600) + "actual-tail".repeat(40);
 		const messages: Message[] = [
 			{
 				role: "toolResult",
@@ -25,7 +25,7 @@ describe("serializeConversation", () => {
 		// Head (80% of 2000 = 1600) is present.
 		expect(result).toContain("x".repeat(1600));
 		// Tail (20% of 2000 = 400) is preserved at the end.
-		expect(result.trimEnd().endsWith("x".repeat(400))).toBe(true);
+		expect(result.trimEnd().endsWith(longContent.slice(-400))).toBe(true);
 	});
 
 	it("should not truncate short tool results", () => {
@@ -43,7 +43,7 @@ describe("serializeConversation", () => {
 
 		const result = serializeConversation(messages);
 
-		expect(result).toBe(`[Tool result]: ${shortContent}`);
+		expect(result).toBe(`[Tool result]: read (call tc1)\n${shortContent}`);
 		expect(result).not.toContain("truncated");
 	});
 
@@ -55,7 +55,9 @@ describe("serializeConversation", () => {
 				toolName: "read",
 				content: [
 					{ type: "text", text: "a".repeat(1500) },
-					{ type: "text", text: "b".repeat(1500) },
+					{ type: "text", text: "b".repeat(1000) },
+					{ type: "text", text: "c".repeat(300) },
+					{ type: "text", text: "d".repeat(200) },
 				],
 				isError: false,
 				timestamp: Date.now(),
@@ -64,11 +66,11 @@ describe("serializeConversation", () => {
 
 		const result = serializeConversation(messages);
 
-		// Total 3000 chars, head=1600 (1500 'a' + 100 'b'), tail=400 'b'.
+		// Total 3000 chars; the final 400 span two separate text blocks.
 		expect(result).toContain("a".repeat(1500));
 		expect(result).toContain("[... middle truncated");
 		// Tail preserves the last 400 characters.
-		expect(result.trimEnd().endsWith("b".repeat(400))).toBe(true);
+		expect(result.trimEnd().endsWith("c".repeat(200) + "d".repeat(200))).toBe(true);
 	});
 
 	it("should not truncate assistant or user messages", () => {

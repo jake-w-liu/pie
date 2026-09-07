@@ -177,6 +177,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	private previousCursorSequence = "";
 	private layoutRoot: Component | undefined;
 	private currentLayout: LayoutFrame | undefined;
+	private pointerFrameInvalidated = false;
 	private readonly implicitDocument: Component;
 	private readonly implicitScrollView: ScrollView;
 	private readonly flashes: AltScreenFlashContainer;
@@ -269,6 +270,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 	setLayoutRoot(component: Component | undefined): void {
 		if (this.layoutRoot === component) return;
+		this.routeMouseCancel();
 		this.layoutRoot = component;
 		this.currentLayout = undefined;
 		this.requestRender();
@@ -430,6 +432,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	}
 
 	protected override resetRenderState(): void {
+		this.routeMouseCancel();
 		this.previousScreen = [];
 		this.previousRawScreen = [];
 		this.previousScreenWidth = 0;
@@ -583,24 +586,40 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return this.isOverlayFocused() && this.activeSearch?.overlay?.isFocused() !== true;
 	}
 
+	protected override routeMouseCancel(): void {
+		const hadActiveSelection = this.selectionPressActive;
+		const hadNonEmptyActiveSelection = hadActiveSelection && this.getSelectionBounds() !== undefined;
+		this.selectionPressActive = false;
+		this.stopSelectionAutoScroll();
+		this.stopScrollbarHover();
+		this.stopScrollbarDrag();
+		this.pressedUrl = undefined;
+		this.selectionDragged = false;
+		if (hadActiveSelection) {
+			this.selectionAnchor = undefined;
+			this.selectionFocus = undefined;
+			this.selectionGranularity = "character";
+			this.selectionInitialRange = undefined;
+			if (hadNonEmptyActiveSelection) this.requestRender();
+		}
+		this.lastClick = undefined;
+	}
+
+	protected override routeTerminalResize(): void {
+		this.routeMouseCancel();
+		this.pointerFrameInvalidated = true;
+		super.routeTerminalResize();
+	}
+
+	protected override routeOverlayChange(): void {
+		this.routeMouseCancel();
+		this.pointerFrameInvalidated = true;
+		this.requestRender();
+	}
+
 	private handleViewportInput(data: string): { consume?: boolean } | undefined {
 		if (data === FOCUS_OUT) {
-			const hadActiveSelection = this.selectionPressActive;
-			const hadNonEmptyActiveSelection = hadActiveSelection && this.getSelectionBounds() !== undefined;
-			this.selectionPressActive = false;
-			this.stopSelectionAutoScroll();
-			this.stopScrollbarHover();
-			this.stopScrollbarDrag();
-			this.pressedUrl = undefined;
-			this.selectionDragged = false;
-			if (hadActiveSelection) {
-				this.selectionAnchor = undefined;
-				this.selectionFocus = undefined;
-				this.selectionGranularity = "character";
-				this.selectionInitialRange = undefined;
-				if (hadNonEmptyActiveSelection) this.requestRender();
-			}
-			this.lastClick = undefined;
+			this.routeMouseCancel();
 			return { consume: true };
 		}
 		if (data === FOCUS_IN) return { consume: true };
@@ -608,12 +627,14 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		const wheelEvent = this.parseWheelEvent(data);
 		if (wheelEvent) {
 			if (this.shouldDeferViewportInputToOverlay()) return undefined;
+			if (this.pointerFrameInvalidated) return { consume: true };
 			this.routeWheel(wheelEvent);
 			return { consume: true };
 		}
 		const mouseEvent = this.parseSgrMouseEvent(data);
 		if (mouseEvent) {
 			if (this.handleRightClickPaste(mouseEvent)) return { consume: true };
+			if (this.pointerFrameInvalidated || !this.currentLayout) return { consume: true };
 			const handled = this.handleScrollbarMouseEvent(mouseEvent);
 			if (!this.scrollbarDrag) this.updateScrollbarHover(mouseEvent.x, mouseEvent.y);
 			if (!handled) this.handleSelectionMouseEvent(mouseEvent);
@@ -623,6 +644,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 		const keybindings = getKeybindings();
 		const isRelease = isKeyRelease(data);
+		if (!isRelease) this.routeMouseCancel();
 		if (keybindings.matches(data, "tui.altScreen.search")) {
 			if (!isRelease) this.openSearch();
 			return { consume: true };
@@ -1033,7 +1055,10 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 	private handleSelectionMouseEvent(event: SgrMouseEvent): void {
 		const button = event.button & 3;
-		if (button !== 0 && !(event.release && button === 3)) return;
+		if (button !== 0 && !(event.release && button === 3)) {
+			if (event.release) this.routeMouseCancel();
+			return;
+		}
 		const anchorScrollView = this.selectionAnchor?.scrollView;
 		const point = this.getSelectionPoint(event, anchorScrollView);
 		if (event.release) {
@@ -1395,6 +1420,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		if (!screenChanged && cursorSequence === this.previousCursorSequence) {
 			this.previousRawScreen = rawScreen;
 			this.currentLayout = nextLayout;
+			this.pointerFrameInvalidated = false;
 			return;
 		}
 
@@ -1443,5 +1469,6 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.previousScreenHeight = height;
 		this.previousCursorSequence = cursorSequence;
 		this.currentLayout = nextLayout;
+		this.pointerFrameInvalidated = false;
 	}
 }

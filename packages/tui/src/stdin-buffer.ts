@@ -205,6 +205,13 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 			// Find the end of this escape sequence
 			let seqEnd = 1;
 			while (seqEnd <= remaining.length) {
+				// ESC cancels an incomplete CSI and starts a new sequence. Keeping
+				// the damaged prefix would swallow later mouse releases/focus reports
+				// and grow the buffer for as long as input keeps arriving.
+				if (seqEnd > 1 && remaining[seqEnd - 1] === ESC && remaining.startsWith(`${ESC}[`)) {
+					pos += seqEnd - 1;
+					break;
+				}
 				const candidate = remaining.slice(0, seqEnd);
 				const status = isCompleteSequence(candidate);
 

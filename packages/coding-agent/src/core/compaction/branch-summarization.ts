@@ -200,15 +200,17 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 	// This ensures we capture cumulative file tracking from prior generated summaries.
 	// Only extract from pi-generated summaries (fromHook !== true), not extension-generated ones
 	for (const entry of entries) {
+		const message = getMessageFromEntry(entry);
+		if (message) extractFileOpsFromMessage(message, fileOps);
 		if ((entry.type === "branch_summary" || entry.type === "compaction") && !entry.fromHook && entry.details) {
 			const details = entry.details as BranchSummaryDetails;
 			if (Array.isArray(details.readFiles)) {
-				for (const f of details.readFiles) fileOps.read.add(f);
+				for (const f of details.readFiles) if (typeof f === "string") fileOps.read.add(f);
 			}
 			if (Array.isArray(details.modifiedFiles)) {
 				// Modified files go into both edited and written for proper deduplication
 				for (const f of details.modifiedFiles) {
-					fileOps.edited.add(f);
+					if (typeof f === "string") fileOps.edited.add(f);
 				}
 			}
 		}
@@ -222,28 +224,19 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 		const serializedMessage = convertToLlm([message])[0];
 		if (!serializedMessage) continue;
 
-		// Extract file ops from assistant messages (tool calls)
-		extractFileOpsFromMessage(message, fileOps);
-
 		const tokens = estimateSerializedSummaryTokens(serializedMessage);
 
 		// Check budget before adding
 		if (tokenBudget > 0 && totalTokens + tokens > tokenBudget) {
-			// If this is a summary entry, try to fit it anyway as it's important context
-			if (entry.type === "compaction" || entry.type === "branch_summary") {
-				if (totalTokens < tokenBudget * 0.9) {
-					messages.unshift(message);
-					totalTokens += tokens;
-				}
-			}
 			// Stop - we've hit the budget
 			break;
 		}
 
-		messages.unshift(message);
+		messages.push(message);
 		totalTokens += tokens;
 	}
 
+	messages.reverse();
 	return { messages, fileOps, totalTokens };
 }
 
@@ -312,11 +305,18 @@ export async function generateBranchSummary(
 	// Token budget = context window minus reserved space for prompt + response
 	const contextWindow = model.contextWindow || 128000;
 	const tokenBudget = contextWindow - reserveTokens;
+	if (!Number.isFinite(tokenBudget) || tokenBudget <= 0 || !Number.isFinite(reserveTokens) || reserveTokens < 0) {
+		return {
+			error: "No input budget is available for branch summarization. Reduce reserveTokens or use a larger-context model.",
+		};
+	}
 
 	const { messages, fileOps } = prepareBranchEntries(entries, tokenBudget);
 
 	if (messages.length === 0) {
-		return { summary: "No content to summarize" };
+		return entries.some((entry) => getMessageFromEntry(entry) !== undefined)
+			? { error: "No branch content fits the summarization input budget. Use a larger-context model." }
+			: { summary: "No content to summarize" };
 	}
 
 	// Transform to LLM-compatible messages, then serialize to text
@@ -371,7 +371,7 @@ export async function generateBranchSummary(
 
 	// Compute file lists and append to summary
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
-	summary += formatFileOperations(readFiles, modifiedFiles);
+	summary += formatFileOperations(readFiles, modifiedFiles, Math.max(0, reserveTokens * 4 - summary.length));
 
 	return {
 		summary,

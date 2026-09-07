@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Changed the default interrupt shortcut from Escape to Ctrl+Alt+C. Escape now clears all editor input without aborting; when a completion menu is open, it closes the menu first. Both shortcuts remain configurable.
+
 ### Added
 
 - Built fff, subagents, and web-access into Pie as always-on core capabilities: they now load as built-in extensions from the shipped dependencies instead of opt-in vendored extension discovery, so every install gets file search, subagent orchestration, and web search/fetch without extra setup. Removed the `discoverBundledExtensions` scan; user and project extensions continue to load unchanged.
@@ -27,6 +31,7 @@
 - Optimized Headroom with lazy copy-on-write transforms, allocation-bounded previews and retrieval filtering, UTF-8 slicing without whole-result buffers, cached unchanged markers, and reused byte measurements.
 - Changed Pie's built-in dark and light theme selections to the corresponding Nippon palettes while leaving the normal Pi executable unchanged.
 - Changed interactive model selections and cycling to become the next startup model, and changed auto-compaction to trigger between agent tool turns at the earlier of 87% context usage or the configured response-token reserve.
+- Changed the default OpenAI and OpenAI Codex model to GPT-5.6 Sol.
 - Removed upstream application update checks, release notifications, self-update commands, and managed-installer update code; `pie update` now updates installed packages by default.
 
 ### Fixed
@@ -73,6 +78,11 @@
 - Fixed `fd`/`ripgrep` downloads on musl-based Linux systems by fetching statically linked musl builds instead of glibc-linked ones.
 - Fixed transient model-catalog failures starting a fresh 4-hour refresh window on stale data; the next catalog refresh now retries immediately instead.
 - Fixed the MLX provider only listing the server's `/v1/models` catalog, which hides usable local checkouts in `~/models` (e.g. Ornith 35B, Qwen3.8 variants); local model directories are now discovered and merged into `/model`, with `MLX_MODELS_DIR` adding extra roots.
+- Fixed subagent help topics reading missing documentation files instead of the references shipped with Pie.
+- Fixed pre-prompt compaction reporting idle, ignoring cancellation, and losing input queued during preparation. Context checks now include incoming input, current tool definitions, and system-prompt overhead before provider requests.
+- Fixed small-context retention preventing compaction, oversized summary requests and file tags, discarded tool-result tails, and lost or superseded checkpoints. Full file tracking remains in summary metadata.
+- Fixed failed session appends advancing the in-memory branch, and persisted summary usage across retries, cancellation, and incomplete multi-phase compaction without double-counting completed checkpoints.
+- Fixed print mode returning success after a context-limit stop and Perplexity accepting non-object JSON responses.
 
 ## [0.84.3] - 2026-08-24
 

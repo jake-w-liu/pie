@@ -26,6 +26,7 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
+import { getSummaryUsage } from "./usage-totals.ts";
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -446,7 +447,7 @@ export function buildContextEntries(
 		if (entry.id === compaction.firstKeptEntryId) {
 			foundFirstKept = true;
 		}
-		if (foundFirstKept) {
+		if (foundFirstKept && entry.type !== "compaction") {
 			contextEntries.push(entry);
 		}
 	}
@@ -1048,12 +1049,16 @@ export class SessionManager {
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 
-		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-		if (!hasAssistant) {
+		const hasResponse = this.fileEntries.some(
+			(e) =>
+				(e.type === "message" && e.message.role === "assistant") ||
+				(e.type !== "session" && getSummaryUsage(e) !== undefined),
+		);
+		if (!hasResponse) {
 			if (this.flushed) {
 				appendSessionLine(this.sessionFile, entry);
 			} else {
-				// Mark as not flushed so when assistant arrives, all entries get written
+				// Defer until an assistant response or summary usage makes the session worth saving.
 				this.flushed = false;
 			}
 			return;
@@ -1076,9 +1081,16 @@ export class SessionManager {
 
 	private _appendEntry(entry: SessionEntry): void {
 		this.fileEntries.push(entry);
+		try {
+			this._persist(entry);
+		} catch (error) {
+			// Persistence reads the pending entry from fileEntries, but the public
+			// branch and index must not advance unless the append succeeds.
+			this.fileEntries.pop();
+			throw error;
+		}
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
-		this._persist(entry);
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
@@ -1427,7 +1439,6 @@ export class SessionManager {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		const fromId = this.leafId ?? "root";
-		this.leafId = branchFromId;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
 			id: generateId(this.byId),

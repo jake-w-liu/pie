@@ -110,7 +110,7 @@ import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-promp
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
-import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
+import { addUsageToTotals, createUsageTotals, getSummaryUsage, SUMMARIZATION_USAGE_TYPE } from "./usage-totals.ts";
 
 // ============================================================================
 // Skill Block Parsing
@@ -321,6 +321,7 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	private _runAbortController: AbortController | undefined;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
 
@@ -555,25 +556,46 @@ export class AgentSession {
 			projectedMessages = messages;
 		}
 
-		const estimate = estimateContextTokens(projectedMessages);
-		if (estimate.lastUsageIndex === null) return estimate.tokens;
-
-		const latestCompaction = getLatestCompactionEntry(this.sessionManager.getBranch());
-		const usageMessage = projectedMessages[estimate.lastUsageIndex];
-		if (
-			latestCompaction &&
-			usageMessage?.role === "assistant" &&
-			usageMessage.timestamp <= new Date(latestCompaction.timestamp).getTime()
-		) {
-			return estimateMessagesTokens(projectedMessages);
-		}
-		return estimate.tokens;
+		// A previously compressed request's usage is not an upper bound after
+		// projection changes. Include current prefix/tool overhead in the fresh
+		// estimate, without adding it twice to provider-reported context usage.
+		const prefixTokens =
+			Math.ceil(this.systemPrompt.length / 4) + Math.ceil(JSON.stringify(this.agent.state.tools).length / 4);
+		return Math.max(
+			estimateContextTokens(projectedMessages).tokens,
+			estimateMessagesTokens(projectedMessages) + prefixTokens,
+		);
 	}
 
 	private _installAgentContextLimitStop(): void {
+		const previousTransformContext = this.agent.transformContext;
+		this.agent.transformContext = async (messages, signal) => {
+			signal?.throwIfAborted();
+			const transformed = (await previousTransformContext?.(messages, signal)) ?? messages;
+			signal?.throwIfAborted();
+			// Last boundary before any ordinary provider request, including initial
+			// steering, retries, and input added while preparation was awaiting work.
+			const tokens = this._estimateProjectedContextTokens(transformed);
+			const contextWindow = this.agent.state.model.contextWindow;
+			if (shouldCompact(tokens, contextWindow, this.settingsManager.getCompactionSettings())) {
+				this._stopAfterTurnForContextLimit = true;
+				this._emit({ type: "context_limit", tokens, contextWindow });
+				throw new Error(
+					"Context limit reached before the provider request. Compact the session or use a larger-context model.",
+				);
+			}
+			return transformed;
+		};
 		const previousShouldStopAfterTurn = this.agent.shouldStopAfterTurn;
 		this.agent.shouldStopAfterTurn = async (context, signal) => {
-			if (this._stopAfterTurnForContextLimit) return true;
+			if (this._stopAfterTurnForContextLimit || signal?.aborted) return true;
+			// Truncated tool calls have already received error results. End the loop
+			// so the same bounded recovery used for text-only length stops can run.
+			if (
+				this.settingsManager.getCompactionEnabled() &&
+				isRecoverableLength(context.message, this.agent.state.model.maxTokens)
+			)
+				return true;
 			return (await previousShouldStopAfterTurn?.(context, signal)) ?? false;
 		};
 	}
@@ -589,12 +611,9 @@ export class AgentSession {
 			const compactionSettings = this.settingsManager.getCompactionSettings();
 			const contextWindow = this.agent.state.model.contextWindow;
 			const contextTokens = this._estimateProjectedContextTokens(turn.context.messages);
-			const willContinue = turn.toolResults.length > 0 || this.agent.hasQueuedMessages();
-			if (
-				willContinue &&
-				turn.message.stopReason !== "length" &&
-				shouldCompact(contextTokens, contextWindow, compactionSettings)
-			) {
+			// This hook only runs when the loop has selected a continuation. Its
+			// input may already have been drained from the Agent's queues.
+			if (shouldCompact(contextTokens, contextWindow, compactionSettings)) {
 				const previousCompactionId = getLatestCompactionEntry(this.sessionManager.getBranch())?.id;
 				const reason = contextTokens >= contextWindow ? "overflow" : "threshold";
 				await this._runAutoCompaction(reason, true);
@@ -674,6 +693,8 @@ export class AgentSession {
 
 	private async _emitAgentSettled(): Promise<void> {
 		this._isAgentRunActive = false;
+		this._runAbortController = undefined;
+		this._stopAfterTurnForContextLimit = false;
 		try {
 			await this._extensionRunner.emit({ type: "agent_settled" });
 			this._emit({ type: "agent_settled" });
@@ -1150,6 +1171,7 @@ export class AgentSession {
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
 		this._isAgentRunActive = true;
+		this._runAbortController ??= new AbortController();
 		try {
 			await this.agent.prompt(messages);
 			while (await this._handlePostAgentRun()) {
@@ -1166,7 +1188,7 @@ export class AgentSession {
 	private async _handlePostAgentRun(): Promise<boolean> {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
-		if (!msg) {
+		if (!msg || this._runAbortController?.signal.aborted) {
 			return false;
 		}
 		if (this._stopAfterTurnForContextLimit) {
@@ -1188,9 +1210,15 @@ export class AgentSession {
 			this._retryAttempt = 0;
 		}
 
-		if (await this._checkCompaction(msg)) {
-			return true;
+		const shouldContinue = await this._checkCompaction(msg);
+		if (this._runAbortController?.signal.aborted) return false;
+		const contextTokens = this._estimateProjectedContextTokens(this.messages);
+		const contextWindow = this.agent.state.model.contextWindow;
+		if (shouldCompact(contextTokens, contextWindow, this.settingsManager.getCompactionSettings())) {
+			this._emit({ type: "context_limit", tokens: contextTokens, contextWindow });
+			return false;
 		}
+		if (shouldContinue) return true;
 
 		// The agent loop drains both queues before emitting agent_end. Any messages
 		// here were queued by agent_end extension handlers and need a continuation.
@@ -1210,6 +1238,7 @@ export class AgentSession {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
+		let ownsRun = false;
 
 		try {
 			// Handle extension commands first (execute immediately, even during streaming)
@@ -1272,6 +1301,12 @@ export class AgentSession {
 				return;
 			}
 
+			// Claim the run before asynchronous preflight, including auto-compaction.
+			// Concurrent prompts can now queue, and abort()/waitForIdle() cover this work.
+			this._isAgentRunActive = true;
+			this._runAbortController = new AbortController();
+			ownsRun = true;
+
 			// Flush any pending bash and custom messages before the new prompt
 			this._flushPendingBashMessages();
 			this._flushPendingCustomMessages();
@@ -1299,8 +1334,11 @@ export class AgentSession {
 			// Check if we need to compact before sending (catches aborted responses).
 			// The user's new prompt is sent below, so do not call agent.continue() here.
 			const lastAssistant = this._findLastAssistantMessage();
-			if (lastAssistant) {
+			if (lastAssistant && !this._runAbortController.signal.aborted) {
 				await this._checkCompaction(lastAssistant, false);
+			}
+			if (this._runAbortController.signal.aborted) {
+				throw new Error("Prompt cancelled");
 			}
 
 			// Build messages array (custom message if any, then user message)
@@ -1318,10 +1356,10 @@ export class AgentSession {
 			});
 
 			// Inject any pending "nextTurn" messages as context alongside the user message
+			const pendingNextTurnCount = this._pendingNextTurnMessages.length;
 			for (const msg of this._pendingNextTurnMessages) {
 				messages.push(msg);
 			}
-			this._pendingNextTurnMessages = [];
 
 			// Emit before_agent_start extension event
 			const result = await this._extensionRunner.emitBeforeAgentStart(
@@ -1344,6 +1382,19 @@ export class AgentSession {
 					});
 				}
 			}
+			if (this._runAbortController.signal.aborted) {
+				throw new Error("Prompt cancelled");
+			}
+			const contextTokens = this._estimateProjectedContextTokens([...this.messages, ...messages]);
+			const contextWindow = this.model.contextWindow;
+			if (shouldCompact(contextTokens, contextWindow, this.settingsManager.getCompactionSettings())) {
+				this._emit({ type: "context_limit", tokens: contextTokens, contextWindow });
+				throw new Error(
+					"Context remains over the compaction limit. Compact the session or switch to a larger-context model before retrying.",
+				);
+			}
+			// Do not consume messages queued while before_agent_start was awaiting work.
+			this._pendingNextTurnMessages.splice(0, pendingNextTurnCount);
 			// Apply extension-modified system prompt, or reset to base
 			if (result?.systemPrompt !== undefined) {
 				this._systemPromptOverride = result.systemPrompt;
@@ -1355,6 +1406,7 @@ export class AgentSession {
 			}
 		} catch (error) {
 			preflightResult?.(false);
+			if (ownsRun) await this._emitAgentSettled();
 			throw error;
 		}
 
@@ -1667,6 +1719,8 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
+		this._runAbortController?.abort();
+		this.abortCompaction();
 		this.abortRetry();
 		this.agent.abort();
 		await this.waitForIdle();
@@ -1955,7 +2009,7 @@ export class AgentSession {
 		env: Record<string, string> | undefined,
 		reason: "manual" | "threshold" | "overflow",
 	): Promise<CompactionResult> {
-		return compact(
+		const result = await compact(
 			preparation,
 			requestModel,
 			apiKey,
@@ -1971,6 +2025,7 @@ export class AgentSession {
 			this.systemPrompt,
 			this.agent.state.tools,
 		);
+		return { ...result, details: { ...result.details, usageRecorded: true } };
 	}
 
 	/**
@@ -1990,6 +2045,9 @@ export class AgentSession {
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
 		await this.abort();
+		if (this._compactionAbortController) {
+			throw new Error("Compaction is already in progress");
+		}
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason: "manual" });
 		let fromExtension = false;
@@ -2004,7 +2062,7 @@ export class AgentSession {
 			const pathEntries = this.sessionManager.getBranch();
 			const settings = this.settingsManager.getCompactionSettings();
 
-			const preparation = prepareCompaction(pathEntries, settings);
+			const preparation = prepareCompaction(pathEntries, settings, this.model.contextWindow);
 			if (!preparation) {
 				// Check why we can't compact
 				const lastEntry = pathEntries[pathEntries.length - 1];
@@ -2198,9 +2256,16 @@ export class AgentSession {
 		// Skip compaction checks if this assistant message is older than the latest
 		// compaction boundary. This prevents a stale pre-compaction usage/error
 		// from retriggering compaction on the first prompt after compaction.
-		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
+		const branchEntries = this.sessionManager.getBranch();
+		const compactionEntry = getLatestCompactionEntry(branchEntries);
+		const assistantEntryIndex = branchEntries.findLastIndex(
+			(entry) => entry.type === "message" && entry.message === assistantMessage,
+		);
+		// Entry order, not millisecond timestamps, defines the checkpoint boundary.
 		const assistantIsFromBeforeCompaction =
-			compactionEntry !== null && assistantMessage.timestamp <= new Date(compactionEntry.timestamp).getTime();
+			compactionEntry !== null &&
+			assistantEntryIndex >= 0 &&
+			assistantEntryIndex < branchEntries.lastIndexOf(compactionEntry);
 		if (assistantIsFromBeforeCompaction) {
 			return false;
 		}
@@ -2305,18 +2370,21 @@ export class AgentSession {
 				return false;
 			}
 
-			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
-
-			const pathEntries = this.sessionManager.getBranch();
-
-			const preparation = prepareCompaction(pathEntries, settings);
-			if (!preparation) {
-				return false;
-			}
-
-			this._emit({ type: "compaction_start", reason });
 			this._autoCompactionAbortController = new AbortController();
 			started = true;
+			if (this._runAbortController?.signal.aborted) {
+				this._autoCompactionAbortController.abort();
+			}
+			this._emit({ type: "compaction_start", reason });
+			this._autoCompactionAbortController.signal.throwIfAborted();
+
+			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
+			this._autoCompactionAbortController.signal.throwIfAborted();
+			const pathEntries = this.sessionManager.getBranch();
+			const preparation = prepareCompaction(pathEntries, settings, this.model.contextWindow);
+			if (!preparation) {
+				throw new Error("No removable history is available for compaction");
+			}
 
 			let extensionCompaction: CompactionResult | undefined;
 
@@ -2369,6 +2437,7 @@ export class AgentSession {
 				details = extensionCompaction.details;
 			} else {
 				// Shared default summary generator, also used by manual compaction.
+				this._autoCompactionAbortController.signal.throwIfAborted();
 				const compactResult = await this._runDefaultCompaction(
 					preparation,
 					requestModel,
@@ -2438,6 +2507,8 @@ export class AgentSession {
 				details,
 			};
 			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+
+			if (this._runAbortController?.signal.aborted) return false;
 
 			if (willRetry) {
 				const messages = this.agent.state.messages;
@@ -2924,6 +2995,11 @@ export class AgentSession {
 		source: { source: "branchSummary" } | { source: "compaction"; reason: "manual" | "threshold" | "overflow" },
 	): RetryCallbacks {
 		return {
+			onResponse: (response) => {
+				// Persist each physical request before another phase can fail or be
+				// cancelled. Checkpoint entries mark this usage as already recorded.
+				this.sessionManager.appendCustomEntry(SUMMARIZATION_USAGE_TYPE, response.usage);
+			},
 			onRetryScheduled: (attempt, maxAttempts, delayMs, errorMessage) => {
 				this._emit({
 					type: "summarization_retry_scheduled",
@@ -3282,6 +3358,7 @@ export class AgentSession {
 				summaryText = result.summary;
 				summaryUsage = result.usage;
 				summaryDetails = {
+					usageRecorded: true,
 					readFiles: result.readFiles || [],
 					modifiedFiles: result.modifiedFiles || [],
 				};
@@ -3394,9 +3471,8 @@ export class AgentSession {
 		const usageTotals = createUsageTotals();
 
 		for (const entry of this.sessionManager.getEntries()) {
-			if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
-				addUsageToTotals(usageTotals, entry.usage);
-			}
+			const summaryUsage = getSummaryUsage(entry);
+			if (summaryUsage) addUsageToTotals(usageTotals, summaryUsage);
 			if (entry.type !== "message") continue;
 			totalMessages++;
 			const message = entry.message;

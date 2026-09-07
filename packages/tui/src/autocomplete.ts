@@ -507,18 +507,25 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 	}
 
 	// Extract the slash command context for the cursor position.
-	// Line-start slash commands keep their historical semantics: the token is the
-	// whole text before the cursor (including argument text). Mid-line text uses a
-	// whitespace-bounded "/" token, which never carries arguments and must not
-	// contain a second separator (that would be a path).
+	// A leading command's argument completer owns its argument region. Otherwise
+	// a later whitespace-bounded slash starts a new command reference, even when
+	// the message itself begins with a command (e.g. two skill references).
+	// Tokens containing a second separator remain paths.
 	private extractSlashCommandContext(
 		textBeforeCursor: string,
 	): { token: string; atLineStart: boolean; hasTrailingWhitespace: boolean } | null {
-		if (textBeforeCursor.startsWith("/")) {
-			return { token: textBeforeCursor, atLineStart: true, hasTrailingWhitespace: false };
-		}
 		const trimmed = textBeforeCursor.replace(/[ \t]+$/, "");
 		const token = findSlashCommandToken(trimmed);
+		if (textBeforeCursor.startsWith("/")) {
+			const spaceIndex = textBeforeCursor.indexOf(" ");
+			const commandName = textBeforeCursor.slice(1, spaceIndex);
+			const hasArgumentCompleter = this.commands.some(
+				(cmd) => "name" in cmd && cmd.name === commandName && !!cmd.getArgumentCompletions,
+			);
+			if (token === null || hasArgumentCompleter) {
+				return { token: textBeforeCursor, atLineStart: true, hasTrailingWhitespace: false };
+			}
+		}
 		if (token === null) return null;
 		return { token, atLineStart: false, hasTrailingWhitespace: trimmed.length !== textBeforeCursor.length };
 	}

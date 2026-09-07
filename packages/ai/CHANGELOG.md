@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added `RetryCallbacks.onResponse` to report every physical attempt, including failed and aborted responses, for complete usage accounting.
 - NVIDIA and OpenRouter now refresh their model catalogs live from their own `/models` endpoints at runtime instead of relying only on the shipped static catalog, so new models appear in the `/model` picker without waiting for a release. NVIDIA keeps its curated static baseline and adds newly-available chat models (filtering out embeddings, safety guards, and code/vision-only endpoints); OpenRouter replaces baseline entries with current metadata (context window, pricing, reasoning, tool support).
 
 ### Fixed

@@ -134,14 +134,16 @@ export function prepareBranchEntries(entries: Entry[], tokenBudget: number = 0):
 	const fileOps = createFileOps();
 	let totalTokens = 0;
 	for (const entry of entries) {
+		const message = getMessageFromEntry(entry);
+		if (message) extractFileOpsFromMessage(message, fileOps);
 		if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.details) {
 			const details = entry.details as BranchSummaryDetails;
 			if (Array.isArray(details.readFiles)) {
-				for (const f of details.readFiles) fileOps.read.add(f);
+				for (const f of details.readFiles) if (typeof f === "string") fileOps.read.add(f);
 			}
 			if (Array.isArray(details.modifiedFiles)) {
 				for (const f of details.modifiedFiles) {
-					fileOps.edited.add(f);
+					if (typeof f === "string") fileOps.edited.add(f);
 				}
 			}
 		}
@@ -152,23 +154,17 @@ export function prepareBranchEntries(entries: Entry[], tokenBudget: number = 0):
 		if (!message) continue;
 		const serializedMessage = convertToLlm([message])[0];
 		if (!serializedMessage) continue;
-		extractFileOpsFromMessage(message, fileOps);
 
 		const tokens = estimateSerializedSummaryTokens(serializedMessage);
 		if (tokenBudget > 0 && totalTokens + tokens > tokenBudget) {
-			if (entry.type === "compaction" || entry.type === "branch_summary") {
-				if (totalTokens < tokenBudget * 0.9) {
-					messages.unshift(message);
-					totalTokens += tokens;
-				}
-			}
 			break;
 		}
 
-		messages.unshift(message);
+		messages.push(message);
 		totalTokens += tokens;
 	}
 
+	messages.reverse();
 	return { messages, fileOps, totalTokens };
 }
 
@@ -223,11 +219,26 @@ export async function generateBranchSummary(
 	} = options;
 	const contextWindow = model.contextWindow || 128000;
 	const tokenBudget = contextWindow - reserveTokens;
+	if (!Number.isFinite(tokenBudget) || tokenBudget <= 0 || !Number.isFinite(reserveTokens) || reserveTokens < 0) {
+		return err(
+			new BranchSummaryError(
+				"summarization_failed",
+				"No input budget is available for branch summarization. Reduce reserveTokens or use a larger-context model.",
+			),
+		);
+	}
 
 	const { messages, fileOps } = prepareBranchEntries(entries, tokenBudget);
 
 	if (messages.length === 0) {
-		return ok({ summary: "No content to summarize", readFiles: [], modifiedFiles: [] });
+		return entries.some((entry) => getMessageFromEntry(entry) !== undefined)
+			? err(
+					new BranchSummaryError(
+						"summarization_failed",
+						"No branch content fits the summarization input budget. Use a larger-context model.",
+					),
+				)
+			: ok({ summary: "No content to summarize", readFiles: [], modifiedFiles: [] });
 	}
 	const llmMessages = convertToLlm(messages);
 	const conversationText = serializeConversation(llmMessages);
@@ -287,7 +298,7 @@ export async function generateBranchSummary(
 	}
 	summary = BRANCH_SUMMARY_PREAMBLE + summary;
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
-	summary += formatFileOperations(readFiles, modifiedFiles);
+	summary += formatFileOperations(readFiles, modifiedFiles, Math.max(0, reserveTokens * 4 - summary.length));
 
 	return ok({
 		summary,

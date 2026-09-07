@@ -49,15 +49,16 @@ function extractFileOperations(
 	prevCompactionIndex: number,
 ): FileOperations {
 	const fileOps = createFileOps();
-	if (prevCompactionIndex >= 0) {
-		const prevCompaction = entries[prevCompactionIndex] as CompactionEntry;
-		if (prevCompaction.details) {
-			const details = prevCompaction.details as CompactionDetails;
+	for (let i = 0; i < entries.length; i++) {
+		const entry = entries[i];
+		if (entry.type !== "branch_summary" && (entry.type !== "compaction" || i !== prevCompactionIndex)) continue;
+		if (entry.details) {
+			const details = entry.details as CompactionDetails;
 			if (Array.isArray(details.readFiles)) {
-				for (const f of details.readFiles) fileOps.read.add(f);
+				for (const f of details.readFiles) if (typeof f === "string") fileOps.read.add(f);
 			}
 			if (Array.isArray(details.modifiedFiles)) {
-				for (const f of details.modifiedFiles) fileOps.edited.add(f);
+				for (const f of details.modifiedFiles) if (typeof f === "string") fileOps.edited.add(f);
 			}
 		}
 	}
@@ -101,6 +102,14 @@ export interface CompactResult<T = unknown> {
 	details?: T;
 }
 
+function estimateSummarizationInputTokens(context: Context): number {
+	return (
+		context.messages.reduce((total, message) => total + estimateTokens(message), 0) +
+		Math.ceil((context.systemPrompt?.length ?? 0) / 4) +
+		Math.ceil(JSON.stringify(context.tools ?? []).length / 4)
+	);
+}
+
 export async function completeSimpleWithRetries(
 	models: Models,
 	model: Model<Api>,
@@ -109,18 +118,32 @@ export async function completeSimpleWithRetries(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 ): Promise<AssistantMessage> {
+	options.signal?.throwIfAborted();
+	const inputTokens = estimateSummarizationInputTokens(context);
+	if (model.contextWindow > 0 && inputTokens + (options.maxTokens ?? model.maxTokens) > model.contextWindow) {
+		throw new CompactionError(
+			"summarization_failed",
+			"Summarization input exceeds the model context budget. Use a larger-context model or reduce the summary input.",
+		);
+	}
 	// Summaries are standalone requests, so isolate routing and avoid cache writes that cannot be reused.
 	const requestOptions: SimpleStreamOptions = {
 		...options,
 		cacheRetention: "none",
 		sessionId: uuidv7(),
 	};
-	return retryAssistantCall(
-		() => models.completeSimple(model, context, requestOptions),
+	let usage: Usage | undefined;
+	const response = await retryAssistantCall(
+		async () => {
+			const response = await models.completeSimple(model, context, requestOptions);
+			usage = usage ? combineUsage(usage, response.usage) : response.usage;
+			return response;
+		},
 		retry,
 		requestOptions.signal,
 		callbacks,
 	);
+	return { ...response, usage: usage ?? response.usage };
 }
 
 function combineUsage(first: Usage, second: Usage): Usage {
@@ -263,9 +286,14 @@ export interface ContextUsageEstimate {
 }
 
 function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; index: number } | undefined {
+	let checkpointTimestamp = Number.NEGATIVE_INFINITY;
+	for (const message of messages) {
+		if (message.role === "compactionSummary") checkpointTimestamp = Math.max(checkpointTimestamp, message.timestamp);
+	}
 	for (let i = messages.length - 1; i >= 0; i--) {
-		const usage = getAssistantUsage(messages[i]);
-		if (usage) return { usage, index: i };
+		const message = messages[i];
+		const usage = getAssistantUsage(message);
+		if (usage && message.timestamp > checkpointTimestamp) return { usage, index: i };
 	}
 	return undefined;
 }
@@ -310,11 +338,15 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
 	if (!settings.enabled || !Number.isFinite(contextWindow) || contextWindow <= 0 || contextTokens <= 0) return false;
 
+	return contextTokens >= compactionThreshold(contextWindow, settings);
+}
+
+function compactionThreshold(contextWindow: number, settings: CompactionSettings): number {
 	const reserveTokens = Number.isFinite(settings.reserveTokens) ? Math.max(0, settings.reserveTokens) : 0;
-	const ratioBoundary = Math.floor(contextWindow * DEFAULT_COMPACTION_TRIGGER_RATIO);
-	const reserveBoundary = contextWindow - reserveTokens;
-	const triggerBoundary = Math.max(1, Math.min(ratioBoundary, reserveBoundary));
-	return contextTokens >= triggerBoundary;
+	return Math.max(
+		1,
+		Math.min(Math.floor(contextWindow * DEFAULT_COMPACTION_TRIGGER_RATIO), contextWindow - reserveTokens),
+	);
 }
 
 const ESTIMATED_IMAGE_CHARS = 4800;
@@ -593,6 +625,7 @@ export function buildCacheReusingSummarizationContext(
 	tools: readonly Tool[] | undefined,
 	instruction: string,
 	messages: readonly Message[],
+	inputBudget = Number.POSITIVE_INFINITY,
 ): Context {
 	const context: Context = {
 		systemPrompt,
@@ -607,6 +640,11 @@ export function buildCacheReusingSummarizationContext(
 	};
 	if (tools !== undefined && tools.length > 0) {
 		context.tools = [...tools];
+	}
+	if (estimateSummarizationInputTokens(context) > inputBudget) {
+		return buildSummarizationContext(
+			`<conversation>\n${serializeConversation([...messages])}\n</conversation>\n\n${instruction}`,
+		);
 	}
 	return context;
 }
@@ -759,7 +797,13 @@ export async function generateSummaryWithUsage(
 		const response = await completeSimpleWithRetries(
 			models,
 			model,
-			buildCacheReusingSummarizationContext(cacheReuse.systemPrompt, cacheReuse.tools, instruction, llmMessages),
+			buildCacheReusingSummarizationContext(
+				cacheReuse.systemPrompt,
+				cacheReuse.tools,
+				instruction,
+				llmMessages,
+				model.contextWindow > 0 ? model.contextWindow - maxTokens : Number.POSITIVE_INFINITY,
+			),
 			completionOptions,
 			retry,
 			callbacks,
@@ -820,6 +864,7 @@ export interface CompactionPreparation {
 export function prepareCompaction(
 	pathEntries: Entry[],
 	settings: CompactionSettings,
+	contextWindow?: number,
 ): Result<CompactionPreparation | undefined, CompactionError> {
 	if (pathEntries.length === 0 || pathEntries[pathEntries.length - 1].type === "compaction") {
 		return ok(undefined);
@@ -852,7 +897,15 @@ export function prepareCompaction(
 
 	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages).tokens;
 
-	const cutPoint = findCutPoint(compactableEntries, 0, boundaryEnd, settings.keepRecentTokens);
+	// Retention is an upper target; leave room for the replacement checkpoint.
+	const keepRecentTokens =
+		contextWindow !== undefined && Number.isFinite(contextWindow) && contextWindow > 0
+			? Math.min(
+					settings.keepRecentTokens,
+					Math.max(0, compactionThreshold(contextWindow, settings) - settings.reserveTokens),
+				)
+			: settings.keepRecentTokens;
+	const cutPoint = findCutPoint(compactableEntries, 0, boundaryEnd, keepRecentTokens);
 	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
 	const messagesToSummarize: AgentMessage[] = [];
 	for (let i = 0; i < historyEnd; i++) {
@@ -934,7 +987,7 @@ export async function compact(
 	let summaryUsage: Usage;
 
 	if (isSplitTurn && turnPrefixMessages.length > 0) {
-		let historyText = "No prior history.";
+		let historyText = previousSummary ?? "No prior history.";
 		let historyUsage: Usage | undefined;
 		if (messagesToSummarize.length > 0) {
 			const historyResult = await generateSummaryWithUsage(
@@ -974,7 +1027,7 @@ export async function compact(
 		// empty-history summary so downstream persists a stateful compaction entry
 		// instead of blocking on or fabricating a model summary.
 		if (messagesToSummarize.length === 0) {
-			summary = "No prior history before the retained context.";
+			summary = previousSummary ?? "No prior history before the retained context.";
 			summaryUsage = {
 				input: 0,
 				output: 0,
@@ -1003,7 +1056,9 @@ export async function compact(
 	}
 
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
-	summary += formatFileOperations(readFiles, modifiedFiles);
+	// Bound visible tags using the context estimator's four characters per token.
+	// Full file lists remain in details.
+	summary += formatFileOperations(readFiles, modifiedFiles, Math.max(0, settings.reserveTokens * 4 - summary.length));
 
 	return ok({
 		summary,

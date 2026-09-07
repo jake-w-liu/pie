@@ -141,7 +141,7 @@ interface CompactionDetails {
 }
 ```
 
-Extensions can store any JSON-serializable data in `details`. The default compaction tracks file operations, but custom extension implementations can use their own structure. Generated and extension-provided summaries store their LLM `usage` when available so session totals include summarization work.
+Extensions can store any JSON-serializable data in `details`. The default compaction tracks file operations, but custom extension implementations can use their own structure. Generated and extension-provided summaries store their LLM `usage` when available. Built-in summarization also records each provider attempt separately, including failed and aborted attempts, so session totals retain usage even when no checkpoint is completed. Completed checkpoints mark that usage as already recorded to avoid double-counting.
 
 See [`prepareCompaction()`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) and [`compact()`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) for the implementation. For direct programmatic summarization, `generateSummary()` returns the summary text and `generateSummaryWithUsage()` returns `{ text, usage }`.
 
@@ -252,6 +252,8 @@ path/to/changed.ts
 </modified-files>
 ```
 
+Visible file tags are limited to the checkpoint's remaining character budget, using the same four-characters-per-token estimate as context accounting. Complete file lists remain in the entry's `details`; individual paths are never cut in half.
+
 ### Message Serialization
 
 Before summarization, messages are serialized to text via [`serializeConversation()`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/utils.ts):
@@ -261,7 +263,8 @@ Before summarization, messages are serialized to text via [`serializeConversatio
 [Assistant thinking]: Internal reasoning
 [Assistant]: Response text
 [Assistant tool calls]: read(path="foo.ts"); edit(path="bar.ts", ...)
-[Tool result]: Output from tool
+[Tool result]: read (call tool-call-id)
+Output from tool
 ```
 
 This prevents the model from treating it as a conversation to continue.
@@ -411,6 +414,6 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
 |---------|---------|-------------|
 | `enabled` | `true` | Enable auto-compaction at the earlier of 87% usage or the reserve boundary |
 | `reserveTokens` | `16384` | Tokens to reserve for the LLM response; a larger reserve can trigger before 87% |
-| `keepRecentTokens` | `20000` | Recent tokens to keep (not summarized) |
+| `keepRecentTokens` | `20000` | Target for recent tokens to keep; reduced on small models to leave room below the trigger for the replacement checkpoint |
 
 Disable auto-compaction with `"enabled": false`. You can still compact manually with `/compact`.

@@ -1,6 +1,49 @@
 import type { Usage } from "@earendil-works/pi-ai/compat";
 import type { SessionEntry } from "./session-manager.ts";
 
+export const SUMMARIZATION_USAGE_TYPE = "pi.summarization.usage";
+
+/** Read summary usage once, including attempts that never produced a checkpoint. */
+export function getSummaryUsage(entry: SessionEntry): Usage | undefined {
+	if (entry.type === "compaction" || entry.type === "branch_summary") {
+		const details = entry.details;
+		if (
+			!entry.fromHook &&
+			details &&
+			typeof details === "object" &&
+			"usageRecorded" in details &&
+			details.usageRecorded === true
+		)
+			return undefined;
+		return entry.usage;
+	}
+	if (entry.type !== "custom" || entry.customType !== SUMMARIZATION_USAGE_TYPE) return undefined;
+	if (!entry.data || typeof entry.data !== "object" || Array.isArray(entry.data)) return undefined;
+	const usage = entry.data as Partial<Usage>;
+	const cost = usage.cost;
+	if (!cost || typeof cost !== "object") return undefined;
+	const values = [
+		usage.input,
+		usage.output,
+		usage.cacheRead,
+		usage.cacheWrite,
+		usage.totalTokens,
+		cost.input,
+		cost.output,
+		cost.cacheRead,
+		cost.cacheWrite,
+		cost.total,
+	];
+	if (!values.every((value) => typeof value === "number" && Number.isFinite(value))) return undefined;
+	if (
+		[usage.reasoning, usage.cacheWrite1h].some(
+			(value) => value !== undefined && (typeof value !== "number" || !Number.isFinite(value)),
+		)
+	)
+		return undefined;
+	return usage as Usage;
+}
+
 export interface UsageTotals {
 	input: number;
 	output: number;
@@ -46,9 +89,9 @@ export function getUsageCostBreakdown(entries: SessionEntry[]): UsageCostBreakdo
 		} else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
 			key = "Tools/summaries";
 			usage = entry.message.usage;
-		} else if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
-			key = "Tools/summaries";
-			usage = entry.usage;
+		} else {
+			usage = getSummaryUsage(entry);
+			if (usage) key = "Tools/summaries";
 		}
 		if (!key || !usage) continue;
 

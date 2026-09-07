@@ -4,7 +4,15 @@ import { getKeybindings } from "./keybindings.ts";
 import { matchesKey } from "./keys.ts";
 import type { Terminal } from "./terminal.ts";
 import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
-import { BoundedTerminalWriter, type Component, Container, type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
+import {
+	BoundedTerminalWriter,
+	type Component,
+	Container,
+	isPrimaryMouseRelease,
+	type TUI,
+	TuiBase,
+	type TuiStopOptions,
+} from "./tui.ts";
 import {
 	getGraphemeCellRange,
 	getWordSegmenter,
@@ -32,8 +40,16 @@ interface SelectionEndpoint {
 interface PendingDrag {
 	row: number;
 	col: number;
+	endCol: number;
 	pressX: number;
 	count: number;
+}
+
+interface SelectionBounds {
+	startRow: number;
+	startCol: number;
+	endRow: number;
+	endCol: number;
 }
 
 /** Wrap visible text in inverse video, re-applying it after inner SGR codes. */
@@ -148,17 +164,29 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	private hardwareCursorRow = 0;
 	private maxLinesRendered = 0;
 	private previousViewportTop = 0;
-	// Reading mode: the user scrolled back, so freeze the frame until they
-	// return to the latest content. While held, renders are skipped entirely
-	// (no writes, no bookkeeping changes), so streaming output never yanks the
-	// view and resume diffs repaint everything missed in one pass.
-	private holdViewport = false;
+	// Set synchronously by lifecycle callbacks so pointer events cannot target
+	// an uncommitted resized or overlaid frame.
+	private terminalGeometryInvalidated = false;
+	private overlayFrameInvalidated = false;
+	// Reading and selection holds are independent: selecting while scrolled
+	// back must not discard the user's explicit reading position.
+	private readingViewport = false;
 	// Text selection endpoints (absolute content rows, exact visible columns).
 	private selectionAnchor: SelectionEndpoint | undefined;
 	private selectionFocus: SelectionEndpoint | undefined;
+	// Selection changes are painted by the throttled render pipeline. The
+	// accumulated row union keeps rapid drag events to at most one write/frame.
+	private selectionRepaintStartRow: number | undefined;
+	private selectionRepaintEndRow: number | undefined;
 	// In-progress drag from the latest press; coordinates share the selection form.
 	private pendingDrag: PendingDrag | undefined;
 	private lastClick: { timestamp: number; count: number; row: number; wordStart: number; wordEnd: number } | undefined;
+	// Coalesce clipboard requests produced by one burst without waiting on older
+	// callbacks, which may be slow or never settle.
+	private pendingSelectionCopy: { text: string; request: number } | undefined;
+	private selectionCopyScheduled = false;
+	private selectionCopyGeneration = 0;
+	private selectionCopyRequest = 0;
 
 	constructor(
 		terminal: Terminal,
@@ -182,9 +210,16 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			const anchor = this.selectionAnchor ? `${this.selectionAnchor.row},${this.selectionAnchor.col}` : "-";
 			const focus = this.selectionFocus ? `${this.selectionFocus.row},${this.selectionFocus.col}` : "-";
 			const pending = this.pendingDrag ? `${this.pendingDrag.row},${this.pendingDrag.col}` : "-";
+			const hold = this.readingViewport
+				? this.pendingDrag
+					? "reading+selection"
+					: "reading"
+				: this.pendingDrag
+					? "selection"
+					: "none";
 			const state =
 				`prevTop=${this.previousViewportTop} hwRow=${this.hardwareCursorRow} ` +
-				`hold=${this.holdViewport} lines=${this.previousLines.length} ` +
+				`hold=${hold} lines=${this.previousLines.length} ` +
 				`sel=${anchor}:${focus} pending=${pending}`;
 			fs.appendFileSync(logPath, `[${new Date().toISOString()}] ${event}${detail ? ` ${detail}` : ""} | ${state}\n`);
 		} catch {
@@ -214,7 +249,15 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.hardwareCursorRow = state.hardwareCursorRow;
 		this.maxLinesRendered = state.maxLinesRendered;
 		this.previousViewportTop = state.previousViewportTop;
-		this.holdViewport = false;
+		this.readingViewport = false;
+		if (this.pendingDrag) {
+			this.selectionAnchor = undefined;
+			this.selectionFocus = undefined;
+			this.lastClick = undefined;
+		}
+		this.pendingDrag = undefined;
+		this.selectionRepaintStartRow = undefined;
+		this.selectionRepaintEndRow = undefined;
 	}
 
 	protected override resetRenderState(): void {
@@ -226,23 +269,44 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.hardwareCursorRow = 0;
 		this.maxLinesRendered = 0;
 		this.previousViewportTop = 0;
-		this.holdViewport = false;
-		// An input sequence cannot span a state reset; drop any half-open drag.
+		this.readingViewport = false;
+		this.selectionRepaintStartRow = undefined;
+		this.selectionRepaintEndRow = undefined;
+		// A partial selection cannot survive a render-state reset.
+		if (this.pendingDrag) {
+			this.selectionAnchor = undefined;
+			this.selectionFocus = undefined;
+			this.lastClick = undefined;
+		}
 		this.pendingDrag = undefined;
+	}
+
+	private hasStalePointerFrame(): boolean {
+		return (
+			this.terminalGeometryInvalidated ||
+			this.overlayFrameInvalidated ||
+			this.terminal.columns !== this.previousWidth ||
+			this.terminal.rows !== this.previousHeight
+		);
 	}
 
 	override routeMousePress(x: number, y: number): void {
 		// Click coordinates are stale across a resize until the re-render lands.
-		// Request it (coalesced, harmless if already pending) so a missed
-		// resize can never wedge mouse handling permanently.
-		if (this.terminal.columns !== this.previousWidth) {
+		// Cancel a half-open gesture and request a fresh frame rather than
+		// interpreting the new press against stale geometry.
+		if (this.hasStalePointerFrame()) {
+			this.cancelSelectionGestureForRerender();
 			this.requestRender();
 			return;
 		}
 		const total = this.previousLines.length;
 		if (total === 0) return;
 		// Overlays cover the base content, so base clicks have no valid target.
-		if (this.hasOverlay()) return;
+		if (this.hasOverlay()) {
+			this.cancelSelectionGestureForRerender();
+			this.requestRender();
+			return;
+		}
 		const absoluteRow = this.previousViewportTop + y;
 		if (absoluteRow < 0 || absoluteRow >= total) return;
 		this.logMouse("press", `x=${x} y=${y} abs=${absoluteRow}`);
@@ -254,12 +318,10 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				const targetHeight = focused.render(width).length;
 				const localFromBottom = total - 1 - absoluteRow - after;
 				if (localFromBottom >= 0 && localFromBottom < targetHeight) {
-					// Inside the focused component: fresh interaction clears selection.
-					// A new press also ends any half-open drag: without a release
-					// (pointer left the window), the stale anchor would otherwise
-					// turn this press/release into a phantom selection and copy.
+					// An editor press ends a half-open transcript gesture before
+					// moving the cursor. Otherwise its release cannot resume rendering.
 					this.clearSelection();
-					this.pendingDrag = undefined;
+					this.resumeViewport();
 					if (
 						typeof focused.handleMousePress === "function" &&
 						focused.handleMousePress(x, targetHeight - 1 - localFromBottom)
@@ -271,60 +333,111 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				}
 			}
 		}
+		// A second press without a release supersedes the old gesture and must
+		// not be mistaken for a valid double-click sequence.
+		if (this.pendingDrag) this.lastClick = undefined;
 		this.handleTranscriptPress(x, absoluteRow);
 		this.logMouse("press-transcript");
 	}
 
-	override routeMouseRelease(x: number, y: number): boolean {
-		if (this.hasOverlay()) return true;
-		if (this.terminal.columns !== this.previousWidth) {
+	override routeMouseRelease(x: number, y: number, button = 0): boolean {
+		if (!isPrimaryMouseRelease({ button, x, y, press: false })) {
+			this.cancelSelectionGestureForRerender();
+			return true;
+		}
+		if (this.hasOverlay() || this.hasStalePointerFrame()) {
+			this.cancelSelectionGestureForRerender();
 			this.requestRender();
 			return true;
 		}
 		const total = this.previousLines.length;
-		if (total === 0) return true;
+		if (total === 0) {
+			this.cancelSelectionGestureForRerender();
+			return true;
+		}
 		const pending = this.pendingDrag;
 		this.pendingDrag = undefined;
 		if (!pending) return true;
 		const row = Math.max(0, Math.min(total - 1, this.previousViewportTop + y));
 		this.logMouse("release", `x=${x} y=${y} row=${row} count=${pending.count}`);
 		if (row === pending.row && x === pending.pressX) {
-			// Press and release in the same cell: multi-press selections made
-			// on press stand; a single click clears any selection and resumes.
-			if (pending.count === 1) {
-				this.clearSelection();
-				if (this.holdViewport) {
-					this.holdViewport = false;
-					this.requestRender();
-				}
-			}
+			// Multi-press selections made on press stand; a single click clears
+			// the selection. Every release ends the transient selection hold.
+			if (pending.count === 1) this.clearSelection();
+			this.requestRender();
 			return true;
 		}
-		const line = this.previousLines[row] ?? "";
-		const focusCol = this.snapFocusCol(line, x);
-		this.setSelection({ row: pending.row, col: pending.col }, { row, col: focusCol });
-		this.holdViewport = true;
+		this.lastClick = undefined;
+		this.updateDragSelection(pending, x, row);
 		this.copySelectionToClipboard();
+		this.requestRender();
 		return true;
 	}
 
 	override routeMouseDrag(x: number, y: number): boolean {
 		const pending = this.pendingDrag;
 		if (!pending) return false;
-		if (this.hasOverlay()) return true;
-		if (this.terminal.columns !== this.previousWidth) {
+		if (this.hasOverlay() || this.hasStalePointerFrame()) {
+			this.cancelSelectionGestureForRerender();
 			this.requestRender();
 			return true;
 		}
 		const total = this.previousLines.length;
-		if (total === 0) return true;
+		if (total === 0) {
+			this.cancelSelectionGestureForRerender();
+			return true;
+		}
 		const row = Math.max(0, Math.min(total - 1, this.previousViewportTop + y));
-		const focusCol = this.snapFocusCol(this.previousLines[row] ?? "", x);
-		const focus = this.selectionFocus;
-		if (focus && focus.row === row && focus.col === focusCol) return true;
+		if (row !== pending.row || x !== pending.pressX) this.lastClick = undefined;
 		this.logMouse("drag", `x=${x} y=${y} row=${row}`);
-		this.setSelection({ row: pending.row, col: pending.col }, { row, col: focusCol });
+		this.updateDragSelection(pending, x, row);
 		return true;
+	}
+
+	private updateDragSelection(pending: PendingDrag, x: number, row: number): void {
+		const backwards = row < pending.row || (row === pending.row && x < pending.pressX);
+		const line = this.previousLines[row] ?? "";
+		const anchorCol = backwards ? pending.endCol : pending.col;
+		const focusCol = backwards ? this.snapAnchorCol(line, x) : this.snapFocusCol(line, x);
+		if (
+			this.selectionAnchor?.row === pending.row &&
+			this.selectionAnchor.col === anchorCol &&
+			this.selectionFocus?.row === row &&
+			this.selectionFocus.col === focusCol
+		)
+			return;
+		this.setSelection({ row: pending.row, col: anchorCol }, { row, col: focusCol });
+	}
+
+	protected override routeMouseCancel(): void {
+		this.cancelSelectionGestureForRerender();
+	}
+
+	protected override routeTerminalFocusChange(focused: boolean): void {
+		if (focused || !this.pendingDrag) return;
+		this.logMouse("focus-out");
+		this.cancelSelectionGestureForRerender();
+	}
+
+	protected override routeTerminalResize(): void {
+		this.terminalGeometryInvalidated = true;
+		this.cancelSelectionGestureForRerender();
+		super.routeTerminalResize();
+	}
+
+	protected override routeOverlayChange(): void {
+		this.overlayFrameInvalidated = true;
+		this.readingViewport = false;
+		this.cancelSelectionGestureForRerender();
+		this.requestRender();
+	}
+
+	private cancelSelectionGestureForRerender(): void {
+		if (!this.pendingDrag) return;
+		this.pendingDrag = undefined;
+		this.lastClick = undefined;
+		this.clearSelection();
+		this.requestRender();
 	}
 
 	private handleTranscriptPress(x: number, absoluteRow: number): void {
@@ -335,8 +448,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const count = this.countPress(row, word);
 		if (!word) {
 			this.clearSelection();
-			this.pendingDrag = { row, col: clampedX, pressX: clampedX, count };
-			this.holdViewport = true;
+			this.pendingDrag = { row, col: clampedX, endCol: clampedX, pressX: clampedX, count };
 			return;
 		}
 		if (count === 1) {
@@ -344,21 +456,20 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			this.pendingDrag = {
 				row,
 				col: this.snapAnchorCol(this.previousLines[row] ?? "", clampedX),
+				endCol: this.snapFocusCol(this.previousLines[row] ?? "", clampedX),
 				pressX: clampedX,
 				count,
 			};
-			this.holdViewport = true;
 			return;
 		}
 		if (count === 2) {
-			this.pendingDrag = { row, col: word.startCol, pressX: clampedX, count };
+			this.pendingDrag = { row, col: word.startCol, endCol: word.endCol, pressX: clampedX, count };
 			this.setSelection({ row, col: word.startCol }, { row, col: word.endCol });
 		} else {
 			const lineWidth = visibleWidth(stripTerminalSequences(this.previousLines[row] ?? ""));
-			this.pendingDrag = { row, col: 0, pressX: clampedX, count };
+			this.pendingDrag = { row, col: 0, endCol: lineWidth, pressX: clampedX, count };
 			this.setSelection({ row, col: 0 }, { row, col: lineWidth });
 		}
-		this.holdViewport = true;
 		this.copySelectionToClipboard();
 	}
 
@@ -416,7 +527,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		return range ? range.end : Math.min(col + 1, visibleWidth(line));
 	}
 
-	private getOrderedSelection(): { startRow: number; startCol: number; endRow: number; endCol: number } | undefined {
+	private getOrderedSelection(): SelectionBounds | undefined {
 		const anchor = this.selectionAnchor;
 		const focus = this.selectionFocus;
 		if (!anchor || !focus) return undefined;
@@ -430,11 +541,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const previous = this.getOrderedSelection();
 		this.selectionAnchor = anchor;
 		this.selectionFocus = focus;
-		// Selection is not part of the line-cache key; force recompute.
-		this.previousRawLines = [];
 		this.logMouse("setSelection", `anchor=${anchor.row},${anchor.col} focus=${focus.row},${focus.col}`);
-		this.repaintSelectionRows(previous);
-		this.requestRender();
+		this.queueSelectionRepaint(previous);
 	}
 
 	private clearSelection(): void {
@@ -442,9 +550,20 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const previous = this.getOrderedSelection();
 		this.selectionAnchor = undefined;
 		this.selectionFocus = undefined;
-		this.previousRawLines = [];
 		this.logMouse("clearSelection");
-		this.repaintSelectionRows(previous);
+		this.queueSelectionRepaint(previous);
+	}
+
+	private queueSelectionRepaint(previous: SelectionBounds | undefined): void {
+		const current = this.getOrderedSelection();
+		const start = Math.min(
+			previous?.startRow ?? Number.POSITIVE_INFINITY,
+			current?.startRow ?? Number.POSITIVE_INFINITY,
+		);
+		const end = Math.max(previous?.endRow ?? Number.NEGATIVE_INFINITY, current?.endRow ?? Number.NEGATIVE_INFINITY);
+		if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+		this.selectionRepaintStartRow = Math.min(this.selectionRepaintStartRow ?? start, start);
+		this.selectionRepaintEndRow = Math.max(this.selectionRepaintEndRow ?? end, end);
 		this.requestRender();
 	}
 
@@ -452,9 +571,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	private withSelectionHighlight(
 		line: string,
 		row: number,
-		selection:
-			| { startRow: number; startCol: number; endRow: number; endCol: number }
-			| undefined = this.getOrderedSelection(),
+		selection: SelectionBounds | undefined = this.getOrderedSelection(),
 	): string {
 		if (!selection || row < selection.startRow || row > selection.endRow || isImageLine(line)) {
 			return line;
@@ -464,30 +581,22 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		return highlightRange(line, start, end);
 	}
 
-	/**
-	 * Repaint rows directly (bypassing the render pipeline) so selection
-	 * changes paint even while the viewport is held. Covers the union of the
-	 * previous and current selection; content bookkeeping is untouched.
-	 */
-	private repaintSelectionRows(
-		previous: { startRow: number; startCol: number; endRow: number; endCol: number } | undefined,
-	): void {
-		const current = this.getOrderedSelection();
-		const minRow = Math.min(
-			previous?.startRow ?? Number.POSITIVE_INFINITY,
-			current?.startRow ?? Number.POSITIVE_INFINITY,
-		);
-		const maxRow = Math.max(
-			previous?.endRow ?? Number.NEGATIVE_INFINITY,
-			current?.endRow ?? Number.NEGATIVE_INFINITY,
-		);
-		if (!Number.isFinite(minRow) || !Number.isFinite(maxRow)) return;
+	/** Paint queued selection rows from the frozen frame at render cadence. */
+	private repaintSelectionRows(): boolean {
+		const dirtyStart = this.selectionRepaintStartRow;
+		const dirtyEnd = this.selectionRepaintEndRow;
+		if (dirtyStart === undefined || dirtyEnd === undefined) return true;
 		const height = this.terminal.rows;
-		const start = Math.max(minRow, this.previousViewportTop);
-		const end = Math.min(maxRow, this.previousViewportTop + height - 1, this.previousLines.length - 1);
-		if (end < start) return;
+		const start = Math.max(dirtyStart, this.previousViewportTop);
+		const end = Math.min(dirtyEnd, this.previousViewportTop + height - 1, this.previousLines.length - 1);
+		if (end < start) {
+			this.selectionRepaintStartRow = undefined;
+			this.selectionRepaintEndRow = undefined;
+			return true;
+		}
 		const cursorScreenRow = this.hardwareCursorRow - this.previousViewportTop;
-		if (cursorScreenRow < 0 || cursorScreenRow >= height) return;
+		if (cursorScreenRow < 0 || cursorScreenRow >= height) return false;
+		const current = this.getOrderedSelection();
 		const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
 		output.append("\x1b[?2026h");
 		const firstScreenRow = start - this.previousViewportTop;
@@ -502,7 +611,10 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		}
 		output.append("\x1b[?2026l");
 		output.flush();
-		this.hardwareCursorRow = start + (end - start);
+		this.hardwareCursorRow = end;
+		this.selectionRepaintStartRow = undefined;
+		this.selectionRepaintEndRow = undefined;
+		return true;
 	}
 
 	private getSelectionText(): string | undefined {
@@ -513,7 +625,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			const line = this.previousLines[row] ?? "";
 			const start = row === selection.startRow ? selection.startCol : 0;
 			const end = row === selection.endRow ? selection.endCol : visibleWidth(line);
-			// The cache may carry highlight escapes; strip all sequences here.
+			// Source rows may contain styling escapes; clipboard text must not.
 			lines.push(stripTerminalSequences(sliceByColumn(line, start, Math.max(0, end - start), true)).trimEnd());
 		}
 		const text = lines.join("\n");
@@ -521,44 +633,75 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	private copySelectionToClipboard(): void {
-		// Best-effort: failures fall back to OSC 52 inside, and the highlight
-		// persists as the visible record either way.
-		void this.copySelectionText();
-	}
-
-	private async copySelectionText(): Promise<void> {
 		const text = this.getSelectionText();
 		if (!text) return;
+		this.selectionCopyRequest += 1;
+		this.pendingSelectionCopy = { text, request: this.selectionCopyRequest };
+		this.scheduleSelectionCopy();
+	}
+
+	private scheduleSelectionCopy(): void {
+		if (this.selectionCopyScheduled) return;
+		this.selectionCopyScheduled = true;
+		const generation = this.selectionCopyGeneration;
+		queueMicrotask(() => {
+			this.selectionCopyScheduled = false;
+			if (generation !== this.selectionCopyGeneration) {
+				if (!this.stopped && this.pendingSelectionCopy !== undefined) this.scheduleSelectionCopy();
+				return;
+			}
+			if (this.stopped) {
+				this.pendingSelectionCopy = undefined;
+				return;
+			}
+			const pending = this.pendingSelectionCopy;
+			this.pendingSelectionCopy = undefined;
+			if (pending !== undefined) void this.copySelectionText(pending, generation);
+		});
+	}
+
+	private async copySelectionText(selection: { text: string; request: number }, generation: number): Promise<void> {
 		if (this.copySelection) {
 			try {
-				if (await this.copySelection(text)) return;
+				if (await this.copySelection(selection.text)) return;
 			} catch {
-				// Fall through to OSC 52.
+				// Fall through to OSC 52 while this terminal session is active.
 			}
 		}
-		this.terminal.write(`\x1b]52;c;${Buffer.from(text).toString("base64")}\x07`);
+		if (
+			!this.stopped &&
+			generation === this.selectionCopyGeneration &&
+			selection.request === this.selectionCopyRequest
+		) {
+			this.terminal.write(`\x1b]52;c;${Buffer.from(selection.text).toString("base64")}\x07`);
+		}
 	}
 
 	protected override routeMouseWheel(delta: number): boolean {
 		if (this.hasOverlay()) return false;
 		// Coordinates are stale across a resize until the re-render lands.
 		// Request it so a missed resize can never wedge wheel handling.
-		if (this.terminal.columns !== this.previousWidth) {
+		if (this.hasStalePointerFrame()) {
+			this.cancelSelectionGestureForRerender();
 			this.requestRender();
 			return true;
 		}
 		const maxTop = Math.max(0, this.previousLines.length - this.terminal.rows);
-		if (maxTop === 0) return true;
-		const base = this.holdViewport ? this.previousViewportTop : maxTop;
+		if (maxTop === 0) {
+			if (this.isViewportHeld()) this.resumeViewport();
+			return true;
+		}
+		const base = this.isViewportHeld() ? this.previousViewportTop : maxTop;
 		const next = Math.max(0, Math.min(maxTop, base + delta * WHEEL_SCROLL_LINES));
 		this.logMouse("wheel", `delta=${delta} base=${base} next=${next} maxTop=${maxTop}`);
 		if (next >= maxTop) {
 			// At (or back to) the latest content: resume live follow.
-			if (!this.holdViewport) return true;
+			if (!this.isViewportHeld()) return true;
 			this.resumeViewport();
 			return true;
 		}
-		this.holdViewport = true;
+		this.cancelSelectionGestureForRerender();
+		this.readingViewport = true;
 		this.displayViewport(next);
 		return true;
 	}
@@ -570,12 +713,19 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		// terminal forwards it). Plain Ctrl+C is interrupt and is never hijacked.
 		if (matchesKey(data, "super+c") && this.getOrderedSelection()) {
 			this.copySelectionToClipboard();
+			if (this.pendingDrag) {
+				// Treat explicit copy as completion when the terminal lost release:
+				// retain the copied highlight but end the transient render hold.
+				this.pendingDrag = undefined;
+				this.lastClick = undefined;
+				this.requestRender();
+			}
 			return true;
 		}
 		const kb = getKeybindings();
 		const isPageUp = kb.matches(data, "tui.editor.pageUp");
 		const isPageDown = kb.matches(data, "tui.editor.pageDown");
-		if (!this.holdViewport) {
+		if (!this.isViewportHeld()) {
 			// PageUp enters reading mode only when older rows exist to read;
 			// otherwise the editor keeps its paging behavior.
 			if (isPageUp && this.previousLines.length > this.terminal.rows) {
@@ -593,22 +743,26 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			return true;
 		}
 		// Any other key resumes live follow; the key still acts normally.
-		// A keyboard action also supersedes any in-progress drag.
-		this.pendingDrag = undefined;
+		// resumeViewport() also supersedes any in-progress drag.
 		this.resumeViewport();
 		return false;
 	}
 
 	/**
-	 * Leave reading mode and repaint the latest viewport. A pure diff cannot
+	 * Leave a held viewport and repaint the latest content. A pure diff cannot
 	 * do this: frozen bookkeeping matches the stale screen, so nothing would
 	 * look changed. Snapping repaints first, then the follow-up render is a
 	 * no-op diff plus cursor positioning.
 	 */
+	private isViewportHeld(): boolean {
+		return this.readingViewport || this.pendingDrag !== undefined;
+	}
+
 	private resumeViewport(): void {
-		if (!this.holdViewport) return;
+		if (!this.isViewportHeld()) return;
 		this.logMouse("resume");
-		this.holdViewport = false;
+		this.cancelSelectionGestureForRerender();
+		this.readingViewport = false;
 		this.displayViewport(Math.max(0, this.previousLines.length - this.terminal.rows));
 		this.requestRender();
 	}
@@ -617,17 +771,18 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const height = this.terminal.rows;
 		const maxTop = Math.max(0, this.previousLines.length - height);
 		if (maxTop === 0) {
-			this.holdViewport = false;
+			if (this.isViewportHeld()) this.resumeViewport();
 			return;
 		}
 		const step = direction * Math.max(1, height - 1);
-		const base = this.holdViewport ? this.previousViewportTop : maxTop;
+		const base = this.isViewportHeld() ? this.previousViewportTop : maxTop;
 		const next = Math.max(0, Math.min(maxTop, base + step));
 		if (next >= maxTop) {
 			this.resumeViewport();
 			return;
 		}
-		this.holdViewport = true;
+		this.cancelSelectionGestureForRerender();
+		this.readingViewport = true;
 		this.displayViewport(next);
 	}
 
@@ -647,7 +802,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		if (cursorScreenRow < 0 || cursorScreenRow >= height) {
 			// Inconsistent cursor tracking: bail out to live follow instead of
 			// painting from a wrong origin.
-			this.holdViewport = false;
+			this.readingViewport = false;
+			this.cancelSelectionGestureForRerender();
 			this.requestRender();
 			return;
 		}
@@ -665,11 +821,16 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		output.flush();
 		this.previousViewportTop = clamped;
 		this.hardwareCursorRow = Math.max(clamped, renderEnd - 1);
+		this.selectionRepaintStartRow = undefined;
+		this.selectionRepaintEndRow = undefined;
 	}
 
 	protected override beforeTerminalStop(options: TuiStopOptions): void {
-		// An input sequence cannot span a stop/start boundary.
-		this.pendingDrag = undefined;
+		// Input and viewport holds cannot span a stop/start boundary.
+		this.cancelSelectionGestureForRerender();
+		this.readingViewport = false;
+		this.pendingSelectionCopy = undefined;
+		this.selectionCopyGeneration += 1;
 		if (options.preserveScreen || this.previousLines.length === 0) return;
 		this.terminal.write(" ");
 		const targetRow = this.previousLines.length;
@@ -777,24 +938,45 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 	protected doRender(): void {
 		if (this.stopped) return;
-		// Held viewport (reading mode): freeze the frame so streaming output
-		// never yanks the view. Bookkeeping stays frozen too, so resuming
-		// diffs repaint everything missed in one pass. Resizes and overlays
-		// resume live follow instead of showing a stale layout.
-		if (this.holdViewport) {
-			if (this.terminal.columns !== this.previousWidth || this.terminal.rows !== this.previousHeight) {
+		const geometryInvalidated = this.terminalGeometryInvalidated;
+		this.terminalGeometryInvalidated = false;
+		this.overlayFrameInvalidated = false;
+		// Held viewports keep content bookkeeping frozen. Selection-only dirty
+		// rows still paint through this throttled path, while resize and overlay
+		// transitions terminate transient gestures and recover live rendering.
+		if (this.isViewportHeld()) {
+			if (
+				geometryInvalidated ||
+				this.terminal.columns !== this.previousWidth ||
+				this.terminal.rows !== this.previousHeight
+			) {
 				// The coming full re-render repaints everything absolutely.
-				this.holdViewport = false;
-				this.pendingDrag = undefined;
+				this.readingViewport = false;
+				this.cancelSelectionGestureForRerender();
 			} else if (this.hasOverlay()) {
-				this.pendingDrag = undefined;
 				this.resumeViewport();
-			} else {
+			} else if (this.repaintSelectionRows()) {
 				return;
+			} else {
+				// Invalid cursor bookkeeping is unsafe for a relative repaint.
+				// Resume through the normal renderer, which recomputes geometry.
+				this.readingViewport = false;
+				this.cancelSelectionGestureForRerender();
 			}
 		}
 		const width = this.terminal.columns;
 		const height = this.terminal.rows;
+		const liveTop = Math.max(0, this.previousLines.length - height);
+		if (
+			!geometryInvalidated &&
+			width === this.previousWidth &&
+			height === this.previousHeight &&
+			this.previousViewportTop < liveTop
+		) {
+			// A lifecycle transition can end reading mode without changing any
+			// content. Restore the physical viewport before the no-change diff.
+			this.displayViewport(liveTop);
+		}
 		const widthChanged = this.previousWidth !== 0 && this.previousWidth !== width;
 		const heightChanged = this.previousHeight !== 0 && this.previousHeight !== height;
 		const previousBufferLength = this.previousHeight > 0 ? this.previousViewportTop + this.previousHeight : height;
@@ -876,6 +1058,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
 			this.previousWidth = width;
 			this.previousHeight = height;
+			this.selectionRepaintStartRow = undefined;
+			this.selectionRepaintEndRow = undefined;
 		};
 
 		const debugRedraw = process.env.PI_DEBUG_REDRAW === "1";
@@ -914,6 +1098,14 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			return;
 		}
 
+		// If the terminal resized away and back between frames, dimensions match
+		// again but its physical contents and cursor may have reflowed twice.
+		if (geometryInvalidated && !widthChanged && !heightChanged) {
+			logRedraw("terminal geometry changed between frames");
+			fullRender(true);
+			return;
+		}
+
 		// Content shrunk below the working area and no overlays - re-render to clear empty rows
 		// (overlays need the padding, so only do this when no overlays are active)
 		// Configurable via setClearOnShrink() or PI_CLEAR_ON_SHRINK=0 env var
@@ -933,18 +1125,22 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			}
 			lastChanged = newLines.length - 1;
 		}
+		const selectionRepaintStart = this.selectionRepaintStartRow;
+		const selectionRepaintEnd = this.selectionRepaintEndRow;
+		this.selectionRepaintStartRow = undefined;
+		this.selectionRepaintEndRow = undefined;
+		if (selectionRepaintStart !== undefined && selectionRepaintEnd !== undefined && newLines.length > 0) {
+			const repaintStart = Math.max(0, Math.min(newLines.length - 1, selectionRepaintStart));
+			const repaintEnd = Math.max(repaintStart, Math.min(newLines.length - 1, selectionRepaintEnd));
+			firstChanged = firstChanged === -1 ? repaintStart : Math.min(firstChanged, repaintStart);
+			lastChanged = Math.max(lastChanged, repaintEnd);
+		}
 		if (firstChanged !== -1) {
 			const expandedRange = this.expandChangedRangeForKittyImages(firstChanged, lastChanged, newLines);
 			firstChanged = expandedRange.firstChanged;
 			lastChanged = expandedRange.lastChanged;
 		}
-		// Keep text selection painted: rows it covers must repaint even when
-		// only unrelated content changed (the highlight lives outside the cache).
 		const activeSelection = this.getOrderedSelection();
-		if (activeSelection && firstChanged !== -1) {
-			firstChanged = Math.min(firstChanged, activeSelection.startRow);
-			lastChanged = Math.max(lastChanged, activeSelection.endRow);
-		}
 		const appendStart = appendedLines && firstChanged === this.previousLines.length && firstChanged > 0;
 
 		// No changes - but still need to update hardware cursor position if it moved

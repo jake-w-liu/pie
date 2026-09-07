@@ -1,10 +1,10 @@
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { getAgentDir, getProjectConfigDir } from "./utils.ts";
+import { getPackageRoot } from "./package-root.ts";
 
 export function getPromptDirectories(cwd: string) {
 	return {
-		package: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "prompts"),
+		package: path.join(getPackageRoot(), "prompts"),
 		user: path.join(getAgentDir(), "prompts"),
 		project: path.join(getProjectConfigDir(cwd), "prompts"),
 	};

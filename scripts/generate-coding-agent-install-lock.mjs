@@ -199,7 +199,7 @@ function resolveExternalDependency(lockPackages, packageName, fromLockPath) {
 	);
 }
 
-function addInternalWorkspace(installLockPackages, addedPaths, queue, name, workspace) {
+function addInternalWorkspace(lockPackages, installLockPackages, addedPaths, queue, name, workspace) {
 	const packageJson = workspace.packageJson;
 	const outputPath = `node_modules/${name}`;
 	const entry = copyPackageJsonEntry(packageJson, { includeName: false });
@@ -209,6 +209,22 @@ function addInternalWorkspace(installLockPackages, addedPaths, queue, name, work
 	addedPaths.add(outputPath);
 
 	for (const dependencyName of Object.keys(packageDependencies(packageJson))) {
+		// Workspaces may pin nested versions (e.g. packages/pi-subagents/node_modules/typebox)
+		// that differ from the hoisted root. Port them as nested install entries so exact
+		// version specs keep resolving to the tested versions after publish.
+		const nestedLockPath = `${workspace.lockPath}/node_modules/${dependencyName}`;
+		const nestedEntry = lockPackages[nestedLockPath];
+		if (nestedEntry && !nestedEntry.link) {
+			const nestedOutputPath = `${outputPath}/node_modules/${dependencyName}`;
+			if (!addedPaths.has(nestedOutputPath)) {
+				installLockPackages[nestedOutputPath] = copyLockEntry(nestedEntry);
+				addedPaths.add(nestedOutputPath);
+				for (const transitiveName of Object.keys(packageDependencies(nestedEntry))) {
+					queue.push({ name: transitiveName, from: nestedOutputPath });
+				}
+			}
+			continue;
+		}
 		queue.push({ name: dependencyName, from: outputPath });
 	}
 }
@@ -383,7 +399,7 @@ function generateInstallLock() {
 			const outputPath = `node_modules/${item.name}`;
 			internalNames.add(item.name);
 			if (!addedPaths.has(outputPath)) {
-				addInternalWorkspace(installLockPackages, addedPaths, queue, item.name, workspace);
+				addInternalWorkspace(lockPackages, installLockPackages, addedPaths, queue, item.name, workspace);
 			}
 			continue;
 		}

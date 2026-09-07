@@ -31,6 +31,9 @@
 			"typebox": ["./node_modules/typebox"],
 			"@earendil-works/pi-tui": ["./packages/tui/src/index.ts"],
 			"@earendil-works/pi-tui/*": ["./packages/tui/src/*"],
+			"@earendil-works/pi-ext-fff": ["./packages/pi-fff/index.ts"],
+			"@earendil-works/pi-ext-subagents": ["./packages/pi-subagents/index.ts"],
+			"@earendil-works/pi-ext-web-access": ["./packages/pi-web-access/index.ts"],
 			"@earendil-works/pi-agent-old": ["./packages/agent-old/src/index.ts"],
 			"@earendil-works/pi-agent-old/*": ["./packages/agent-old/src/*"]
 		}

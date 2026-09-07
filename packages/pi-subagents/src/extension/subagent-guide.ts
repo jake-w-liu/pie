@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { getPackageRoot } from "../shared/package-root.ts";
 
 export const SUBAGENT_GUIDE_TOPICS = [
 	"overview",
@@ -17,7 +17,7 @@ export const SUBAGENT_GUIDE_TOPICS = [
 
 export type SubagentGuideTopic = (typeof SUBAGENT_GUIDE_TOPICS)[number];
 
-const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const packageRoot = getPackageRoot();
 
 function isGuideTopic(value: string): value is SubagentGuideTopic {
 	return (SUBAGENT_GUIDE_TOPICS as readonly string[]).includes(value);

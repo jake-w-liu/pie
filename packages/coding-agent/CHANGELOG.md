@@ -4,6 +4,9 @@
 
 ### Added
 
+- Built fff, subagents, and web-access into Pie as always-on core capabilities: they now load as built-in extensions from the shipped dependencies instead of opt-in vendored extension discovery, so every install gets file search, subagent orchestration, and web search/fetch without extra setup. Removed the `discoverBundledExtensions` scan; user and project extensions continue to load unchanged.
+- Built the former `.pi/extensions` helpers into Pie: token-speed (TPS) agent summaries, the `/tui` redraw counter, the PR/issue/advisory prompt widget with session renaming, and the `/ir` CI session importer. The `.pi/extensions` copies were removed.
+
 - Added a built-in MLX provider extension that serves models from a local `mlx_lm.server` / `mlx_vlm.server` via the `MLX_BASE_URL` config or credential, discovering models from the server's `/v1/models` endpoint.
 - Added Pie distribution branding, pinned first-run defaults for pi-fff, pi-web-access, and pi-subagents, and the verified setup checklist.
 - Shipped web search with terminal-only defaults: a fresh config seeds `workflow: auto-summary` and `autoOpenBrowser: false` in `web-search.json`, so web search returns a summary in the terminal without opening a browser curator or asking for approval. Existing user config is never overwritten.

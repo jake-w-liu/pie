@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { getPackageRoot } from "../../shared/package-root.ts";
 import { createRequire } from "node:module";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { discoverAgents, formatUnknownAgentError, unknownAgentDiagnosticContext, type AgentConfig, type UnknownAgentDiagnosticContext } from "../../agents/agents.ts";
@@ -542,7 +542,7 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 	const launchBarrierToken = hasRevivalLease ? undefined : runnerProcessInstanceId;
 	const launchConfig = { ...cfg, runnerProcessInstanceId, ...(launchBarrierToken ? { launchBarrierToken } : {}) };
 	writePrivateAtomicJson(cfgPath, launchConfig);
-	const runner = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-runner.ts");
+	const runner = path.join(getPackageRoot(), "src", "runs", "background", "subagent-runner.ts");
 	if (!fs.existsSync(runner)) {
 		return { error: "async runner entry could not be found; the active Pie installation may have changed (e.g. refresh:pie). Restart pie and retry." };
 	}

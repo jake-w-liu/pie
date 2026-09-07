@@ -18,7 +18,7 @@
 import { Buffer } from "node:buffer";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "../../core/extensions/types.ts";
 
 const GIST_ID_RE = /^[0-9a-fA-F]{20,}$/;
 const GIST_URL_RE = /^https:\/\/gist\.github\.com\/(?:[^/]+\/)?([0-9a-fA-F]{20,})(?:[/#?].*)?$/;
@@ -58,7 +58,10 @@ interface IssueComment {
 function parseRef(
 	ref: string,
 	cwd: string,
-): { type: "gist"; id: string } | { type: "file"; path: string } | { type: "issue"; owner: string; repo: string; issue: string } {
+):
+	| { type: "gist"; id: string }
+	| { type: "file"; path: string }
+	| { type: "issue"; owner: string; repo: string; issue: string } {
 	if (ref.endsWith(".html") || ref.endsWith(".jsonl")) {
 		return { type: "file", path: isAbsolute(ref) ? ref : resolve(cwd, ref) };
 	}
@@ -87,7 +90,12 @@ function parseSessionJsonl(raw: string): { header: SessionHeader; jsonl: string 
 		throw new Error("first line of session file is not valid JSON");
 	}
 	const header = parsed as Partial<SessionHeader>;
-	if (header.type !== "session" || typeof header.id !== "string" || typeof header.cwd !== "string" || header.cwd === "") {
+	if (
+		header.type !== "session" ||
+		typeof header.id !== "string" ||
+		typeof header.cwd !== "string" ||
+		header.cwd === ""
+	) {
 		throw new Error("session file has no valid session header with a cwd");
 	}
 	return { header: header as SessionHeader, jsonl: raw };
@@ -166,7 +174,9 @@ function getCwdRewriteVariants(sourceCwd: string): string[] {
 		variants.add(`/${driveParts.drive}/${rest}`);
 	}
 
-	return Array.from(variants).filter(Boolean).sort((a, b) => b.length - a.length);
+	return Array.from(variants)
+		.filter(Boolean)
+		.sort((a, b) => b.length - a.length);
 }
 
 function getCiWorkdirName(sourceCwd: string): string | undefined {

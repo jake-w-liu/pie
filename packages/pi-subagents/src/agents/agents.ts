@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import { parse as parseYaml } from "yaml";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { getPackageRoot } from "../shared/package-root.ts";
 import type { AcceptanceInput, AcceptanceRole, AgentRunnerConfig, OutputMode, ToolBudgetConfig, TurnBudgetConfig } from "../shared/types.ts";
 import { CODE_OWNED_EXTERNAL_CLI_ADAPTER_LABEL, isCodeOwnedExternalCliAdapterId, parseExternalCliCapabilityNarrowing, validateCodeOwnedProfileRunner } from "../runs/shared/external-cli-contract.ts";
 import { getAgentDir, getProjectConfigDir } from "../shared/utils.ts";
@@ -2216,7 +2216,7 @@ function resolveNearestProjectChainDirs(cwd: string): { readDirs: string[]; pref
 		preferredDir,
 	};
 }
-const BUILTIN_AGENTS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "agents");
+const BUILTIN_AGENTS_DIR = path.join(getPackageRoot(), "agents");
 // Candidate files and inspection state must describe the same cached builtin scan.
 const BUILTIN_AGENT_DEFINITION_INSPECTION = inspectAgentDefinitionDirectory(BUILTIN_AGENTS_DIR);
 const BUILTIN_AGENT_DEFINITION_FILES = readAgentDefinitionFiles(BUILTIN_AGENTS_DIR, BUILTIN_AGENT_DEFINITION_INSPECTION);

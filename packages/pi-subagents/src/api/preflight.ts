@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { getPackageRoot } from "../shared/package-root.ts";
 import { discoverAgents, discoverAgentsAll, findBlockingAgentDiagnostic, formatUnknownAgentError, resolveAgentName, unknownAgentDiagnosticContext, type AgentConfig, type AgentScope, type AgentSource } from "../agents/agents.ts";
 import { resolveExecutionAgentScope } from "../agents/agent-scope.ts";
 import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } from "../agents/skills.ts";
@@ -179,7 +179,7 @@ export type SubagentLaunchContractResult =
 	| { ok: false; code: SubagentLaunchContractReasonCode; message: string; diagnostics: SubagentLaunchContractDiagnostic[] };
 
 function packageVersion(): string {
-	const packagePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "package.json");
+	const packagePath = path.join(getPackageRoot(), "package.json");
 	const parsed = JSON.parse(fs.readFileSync(packagePath, "utf-8")) as { version?: unknown };
 	if (typeof parsed.version !== "string" || !parsed.version.trim()) {
 		throw new Error(`Invalid package version in '${packagePath}'.`);

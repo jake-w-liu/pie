@@ -50,10 +50,13 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 	private readonly metadata: JsonlSessionMetadata;
 	private readonly state = new SessionState();
 	private tail: Promise<void> = Promise.resolve();
+	private acknowledgedContent: string;
+	private recoveryError: SessionError | undefined;
 
-	constructor(fs: JsonlSessionRepoFileSystem, metadata: JsonlSessionMetadata) {
+	private constructor(fs: JsonlSessionRepoFileSystem, metadata: JsonlSessionMetadata, content: string) {
 		this.fs = fs;
 		this.metadata = structuredClone(metadata);
+		this.acknowledgedContent = content;
 	}
 
 	static async create(
@@ -61,9 +64,10 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 		path: string,
 		header: JsonlV4Header,
 	): Promise<JsonlSessionStorage> {
-		fileResult(await fs.writeFile(path, encodeHeader(header)), `Failed to initialize session ${path}`);
+		const content = encodeHeader(header);
+		fileResult(await fs.writeFile(path, content), `Failed to initialize session ${path}`);
 		const fileInfo = fileResult(await fs.fileInfo(path), `Failed to read session metadata ${path}`);
-		return new JsonlSessionStorage(fs, metadataFromHeader(header, path, fileInfo.mtimeMs));
+		return new JsonlSessionStorage(fs, metadataFromHeader(header, path, fileInfo.mtimeMs), content);
 	}
 
 	static async load(fs: JsonlSessionRepoFileSystem, path: string): Promise<JsonlSessionStorage> {
@@ -76,7 +80,11 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 		const headerResult = parseHeader(physicalLines[0]);
 		if (!headerResult.ok) throw invalidFile(path, 1, headerResult.error);
 		const fileInfo = fileResult(await fs.fileInfo(path), `Failed to read session metadata ${path}`);
-		const storage = new JsonlSessionStorage(fs, metadataFromHeader(headerResult.value, path, fileInfo.mtimeMs));
+		const storage = new JsonlSessionStorage(
+			fs,
+			metadataFromHeader(headerResult.value, path, fileInfo.mtimeMs),
+			content,
+		);
 		for (let index = 1; index < physicalLines.length; index++) {
 			const line = physicalLines[index]!;
 			const mutationResult = parseMutation(line);
@@ -88,6 +96,7 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 					await publishFileAtomically(fs, path, async (tempPath) => {
 						fileResult(await fs.writeFile(tempPath, validPrefix), `Failed to stage torn-tail repair ${path}`);
 					});
+					storage.acknowledgedContent = validPrefix;
 					return storage;
 				}
 				throw invalidFile(path, index + 1, mutationResult.error);
@@ -103,12 +112,14 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 		}
 		if (!content.endsWith("\n")) {
 			fileResult(await fs.appendFile(path, "\n"), `Failed to repair unterminated session tail ${path}`);
+			storage.acknowledgedContent += "\n";
 		}
 		return storage;
 	}
 
 	async fork(path: string, header: JsonlV4Header, options: ForkOptions): Promise<JsonlSessionStorage> {
-		const mutations = this.state.createForkMutations(options);
+		// Snapshot under the same queue as appends; never replay/repair a live writer's file.
+		const mutations = await this.enqueue(async () => this.state.createForkMutations(options));
 		await publishFileAtomically(this.fs, path, async (tempPath) => {
 			const targetStorage = await JsonlSessionStorage.create(this.fs, tempPath, header);
 			for (const mutation of mutations) {
@@ -256,7 +267,10 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 	}
 
 	private enqueue<T>(operation: () => Promise<T>): Promise<T> {
-		const result = this.tail.then(operation);
+		const result = this.tail.then(() => {
+			if (this.recoveryError) throw this.recoveryError;
+			return operation();
+		});
 		this.tail = result.then(
 			() => undefined,
 			() => undefined,
@@ -265,10 +279,36 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 	}
 
 	private async appendMutation(mutation: SessionMutation): Promise<void> {
-		fileResult(
-			await this.fs.appendFile(this.metadata.path, encodeMutation(mutation)),
-			`Failed to append session ${this.metadata.path}`,
-		);
+		const encoded = encodeMutation(mutation);
+		const path = this.metadata.path;
+		try {
+			fileResult(await this.fs.appendFile(path, encoded), `Failed to append session ${path}`);
+		} catch (error) {
+			// An I/O error may follow a partial or even complete write. Neither is acknowledged:
+			// restore the exact accepted prefix before admitting another mutation, without replay.
+			try {
+				const content = fileResult(await this.fs.readTextFile(path), `Failed to inspect failed append ${path}`);
+				if (!content.startsWith(this.acknowledgedContent)) {
+					throw new SessionError("invalid_entry", `Acknowledged session prefix changed: ${path}`);
+				}
+				if (content !== this.acknowledgedContent) {
+					await publishFileAtomically(this.fs, path, async (tempPath) => {
+						fileResult(
+							await this.fs.writeFile(tempPath, this.acknowledgedContent),
+							`Failed to stage append recovery ${path}`,
+						);
+					});
+				}
+			} catch (recoveryError) {
+				this.recoveryError = new SessionError(
+					"storage",
+					`Failed to recover append; reopen session before writing: ${path}`,
+					recoveryError instanceof Error ? recoveryError : undefined,
+				);
+			}
+			throw error;
+		}
+		this.acknowledgedContent += encoded;
 	}
 
 	private applyMutation(mutation: SessionMutation): void {

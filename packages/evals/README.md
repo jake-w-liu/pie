@@ -2,6 +2,8 @@
 
 Pi evals are behavioral, model-backed checks for Pi workflows. They adapt a real `AgentSession` to `vitest-evals`, run
 it in isolated temporary project and agent directories, and attach native Pi session artifacts.
+Skill and context discovery stays within those temporary roots, including after reload; host HOME skills and ancestor
+context are excluded. Workspace skills and extensions created during a run can still load on reload.
 Use them to measure end-to-end behavior and compare prompts, tools, skills, models, or other harness configurations.
 
 ## Running evals
@@ -136,6 +138,8 @@ describe.for(harnessTable)("$name repetition $repetition", ({ harness }) => {
 Comparative suites should record correctness with deterministic or model-backed judges and set `judgeThreshold: null`.
 This keeps a low score as an observation instead of making the Vitest invocation fail. Use hard assertions only for
 suite invariants and infrastructure contracts. `expect.soft(...)` still fails the test and is not a scoring mechanism.
+A failed invariant excludes the run from paired observations even if judges recorded a score. Deliberate judge-threshold
+failures remain scored observations, while harness execution errors remain excluded.
 
 The Pi harness snapshots native session JSONL before deleting its temporary workspace. An eval-only `afterEach` hook
 registers that snapshot against the explicit Vitest test task before reporters run.

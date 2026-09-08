@@ -39,6 +39,7 @@ export class LiveSessionManager {
 	private readonly options: LiveSessionManagerOptions;
 	private readonly liveSessions = new Map<string, LiveSession>();
 	private readonly openingSessions = new Map<string, Promise<LiveSession>>();
+	private readonly pendingAttachments = new Map<string, number>();
 
 	constructor(options: LiveSessionManagerOptions) {
 		this.options = options;
@@ -57,17 +58,15 @@ export class LiveSessionManager {
 					model: command.model,
 					thinkingLevel: command.thinkingLevel,
 				};
-				const live = await this.acquire(id, () => this.options.service.createSession(options));
-				await this.attach(connection, live);
+				const live = await this.acquireAndAttach(connection, id, () => this.options.service.createSession(options));
 				const session = this.forConnection(await this.broadcastSnapshot(live), connection);
 				this.options.broadcastServerSnapshot();
 				return { command: "create" as const, session };
 			}
 			case "attach": {
-				const live = await this.acquire(command.sessionId, () =>
+				const live = await this.acquireAndAttach(connection, command.sessionId, () =>
 					this.options.service.openSession(command.sessionId),
 				);
-				await this.attach(connection, live);
 				const session = this.forConnection(await this.broadcastSnapshot(live), connection);
 				this.options.broadcastServerSnapshot();
 				return { command: "attach" as const, session };
@@ -297,13 +296,32 @@ export class LiveSessionManager {
 		return snapshot;
 	}
 
-	private async attach(connection: ConnectionState, live: LiveSession): Promise<void> {
-		if (connection.disconnected || connection.stage !== "ready" || connection.connection.closed) {
-			await this.maybeDispose(live);
-			throw new PiServerError("invalid_request", "Connection closed while attaching to a session");
+	private async acquireAndAttach(
+		connection: ConnectionState,
+		id: string,
+		acquireRuntime: () => Promise<PiSessionRuntime>,
+	): Promise<LiveSession> {
+		// Every waiter owns a reservation until it attaches or fails, including
+		// waiters sharing an opening whose originating connection has disconnected.
+		this.pendingAttachments.set(id, (this.pendingAttachments.get(id) ?? 0) + 1);
+		let live: LiveSession | undefined;
+		try {
+			live = await this.acquire(id, acquireRuntime);
+			if (connection.disconnected || connection.stage !== "ready" || connection.connection.closed) {
+				throw new PiServerError("invalid_request", "Connection closed while attaching to a session");
+			}
+			if (this.options.isClosing() || live.terminal || live.disposing || this.liveSessions.get(id) !== live) {
+				throw new PiServerError("session_locked", `Session runtime is unavailable: ${id}`);
+			}
+			connection.sessionIds.add(id);
+			live.connections.add(connection);
+			return live;
+		} finally {
+			const remaining = (this.pendingAttachments.get(id) ?? 1) - 1;
+			if (remaining === 0) this.pendingAttachments.delete(id);
+			else this.pendingAttachments.set(id, remaining);
+			if (live) this.scheduleMaybeDispose(live);
 		}
-		connection.sessionIds.add(live.id);
-		live.connections.add(connection);
 	}
 
 	private requireAttached(connection: ConnectionState, sessionId: string): LiveSession {
@@ -327,6 +345,7 @@ export class LiveSessionManager {
 			!live.ready ||
 			live.disposing ||
 			live.connections.size > 0 ||
+			this.pendingAttachments.has(live.id) ||
 			live.operationCount > 0 ||
 			(!live.terminal && live.runtime.getPhase() !== "idle")
 		) {

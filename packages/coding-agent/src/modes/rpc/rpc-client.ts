@@ -490,24 +490,35 @@ export class RpcClient {
 	}
 
 	/**
-	 * Collect events until agent becomes idle.
+	 * Collect events until agent becomes idle. The signal cancels collection,
+	 * not the agent operation, and releases the listener and timeout.
 	 */
-	collectEvents(timeout = 60000): Promise<JsonAgentSessionEvent[]> {
+	collectEvents(timeout = 60000, signal?: AbortSignal): Promise<JsonAgentSessionEvent[]> {
 		return new Promise((resolve, reject) => {
+			signal?.throwIfAborted();
 			const events: JsonAgentSessionEvent[] = [];
-			const timer = setTimeout(() => {
+			const cleanup = () => {
+				clearTimeout(timer);
 				unsubscribe();
+				signal?.removeEventListener("abort", onAbort);
+			};
+			const onAbort = () => {
+				cleanup();
+				reject(signal?.reason);
+			};
+			const timer = setTimeout(() => {
+				cleanup();
 				reject(new Error(`Timeout collecting events. Stderr: ${this.stderr}`));
 			}, timeout);
 
 			const unsubscribe = this.onEvent((event) => {
 				events.push(event);
 				if (event.type === "agent_settled") {
-					clearTimeout(timer);
-					unsubscribe();
+					cleanup();
 					resolve(events);
 				}
 			});
+			signal?.addEventListener("abort", onAbort, { once: true });
 		});
 	}
 
@@ -515,9 +526,14 @@ export class RpcClient {
 	 * Send prompt and wait for completion, returning all events.
 	 */
 	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<JsonAgentSessionEvent[]> {
-		const eventsPromise = this.collectEvents(timeout);
-		await this.prompt(message, images);
-		return eventsPromise;
+		const controller = new AbortController();
+		const eventsPromise = this.collectEvents(timeout, controller.signal);
+		try {
+			const [, events] = await Promise.all([this.prompt(message, images), eventsPromise]);
+			return events;
+		} finally {
+			controller.abort();
+		}
 	}
 
 	// =========================================================================
@@ -547,7 +563,9 @@ export class RpcClient {
 		// Otherwise it's an event. Dispatch to every listener even if one throws, and
 		// surface listener errors instead of silently swallowing them (the old broad
 		// catch{} also skipped the remaining listeners for this line).
-		for (const listener of this.eventListeners) {
+		// A waiter can unsubscribe while handling this event. Preserve the
+		// subscribers admitted for this dispatch; changes apply to the next one.
+		for (const listener of [...this.eventListeners]) {
 			try {
 				listener(data as JsonAgentSessionEvent);
 			} catch (error) {
@@ -599,7 +617,11 @@ export class RpcClient {
 			this.pendingRequests.set(id, {
 				resolve: (response) => {
 					clearTimeout(timeout);
-					resolve(response);
+					if (!response.success) {
+						reject(new Error(response.error));
+					} else {
+						resolve(response);
+					}
 				},
 				reject: (error) => {
 					clearTimeout(timeout);

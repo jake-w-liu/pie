@@ -30,13 +30,16 @@ import type {
 	ToolResultMessage,
 } from "../types.ts";
 import { splitDeferredTools } from "../utils/deferred-tools.ts";
+import { safeJsonStringify } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
+import { cancelResponseBody } from "../utils/http-response.ts";
 import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
+import { iterateSseMessages } from "../utils/sse.ts";
 
 import { getJsonSchemaToolParameters, resolveJsonSchemaStrictSampling } from "./constrained-sampling.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
@@ -306,18 +309,6 @@ function assertRequestAuth(provider: string, apiKey: string | undefined, headers
 	throw new Error(`No API key for provider: ${provider}`);
 }
 
-interface ServerSentEvent {
-	event: string | null;
-	data: string;
-	raw: string[];
-}
-
-interface SseDecoderState {
-	event: string | null;
-	data: string[];
-	raw: string[];
-}
-
 const ANTHROPIC_MESSAGE_EVENTS: ReadonlySet<string> = new Set([
 	"message_start",
 	"message_delta",
@@ -326,136 +317,6 @@ const ANTHROPIC_MESSAGE_EVENTS: ReadonlySet<string> = new Set([
 	"content_block_delta",
 	"content_block_stop",
 ]);
-
-function flushSseEvent(state: SseDecoderState): ServerSentEvent | null {
-	if (!state.event && state.data.length === 0) {
-		return null;
-	}
-
-	const event: ServerSentEvent = {
-		event: state.event,
-		data: state.data.join("\n"),
-		raw: [...state.raw],
-	};
-	state.event = null;
-	state.data = [];
-	state.raw = [];
-	return event;
-}
-
-function decodeSseLine(line: string, state: SseDecoderState): ServerSentEvent | null {
-	if (line === "") {
-		return flushSseEvent(state);
-	}
-
-	state.raw.push(line);
-	if (line.startsWith(":")) {
-		return null;
-	}
-
-	const delimiterIndex = line.indexOf(":");
-	const fieldName = delimiterIndex === -1 ? line : line.slice(0, delimiterIndex);
-	let value = delimiterIndex === -1 ? "" : line.slice(delimiterIndex + 1);
-	if (value.startsWith(" ")) {
-		value = value.slice(1);
-	}
-
-	if (fieldName === "event") {
-		state.event = value;
-	} else if (fieldName === "data") {
-		state.data.push(value);
-	}
-
-	return null;
-}
-
-function nextLineBreakIndex(text: string): number {
-	const carriageReturnIndex = text.indexOf("\r");
-	const newlineIndex = text.indexOf("\n");
-	if (carriageReturnIndex === -1) {
-		return newlineIndex;
-	}
-	if (newlineIndex === -1) {
-		return carriageReturnIndex;
-	}
-	return Math.min(carriageReturnIndex, newlineIndex);
-}
-
-function consumeLine(text: string): { line: string; rest: string } | null {
-	const lineBreakIndex = nextLineBreakIndex(text);
-	if (lineBreakIndex === -1) {
-		return null;
-	}
-
-	let nextIndex = lineBreakIndex + 1;
-	if (text[lineBreakIndex] === "\r" && text[nextIndex] === "\n") {
-		nextIndex += 1;
-	}
-
-	return {
-		line: text.slice(0, lineBreakIndex),
-		rest: text.slice(nextIndex),
-	};
-}
-
-async function* iterateSseMessages(
-	body: ReadableStream<Uint8Array>,
-	signal?: AbortSignal,
-): AsyncGenerator<ServerSentEvent> {
-	const reader = body.getReader();
-	const decoder = new TextDecoder();
-	const state: SseDecoderState = { event: null, data: [], raw: [] };
-	let buffer = "";
-
-	try {
-		while (true) {
-			if (signal?.aborted) {
-				throw new Error("Request was aborted");
-			}
-
-			const { value, done } = await reader.read();
-			if (done) {
-				break;
-			}
-
-			buffer += decoder.decode(value, { stream: true });
-			let consumed = consumeLine(buffer);
-			while (consumed) {
-				buffer = consumed.rest;
-				const event = decodeSseLine(consumed.line, state);
-				if (event) {
-					yield event;
-				}
-				consumed = consumeLine(buffer);
-			}
-		}
-
-		buffer += decoder.decode();
-		let consumed = consumeLine(buffer);
-		while (consumed) {
-			buffer = consumed.rest;
-			const event = decodeSseLine(consumed.line, state);
-			if (event) {
-				yield event;
-			}
-			consumed = consumeLine(buffer);
-		}
-
-		if (buffer.length > 0) {
-			const event = decodeSseLine(buffer, state);
-			if (event) {
-				yield event;
-			}
-		}
-
-		const trailingEvent = flushSseEvent(state);
-		if (trailingEvent) {
-			yield trailingEvent;
-		}
-	} finally {
-		reader.releaseLock();
-	}
-}
 
 /**
  * Extract a readable message from an Anthropic SSE `error` event payload,
@@ -548,6 +409,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			timestamp: Date.now(),
 		};
 
+		let response: Response | undefined;
 		try {
 			let client: Anthropic;
 			let isOAuth: boolean;
@@ -596,7 +458,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 				maxRetries: 0,
 			};
-			const response = await retryProviderRequest(
+			response = await retryProviderRequest(
 				() => client.messages.create({ ...params, stream: true }, requestOptions).asResponse(),
 				{
 					maxRetries: options?.maxRetries,
@@ -799,6 +661,8 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					output.usage.totalTokens =
 						output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 					calculateCost(usageModel, output.usage);
+				} else if (event.type === "message_stop") {
+					break;
 				}
 			}
 
@@ -816,13 +680,14 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
+			await cancelResponseBody(response);
 			for (const block of output.content) {
 				delete (block as { index?: number }).index;
 				// partialJson is only a streaming scratch buffer; never persist it.
 				delete (block as { partialJson?: string }).partialJson;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+			output.errorMessage = error instanceof Error ? error.message : safeJsonStringify(error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}

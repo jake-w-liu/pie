@@ -425,6 +425,12 @@ export interface TUI extends Component {
 	getClearOnShrink(): boolean;
 	setClearOnShrink(enabled: boolean): void;
 	setFocus(component: Component | null): void;
+	/**
+	 * Retarget a detached component's focus and stored fallbacks to its replacement.
+	 * The caller owns unmounting/mounting. Unrelated current focus is preserved;
+	 * overlay removal must still use its handle.
+	 */
+	replaceFocus(previous: Component, replacement: Component | null): void;
 	showOverlay(component: Component, options?: OverlayOptions): OverlayHandle;
 	hideOverlay(): void;
 	hasOverlay(): boolean;
@@ -455,6 +461,7 @@ export abstract class TuiBase extends Container implements TUI {
 	abstract readonly mode: TuiMode;
 	public terminal: Terminal;
 	private focusedComponent: Component | null = null;
+	private focusChangeId = 0;
 	private inputListeners = new Set<TuiInputListener>();
 
 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
@@ -607,6 +614,12 @@ export abstract class TuiBase extends Container implements TUI {
 		this.setFocusInternal({ component, overlayFocusRestore: "clear" });
 	}
 
+	replaceFocus(previous: Component, replacement: Component | null): void {
+		if (previous === replacement) return;
+		this.retargetFocusReferences(previous, replacement);
+		if (this.focusedComponent === previous) this.setFocus(replacement);
+	}
+
 	private setFocusInternal({
 		component,
 		overlayFocusRestore,
@@ -654,22 +667,34 @@ export abstract class TuiBase extends Container implements TUI {
 			}
 		}
 
-		if (isFocusable(this.focusedComponent)) {
-			this.focusedComponent.focused = false;
-		}
-
+		// Publish ownership before invoking extension setters: a throwing blur must
+		// not retain removed UI, and a reentrant focus change must win over this one.
+		const changeId = ++this.focusChangeId;
 		this.focusedComponent = nextFocus;
-
-		if (isFocusable(nextFocus)) {
-			nextFocus.focused = true;
+		const errors: unknown[] = [];
+		try {
+			if (isFocusable(previousFocus)) previousFocus.focused = false;
+		} catch (error) {
+			errors.push(error);
+		}
+		if (this.focusChangeId === changeId) {
+			try {
+				if (isFocusable(nextFocus)) nextFocus.focused = true;
+			} catch (error) {
+				errors.push(error);
+			}
 		}
 
-		const focusedOverlay = nextFocus
-			? this.overlayStack.find((entry) => entry.component === nextFocus && this.isOverlayVisible(entry))
-			: undefined;
-		if (focusedOverlay) {
-			this.overlayFocusRestore = { status: "eligible", overlay: focusedOverlay };
+		if (this.focusChangeId === changeId) {
+			const focusedOverlay = nextFocus
+				? this.overlayStack.find((entry) => entry.component === nextFocus && this.isOverlayVisible(entry))
+				: undefined;
+			if (focusedOverlay) {
+				this.overlayFocusRestore = { status: "eligible", overlay: focusedOverlay };
+			}
 		}
+		if (errors.length === 1) throw errors[0];
+		if (errors.length > 1) throw new AggregateError(errors, "Focus change callbacks failed");
 	}
 
 	private clearOverlayFocusRestore(): void {
@@ -708,11 +733,20 @@ export abstract class TuiBase extends Container implements TUI {
 		return false;
 	}
 
-	private retargetOverlayPreFocus(removed: OverlayStackEntry): void {
+	private retargetFocusReferences(previous: Component, replacement: Component | null): void {
 		for (const overlay of this.overlayStack) {
-			if (overlay !== removed && overlay.preFocus === removed.component) {
-				overlay.preFocus = removed.preFocus;
-			}
+			if (overlay.preFocus === previous) overlay.preFocus = replacement;
+		}
+		const restoreState = this.overlayFocusRestore;
+		if (
+			restoreState.status === "blocked" &&
+			restoreState.resume.status === "focus-target" &&
+			restoreState.resume.target === previous
+		) {
+			this.overlayFocusRestore = {
+				...restoreState,
+				resume: { status: "focus-target", target: replacement },
+			};
 		}
 	}
 
@@ -743,34 +777,30 @@ export abstract class TuiBase extends Container implements TUI {
 			focusOrder: ++this.focusOrderCounter,
 		};
 		this.overlayStack.push(entry);
-		this.routeOverlayChange();
-		// Only focus if overlay is actually visible
-		if (!options?.nonCapturing && this.isOverlayVisible(entry)) {
-			this.setFocus(component);
+		try {
+			this.routeOverlayChange();
+			// Only focus if overlay is actually visible
+			if (!options?.nonCapturing && this.isOverlayVisible(entry)) {
+				this.setFocus(component);
+			}
+			this.terminal.hideCursor();
+			this.requestRender();
+		} catch (error) {
+			// A callback can throw before the caller receives its handle, or create
+			// another overlay. Roll back only this entry, never the current top.
+			try {
+				this.removeOverlay(entry);
+			} catch (cleanupError) {
+				throw new AggregateError([error, cleanupError], "Overlay acquisition and rollback failed");
+			}
+			throw error;
 		}
-		this.terminal.hideCursor();
-		this.requestRender();
 
 		// Return handle for controlling this overlay
 		return {
-			hide: () => {
-				const index = this.overlayStack.indexOf(entry);
-				if (index !== -1) {
-					this.clearOverlayFocusRestoreFor(entry);
-					this.retargetOverlayPreFocus(entry);
-					this.overlayStack.splice(index, 1);
-					this.routeOverlayChange();
-					// Restore focus if this overlay had focus
-					if (this.focusedComponent === component) {
-						const topVisible = this.getTopmostVisibleOverlay();
-						this.setFocus(topVisible?.component ?? entry.preFocus);
-					}
-					if (this.overlayStack.length === 0) this.terminal.hideCursor();
-					this.requestRender();
-				}
-			},
+			hide: () => this.removeOverlay(entry),
 			setHidden: (hidden: boolean) => {
-				if (entry.hidden === hidden) return;
+				if (!this.overlayStack.includes(entry) || entry.hidden === hidden) return;
 				entry.hidden = hidden;
 				this.routeOverlayChange();
 				// Update focus when hiding/showing
@@ -798,6 +828,7 @@ export abstract class TuiBase extends Container implements TUI {
 				this.requestRender();
 			},
 			unfocus: (unfocusOptions) => {
+				if (!this.overlayStack.includes(entry)) return;
 				const isFocused = this.focusedComponent === component;
 				const restoreState = this.overlayFocusRestore;
 				const hasPendingRestore = restoreState.status !== "inactive" && restoreState.overlay === entry;
@@ -828,25 +859,32 @@ export abstract class TuiBase extends Container implements TUI {
 				}
 				this.requestRender();
 			},
-			isFocused: () => this.focusedComponent === component,
+			isFocused: () => this.overlayStack.includes(entry) && this.focusedComponent === component,
 		};
+	}
+
+	private removeOverlay(entry: OverlayStackEntry): void {
+		const index = this.overlayStack.indexOf(entry);
+		if (index === -1) return;
+		this.clearOverlayFocusRestoreFor(entry);
+		this.overlayStack.splice(index, 1);
+		this.retargetFocusReferences(entry.component, entry.preFocus);
+		this.routeOverlayChange();
+		try {
+			if (this.focusedComponent === entry.component) {
+				const topVisible = this.getTopmostVisibleOverlay();
+				this.setFocus(topVisible?.component ?? entry.preFocus);
+			}
+		} finally {
+			if (this.overlayStack.length === 0) this.terminal.hideCursor();
+			this.requestRender();
+		}
 	}
 
 	/** Hide the topmost overlay and restore previous focus. */
 	hideOverlay(): void {
 		const overlay = this.overlayStack[this.overlayStack.length - 1];
-		if (!overlay) return;
-		this.clearOverlayFocusRestoreFor(overlay);
-		this.retargetOverlayPreFocus(overlay);
-		this.overlayStack.pop();
-		this.routeOverlayChange();
-		if (this.focusedComponent === overlay.component) {
-			// Find topmost visible overlay, or fall back to preFocus
-			const topVisible = this.getTopmostVisibleOverlay();
-			this.setFocus(topVisible?.component ?? overlay.preFocus);
-		}
-		if (this.overlayStack.length === 0) this.terminal.hideCursor();
-		this.requestRender();
+		if (overlay) this.removeOverlay(overlay);
 	}
 
 	/** Check if there are any visible overlays */

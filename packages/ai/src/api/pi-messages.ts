@@ -23,10 +23,13 @@ import type {
 	ToolCall,
 } from "../types.ts";
 import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
+import { safeJsonStringify } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
+import { cancelResponseBody } from "../utils/http-response.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
+import { iterateSseMessages } from "../utils/sse.ts";
 
 export interface PiMessagesOptions extends StreamOptions {
 	reasoning?: ThinkingLevel;
@@ -173,17 +176,7 @@ function appendRewriteDiagnostic(message: AssistantMessage, rewrite: PiMessagesR
 	});
 }
 
-function createEventConverter(model: Model<"pi-messages">) {
-	const partial: AssistantMessage = {
-		role: "assistant",
-		content: [],
-		api: model.api,
-		provider: model.provider,
-		model: model.id,
-		usage: createEmptyUsage(),
-		stopReason: "pending",
-		timestamp: Date.now(),
-	};
+function createEventConverter(partial: AssistantMessage) {
 	const toolJson = new Map<number, string>();
 
 	return (event: PiMessagesEvent): AssistantMessageEvent => {
@@ -263,66 +256,21 @@ function createEventConverter(model: Model<"pi-messages">) {
 	};
 }
 
-async function* readPiMessagesEvents(stream: ReadableStream<Uint8Array>): AsyncGenerator<PiMessagesEvent> {
-	const decoder = new TextDecoder();
-	const reader = stream.getReader();
-	let buffer = "";
-
-	try {
-		while (true) {
-			const { done, value } = await reader.read();
-			buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
-			buffer = buffer.replace(/\r\n/g, "\n");
-
-			let split = buffer.indexOf("\n\n");
-			while (split !== -1) {
-				const event = parsePiMessagesEvent(buffer.slice(0, split));
-				if (event) {
-					yield event;
-				}
-				buffer = buffer.slice(split + 2);
-				split = buffer.indexOf("\n\n");
-			}
-
-			if (done) {
-				break;
-			}
-		}
-
-		if (buffer.trim()) {
-			const event = parsePiMessagesEvent(buffer);
-			if (event) {
-				yield event;
-			}
-		}
-	} finally {
-		reader.releaseLock();
+async function* readPiMessagesEvents(
+	body: ReadableStream<Uint8Array>,
+	signal?: AbortSignal,
+): AsyncGenerator<PiMessagesEvent> {
+	for await (const event of iterateSseMessages(body, signal)) {
+		const data = event.data.trim();
+		if (data && data !== "[DONE]") yield JSON.parse(data) as PiMessagesEvent;
 	}
 }
 
-function parsePiMessagesEvent(raw: string): PiMessagesEvent | undefined {
-	const data = raw
-		.split("\n")
-		.find((line) => line.startsWith("data:"))
-		?.slice(5)
-		.trim();
-
-	return data && data !== "[DONE]" ? (JSON.parse(data) as PiMessagesEvent) : undefined;
-}
-
-function createErrorEvent(model: Model<"pi-messages">, error: unknown, aborted: boolean): AssistantMessageEvent {
+function createErrorEvent(assistantMessage: AssistantMessage, error: unknown, aborted: boolean): AssistantMessageEvent {
 	const reason = aborted ? "aborted" : "error";
-	const assistantMessage: AssistantMessage = {
-		role: "assistant",
-		content: [],
-		api: model.api,
-		provider: model.provider,
-		model: model.id,
-		usage: createEmptyUsage(),
-		stopReason: reason,
-		errorMessage: error instanceof Error ? error.message : String(error),
-		timestamp: Date.now(),
-	};
+	assistantMessage.stopReason = reason;
+	assistantMessage.errorMessage =
+		error instanceof Error ? error.message : typeof error === "string" ? error : safeJsonStringify(error);
 
 	if (!aborted && error instanceof PiMessagesResponseError) {
 		appendAssistantMessageDiagnostic(
@@ -348,9 +296,20 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 	options?: PiMessagesOptions,
 ): AssistantMessageEventStream => {
 	const eventStream = new AssistantMessageEventStream();
-	const convertEvent = createEventConverter(model);
+	const partial: AssistantMessage = {
+		role: "assistant",
+		content: [],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: createEmptyUsage(),
+		stopReason: "pending",
+		timestamp: Date.now(),
+	};
+	const convertEvent = createEventConverter(partial);
 
 	void (async () => {
+		let response: Response | undefined;
 		try {
 			const apiKey = options?.apiKey;
 			if (!apiKey) {
@@ -379,7 +338,7 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 				payload = nextPayload;
 			}
 
-			const response = await (options?.fetch ?? globalThis.fetch)(url, {
+			response = await (options?.fetch ?? globalThis.fetch)(url, {
 				method: "POST",
 				headers: {
 					authorization: `Bearer ${apiKey}`,
@@ -401,17 +360,24 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 				throw new Error(`${model.provider} response has no body`);
 			}
 
-			for await (const piEvent of readPiMessagesEvents(response.body)) {
+			let terminal: AssistantMessageEvent | undefined;
+			for await (const piEvent of readPiMessagesEvents(response.body, options?.signal)) {
 				const event = convertEvent(piEvent);
-				eventStream.push(event);
 				if (event.type === "done" || event.type === "error") {
-					return;
+					terminal = event;
+					break;
 				}
+				eventStream.push(event);
+			}
+			if (terminal) {
+				eventStream.push(terminal);
+				return;
 			}
 
 			throw new Error(`${model.provider} stream ended without a terminal event`);
 		} catch (error) {
-			eventStream.push(createErrorEvent(model, error, options?.signal?.aborted ?? false));
+			await cancelResponseBody(response);
+			eventStream.push(createErrorEvent(partial, error, options?.signal?.aborted ?? false));
 		}
 	})();
 

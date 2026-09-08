@@ -1,5 +1,8 @@
 import { EventEmitter } from "node:events";
-import * as undici from "undici";
+// Bun substitutes a dispatcher-ignoring shim for the bare "undici" specifier.
+// Its public package entry selects the actual pinned npm implementation.
+import * as undici from "undici/index.js";
+import { fetchWithResponseErrors } from "./http-response.ts";
 
 export const DEFAULT_HTTP_IDLE_TIMEOUT_MS = 300_000;
 // Node's 250ms default can terminate valid connection attempts on high-latency routes.
@@ -106,6 +109,29 @@ export function configureHttpDispatcher(timeoutMs: number = DEFAULT_HTTP_IDLE_TI
 			: globalThis.fetch === installedGlobalFetch;
 	if (shouldInstallGlobals) {
 		undici.install?.();
+		if (process.versions.bun) {
+			globalThis.fetch = (input, init) => {
+				const requestInit = init as (RequestInit & { dispatcher?: undici.Dispatcher }) | undefined;
+				const requestDispatcher = requestInit?.dispatcher ?? undici.getGlobalDispatcher();
+				const signal =
+					init?.signal !== undefined
+						? init.signal
+						: typeof input === "string" || input instanceof URL
+							? undefined
+							: input.signal;
+				return fetchWithResponseErrors(
+					requestDispatcher,
+					(observed) =>
+						// The installed npm constructors and fetch share this exact implementation;
+						// Node's ambient undici-types declarations describe a different version.
+						undici.fetch(
+							input as undici.RequestInfo,
+							{ ...init, dispatcher: observed } as undici.RequestInit,
+						) as unknown as Promise<Response>,
+					signal,
+				);
+			};
+		}
 		installedGlobalFetch = globalThis.fetch;
 	}
 }

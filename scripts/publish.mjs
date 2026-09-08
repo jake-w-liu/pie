@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { getPublicWorkspacePackages } from "./release-packages.mjs";
+import { getPublicWorkspacePackages, parseNpmPackResult } from "./release-packages.mjs";
 
 const packages = getPublicWorkspacePackages();
 
@@ -36,14 +36,16 @@ function run(command, args, options = {}) {
 }
 
 function assertBuildOutputExists(directory) {
-	if (!existsSync(join(directory, "dist"))) {
+	const manifest = JSON.parse(readFileSync(join(directory, "package.json"), "utf8"));
+	if (manifest.files?.includes("dist") && !existsSync(join(directory, "dist"))) {
 		throw new Error(`${directory}/dist does not exist. Run npm run build before publishing.`);
 	}
 }
 
 function validatePack(directory) {
 	const result = run("npm", ["pack", "--dry-run", "--ignore-scripts", "--json"], { capture: true, cwd: directory });
-	const packed = JSON.parse(result.stdout)[0];
+	const manifest = JSON.parse(readFileSync(join(directory, "package.json"), "utf8"));
+	const packed = parseNpmPackResult(result.stdout, manifest);
 	console.log(`  ${packed.filename}: ${packed.files.length} files, ${packed.size} bytes packed, ${packed.unpackedSize} bytes unpacked`);
 }
 

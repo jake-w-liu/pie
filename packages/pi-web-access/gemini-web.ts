@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { fetchWithResponseErrors } from "@earendil-works/pi-coding-agent";
 import { basename } from "node:path";
 import { getLastGoogleCookieDiagnostic, getLastGoogleCookieDiagnosticDetails, type BrowserCookieDiagnosticDetails, type CookieMap, getGoogleCookies } from "./chrome-cookies.ts";
 import { getBrowserCookieSelectionFromConfig, isBrowserCookieAccessAllowed, normalizeChromeProfile } from "./gemini-web-config.ts";
@@ -66,11 +67,11 @@ export function createGeminiFetch(undiciImpl: typeof import("undici")): typeof f
 	// Headers); the shape this module uses (status, ok, headers.get, text) is
 	// identical, so bridge the two.
 	type UndiciFetch = typeof undiciImpl.fetch;
-	return (input, init) =>
+	return (input, init) => fetchWithResponseErrors(agent, (dispatcher) =>
 		undiciImpl.fetch(
 			input as unknown as Parameters<UndiciFetch>[0],
-			{ ...init, dispatcher: agent } as unknown as Parameters<UndiciFetch>[1],
-		) as unknown as Promise<Response>;
+			{ ...init, dispatcher } as unknown as Parameters<UndiciFetch>[1],
+		) as unknown as Promise<Response>, init?.signal);
 }
 
 export async function resolveGeminiFetch(): Promise<typeof fetch> {
@@ -79,7 +80,8 @@ export async function resolveGeminiFetch(): Promise<typeof fetch> {
 
 	let undici: typeof import("undici");
 	try {
-		undici = await import("undici");
+		// Use the declared npm transport rather than Bun's bare-module shim.
+		undici = await import("undici/index.js");
 	} catch {
 		geminiFetchImpl = fetch;
 		return geminiFetchImpl;
@@ -271,6 +273,7 @@ async function fetchWithCookieRedirects(
 		if (res.status >= 300 && res.status < 400) {
 			const location = res.headers.get("location");
 			if (location) {
+				await res.body?.cancel();
 				const next = new URL(location, current);
 				if (next.origin !== allowedOrigin) {
 					throw new Error(`Refusing to send Google cookies across origins: ${allowedOrigin} -> ${next.origin}`);

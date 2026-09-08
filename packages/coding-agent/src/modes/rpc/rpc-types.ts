@@ -6,7 +6,8 @@
  */
 
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Model } from "@earendil-works/pi-ai";
+import type { Model } from "@earendil-works/pi-ai";
+import { type Static, Type } from "typebox";
 import type { SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
@@ -17,61 +18,102 @@ import type { SourceInfo } from "../../core/source-info.ts";
 // RPC Commands (stdin)
 // ============================================================================
 
-export type RpcCommand =
+const commandId = { id: Type.Optional(Type.String()) };
+const messageFields = {
+	message: Type.String(),
+	images: Type.Optional(
+		Type.Array(
+			Type.Object({
+				type: Type.Literal("image"),
+				data: Type.String(),
+				mimeType: Type.String(),
+			}),
+		),
+	),
+};
+const queueMode = Type.Union([Type.Literal("all"), Type.Literal("one-at-a-time")]);
+
+/** Runtime validation and the typed client share one command contract. */
+export const rpcCommandSchema = Type.Union([
 	// Prompting
-	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
-	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
-	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
-	| { id?: string; type: "abort" }
-	| { id?: string; type: "clear_queue" }
-	| { id?: string; type: "new_session"; parentSession?: string }
+	Type.Object({
+		...commandId,
+		type: Type.Literal("prompt"),
+		...messageFields,
+		streamingBehavior: Type.Optional(Type.Union([Type.Literal("steer"), Type.Literal("followUp")])),
+	}),
+	Type.Object({ ...commandId, type: Type.Literal("steer"), ...messageFields }),
+	Type.Object({ ...commandId, type: Type.Literal("follow_up"), ...messageFields }),
+	Type.Object({ ...commandId, type: Type.Literal("abort") }),
+	Type.Object({ ...commandId, type: Type.Literal("clear_queue") }),
+	Type.Object({ ...commandId, type: Type.Literal("new_session"), parentSession: Type.Optional(Type.String()) }),
 
 	// State
-	| { id?: string; type: "get_state" }
+	Type.Object({ ...commandId, type: Type.Literal("get_state") }),
 
 	// Model
-	| { id?: string; type: "set_model"; provider: string; modelId: string }
-	| { id?: string; type: "cycle_model" }
-	| { id?: string; type: "get_available_models" }
+	Type.Object({ ...commandId, type: Type.Literal("set_model"), provider: Type.String(), modelId: Type.String() }),
+	Type.Object({ ...commandId, type: Type.Literal("cycle_model") }),
+	Type.Object({ ...commandId, type: Type.Literal("get_available_models") }),
 
 	// Thinking
-	| { id?: string; type: "set_thinking_level"; level: ThinkingLevel }
-	| { id?: string; type: "cycle_thinking_level" }
-	| { id?: string; type: "get_available_thinking_levels" }
+	Type.Object({
+		...commandId,
+		type: Type.Literal("set_thinking_level"),
+		level: Type.Union([
+			Type.Literal("off"),
+			Type.Literal("minimal"),
+			Type.Literal("low"),
+			Type.Literal("medium"),
+			Type.Literal("high"),
+			Type.Literal("xhigh"),
+			Type.Literal("max"),
+		]),
+	}),
+	Type.Object({ ...commandId, type: Type.Literal("cycle_thinking_level") }),
+	Type.Object({ ...commandId, type: Type.Literal("get_available_thinking_levels") }),
 
 	// Queue modes
-	| { id?: string; type: "set_steering_mode"; mode: "all" | "one-at-a-time" }
-	| { id?: string; type: "set_follow_up_mode"; mode: "all" | "one-at-a-time" }
+	Type.Object({ ...commandId, type: Type.Literal("set_steering_mode"), mode: queueMode }),
+	Type.Object({ ...commandId, type: Type.Literal("set_follow_up_mode"), mode: queueMode }),
 
 	// Compaction
-	| { id?: string; type: "compact"; customInstructions?: string }
-	| { id?: string; type: "set_auto_compaction"; enabled: boolean }
+	Type.Object({ ...commandId, type: Type.Literal("compact"), customInstructions: Type.Optional(Type.String()) }),
+	Type.Object({ ...commandId, type: Type.Literal("set_auto_compaction"), enabled: Type.Boolean() }),
 
 	// Retry
-	| { id?: string; type: "set_auto_retry"; enabled: boolean }
-	| { id?: string; type: "abort_retry" }
+	Type.Object({ ...commandId, type: Type.Literal("set_auto_retry"), enabled: Type.Boolean() }),
+	Type.Object({ ...commandId, type: Type.Literal("abort_retry") }),
 
 	// Bash
-	| { id?: string; type: "bash"; command: string; excludeFromContext?: boolean }
-	| { id?: string; type: "abort_bash" }
+	Type.Object({
+		...commandId,
+		type: Type.Literal("bash"),
+		command: Type.String(),
+		excludeFromContext: Type.Optional(Type.Boolean()),
+	}),
+	Type.Object({ ...commandId, type: Type.Literal("abort_bash") }),
 
 	// Session
-	| { id?: string; type: "get_session_stats" }
-	| { id?: string; type: "export_html"; outputPath?: string }
-	| { id?: string; type: "switch_session"; sessionPath: string }
-	| { id?: string; type: "fork"; entryId: string }
-	| { id?: string; type: "clone" }
-	| { id?: string; type: "get_fork_messages" }
-	| { id?: string; type: "get_entries"; since?: string }
-	| { id?: string; type: "get_tree" }
-	| { id?: string; type: "get_last_assistant_text" }
-	| { id?: string; type: "set_session_name"; name: string }
+	Type.Object({ ...commandId, type: Type.Literal("get_session_stats") }),
+	Type.Object({ ...commandId, type: Type.Literal("export_html"), outputPath: Type.Optional(Type.String()) }),
+	Type.Object({ ...commandId, type: Type.Literal("switch_session"), sessionPath: Type.String() }),
+	Type.Object({ ...commandId, type: Type.Literal("fork"), entryId: Type.String() }),
+	Type.Object({ ...commandId, type: Type.Literal("clone") }),
+	Type.Object({ ...commandId, type: Type.Literal("get_fork_messages") }),
+	Type.Object({ ...commandId, type: Type.Literal("get_entries"), since: Type.Optional(Type.String()) }),
+	Type.Object({ ...commandId, type: Type.Literal("get_tree") }),
+	Type.Object({ ...commandId, type: Type.Literal("get_last_assistant_text") }),
+	Type.Object({ ...commandId, type: Type.Literal("set_session_name"), name: Type.String() }),
 
 	// Messages
-	| { id?: string; type: "get_messages" }
+	Type.Object({ ...commandId, type: Type.Literal("get_messages") }),
 
 	// Commands (available for invocation via prompt)
-	| { id?: string; type: "get_commands" };
+	Type.Object({ ...commandId, type: Type.Literal("get_commands") }),
+]);
+
+export type RpcCommand = Static<typeof rpcCommandSchema>;
 
 // ============================================================================
 // RPC Slash Command (for get_commands response)

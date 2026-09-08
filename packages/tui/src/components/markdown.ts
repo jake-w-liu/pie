@@ -876,7 +876,7 @@ export class Markdown implements Component {
 		const availableForCells = availableWidth - borderOverhead;
 		if (availableForCells < numCols) {
 			// Too narrow to render a stable table. Fall back to raw markdown.
-			const fallbackLines = token.raw ? wrapTextWithAnsi(token.raw, availableWidth) : [];
+			const fallbackLines = token.raw ? [...wrapTextWithAnsi(token.raw, availableWidth)] : [];
 			if (nextTokenType && nextTokenType !== "space") {
 				fallbackLines.push("");
 			}

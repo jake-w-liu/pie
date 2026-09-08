@@ -1,4 +1,4 @@
-import type { SimpleStreamOptions, Transport } from "@earendil-works/pi-ai";
+import { formatThrownValue, type SimpleStreamOptions, type Transport } from "@earendil-works/pi-ai";
 import type { Static, TSchema } from "typebox";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "../types.ts";
 
@@ -28,12 +28,12 @@ export function getOrUndefined<TValue extends object, TError>(result: Result<TVa
 
 /** Normalize unknown thrown values into Error instances before using them as typed error causes. */
 export function toError(error: unknown): Error {
-	if (error instanceof Error) return error;
-	if (typeof error === "string") return new Error(error);
 	try {
+		if (error instanceof Error) return error;
+		if (typeof error === "string") return new Error(error);
 		return new Error(JSON.stringify(error));
 	} catch {
-		return new Error(String(error));
+		return new Error(formatThrownValue(error));
 	}
 }
 

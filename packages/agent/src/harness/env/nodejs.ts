@@ -14,7 +14,7 @@ import {
 	rm,
 	writeFile,
 } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { homedir, constants as osConstants, tmpdir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -301,6 +301,7 @@ function waitForChildProcess(child: ChildProcess): Promise<number | null> {
 		let settled = false;
 		let exited = false;
 		let exitCode: number | null = null;
+		let exitSignal: NodeJS.Signals | null = null;
 		let postExitTimer: ReturnType<typeof setTimeout> | undefined;
 		let stdoutEnded = child.stdout === null;
 		let stderrEnded = child.stderr === null;
@@ -315,20 +316,20 @@ function waitForChildProcess(child: ChildProcess): Promise<number | null> {
 			child.stdout?.removeListener("data", onData);
 			child.stderr?.removeListener("data", onData);
 		};
-		const finalize = (code: number | null): void => {
+		const finalize = (code: number | null, signal: NodeJS.Signals | null): void => {
 			if (settled) return;
 			settled = true;
 			cleanup();
 			child.stdout?.destroy();
 			child.stderr?.destroy();
-			resolvePromise(code);
+			resolvePromise(code ?? (signal === null ? null : 128 + osConstants.signals[signal]));
 		};
 		const maybeFinalizeAfterExit = (): void => {
-			if (exited && stdoutEnded && stderrEnded) finalize(exitCode);
+			if (exited && stdoutEnded && stderrEnded) finalize(exitCode, exitSignal);
 		};
 		const armIdleTimer = (): void => {
 			if (postExitTimer) clearTimeout(postExitTimer);
-			postExitTimer = setTimeout(() => finalize(exitCode), EXIT_STDIO_GRACE_MS);
+			postExitTimer = setTimeout(() => finalize(exitCode, exitSignal), EXIT_STDIO_GRACE_MS);
 		};
 		const onData = (): void => {
 			if (exited && !settled) armIdleTimer();
@@ -347,13 +348,14 @@ function waitForChildProcess(child: ChildProcess): Promise<number | null> {
 			cleanup();
 			reject(error);
 		};
-		const onExit = (code: number | null): void => {
+		const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
 			exited = true;
 			exitCode = code;
+			exitSignal = signal;
 			maybeFinalizeAfterExit();
 			if (!settled) armIdleTimer();
 		};
-		const onClose = (code: number | null): void => finalize(code);
+		const onClose = (code: number | null, signal: NodeJS.Signals | null): void => finalize(code, signal);
 
 		child.stdout?.once("end", onStdoutEnd);
 		child.stderr?.once("end", onStderrEnd);
@@ -385,6 +387,7 @@ export class NodeExecutionEnv implements ExecutionEnv {
 		return ok(join(...parts));
 	}
 
+	/** Signal termination returns the conventional nonzero status 128 + the platform signal number. */
 	async exec(
 		command: string,
 		options?: ShellExecOptions,
@@ -513,7 +516,11 @@ export class NodeExecutionEnv implements ExecutionEnv {
 						settle(err(new ExecutionError("aborted", "aborted")));
 						return;
 					}
-					settle(ok({ stdout, stderr, exitCode: code ?? 0 }));
+					if (code === null) {
+						settle(err(new ExecutionError("unknown", "Command ended without an exit status")));
+						return;
+					}
+					settle(ok({ stdout, stderr, exitCode: code }));
 				},
 				(error: Error) => settle(err(new ExecutionError("spawn_error", error.message, error))),
 			);

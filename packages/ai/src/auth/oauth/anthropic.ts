@@ -6,10 +6,12 @@
  */
 
 import type { Server } from "node:http";
+import { raceWithAbortSignal } from "../../utils/abort.ts";
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { oauthErrorHtml, oauthSuccessHtml } from "./oauth-page.ts";
 import { generatePKCE } from "./pkce.ts";
+import { parseOAuthTokenResponse } from "./token-response.ts";
 
 type CallbackServerInfo = {
 	server: Server;
@@ -214,14 +216,16 @@ async function exchangeAuthorizationCode(
 		);
 	}
 
-	let tokenData: { access_token: string; refresh_token: string; expires_in: number };
+	let tokenJson: unknown;
 	try {
-		tokenData = JSON.parse(responseBody) as { access_token: string; refresh_token: string; expires_in: number };
+		tokenJson = JSON.parse(responseBody);
 	} catch (error) {
 		throw new Error(
 			`Token exchange returned invalid JSON. url=${TOKEN_URL}; body=${responseBody}; details=${formatErrorDetails(error)}`,
 		);
 	}
+
+	const tokenData = parseOAuthTokenResponse(tokenJson, "Anthropic token exchange");
 
 	return {
 		type: "oauth",
@@ -232,10 +236,14 @@ async function exchangeAuthorizationCode(
 }
 
 async function loginAnthropic(interaction: ProviderAuthInteraction): Promise<OAuthCredential> {
+	interaction.signal.throwIfAborted();
 	const { verifier, challenge } = await generatePKCE();
 	const server = await startCallbackServer(verifier);
 	const manualAbort = new AbortController();
-	const onAbort = () => server.cancelWait();
+	const onAbort = () => {
+		manualAbort.abort(interaction.signal.reason);
+		server.cancelWait();
+	};
 	interaction.signal.addEventListener("abort", onAbort, { once: true });
 	if (interaction.signal.aborted) onAbort();
 	let code: string | undefined;
@@ -244,6 +252,7 @@ async function loginAnthropic(interaction: ProviderAuthInteraction): Promise<OAu
 	let manualError: Error | undefined;
 
 	try {
+		interaction.signal.throwIfAborted();
 		const authParams = new URLSearchParams({
 			code: "true",
 			client_id: CLIENT_ID,
@@ -278,6 +287,7 @@ async function loginAnthropic(interaction: ProviderAuthInteraction): Promise<OAu
 			});
 
 		const result = await server.waitForCode();
+		interaction.signal.throwIfAborted();
 		if (manualError) throw manualError;
 		if (result?.code) {
 			code = result.code;
@@ -290,7 +300,7 @@ async function loginAnthropic(interaction: ProviderAuthInteraction): Promise<OAu
 		}
 
 		if (!code) {
-			await manualPromise;
+			await raceWithAbortSignal(manualPromise, interaction.signal);
 			if (manualError) throw manualError;
 			if (manualInput) {
 				const parsed = parseAuthorizationInput(manualInput);
@@ -330,19 +340,16 @@ async function refreshAnthropicToken(refreshToken: string, signal: AbortSignal):
 		throw new Error(`Anthropic token refresh request failed. url=${TOKEN_URL}; details=${formatErrorDetails(error)}`);
 	}
 
-	let data: { access_token: string; refresh_token: string; expires_in: number; scope?: string };
+	let tokenJson: unknown;
 	try {
-		data = JSON.parse(responseBody) as {
-			access_token: string;
-			refresh_token: string;
-			expires_in: number;
-			scope?: string;
-		};
+		tokenJson = JSON.parse(responseBody);
 	} catch (error) {
 		throw new Error(
 			`Anthropic token refresh returned invalid JSON. url=${TOKEN_URL}; body=${responseBody}; details=${formatErrorDetails(error)}`,
 		);
 	}
+
+	const data = parseOAuthTokenResponse(tokenJson, "Anthropic token refresh");
 
 	return {
 		type: "oauth",

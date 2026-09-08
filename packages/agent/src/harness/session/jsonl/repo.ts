@@ -112,6 +112,7 @@ export class JsonlSessionRepo
 	private readonly fs: JsonlSessionRepoFileSystem;
 	private readonly sessionsRootInput: string;
 	private readonly activeCreateDestinations = new Set<string>();
+	private readonly liveStorages = new Map<string, WeakRef<JsonlSessionStorage>>();
 	private rootPromise: Promise<string> | undefined;
 
 	constructor(options: JsonlSessionRepoOptions) {
@@ -123,12 +124,16 @@ export class JsonlSessionRepo
 		const destination = await this.resolveCreateDestination(options);
 		return this.claimCreateDestination(destination, async () => {
 			const { header, path } = await this.prepareCreate(destination, options);
-			return new Session(await JsonlSessionStorage.create(this.fs, path, header));
+			const storage = await JsonlSessionStorage.create(this.fs, path, header);
+			this.liveStorages.set(path, new WeakRef(storage));
+			return new Session(storage);
 		});
 	}
 
 	async open(metadata: JsonlSessionMetadata): Promise<Session<JsonlSessionMetadata>> {
-		return new Session(await this.loadStorage(metadata));
+		const storage = await this.loadStorage(metadata);
+		this.liveStorages.set(metadata.path, new WeakRef(storage));
+		return new Session(storage);
 	}
 
 	async list(options: JsonlSessionListOptions = {}): Promise<JsonlSessionMetadata[]> {
@@ -137,13 +142,17 @@ export class JsonlSessionRepo
 
 	async delete(metadata: JsonlSessionMetadata): Promise<void> {
 		fileResult(await this.fs.remove(metadata.path, { force: true }), `Failed to delete session ${metadata.path}`);
+		this.liveStorages.delete(metadata.path);
 	}
 
 	async fork(
 		source: JsonlSessionMetadata,
 		options: ForkOptions & JsonlSessionCreateOptions,
 	): Promise<Session<JsonlSessionMetadata>> {
-		const sourceStorage = await this.loadStorage(source);
+		const sourceStorage = this.liveStorages.get(source.path)?.deref() ?? (await this.loadStorage(source));
+		if ((await sourceStorage.getMetadata()).id !== source.id) {
+			throw new SessionError("invalid_entry", `Session id does not match header: ${source.id}`);
+		}
 		const createOptions = {
 			...options,
 			parentSessionId: options.parentSessionId ?? source.id,
@@ -151,7 +160,9 @@ export class JsonlSessionRepo
 		const destination = await this.resolveCreateDestination(createOptions);
 		return this.claimCreateDestination(destination, async () => {
 			const { header, path } = await this.prepareCreate(destination, createOptions);
-			return new Session(await sourceStorage.fork(path, header, options));
+			const storage = await sourceStorage.fork(path, header, options);
+			this.liveStorages.set(path, new WeakRef(storage));
+			return new Session(storage);
 		});
 	}
 

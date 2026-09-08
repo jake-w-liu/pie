@@ -101,6 +101,7 @@ function isAbortError(err: unknown): boolean {
 function isRedirectPolicyError(message: string): boolean {
 	return message.startsWith("Authenticated fetch refused cross-origin redirect") ||
 		message.startsWith("Blocked internal ") ||
+		message.startsWith("Proxy DNS requires ssrf.trustEnvProxy") ||
 		message.startsWith("Blocked hostname by fetch_content domain policy") ||
 		message.startsWith("Hostname not allowed by fetch_content domain policy") ||
 		message.startsWith("Too many redirects fetching ") ||
@@ -128,43 +129,26 @@ async function resolveAuthCookieHeader(url: string | URL, profile: AuthFetchProf
 	throw new Error(`Authenticated fetch profile ${profile.name} could not build a cookie header`);
 }
 
-const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
-
 async function fetchAuthenticatedRemoteUrl(
 	url: string,
 	init: RequestInit,
 	validationOptions: { ssrf: SsrfConfig; domainPolicy: DomainPolicy; lookup?: Lookup },
 	profile: AuthFetchProfile,
 ): Promise<Response> {
-	let current = await validateRemoteUrl(url, {
-		allowRanges: validationOptions.ssrf.allowRanges,
-		trustEnvProxy: validationOptions.ssrf.trustEnvProxy,
+	return fetchRemoteUrl(url, init, {
+		...validationOptions.ssrf,
 		domainPolicy: validationOptions.domainPolicy,
-		...(validationOptions.lookup ? { lookup: validationOptions.lookup } : {}),
+		lookup: validationOptions.lookup,
+		beforeRequest: async (current, requestInit) => {
+			const headers = new Headers(requestInit.headers);
+			headers.set("cookie", await resolveAuthCookieHeader(current, profile));
+			return { ...requestInit, headers };
+		},
+		onRedirect: ({ from, to, init: requestInit }) => {
+			authFetchRedirectGuard(profile, from, to);
+			return requestInit;
+		},
 	});
-	let requestInit = init;
-	for (let redirects = 0; redirects <= 5; redirects++) {
-		const cookieHeader = await resolveAuthCookieHeader(current, profile);
-		const headers = { ...(requestInit.headers as Record<string, string>), cookie: cookieHeader };
-		const response = await fetch(current, { ...requestInit, headers, redirect: "manual" });
-		if (!REDIRECT_STATUSES.has(response.status)) return response;
-		const location = response.headers.get("location");
-		if (!location) return response;
-		if (redirects === 5) throw new Error(`Too many redirects fetching ${current.toString()}`);
-		const from = current;
-		current = await validateRemoteUrl(new URL(location, current), {
-			allowRanges: validationOptions.ssrf.allowRanges,
-			trustEnvProxy: validationOptions.ssrf.trustEnvProxy,
-			domainPolicy: validationOptions.domainPolicy,
-			...(validationOptions.lookup ? { lookup: validationOptions.lookup } : {}),
-		});
-		authFetchRedirectGuard(profile, from, current);
-		if (response.status === 303 || ((response.status === 301 || response.status === 302) && requestInit.method?.toUpperCase() === "POST")) {
-			const { body: _body, ...nextInit } = requestInit;
-			requestInit = { ...nextInit, method: "GET" };
-		}
-	}
-	throw new Error(`Too many redirects fetching ${current.toString()}`);
 }
 
 function loadFetchRouting(): FetchRouting {
@@ -292,7 +276,7 @@ export interface ExtractOptions {
 	answerModel?: string;
 	authFetchProfile?: AuthFetchProfile;
 	toolNames?: RegisteredToolNames;
-	/** Optional http(s) proxy URL; routed through the curl-backed transport. */
+	/** Optional http(s) proxy URL; protected fetches require ssrf.trustEnvProxy. */
 	proxy?: string;
 	/** Custom DNS resolver used for SSRF validation. Primarily a test seam. */
 	lookup?: Lookup;
@@ -479,6 +463,7 @@ export async function extractContent(
 			const ssrf = loadSsrfConfig();
 			const domainPolicy = loadFetchContentDomainPolicy();
 			await validateRemoteUrl(remoteUrl, {
+				proxy: options?.proxy,
 				allowRanges: ssrf.allowRanges,
 				trustEnvProxy: ssrf.trustEnvProxy,
 				domainPolicy,
@@ -1091,7 +1076,7 @@ async function extractViaHttp(
 		const ssrf = loadSsrfConfig();
 		const domainPolicy = loadFetchContentDomainPolicy();
 		const authProfile = options?.authFetchProfile;
-		const trustEnvProxy = options?.proxy === undefined && ssrf.trustEnvProxy;
+		const trustEnvProxy = ssrf.trustEnvProxy;
 		const requestInit: ProxiedRequestInit = {
 			signal: controller.signal,
 			__proxy: options?.proxy,
@@ -1349,6 +1334,8 @@ async function extractViaHttp(
 		}
 		return { url, title: "", content: "", error: message };
 	} finally {
+		// Early status/type/size rejections must cancel an unread streaming body.
+		controller.abort();
 		clearTimeout(timeoutId);
 		signal?.removeEventListener("abort", onAbort);
 	}

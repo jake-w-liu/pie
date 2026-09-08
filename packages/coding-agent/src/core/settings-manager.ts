@@ -191,6 +191,7 @@ export interface SettingsManagerCreateOptions {
 }
 
 export interface SettingsStorage {
+	/** fn may be retried with fresh content when a missing file needs initialization. */
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void;
 }
 
@@ -260,7 +261,7 @@ export class FileSettingsStorage implements SettingsStorage {
 				release = this.acquireLockSyncWithRetry(path);
 			}
 			const current = fileExists ? readFileSync(path, "utf-8") : undefined;
-			const next = fn(current);
+			let next = fn(current);
 			if (next !== undefined) {
 				// Only create directory when we actually need to write
 				if (!existsSync(dir)) {
@@ -268,8 +269,13 @@ export class FileSettingsStorage implements SettingsStorage {
 				}
 				if (!release) {
 					release = this.acquireLockSyncWithRetry(path);
+					// The preflight above avoids creating directories for read-only access.
+					// Never commit its result: a first writer may have won the lock meanwhile.
+					next = fn(existsSync(path) ? readFileSync(path, "utf-8") : undefined);
 				}
-				writeFileSync(path, next, "utf-8");
+				if (next !== undefined) {
+					writeFileSync(path, next, "utf-8");
+				}
 			}
 		} finally {
 			if (release) {

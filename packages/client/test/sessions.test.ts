@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
-import { PiSessionDetachedError, PiSessionOwnershipError } from "../src/index.ts";
-import { connectClient, MemoryByteServer, sessionSnapshot } from "./support.ts";
+import { PiDisconnectedError, PiSessionDetachedError, PiSessionOwnershipError } from "../src/index.ts";
+import { collectRequests, connectClient, MemoryByteServer, sessionSnapshot } from "./support.ts";
 
 describe("PiClient", () => {
 	test("keeps multiple session handles independent and enforces detach", async () => {
@@ -111,6 +111,164 @@ describe("PiClient", () => {
 			PiSessionOwnershipError,
 		);
 		await exclusive[Symbol.asyncDispose]();
+	});
+
+	test.each(["attach", "create"] as const)(
+		"invalidates a %s response followed synchronously by disconnect",
+		async (command) => {
+			const server = new MemoryByteServer();
+			const client = await connectClient(server);
+			let disconnect = true;
+			const requests: string[] = [];
+			server.onMessage((message) => {
+				if (message.type !== "request") return;
+				const request = message.request;
+				requests.push(request.command);
+				if (request.command === "attach" || request.command === "create") {
+					server.send({
+						type: "response",
+						id: message.id,
+						ok: true,
+						result: { command: request.command, session: sessionSnapshot("session-1") },
+					});
+					if (disconnect) server.close();
+				} else if (request.command === "detach") {
+					server.send({
+						type: "response",
+						id: message.id,
+						ok: true,
+						result: { command: "detach", sessionId: "session-1" },
+					});
+				}
+			});
+			const stale =
+				command === "create" ? client.createSession() : client.acquireSession("session-1", { mode: "exclusive" });
+			await expect(stale).rejects.toBeInstanceOf(PiDisconnectedError);
+			disconnect = false;
+			await client.reconnect();
+			const current = await client.acquireSession("session-1", { mode: "exclusive" });
+			expect(current.active).toBe(true);
+			await expect(client.attachSession("session-1")).rejects.toBeInstanceOf(PiSessionOwnershipError);
+			await current.dispose();
+			expect(requests).toEqual([command, "attach", "detach"]);
+			await client.dispose();
+		},
+	);
+
+	test("reentrant reconnect does not reuse the old in-flight attachment", async () => {
+		const server = new MemoryByteServer();
+		const client = await connectClient(server);
+		const requests = collectRequests(server);
+		let reconnecting: ReturnType<typeof client.reconnect> | undefined;
+		let replacement: ReturnType<typeof client.acquireSession> | undefined;
+		let reconnectStarted = false;
+		client.onConnectionStateChange(({ state }) => {
+			if (state === "disconnected" && !reconnectStarted) {
+				reconnectStarted = true;
+				reconnecting = client.reconnect();
+			} else if (state === "connected" && reconnectStarted) {
+				replacement = client.acquireSession("session-1", { mode: "exclusive" });
+			}
+		});
+		server.onMessage((message) => {
+			if (message.type !== "request" || message.request.command !== "attach") return;
+			server.send({
+				type: "response",
+				id: message.id,
+				ok: true,
+				result: { command: "attach", session: sessionSnapshot("session-1") },
+			});
+			if (!reconnectStarted) server.close();
+		});
+		try {
+			await expect(client.attachSession("session-1")).rejects.toBeInstanceOf(PiSessionDetachedError);
+			await reconnecting;
+			expect(replacement).toBeDefined();
+			const current = await replacement;
+			expect(current?.active).toBe(true);
+			expect(requests.map(({ request }) => request.command)).toEqual(["attach", "attach"]);
+		} finally {
+			await client.dispose();
+		}
+	});
+
+	test("old failed acquisition cannot release a replacement reservation", async () => {
+		const server = new MemoryByteServer();
+		const client = await connectClient(server);
+		const requests = collectRequests(server);
+		const stale = client.acquireSession("session-1", { mode: "shared" });
+		const rejected = expect(stale).rejects.toThrow("old attach failed");
+		server.send({ type: "event", event: { type: "session_removed", sessionId: "session-1" } });
+		const replacement = client.acquireSession("session-1", { mode: "exclusive" });
+		const replacementResult = replacement.catch((error: unknown) => error);
+		try {
+			expect(requests).toHaveLength(2);
+			server.send({
+				type: "response",
+				id: requests[0].id,
+				ok: false,
+				error: { code: "not_found", message: "old attach failed" },
+			});
+			await rejected;
+			server.send({
+				type: "response",
+				id: requests[1].id,
+				ok: true,
+				result: { command: "attach", session: sessionSnapshot("session-1") },
+			});
+			const lease = await replacement;
+			expect(lease.active).toBe(true);
+			await expect(client.acquireSession("session-1", { mode: "exclusive" })).rejects.toBeInstanceOf(
+				PiSessionOwnershipError,
+			);
+			await expect(client.attachSession("session-1")).rejects.toBeInstanceOf(PiSessionOwnershipError);
+		} finally {
+			await client.dispose();
+			await replacementResult;
+		}
+	});
+
+	test("a completed old detach cannot release a new attachment's count", async () => {
+		const server = new MemoryByteServer();
+		const client = await connectClient(server);
+		let invalidateOnDetach = false;
+		const requests = collectRequests(server);
+		server.onMessage((message) => {
+			if (message.type !== "request") return;
+			if (message.request.command === "attach") {
+				server.send({
+					type: "response",
+					id: message.id,
+					ok: true,
+					result: { command: "attach", session: sessionSnapshot("session-1") },
+				});
+			} else if (message.request.command === "detach") {
+				server.send({
+					type: "response",
+					id: message.id,
+					ok: true,
+					result: { command: "detach", sessionId: "session-1" },
+				});
+				if (invalidateOnDetach)
+					server.send({ type: "event", event: { type: "session_removed", sessionId: "session-1" } });
+			}
+		});
+		const old = await client.attachSession("session-1");
+		invalidateOnDetach = true;
+		const detaching = old.dispose();
+		const acquiring = client.attachSession("session-1");
+		await detaching;
+		const current = await acquiring;
+		expect(old.active).toBe(false);
+		expect(current.active).toBe(true);
+		await expect(client.acquireSession("session-1", { mode: "exclusive" })).rejects.toBeInstanceOf(
+			PiSessionOwnershipError,
+		);
+		await old.dispose();
+		expect(requests.map(({ request }) => request.command)).toEqual(["attach", "detach", "attach"]);
+		invalidateOnDetach = false;
+		await current.dispose();
+		await client.dispose();
 	});
 
 	test("invalidated leases dispose without protocol cleanup", async () => {

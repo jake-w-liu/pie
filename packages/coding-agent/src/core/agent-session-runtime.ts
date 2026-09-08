@@ -1,5 +1,6 @@
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { constants, copyFileSync, existsSync, mkdirSync, statSync, unlinkSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { resolvePath } from "../utils/paths.ts";
 import type { AgentSession } from "./agent-session.ts";
 import type { AgentSessionRuntimeDiagnostic, AgentSessionServices } from "./agent-session-services.ts";
@@ -12,7 +13,7 @@ import type {
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { CreateAgentSessionResult } from "./sdk.ts";
 import { assertSessionCwdExists } from "./session-cwd.ts";
-import { SessionManager } from "./session-manager.ts";
+import { loadEntriesFromFile, SessionManager } from "./session-manager.ts";
 
 /**
  * Result returned by runtime creation.
@@ -333,12 +334,14 @@ export class AgentSessionRuntime {
 		}
 
 		const sessionManager = this.session.sessionManager;
+		// This manager is reused; late response events and shutdown handlers still
+		// belong to the outgoing session until teardown has completely settled.
+		await this.teardownCurrent("fork");
 		if (!targetLeafId) {
-			sessionManager.newSession({ parentSession: this.session.sessionFile });
+			sessionManager.newSession({ parentSession: previousSessionFile });
 		} else {
 			sessionManager.createBranchedSession(targetLeafId);
 		}
-		await this.teardownCurrent("fork", sessionManager.getSessionFile());
 		this.apply(
 			await this.createRuntime({
 				cwd: this.cwd,
@@ -364,24 +367,38 @@ export class AgentSessionRuntime {
 			throw new SessionImportFileNotFoundError(resolvedPath);
 		}
 
-		const sessionDir = this.session.sessionManager.getSessionDir();
-		if (!existsSync(sessionDir)) {
-			mkdirSync(sessionDir, { recursive: true });
+		// Loading is side-effect free, unlike open(), which migrates legacy files.
+		if (loadEntriesFromFile(resolvedPath).length === 0) {
+			throw new Error(`Cannot import: source session file is empty or invalid: ${resolvedPath}`);
 		}
-
-		const destinationPath = join(sessionDir, basename(resolvedPath));
+		const sessionDir = this.session.sessionManager.getSessionDir();
+		const alreadyManaged = resolve(dirname(resolvedPath)) === resolve(sessionDir);
+		const destinationPath = alreadyManaged ? resolvedPath : join(sessionDir, `import_${randomUUID()}.jsonl`);
 		const beforeResult = await this.emitBeforeSwitch("resume", destinationPath);
 		if (beforeResult.cancelled) {
 			return beforeResult;
 		}
 
 		const previousSessionFile = this.session.sessionFile;
-		if (resolve(destinationPath) !== resolvedPath) {
-			copyFileSync(resolvedPath, destinationPath);
+		if (!alreadyManaged) {
+			mkdirSync(sessionDir, { recursive: true });
+			copyFileSync(resolvedPath, destinationPath, constants.COPYFILE_EXCL);
 		}
 
-		const sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
-		assertSessionCwdExists(sessionManager, this.cwd);
+		let sessionManager: SessionManager;
+		try {
+			// open() initializes empty files, but an import must remain a valid snapshot
+			// even if the source changed while the before-switch hook was running.
+			if (statSync(destinationPath).size === 0) {
+				throw new Error(`Cannot import: source session file is empty or invalid: ${resolvedPath}`);
+			}
+			sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
+			assertSessionCwdExists(sessionManager, this.cwd);
+		} catch (error) {
+			// Only remove the snapshot this import owns, never an existing session.
+			if (!alreadyManaged) unlinkSync(destinationPath);
+			throw error;
+		}
 		await this.teardownCurrent("resume", sessionManager.getSessionFile());
 		this.apply(
 			await this.createRuntime({

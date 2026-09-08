@@ -1,4 +1,6 @@
 import type { AssistantMessage } from "../types.ts";
+import { operationSignal } from "./abort.ts";
+import { sleep } from "./sleep.ts";
 
 function buildProviderErrorPattern(patterns: readonly string[]): RegExp {
 	return new RegExp(patterns.join("|"), "i");
@@ -120,30 +122,6 @@ export interface RetryCallbacks {
 	onRetryFinished?: (success: boolean, attempt: number, finalError?: string) => void | Promise<void>;
 }
 
-class RetrySleepAbortError extends Error {
-	constructor() {
-		super("Aborted");
-	}
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-	return new Promise((resolve, reject) => {
-		if (signal?.aborted) {
-			reject(new RetrySleepAbortError());
-			return;
-		}
-		const timeout = setTimeout(resolve, ms);
-		signal?.addEventListener(
-			"abort",
-			() => {
-				clearTimeout(timeout);
-				reject(new RetrySleepAbortError());
-			},
-			{ once: true },
-		);
-	});
-}
-
 /**
  * Run a single assistant-producing call with bounded retry on transient errors.
  *
@@ -202,10 +180,10 @@ export async function retryAssistantCall(
 		// Normalize aborts during retry backoff to the same AssistantMessage shape as
 		// provider stream aborts, so callers do not need to care when cancellation happened.
 		try {
-			await sleep(delayMs, signal);
+			await sleep(delayMs, operationSignal(signal));
 		} catch (error) {
 			await callbacks?.onRetryFinished?.(false, attempt, lastRetry.errorMessage);
-			if (error instanceof RetrySleepAbortError) {
+			if (signal?.aborted) {
 				return { ...response, stopReason: "aborted", errorMessage: undefined };
 			}
 			throw error;

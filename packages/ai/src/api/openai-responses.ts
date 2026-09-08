@@ -19,6 +19,7 @@ import { splitDeferredTools } from "../utils/deferred-tools.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
+import { cancelResponseBody } from "../utils/http-response.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
@@ -127,6 +128,8 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			timestamp: Date.now(),
 		};
 
+		let response: Response | undefined;
+		let requestController: AbortController | undefined;
 		try {
 			// Create OpenAI client
 			const apiKey = getClientApiKey(model.provider, options?.apiKey, options?.headers);
@@ -148,7 +151,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 				maxRetries: 0,
 			};
-			const { data: openaiStream, response } = await retryProviderRequest(
+			const { data: openaiStream, response: rawResponse } = await retryProviderRequest(
 				() => client.responses.create(params, requestOptions).withResponse(),
 				{
 					maxRetries: options?.maxRetries,
@@ -156,6 +159,8 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 					signal: options?.signal,
 				},
 			);
+			response = rawResponse;
+			requestController = openaiStream.controller;
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
@@ -179,6 +184,8 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
+			requestController?.abort();
+			await cancelResponseBody(response);
 			for (const block of output.content) {
 				delete (block as { index?: number }).index;
 				// Streaming scratch buffers are only used during parsing; never persist them.

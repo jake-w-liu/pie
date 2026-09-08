@@ -114,7 +114,7 @@ export class ExtensionEditorComponent extends Container implements Focusable {
 	}
 
 	private async handleOpenExternalEditor(): Promise<void> {
-		const content = this.editor.getText();
+		const content = this.editor.getExpandedText();
 		this.tui.stop();
 		try {
 			const result = await editInExternalEditor({

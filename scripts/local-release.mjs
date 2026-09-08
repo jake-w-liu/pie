@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
+import { getPublicWorkspacePackages, parseNpmPackResult } from "./release-packages.mjs";
 
-const packages = [
+// Source-distributed extensions have no emitted build. Keep core compilation in dependency order.
+const buildPackages = [
 	{ directory: "packages/telemetry", name: "@earendil-works/pi-telemetry" },
 	{ directory: "packages/ai", name: "@earendil-works/pi-ai" },
 	{ directory: "packages/tui", name: "@earendil-works/pi-tui" },
@@ -111,21 +113,31 @@ function commandExists(command) {
 
 function isInsidePath(child, parent) {
 	const relativePath = relative(parent, child);
-	return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
+	return relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath);
 }
 
 function prepareOutputDirectory(options, repoRoot) {
-	if (!options.outDir) {
-		return mkdtempSync(join(tmpdir(), "pi-local-release-"));
+	const generated = !options.outDir;
+	const outDir = generated ? mkdtempSync(join(tmpdir(), "pi-local-release-")) : resolve(options.outDir);
+	try {
+		// Resolve existing ancestors too: a nonexistent output can still traverse a symlink into the repository.
+		let ancestor = outDir;
+		while (!existsSync(ancestor)) {
+			const parent = dirname(ancestor);
+			if (parent === ancestor) throw new Error(`Cannot resolve output directory: ${outDir}`);
+			ancestor = parent;
+		}
+		const realOutDir = resolve(realpathSync(ancestor), relative(ancestor, outDir));
+		const realRepoRoot = realpathSync(repoRoot);
+		if (isInsidePath(realOutDir, realRepoRoot) || isInsidePath(realRepoRoot, realOutDir)) {
+			throw new Error(`Output directory must be outside the repository and must not contain it: ${outDir}`);
+		}
+	} catch (error) {
+		if (generated) rmSync(outDir, { recursive: true, force: true });
+		throw error;
 	}
 
-	const outDir = resolve(options.outDir);
-
-	if (isInsidePath(outDir, repoRoot)) {
-		throw new Error(`Output directory must be outside the repository: ${outDir}`);
-	}
-
-	if (existsSync(outDir)) {
+	if (!generated && existsSync(outDir)) {
 		if (!options.force) {
 			throw new Error(`Output directory already exists. Use --force to replace it: ${outDir}`);
 		}
@@ -172,17 +184,20 @@ function buildBunBinaryRelease(targetDirectory, archiveDirectory) {
 
 function createPiShim(installDirectory) {
 	const binDirectory = join(installDirectory, "node_modules", ".bin");
+	// The npm package exposes pie; the release-level pi alias matches the standalone binary.
 	if (process.platform === "win32") {
-		if (existsSync(join(binDirectory, "pi.cmd"))) {
-			writeFileSync(join(installDirectory, "pi.cmd"), '@ECHO off\r\n"%~dp0node_modules\\.bin\\pi.cmd" %*\r\n');
-			writeFileSync(join(installDirectory, "pi.ps1"), '& "$PSScriptRoot/node_modules/.bin/pi.ps1" @args\n');
+		if (existsSync(join(binDirectory, "pie.cmd"))) {
+			writeFileSync(join(installDirectory, "pi.cmd"), '@ECHO off\r\n"%~dp0node_modules\\.bin\\pie.cmd" %*\r\n');
+			writeFileSync(join(installDirectory, "pi.ps1"), '& "$PSScriptRoot/node_modules/.bin/pie.cmd" @args\n');
 			return;
 		}
-		writeFileSync(join(installDirectory, "pi.cmd"), '@ECHO off\r\n"%~dp0node_modules\\.bin\\pi.exe" %*\r\n');
-		writeFileSync(join(installDirectory, "pi.ps1"), '& "$PSScriptRoot/node_modules/.bin/pi.exe" @args\n');
+		if (!existsSync(join(binDirectory, "pie.exe"))) throw new Error(`Missing installed pie executable: ${binDirectory}`);
+		writeFileSync(join(installDirectory, "pi.cmd"), '@ECHO off\r\n"%~dp0node_modules\\.bin\\pie.exe" %*\r\n');
+		writeFileSync(join(installDirectory, "pi.ps1"), '& "$PSScriptRoot/node_modules/.bin/pie.exe" @args\n');
 		return;
 	}
-	symlinkSync(join("node_modules", ".bin", "pi"), join(installDirectory, "pi"));
+	if (!existsSync(join(binDirectory, "pie"))) throw new Error(`Missing installed pie executable: ${binDirectory}`);
+	symlinkSync(join("node_modules", ".bin", "pie"), join(installDirectory, "pi"));
 }
 
 function packPackage(pkg, tarballDirectory) {
@@ -191,13 +206,11 @@ function packPackage(pkg, tarballDirectory) {
 		throw new Error(`${pkg.directory}/package.json has name ${packageJson.name}, expected ${pkg.name}`);
 	}
 
-	const output = run("npm", ["pack", "--json", "--pack-destination", tarballDirectory], {
+	const output = run("npm", ["pack", "--json", "--ignore-scripts", "--pack-destination", tarballDirectory], {
 		capture: true,
 		cwd: pkg.directory,
 	});
-	// npm <11.6 returns an array; newer npm returns an object keyed by package name.
-	const parsed = JSON.parse(output);
-	const packed = Array.isArray(parsed) ? parsed[0] : Object.values(parsed)[0];
+	const packed = parseNpmPackResult(output, packageJson);
 	return join(tarballDirectory, packed.filename);
 }
 
@@ -209,6 +222,7 @@ if (rootPackageJson.name !== "pi-monorepo") {
 	throw new Error("Run this script from the repository root");
 }
 
+const packages = getPublicWorkspacePackages();
 const outDir = prepareOutputDirectory(options, repoRoot);
 const tarballDirectory = join(outDir, "tarballs");
 const nodeInstallDirectory = join(outDir, "node");
@@ -224,7 +238,7 @@ if (!options.skipCheck) {
 	run("npm", ["run", "check"], { cwd: repoRoot });
 }
 
-for (const pkg of packages) {
+for (const pkg of buildPackages) {
 	run("npm", ["run", "clean"], { cwd: pkg.directory });
 	run("npm", ["run", pkg.directory === "packages/ai" ? "build:offline" : "build"], { cwd: pkg.directory });
 }

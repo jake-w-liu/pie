@@ -230,6 +230,7 @@ export class FffRuntime {
 	private basePath: string;
 	private finder: FileFinder | null = null;
 	private initPromise: Promise<AppResult<FileFinder, RuntimeInitializationError>> | null = null;
+	private generation = 0;
 	private loadError: RuntimeInitializationError | null = null;
 	private grepCursorCounter = 0;
 	private readonly grepContinuations = new Map<string, StoredGrepContinuation>();
@@ -244,18 +245,31 @@ export class FffRuntime {
 	async ensure(): Promise<AppResult<FileFinder, RuntimeInitializationError>> {
 		if (this.finder) return Result.ok(this.finder);
 		if (this.loadError) return errResult(this.loadError);
-		if (!this.initPromise) this.initPromise = this.initialize();
-		const initialized = await this.initPromise;
-		if (initialized.isErr()) {
-			this.loadError = initialized.error;
-			return initialized;
+		if (!this.initPromise) {
+			const generation = this.generation;
+			// One completion owns publication/cleanup, even with multiple ensure callers.
+			this.initPromise = this.initialize().then((initialized) => {
+				if (generation !== this.generation) {
+					const discarded = Result.try({
+						try: () => { if (initialized.isOk()) initialized.value.destroy(); },
+						catch: (cause) => new RuntimeInitializationError({ cwd: this.cwd, step: "destroy stale finder", cause }),
+					});
+					if (discarded.isErr()) return propagateError(discarded);
+					return errResult(new RuntimeInitializationError({ cwd: this.cwd, step: "initialization invalidated", cause: "Runtime disposed during initialization" }));
+				}
+				if (initialized.isErr()) this.loadError = initialized.error;
+				else {
+					this.loadError = null;
+					this.finder = initialized.value;
+				}
+				return initialized;
+			});
 		}
-		this.loadError = null;
-		this.finder = initialized.value;
-		return initialized;
+		return this.initPromise;
 	}
 
 	dispose(): void {
+		this.generation++;
 		void Result.try({
 			try: () => {
 				if (this.finder && this.finder !== this.options.finder) this.finder.destroy();

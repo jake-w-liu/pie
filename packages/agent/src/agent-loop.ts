@@ -7,6 +7,7 @@ import {
 	type AssistantMessage,
 	type Context,
 	EventStream,
+	formatThrownValue,
 	type ToolResultMessage,
 	validateToolArguments,
 } from "@earendil-works/pi-ai";
@@ -549,9 +550,15 @@ async function executeToolCallsParallel(
 		}
 	}
 
-	const orderedFinalizedCalls = await Promise.all(
-		finalizedCalls.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry))),
-	);
+	const executions = finalizedCalls.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry)));
+	let orderedFinalizedCalls: FinalizedToolCallOutcome[];
+	try {
+		orderedFinalizedCalls = await Promise.all(executions);
+	} finally {
+		// Preserve the first failure, but never publish idle/terminal lifecycle while
+		// admitted siblings (including finalizers and listeners) can still emit events.
+		await Promise.allSettled(executions);
+	}
 	const messages: ToolResultMessage[] = [];
 	for (const finalized of orderedFinalizedCalls) {
 		const toolResultMessage = createToolResultMessage(finalized);
@@ -579,6 +586,7 @@ type ImmediateToolCallOutcome = {
 };
 
 type ExecutedToolCallOutcome = {
+	kind: "executed" | "not-executed";
 	result: AgentToolResult<any>;
 	isError: boolean;
 };
@@ -673,7 +681,7 @@ async function prepareToolCall(
 	} catch (error) {
 		return {
 			kind: "immediate",
-			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+			result: createErrorToolResult(formatThrownValue(error)),
 			isError: true,
 		};
 	}
@@ -684,8 +692,13 @@ async function executePreparedToolCall(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallOutcome> {
+	if (signal?.aborted) {
+		return { kind: "not-executed", result: createErrorToolResult("Operation aborted"), isError: true };
+	}
 	const updateEvents: Promise<void>[] = [];
+	let updateFailure: { error: unknown } | undefined;
 	let acceptingUpdates = true;
+	let outcome: ExecutedToolCallOutcome;
 
 	try {
 		const result = await prepared.tool.execute(
@@ -695,31 +708,38 @@ async function executePreparedToolCall(
 			(partialResult) => {
 				if (!acceptingUpdates) return;
 				updateEvents.push(
-					Promise.resolve(
-						emit({
-							type: "tool_execution_update",
-							toolCallId: prepared.toolCall.id,
-							toolName: prepared.toolCall.name,
-							args: prepared.toolCall.arguments,
-							partialResult,
-						}),
-					),
+					(async () => {
+						try {
+							await emit({
+								type: "tool_execution_update",
+								toolCallId: prepared.toolCall.id,
+								toolName: prepared.toolCall.name,
+								args: prepared.toolCall.arguments,
+								partialResult,
+							});
+						} catch (error) {
+							// Observe rejection immediately, even while execute is still running.
+							// Re-throw only after every admitted update listener has settled.
+							updateFailure ??= { error };
+						}
+					})(),
 				);
 			},
 		);
-		acceptingUpdates = false;
-		await Promise.all(updateEvents);
-		return { result, isError: false };
+		outcome = { kind: "executed", result, isError: false };
 	} catch (error) {
-		acceptingUpdates = false;
-		await Promise.all(updateEvents);
-		return {
-			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+		outcome = {
+			kind: "executed",
+			result: createErrorToolResult(formatThrownValue(error)),
 			isError: true,
 		};
 	} finally {
 		acceptingUpdates = false;
+		// Even an unexpected normalization failure cannot abandon admitted listeners.
+		await Promise.all(updateEvents);
 	}
+	if (updateFailure) throw updateFailure.error;
+	return outcome;
 }
 
 async function finalizeExecutedToolCall(
@@ -733,7 +753,7 @@ async function finalizeExecutedToolCall(
 	let result = executed.result;
 	let isError = executed.isError;
 
-	if (config.afterToolCall) {
+	if (executed.kind === "executed" && config.afterToolCall) {
 		try {
 			const afterResult = await config.afterToolCall(
 				{
@@ -750,14 +770,14 @@ async function finalizeExecutedToolCall(
 				result = {
 					...result,
 					content: afterResult.content ?? result.content,
-					details: afterResult.details ?? result.details,
+					details: afterResult.details === undefined ? result.details : afterResult.details,
 					usage: afterResult.usage ?? result.usage,
 					terminate: afterResult.terminate ?? result.terminate,
 				};
 				isError = afterResult.isError ?? isError;
 			}
 		} catch (error) {
-			result = createErrorToolResult(error instanceof Error ? error.message : String(error));
+			result = createErrorToolResult(formatThrownValue(error));
 			isError = true;
 		}
 	}

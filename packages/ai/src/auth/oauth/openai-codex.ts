@@ -17,11 +17,13 @@ if (typeof process !== "undefined" && (process.versions?.node || process.version
 	});
 }
 
+import { raceWithAbortSignal } from "../../utils/abort.ts";
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 import { oauthErrorHtml, oauthSuccessHtml } from "./oauth-page.ts";
 import { generatePKCE } from "./pkce.ts";
+import { parseOAuthTokenResponse } from "./token-response.ts";
 
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTH_BASE_URL = "https://auth.openai.com";
@@ -129,15 +131,7 @@ async function readTokenResponse(response: Response, operation: TokenOperation):
 		throw new Error(`OpenAI Codex token ${operation} failed (${response.status}): ${text || response.statusText}`);
 	}
 
-	const rawJson = await response.json();
-	const json = rawJson as {
-		access_token?: string;
-		refresh_token?: string;
-		expires_in?: number;
-	} | null;
-	if (!json?.access_token || !json.refresh_token || typeof json.expires_in !== "number") {
-		throw new Error(`OpenAI Codex token ${operation} response missing fields: ${JSON.stringify(json)}`);
-	}
+	const json = parseOAuthTokenResponse(await response.json(), `OpenAI Codex token ${operation}`);
 
 	return {
 		access: json.access_token,
@@ -443,23 +437,28 @@ async function loginOpenAICodexDeviceCode(interaction: ProviderAuthInteraction):
 }
 
 async function loginOpenAICodex(interaction: ProviderAuthInteraction): Promise<OAuthCredential> {
+	interaction.signal.throwIfAborted();
 	const { verifier, state, url } = await createAuthorizationFlow();
 	const server = await startLocalOAuthServer(state);
 	const manualAbort = new AbortController();
-	const onAbort = () => server.cancelWait();
+	const onAbort = () => {
+		manualAbort.abort(interaction.signal.reason);
+		server.cancelWait();
+	};
 	interaction.signal.addEventListener("abort", onAbort, { once: true });
 	if (interaction.signal.aborted) onAbort();
 	let code: string | undefined;
 	let manualCode: string | undefined;
 	let manualError: Error | undefined;
 
-	interaction.notify({
-		type: "auth_url",
-		url,
-		instructions: "A browser window should open. Complete login to finish.",
-	});
-
 	try {
+		interaction.signal.throwIfAborted();
+		interaction.notify({
+			type: "auth_url",
+			url,
+			instructions: "A browser window should open. Complete login to finish.",
+		});
+
 		const manualPromise = interaction
 			.prompt({
 				type: "manual_code",
@@ -477,6 +476,7 @@ async function loginOpenAICodex(interaction: ProviderAuthInteraction): Promise<O
 			});
 
 		const result = await server.waitForCode();
+		interaction.signal.throwIfAborted();
 		if (manualError) throw manualError;
 		if (result?.code) {
 			code = result.code;
@@ -487,7 +487,7 @@ async function loginOpenAICodex(interaction: ProviderAuthInteraction): Promise<O
 		}
 
 		if (!code) {
-			await manualPromise;
+			await raceWithAbortSignal(manualPromise, interaction.signal);
 			if (manualError) throw manualError;
 			if (manualCode) {
 				const parsed = parseAuthorizationInput(manualCode);
@@ -517,6 +517,7 @@ export const openaiCodexOAuth: OAuthAuth = {
 	isSubscription: true,
 
 	async login(interaction) {
+		interaction.signal.throwIfAborted();
 		const method = await interaction.prompt({
 			type: "select",
 			message: "Select OpenAI Codex login method:",

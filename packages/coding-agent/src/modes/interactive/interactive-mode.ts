@@ -240,6 +240,13 @@ type CompactionCostNotice = {
 
 type RenderSessionItem = AgentMessage | Extract<SessionEntry, { type: "custom" }> | CompactionCostNotice;
 
+interface RenderSessionOptions {
+	updateFooter?: boolean;
+	populateHistory?: boolean;
+	/** Reuse active executions when rebuilding the same session's transcript. */
+	liveTools?: ReadonlyMap<string, ToolExecutionComponent>;
+}
+
 function isCustomSessionEntry(item: RenderSessionItem): item is Extract<SessionEntry, { type: "custom" }> {
 	return "type" in item && item.type === "custom";
 }
@@ -2760,8 +2767,8 @@ export class InteractiveMode {
 	private setCustomEditorComponent(factory: EditorFactory | undefined): void {
 		this.editorComponentFactory = factory;
 
-		// Save text from current editor before switching
-		const currentText = this.editor.getText();
+		// Paste markers belong to the originating editor's private registry.
+		const currentText = this.editor.getExpandedText?.() ?? this.editor.getText();
 
 		this.disposeActiveSelector();
 		this.editorContainer.clear();
@@ -2774,8 +2781,9 @@ export class InteractiveMode {
 			newEditor.onSubmit = this.defaultEditor.onSubmit;
 			newEditor.onChange = this.defaultEditor.onChange;
 
-			// Copy text from previous editor
-			newEditor.setText(currentText);
+			// A factory may return the existing editor. Remounting must not reset
+			// its cursor, undo history, or paste registry.
+			if (newEditor !== this.editor) newEditor.setText(currentText);
 
 			// Copy appearance settings if supported
 			if (newEditor.borderColor !== undefined) {
@@ -2817,8 +2825,8 @@ export class InteractiveMode {
 
 			this.editor = newEditor;
 		} else {
-			// Restore default editor with text from custom editor
-			this.defaultEditor.setText(currentText);
+			// Transfer only when actually switching back from a custom editor.
+			if (this.editor !== this.defaultEditor) this.defaultEditor.setText(currentText);
 			this.editor = this.defaultEditor;
 		}
 
@@ -2854,39 +2862,91 @@ export class InteractiveMode {
 			onHandle?: (handle: OverlayHandle) => void;
 		},
 	): Promise<T> {
-		const savedText = this.editor.getText();
 		const isOverlay = options?.overlay ?? false;
 
-		const restoreEditor = () => {
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.editor);
-			this.editor.setText(savedText);
-			this.ui.setFocus(this.editor);
-			this.ui.requestRender();
-		};
-
 		return new Promise((resolve, reject) => {
-			let component: Component & { dispose?(): void };
+			let component: (Component & { dispose?(): void }) | undefined;
+			let overlayHandle: OverlayHandle | undefined;
+			let mounted = false;
+			let mounting = false;
 			let closed = false;
+			let settled = false;
+			let disposed = false;
+			let outcome: { status: "fulfilled"; value: T } | { status: "rejected"; error: unknown } | undefined;
 
-			const close = (result: T) => {
-				if (closed) return;
-				closed = true;
-				if (isOverlay) this.ui.hideOverlay();
-				else restoreEditor();
-				// Note: both branches above already call requestRender
-				resolve(result);
+			const disposeComponent = () => {
+				if (!component || disposed) return;
+				disposed = true;
 				try {
-					component?.dispose?.();
+					component.dispose?.();
 				} catch {
 					/* ignore dispose errors */
 				}
 			};
+			const cleanup = () => {
+				// Release only this invocation's handle, even if a focus setter throws.
+				const handle = overlayHandle;
+				overlayHandle = undefined;
+				try {
+					handle?.hide();
+					if (!isOverlay && mounted && component) {
+						if (this.editorContainer.children.includes(component)) {
+							this.editorContainer.clear();
+							// The editor was only detached: its logical state is still intact.
+							this.editorContainer.addChild(this.editor);
+						}
+						try {
+							// Even displaced components must retire their stored fallbacks;
+							// container replacement and current focus remain separately owned.
+							this.ui.replaceFocus(component, this.editor);
+						} finally {
+							this.ui.requestRender();
+						}
+					}
+				} finally {
+					mounted = false;
+					disposeComponent();
+				}
+			};
+			const settle = () => {
+				const result = outcome;
+				// A reentrant done() must wait for showOverlay to return its handle.
+				if (!result || mounting || settled) return;
+				settled = true;
+				try {
+					cleanup();
+				} catch (error) {
+					reject(
+						result.status === "rejected"
+							? new AggregateError([result.error, error], "Custom UI and cleanup failed")
+							: error,
+					);
+					return;
+				}
+				if (result.status === "rejected") reject(result.error);
+				else resolve(result.value);
+			};
+			const close = (value: T) => {
+				if (closed) return;
+				closed = true;
+				outcome = { status: "fulfilled", value };
+				settle();
+			};
+			const fail = (error: unknown) => {
+				if (closed) return;
+				closed = true;
+				outcome = { status: "rejected", error };
+				settle();
+			};
 
-			Promise.resolve(factory(this.ui, theme, this.keybindings, close))
-				.then((c) => {
-					if (closed) return;
-					component = c;
+			const mount = (c: Component & { dispose?(): void }) => {
+				component = c;
+				if (closed) {
+					disposeComponent();
+					return;
+				}
+				mounting = true;
+				try {
 					if (isOverlay) {
 						// Resolve overlay options - can be static or dynamic function
 						const resolveOptions = (): OverlayOptions | undefined => {
@@ -2901,22 +2961,37 @@ export class InteractiveMode {
 							const w = (component as { width?: number }).width;
 							return w ? { width: w } : undefined;
 						};
-						const handle = this.ui.showOverlay(component, resolveOptions());
-						// Expose handle to caller for visibility control
-						options?.onHandle?.(handle);
+						const overlayOptions = resolveOptions();
+						if (closed) return;
+						overlayHandle = this.ui.showOverlay(component, overlayOptions);
+						if (closed) return;
+						// Retain ownership before calling extension code (which may close or throw).
+						options?.onHandle?.(overlayHandle);
 					} else {
 						this.disposeActiveSelector();
+						if (closed) return;
 						this.editorContainer.clear();
 						this.editorContainer.addChild(component);
+						mounted = true;
 						this.ui.setFocus(component);
 						this.ui.requestRender();
 					}
-				})
-				.catch((err) => {
-					if (closed) return;
-					if (!isOverlay) restoreEditor();
-					reject(err);
-				});
+				} catch (error) {
+					// Mount failure is observable even if a setter first requested done().
+					closed = true;
+					outcome = { status: "rejected", error };
+				} finally {
+					mounting = false;
+					settle();
+				}
+			};
+			try {
+				Promise.resolve(factory(this.ui, theme, this.keybindings, close))
+					.then(mount)
+					.catch(fail);
+			} catch (error) {
+				fail(error);
+			}
 		});
 	}
 
@@ -3800,10 +3875,7 @@ export class InteractiveMode {
 		}
 	}
 
-	private renderSessionItems(
-		items: readonly RenderSessionItem[],
-		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
-	): void {
+	private renderSessionItems(items: readonly RenderSessionItem[], options: RenderSessionOptions = {}): void {
 		this.pendingTools.clear();
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
 		// Cache-miss notices are not persisted; re-derive them from the full entry
@@ -3834,18 +3906,20 @@ export class InteractiveMode {
 				// Render tool call components
 				for (const content of message.content) {
 					if (content.type === "toolCall") {
-						const component = new ToolExecutionComponent(
-							content.name,
-							content.id,
-							content.arguments,
-							{
-								showImages: this.settingsManager.getShowImages(),
-								imageWidthCells: this.settingsManager.getImageWidthCells(),
-							},
-							this.getRegisteredToolDefinition(content.name),
-							this.ui,
-							this.sessionManager.getCwd(),
-						);
+						const component =
+							options.liveTools?.get(content.id) ??
+							new ToolExecutionComponent(
+								content.name,
+								content.id,
+								content.arguments,
+								{
+									showImages: this.settingsManager.getShowImages(),
+									imageWidthCells: this.settingsManager.getImageWidthCells(),
+								},
+								this.getRegisteredToolDefinition(content.name),
+								this.ui,
+								this.sessionManager.getCwd(),
+							);
 						component.setExpanded(this.toolOutputExpanded);
 						this.chatContainer.addChild(component);
 
@@ -3895,10 +3969,7 @@ export class InteractiveMode {
 	 * @param options.updateFooter Update footer state
 	 * @param options.populateHistory Add user messages to editor history
 	 */
-	private renderSessionEntries(
-		entries: SessionEntry[],
-		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
-	): void {
+	private renderSessionEntries(entries: SessionEntry[], options: RenderSessionOptions = {}): void {
 		const items = entries.flatMap((entry): RenderSessionItem[] => {
 			if (entry.type === "custom") {
 				return [entry];
@@ -4010,8 +4081,24 @@ export class InteractiveMode {
 	}
 
 	private rebuildChatFromMessages(): void {
+		const liveTools = new Map(this.pendingTools);
+		const liveComponents = new Set<Component>(liveTools.values());
+		if (this.streamingComponent) liveComponents.add(this.streamingComponent);
+		const liveOrder = this.chatContainer.children.filter((child) => liveComponents.has(child));
+
 		this.chatContainer.clear();
-		this.renderSessionEntries(this.sessionManager.buildContextEntries());
+		this.renderSessionEntries(this.sessionManager.buildContextEntries(), { liveTools });
+		// A tool call can be persisted while its execution is still running. Those
+		// components were reused above, including partial output and async work.
+		// Assistant/tool deltas not persisted yet must remain mounted too, in order.
+		const rendered = new Set(this.chatContainer.children);
+		for (const [id, component] of liveTools) {
+			if (!rendered.has(component)) this.pendingTools.set(id, component);
+		}
+		for (const component of liveOrder) {
+			if (!rendered.has(component)) this.chatContainer.addChild(component);
+		}
+		this.ui.requestRender();
 	}
 
 	// =========================================================================
@@ -4457,7 +4544,7 @@ export class InteractiveMode {
 			return 0;
 		}
 		const queuedText = allQueued.join("\n\n");
-		const currentText = options?.currentText ?? this.editor.getText();
+		const currentText = options?.currentText ?? this.editor.getExpandedText?.() ?? this.editor.getText();
 		const combinedText = [queuedText, currentText].filter((t) => t.trim()).join("\n\n");
 		this.editor.setText(combinedText);
 		this.updatePendingMessagesDisplay();

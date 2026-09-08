@@ -1,4 +1,4 @@
-import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, rmSync, statSync, unlinkSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, rmSync, statSync, unlinkSync } from "node:fs";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { basename, dirname, extname, join, resolve as resolvePath, sep as pathSep } from "node:path";
@@ -40,8 +40,9 @@ export interface GitHubUrlInfo {
 }
 
 interface CachedClone {
-	destination: CloneDestination;
 	clonePromise: Promise<string | null>;
+	active: boolean;
+	settled: boolean;
 }
 
 interface CloneDestination {
@@ -57,6 +58,8 @@ interface GitHubCloneConfig {
 }
 
 const cloneCache = new Map<string, CachedClone>();
+let cloneRoot: string | null = null;
+let cloneGeneration = 0;
 
 let cachedConfig: GitHubCloneConfig | null = null;
 
@@ -192,7 +195,9 @@ function cacheKey(owner: string, repo: string, ref?: string): string {
 function cloneDestination(config: GitHubCloneConfig, owner: string, repo: string, ref?: string): CloneDestination | null {
 	try {
 		mkdirSync(resolvePath(config.clonePath), { recursive: true });
-		const rootPath = realpathSync(resolvePath(config.clonePath));
+		// Cache ownership is local to this extension instance, not the shared base.
+		cloneRoot ??= mkdtempSync(join(realpathSync(resolvePath(config.clonePath)), "owner-"));
+		const rootPath = cloneRoot;
 		const digest = createHash("sha256").update(JSON.stringify([owner, repo, ref ?? null])).digest("hex");
 		const localPath = resolvePath(rootPath, digest);
 		if (dirname(localPath) !== rootPath) return null;
@@ -486,8 +491,8 @@ function buildDirListing(rootPath: string, subPath: string): string {
 function readReadme(localPath: string): string | null {
 	const candidates = ["README.md", "readme.md", "README", "README.txt", "README.rst"];
 	for (const name of candidates) {
-		const readmePath = join(localPath, name);
-		if (existsSync(readmePath)) {
+		const readmePath = resolveWithinRepo(localPath, name);
+		if (readmePath && existsSync(readmePath)) {
 			try {
 				const content = readFileSync(readmePath, "utf-8");
 				return content.length > 8192 ? content.slice(0, 8192) + "\n\n[README truncated at 8K chars]" : content;
@@ -614,7 +619,7 @@ async function awaitCachedClone(
 ): Promise<ExtractedContent | null> {
 	if (signal?.aborted) return null;
 	const result = await cached.clonePromise;
-	if (signal?.aborted) return null;
+	if (signal?.aborted || !cached.active) return null;
 	if (result) {
 		const content = generateContent(result, info);
 		const title = info.path ? `${owner}/${repo} - ${info.path}` : `${owner}/${repo}`;
@@ -635,6 +640,7 @@ export async function extractGitHub(
 
 	const config = loadGitHubConfig();
 	if (!config.enabled) return null;
+	const generation = cloneGeneration;
 
 	const { owner, repo } = info;
 	const key = cacheKey(owner, repo, info.ref);
@@ -652,7 +658,7 @@ export async function extractGitHub(
 
 	if (!forceClone) {
 		const sizeKB = await checkRepoSize(owner, repo);
-		if (signal?.aborted) {
+		if (signal?.aborted || generation !== cloneGeneration) {
 			activityMonitor.logComplete(activityId, 0);
 			return null;
 		}
@@ -705,9 +711,19 @@ export async function extractGitHub(
 		return apiFallback;
 	}
 	const clonePromise = cloneRepo(owner, repo, info.ref, config, destination, signal);
-	cloneCache.set(key, { destination, clonePromise });
+	const entry: CachedClone = { clonePromise, active: true, settled: false };
+	cloneCache.set(key, entry);
 
-	const result = await clonePromise;
+	let result: string | null;
+	try {
+		result = await clonePromise;
+	} finally {
+		entry.settled = true;
+	}
+	if (!entry.active) {
+		activityMonitor.logComplete(activityId, 0);
+		return null;
+	}
 	if (signal?.aborted) {
 		if (!result) cloneCache.delete(key);
 		activityMonitor.logComplete(activityId, 0);
@@ -738,9 +754,19 @@ export async function extractGitHub(
 }
 
 export function clearCloneCache(): void {
-	for (const entry of cloneCache.values()) {
-		removeCloneDestination(entry.destination);
-	}
+	cloneGeneration++;
+	const entries = [...cloneCache.values()];
+	const root = cloneRoot;
+	for (const entry of entries) entry.active = false;
 	cloneCache.clear();
+	cloneRoot = null;
 	cachedConfig = null;
+	if (!root) return;
+	const cleanup = () => {
+		try { rmSync(root, { recursive: true, force: true }); }
+		catch (error) { console.warn("Failed to remove owned GitHub clone cache:", error); }
+	};
+	// Never race a still-running clone or remove a replacement owner's root.
+	if (entries.every(entry => entry.settled)) cleanup();
+	else void Promise.allSettled(entries.map(entry => entry.clonePromise)).then(cleanup);
 }

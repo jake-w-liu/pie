@@ -7,6 +7,7 @@ import type {
 	ThinkingBudgets,
 	Transport,
 } from "@earendil-works/pi-ai";
+import { formatThrownValue } from "@earendil-works/pi-ai";
 import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
@@ -417,7 +418,7 @@ export class Agent {
 				messages,
 				this.createContextSnapshot(),
 				this.createLoopConfig(options),
-				(event) => this.processEvents(event),
+				(event) => this.processEvents(event, signal),
 				signal,
 				this.streamFunction,
 			);
@@ -429,7 +430,7 @@ export class Agent {
 			await runAgentLoopContinue(
 				this.createContextSnapshot(),
 				this.createLoopConfig(),
-				(event) => this.processEvents(event),
+				(event) => this.processEvents(event, signal),
 				signal,
 				this.streamFunction,
 			);
@@ -504,13 +505,13 @@ export class Agent {
 		try {
 			await executor(abortController.signal);
 		} catch (error) {
-			await this.handleRunFailure(error, abortController.signal.aborted);
+			await this.handleRunFailure(error, abortController.signal);
 		} finally {
 			this.finishRun();
 		}
 	}
 
-	private async handleRunFailure(error: unknown, aborted: boolean): Promise<void> {
+	private async handleRunFailure(error: unknown, signal: AbortSignal): Promise<void> {
 		const failureMessage = {
 			role: "assistant",
 			content: [{ type: "text", text: "" }],
@@ -518,8 +519,8 @@ export class Agent {
 			provider: this._state.model.provider,
 			model: this._state.model.id,
 			usage: EMPTY_USAGE,
-			stopReason: aborted ? "aborted" : "error",
-			errorMessage: error instanceof Error ? error.message : String(error),
+			stopReason: signal.aborted ? "aborted" : "error",
+			errorMessage: formatThrownValue(error),
 			timestamp: Date.now(),
 		} satisfies AgentMessage;
 
@@ -533,10 +534,10 @@ export class Agent {
 			return;
 		}
 
-		await this.processEvents({ type: "message_start", message: failureMessage });
-		await this.processEvents({ type: "message_end", message: failureMessage });
-		await this.processEvents({ type: "turn_end", message: failureMessage, toolResults: [] });
-		await this.processEvents({ type: "agent_end", messages: [failureMessage] });
+		await this.processEvents({ type: "message_start", message: failureMessage }, signal);
+		await this.processEvents({ type: "message_end", message: failureMessage }, signal);
+		await this.processEvents({ type: "turn_end", message: failureMessage, toolResults: [] }, signal);
+		await this.processEvents({ type: "agent_end", messages: [failureMessage] }, signal);
 	}
 
 	private finishRun(): void {
@@ -555,7 +556,10 @@ export class Agent {
 	 * considered idle later, after all awaited listeners for `agent_end` finish
 	 * and `finishRun()` clears runtime-owned state.
 	 */
-	private async processEvents(event: AgentEvent): Promise<void> {
+	private async processEvents(event: AgentEvent, signal: AbortSignal): Promise<void> {
+		if (this.activeRun?.abortController.signal !== signal) {
+			throw new Error("Agent listener invoked outside originating run");
+		}
 		switch (event.type) {
 			case "agent_start":
 				this._runStarted = true;
@@ -599,10 +603,6 @@ export class Agent {
 				break;
 		}
 
-		const signal = this.activeRun?.abortController.signal;
-		if (!signal) {
-			throw new Error("Agent listener invoked outside active run");
-		}
 		for (const listener of this.listeners) {
 			await listener(event, signal);
 		}

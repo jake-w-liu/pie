@@ -67,7 +67,6 @@ class UnixListener implements PiServerListener {
 		await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
 		await removeStaleSocket(this.path);
 		await removeStaleSocket(ownedBindPath);
-		this.ownedBindPath = ownedBindPath;
 		const server = createServer((socket) => this.acceptSocket(socket));
 		server.on("error", (error) => this.reportError(error));
 		this.server = server;
@@ -85,6 +84,8 @@ class UnixListener implements PiServerListener {
 				server.once("listening", onListening);
 				server.listen(ownedBindPath);
 			});
+			// A failed listen has no ownership, even if another starter bound this path.
+			this.ownedBindPath = ownedBindPath;
 			const stats = await lstat(ownedBindPath);
 			if (!stats.isSocket()) throw new Error(`Unix listener path is not a socket after binding: ${ownedBindPath}`);
 			this.socketIdentity = { dev: stats.dev, ino: stats.ino };
@@ -141,8 +142,6 @@ class UnixListener implements PiServerListener {
 		const serverClosed = this.server ? this.closeServerAndCleanup(this.server) : this.cleanupOwnedSocket();
 		await Promise.all([...this.connections].map((connection) => connection.close()));
 		await serverClosed;
-		if (this.ownedBindPath) await removePath(this.ownedBindPath);
-		this.ownedBindPath = undefined;
 		this.connections.clear();
 		this.server = undefined;
 	}
@@ -152,7 +151,6 @@ class UnixListener implements PiServerListener {
 			await closeNetServer(server, (error) => this.reportError(error));
 		} finally {
 			await this.cleanupOwnedSocket();
-			if (this.ownedBindPath) await removePath(this.ownedBindPath);
 			this.ownedBindPath = undefined;
 		}
 	}
@@ -161,18 +159,23 @@ class UnixListener implements PiServerListener {
 		const identity = this.socketIdentity;
 		this.socketIdentity = undefined;
 		if (!identity) return;
+		await this.cleanupOwnedPath(this.path, identity);
+		if (this.ownedBindPath) await this.cleanupOwnedPath(this.ownedBindPath, identity);
+	}
+
+	private async cleanupOwnedPath(path: string, identity: FileIdentity): Promise<void> {
 		let current: Stats;
 		try {
-			current = await lstat(this.path);
+			current = await lstat(path);
 		} catch (error) {
 			if (isErrorCode(error, "ENOENT")) return;
 			throw error;
 		}
 		if (!current.isSocket() || current.dev !== identity.dev || current.ino !== identity.ino) return;
 
-		const preserved = join(dirname(this.path), `.c-${randomUUID().slice(0, 6)}`);
+		const preserved = join(dirname(path), `.c-${randomUUID().slice(0, 6)}`);
 		try {
-			await rename(this.path, preserved);
+			await rename(path, preserved);
 		} catch (error) {
 			if (isErrorCode(error, "ENOENT")) return;
 			throw error;
@@ -183,9 +186,9 @@ class UnixListener implements PiServerListener {
 			return;
 		}
 		try {
-			await lstat(this.path);
+			await lstat(path);
 		} catch (error) {
-			if (isErrorCode(error, "ENOENT")) await rename(preserved, this.path);
+			if (isErrorCode(error, "ENOENT")) await rename(preserved, path);
 			else throw error;
 		}
 		throw new Error(`Unix listener path changed during cleanup; preserved replacement at ${preserved}`);
@@ -281,7 +284,8 @@ export class UnixByteConnection implements ByteConnection {
 	}
 
 	private write(chunk: Uint8Array): Promise<void> {
-		if (this.closedValue || this.closing || !this.socket.writable) {
+		// Closing stops admission in send(), not writes already accepted into the queue.
+		if (this.closedValue || !this.socket.writable) {
 			return Promise.reject(new Error("Unix connection is closed"));
 		}
 		return new Promise<void>((resolve, reject) => {

@@ -44,11 +44,7 @@ export class ToolExecutionComponent extends Container {
 		number,
 		{ sourceData: string; sourceMimeType: string; data: string; mimeType: string }
 	>();
-	private imageResultGeneration = 0;
-	private pendingImageConversions = new Map<
-		number,
-		{ sourceData: string; sourceMimeType: string; generation: number }
-	>();
+	private pendingImageConversions = new Map<number, { sourceData: string; sourceMimeType: string }>();
 	private hideComponent = false;
 
 	constructor(
@@ -188,14 +184,6 @@ export class ToolExecutionComponent extends Container {
 		},
 		isPartial = false,
 	): void {
-		const previousImages = this.result?.content.filter((content) => content.type === "image") ?? [];
-		const nextImages = result.content.filter((content) => content.type === "image");
-		const imageSourcesChanged =
-			previousImages.length !== nextImages.length ||
-			previousImages.some(
-				(image, index) => image.data !== nextImages[index]?.data || image.mimeType !== nextImages[index]?.mimeType,
-			);
-		if (imageSourcesChanged) this.imageResultGeneration++;
 		this.result = result;
 		this.isPartial = isPartial;
 		this.updateDisplay();
@@ -221,7 +209,6 @@ export class ToolExecutionComponent extends Container {
 			}
 		}
 
-		const generation = this.imageResultGeneration;
 		for (let i = 0; i < imageBlocks.length; i++) {
 			const img = imageBlocks[i];
 			if (!img.data || !img.mimeType || img.mimeType === "image/png") continue;
@@ -233,18 +220,16 @@ export class ToolExecutionComponent extends Container {
 			const index = i;
 			const sourceData = img.data;
 			const sourceMimeType = img.mimeType;
-			this.pendingImageConversions.set(index, { sourceData, sourceMimeType, generation });
+			const conversion = { sourceData, sourceMimeType };
+			this.pendingImageConversions.set(index, conversion);
 			convertToPng(sourceData, sourceMimeType).then((converted) => {
-				const pendingConversion = this.pendingImageConversions.get(index);
-				if (pendingConversion?.generation === generation) this.pendingImageConversions.delete(index);
+				// Slot identity rejects replacements (including A -> B -> A), without
+				// invalidating unchanged work when a different image slot changes.
+				if (this.pendingImageConversions.get(index) !== conversion) return;
+				this.pendingImageConversions.delete(index);
 				const currentImages = this.result?.content.filter((content) => content.type === "image") ?? [];
 				const current = currentImages[index];
-				if (
-					!converted ||
-					generation !== this.imageResultGeneration ||
-					current?.data !== sourceData ||
-					current.mimeType !== sourceMimeType
-				) {
+				if (!converted || current?.data !== sourceData || current.mimeType !== sourceMimeType) {
 					return;
 				}
 				this.convertedImages.set(index, { sourceData, sourceMimeType, ...converted });

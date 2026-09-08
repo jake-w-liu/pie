@@ -28,9 +28,15 @@ export type WorkflowForegroundSteeringResolution =
 
 function activeWorkflowError(state: SubagentState, workflowRunId: string, asyncDirRoot: string): string | undefined {
 	if (!state.currentSessionId) return "Workflow steering requires an active parent session.";
-	if (!state.workflowControllers?.has(workflowRunId)) return `Workflow '${workflowRunId}' has no live foreground child.`;
 	const status = readStatus(path.join(asyncDirRoot, workflowRunId));
-	if (!status || status.mode !== "workflow" || (status.state !== "running" && status.state !== "queued")) {
+	if (!status || status.mode !== "workflow" || (status.state !== "running" && status.state !== "queued" && status.state !== "paused")) {
+		return `Workflow '${workflowRunId}' has no live foreground child.`;
+	}
+	// Native supervisor detach pauses the scheduling shell and releases its
+	// controller, but this session still owns the live child's control. Resolution
+	// below must prove that ownership and an active child: a paused record alone
+	// is never a control path.
+	if (status.state !== "paused" && !state.workflowControllers?.has(workflowRunId)) {
 		return `Workflow '${workflowRunId}' has no live foreground child.`;
 	}
 	if (status.sessionId !== state.currentSessionId) return `Workflow '${workflowRunId}' was not found in the active session.`;

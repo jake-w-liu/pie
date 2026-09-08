@@ -265,9 +265,13 @@ export function stream<TApi extends Api>(
 		return provider.stream(model, context, withEnvApiKey(model, options) as StreamOptions);
 	} catch (error) {
 		// Failures belong in the returned stream, never thrown synchronously.
-		return lazyStream(model, async () => {
-			throw error;
-		});
+		return lazyStream(
+			model,
+			async () => {
+				throw error;
+			},
+			options?.signal,
+		);
 	}
 }
 
@@ -297,9 +301,13 @@ export function streamSimple<TApi extends Api>(
 		return provider.streamSimple(model, context, withEnvApiKey(model, options));
 	} catch (error) {
 		// Failures belong in the returned stream, never thrown synchronously.
-		return lazyStream(model, async () => {
-			throw error;
-		});
+		return lazyStream(
+			model,
+			async () => {
+				throw error;
+			},
+			options?.signal,
+		);
 	}
 }
 

@@ -327,7 +327,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const websocketConnectTimeoutMs =
 				options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs();
 			const headerRunner = extensionRunnerRef.current;
-			return modelRuntime.streamSimple(model, context, {
+			// Compaction uses this stream directly, bypassing Agent's normal message converter.
+			const requestContext = { ...context, messages: convertToLlmWithBlockImages(context.messages) };
+			return modelRuntime.streamSimple(model, requestContext, {
 				...options,
 				timeoutMs,
 				websocketConnectTimeoutMs,

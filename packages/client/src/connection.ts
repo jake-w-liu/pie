@@ -154,7 +154,7 @@ export class Connection {
 			return;
 		}
 		for (const message of messages) {
-			if (this.#lifecycle.state === "disconnected") return;
+			if (!this.#isCurrent(id)) return;
 			this.#handleMessage(message);
 		}
 	}

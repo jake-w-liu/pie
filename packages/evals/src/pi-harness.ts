@@ -1,11 +1,12 @@
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { performance } from "node:perf_hooks";
 import { contentText } from "@earendil-works/pi-ai";
 import {
 	type AgentSession,
+	CONFIG_DIR_NAME,
 	type CreateAgentSessionOptions,
 	createAgentSessionFromServices,
 	createAgentSessionServices,
@@ -127,15 +128,36 @@ async function runPiCodingAgent<TOutput extends JsonValue>(
 	let session: AgentSession | undefined;
 	let outcome: { success: true; result: SimpleHarnessResult<string | TOutput> } | { success: false; error: unknown };
 	try {
-		await Promise.all([mkdir(cwd), mkdir(agentDir)]);
+		const skillPaths = [
+			join(cwd, CONFIG_DIR_NAME, "skills"),
+			join(cwd, ".agents", "skills"),
+			join(agentDir, "skills"),
+		];
+		await Promise.all(skillPaths.map((path) => mkdir(path, { recursive: true })));
+		const resourceRoots = [realpathSync(cwd), realpathSync(agentDir)];
+		const isIsolatedResource = (path: string): boolean => {
+			const resolved = realpathSync(path);
+			return resourceRoots.some((root) => resolved.startsWith(`${root}${sep}`));
+		};
 		const services = await createAgentSessionServices({
 			cwd,
 			agentDir,
 			modelRuntime,
 			settingsManager: SettingsManager.inMemory(),
-			...(options.transformSystemPrompt
-				? { resourceLoaderOptions: { systemPromptOverride: () => transformedSystemPrompt } }
-				: {}),
+			resourceLoaderOptions: {
+				// Default skill discovery includes HOME and workspace ancestors. Select
+				// temporary roots before loading/deduplicating, but keep reload discovery.
+				noSkills: true,
+				additionalSkillPaths: skillPaths,
+				skillsOverride: ({ skills, diagnostics }) => ({
+					skills: skills.filter((skill) => isIsolatedResource(skill.filePath)),
+					diagnostics,
+				}),
+				agentsFilesOverride: ({ agentsFiles }) => ({
+					agentsFiles: agentsFiles.filter((file) => isIsolatedResource(file.path)),
+				}),
+				...(options.transformSystemPrompt ? { systemPromptOverride: () => transformedSystemPrompt } : {}),
+			},
 		});
 		signal?.throwIfAborted();
 		sessionManager = SessionManager.create(cwd, join(root, "sessions"));

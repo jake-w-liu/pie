@@ -1,8 +1,24 @@
 import assert from "node:assert";
+import { spawnSync } from "node:child_process";
 import { describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 import { visibleWidth, wrapTextWithAnsi } from "../src/utils.ts";
 
 describe("wrapTextWithAnsi memoization", () => {
+	it("does not cache expanded output larger than the character budget", () => {
+		// Run in an owned subprocess so an eviction-loop regression cannot hang the test runner.
+		const result = spawnSync(
+			process.execPath,
+			[fileURLToPath(new URL("./fixtures/wrap-large-output.ts", import.meta.url))],
+			{
+				encoding: "utf8",
+				timeout: 10_000,
+			},
+		);
+		assert.ifError(result.error);
+		assert.strictEqual(result.status, 0, result.stderr);
+	});
+
 	it("returns identical output for repeated inputs without recomputing", () => {
 		const text = "the quick brown fox jumps over the lazy dog near the riverbank";
 		const first = wrapTextWithAnsi(text, 20);

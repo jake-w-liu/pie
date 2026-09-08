@@ -155,7 +155,14 @@ export function toProtocolJsonValue(value: unknown, seen = new Set<object>()): J
 	try {
 		if (Array.isArray(value)) return Array.from(value, (entry) => toProtocolJsonValue(entry, seen));
 		const result: Record<string, JsonValue> = {};
-		for (const [key, entry] of Object.entries(value)) result[key] = toProtocolJsonValue(entry, seen);
+		for (const [key, entry] of Object.entries(value)) {
+			Object.defineProperty(result, key, {
+				value: toProtocolJsonValue(entry, seen),
+				enumerable: true,
+				writable: true,
+				configurable: true,
+			});
+		}
 		return result;
 	} finally {
 		seen.delete(value);
@@ -168,7 +175,7 @@ export function sanitizeProtocolDetails(value: unknown, seen = new Set<object>()
 	if (typeof value === "number") return Number.isFinite(value) ? value : String(value);
 	if (typeof value === "bigint") return value.toString();
 	if (value === undefined || typeof value === "function" || typeof value === "symbol") return undefined;
-	if (value instanceof Date) return value.toISOString();
+	if (value instanceof Date) return Number.isNaN(value.getTime()) ? "Invalid Date" : value.toISOString();
 	if (typeof value !== "object") return String(value);
 	if (seen.has(value)) return "[Circular]";
 	seen.add(value);
@@ -177,7 +184,14 @@ export function sanitizeProtocolDetails(value: unknown, seen = new Set<object>()
 		const result: Record<string, JsonValue> = {};
 		for (const [key, entry] of Object.entries(value)) {
 			const normalized = sanitizeProtocolDetails(entry, seen);
-			if (normalized !== undefined) result[key] = normalized;
+			if (normalized !== undefined) {
+				Object.defineProperty(result, key, {
+					value: normalized,
+					enumerable: true,
+					writable: true,
+					configurable: true,
+				});
+			}
 		}
 		return result;
 	} finally {

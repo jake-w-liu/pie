@@ -11,6 +11,7 @@ import {
 	isWhitespaceChar,
 	sliceByColumn,
 	visibleWidth,
+	wrapTextWithAnsi,
 } from "../utils.ts";
 import { findWordBackward, findWordForward } from "../word-navigation.ts";
 import { SelectList, type SelectListLayoutOptions, type SelectListTheme } from "./select-list.ts";
@@ -161,12 +162,20 @@ export function wordWrapLine(line: string, maxWidth: number, preSegmented?: Intl
 		}
 
 		if (gWidth > maxWidth) {
-			// Single atomic segment wider than maxWidth (e.g. paste marker
-			// in a narrow terminal). Re-wrap it at grapheme granularity.
+			const subSegments = [...graphemeSegmenter.segment(grapheme)];
+			if (subSegments.length === 1) {
+				// Indivisible: retain the source range for editing and render a narrow
+				// placeholder later. Recursing here would repeat the same arguments.
+				chunkStart = charIndex + grapheme.length;
+				chunks.push({ text: grapheme, startIndex: charIndex, endIndex: chunkStart });
+				currentWidth = 0;
+				continue;
+			}
+			// Composite atomic segment (e.g. paste marker): split only its layout.
 
 			// The segment remains logically atomic for cursor
 			// movement / editing — the split is purely visual for word-wrap layout.
-			const subChunks = wordWrapLine(grapheme, maxWidth);
+			const subChunks = wordWrapLine(grapheme, maxWidth, subSegments);
 			for (let j = 0; j < subChunks.length - 1; j++) {
 				const sc = subChunks[j]!;
 				chunks.push({ text: sc.text, startIndex: charIndex + sc.startIndex, endIndex: charIndex + sc.endIndex });
@@ -200,7 +209,9 @@ export function wordWrapLine(line: string, maxWidth: number, preSegmented?: Intl
 	}
 
 	// Push final chunk.
-	chunks.push({ text: line.slice(chunkStart), startIndex: chunkStart, endIndex: line.length });
+	if (chunkStart < line.length) {
+		chunks.push({ text: line.slice(chunkStart), startIndex: chunkStart, endIndex: line.length });
+	}
 
 	return chunks;
 }
@@ -504,6 +515,25 @@ export class Editor implements Component, Focusable {
 
 		// Layout the text
 		const layoutLines = this.layoutText(layoutWidth);
+		// A one-cell terminal cannot reserve a separate end-cursor column. Give
+		// the cursor its own row instead of overwriting text or overflowing.
+		const endCursorLine = layoutLines.findIndex(
+			(line) =>
+				line.hasCursor &&
+				line.cursorPos === line.text.length &&
+				Math.min(visibleWidth(line.text), layoutWidth) >= width - paddingX,
+		);
+		if (endCursorLine >= 0) {
+			const line = layoutLines[endCursorLine]!;
+			line.hasCursor = false;
+			layoutLines.splice(endCursorLine + 1, 0, {
+				text: "",
+				hasCursor: true,
+				cursorPos: 0,
+				bufferLine: line.bufferLine,
+				startIndex: line.startIndex + line.text.length,
+			});
+		}
 
 		// Calculate max visible lines: 30% of terminal height, minimum 5 lines
 		const terminalRows = this.tui.terminal.rows;
@@ -557,13 +587,21 @@ export class Editor implements Component, Focusable {
 
 		for (const layoutLine of visibleLines) {
 			let displayText = layoutLine.text;
-			let lineVisibleWidth = visibleWidth(layoutLine.text);
+			let lineVisibleWidth = visibleWidth(displayText);
+			let cursorPos = layoutLine.cursorPos;
+			if (lineVisibleWidth > layoutWidth) {
+				// wordWrapLine isolates indivisible over-wide graphemes. Keep its
+				// source offsets and use the shared wrapper's visual fallback only.
+				displayText = wrapTextWithAnsi(displayText, layoutWidth)[0]!;
+				lineVisibleWidth = visibleWidth(displayText);
+				if (cursorPos !== undefined && cursorPos > 0) cursorPos = displayText.length;
+			}
 			let cursorInPadding = false;
 
 			// Add cursor if this line has it
-			if (layoutLine.hasCursor && layoutLine.cursorPos !== undefined) {
-				const before = displayText.slice(0, layoutLine.cursorPos);
-				const after = displayText.slice(layoutLine.cursorPos);
+			if (layoutLine.hasCursor && cursorPos !== undefined) {
+				const before = displayText.slice(0, cursorPos);
+				const after = displayText.slice(cursorPos);
 
 				// Hardware cursor marker (zero-width, emitted before fake cursor for IME positioning)
 				const marker = emitCursorMarker ? CURSOR_MARKER : "";
@@ -1119,7 +1157,9 @@ export class Editor implements Component, Focusable {
 		let bestIndex = 0;
 		let bestDist = col;
 		for (const seg of this.segment(text, "grapheme")) {
-			pos += visibleWidth(seg.segment);
+			// An indivisible grapheme wider than the layout is displayed in one cell.
+			const segmentWidth = visibleWidth(seg.segment);
+			pos += segmentWidth > this.lastWidth && !isPasteMarker(seg.segment) ? 1 : segmentWidth;
 			const index = seg.index + seg.segment.length;
 			const dist = Math.abs(col - pos);
 			if (dist < bestDist) {

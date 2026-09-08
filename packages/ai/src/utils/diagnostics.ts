@@ -1,3 +1,5 @@
+import { safeJsonStringify } from "./error-body.ts";
+
 export interface DiagnosticErrorInfo {
 	name?: string;
 	message: string;
@@ -13,9 +15,14 @@ export interface AssistantMessageDiagnostic {
 }
 
 export function formatThrownValue(value: unknown): string {
-	if (value instanceof Error) return value.message || value.name;
-	if (typeof value === "string") return value;
-	return String(value);
+	try {
+		if (value instanceof Error) return value.message || value.name;
+		if (typeof value === "string") return value;
+		return String(value);
+	} catch {
+		// Formatting an opaque rejection must not interrupt failure settlement.
+		return safeJsonStringify(value);
+	}
 }
 
 export function extractDiagnosticError(error: unknown): DiagnosticErrorInfo {

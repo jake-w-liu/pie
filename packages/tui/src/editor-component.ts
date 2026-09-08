@@ -13,7 +13,7 @@ export interface EditorComponent extends Component {
 	// Core text access (required)
 	// =========================================================================
 
-	/** Get the current text content */
+	/** Get editor-local text, which may contain private display markers. */
 	getText(): string;
 
 	/** Set the text content */
@@ -48,7 +48,9 @@ export interface EditorComponent extends Component {
 
 	/**
 	 * Get text with any markers expanded (e.g., paste markers).
-	 * Falls back to getText() if not implemented.
+	 * Hosts use this when exporting or transferring text to another editor,
+	 * falling back to getText() if not implemented. Simply remounting the same
+	 * editor should not call setText(), which may reset private editing state.
 	 */
 	getExpandedText?(): string;
 

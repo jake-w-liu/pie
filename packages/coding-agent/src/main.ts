@@ -733,7 +733,23 @@ export async function main(args: string[], options?: MainOptions) {
 	const { migratedAuthProviders: migratedProviders, deprecationWarnings } = runMigrations(cwd);
 	time("runMigrations");
 
-	const startupSettingsManager = SettingsManager.create(cwd, agentDir);
+	const trustStore = new ProjectTrustStore(agentDir);
+	// Session storage is selected before runtime trust hooks/prompts. Only an
+	// already-authorized project may influence that selection; later approval
+	// must not retroactively move the session to different storage.
+	const startupProjectTrusted = await resolveProjectTrusted({
+		cwd,
+		trustStore,
+		trustOverride: parsed.projectTrustOverride,
+		defaultProjectTrust: bootstrapSettingsManager.getDefaultProjectTrust(),
+		projectTrustContext: createProjectTrustContext({
+			cwd,
+			mode: "print",
+			settingsManager: bootstrapSettingsManager,
+			hasUI: false,
+		}),
+	});
+	const startupSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: startupProjectTrusted });
 	const startupSettingsDiagnostics = collectSettingsDiagnostics(startupSettingsManager);
 
 	if (shouldFastPrintCoreHelp(parsed)) {
@@ -788,7 +804,6 @@ export async function main(args: string[], options?: MainOptions) {
 	await exitOnPreRuntimeCliModelError(parsed, sessionManager.getCwd(), agentDir, startupSettingsManager);
 	time("createSessionManager");
 
-	const trustStore = new ProjectTrustStore(agentDir);
 	const sessionCwd = sessionManager.getCwd();
 	const autoTrustOnReloadCwd =
 		parsed.projectTrustOverride === undefined && !hasTrustRequiringProjectResources(sessionCwd)

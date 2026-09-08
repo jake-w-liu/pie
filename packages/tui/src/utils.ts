@@ -829,10 +829,11 @@ function splitIntoTokensWithAnsi(text: string): string[] {
  *
  * ONLY does word wrapping - NO padding, NO background colors.
  * Returns lines where each line is <= width visible chars.
- * Active ANSI codes are preserved across line breaks.
+ * Active ANSI codes are preserved across line breaks. An indivisible grapheme
+ * wider than the line is displayed as a one-cell replacement character (U+FFFD).
  *
  * @param text - Text to wrap (may contain ANSI codes and newlines)
- * @param width - Maximum visible width per line
+ * @param width - Positive maximum visible width per line
  * @returns Array of wrapped lines (NOT padded to width)
  */
 // Memoized wrapping for streaming re-renders. wrapTextWithAnsi is a pure
@@ -866,10 +867,14 @@ export function wrapTextWithAnsi(text: string, width: number): string[] {
 		const cached = wrapCache.get(key);
 		if (cached) return cached as string[];
 		const result = Object.freeze(wrapTextWithAnsiUncached(text, width));
-		while (wrapCache.size >= WRAP_CACHE_MAX_ENTRIES) wrapCacheEvict();
-		for (const line of result) wrapCacheChars += line.length;
-		while (wrapCacheChars > WRAP_CACHE_MAX_CHARS) wrapCacheEvict();
+		const resultChars = result.reduce((total, line) => total + line.length, 0);
+		// Reopened ANSI hyperlinks can expand short input beyond the entire cache budget.
+		if (resultChars > WRAP_CACHE_MAX_CHARS) return result as string[];
+		while (wrapCache.size >= WRAP_CACHE_MAX_ENTRIES || wrapCacheChars + resultChars > WRAP_CACHE_MAX_CHARS) {
+			wrapCacheEvict();
+		}
 		wrapCache.set(key, result);
+		wrapCacheChars += resultChars;
 		return result as string[];
 	}
 	return wrapTextWithAnsiUncached(text, width);
@@ -900,6 +905,29 @@ function wrapTextWithAnsiUncached(text: string, width: number): string[] {
 	return result.length > 0 ? result : [""];
 }
 
+function clipWhitespaceToken(token: string, width: number, tracker: AnsiCodeTracker): { text: string; width: number } {
+	let text = "";
+	let usedWidth = 0;
+	let i = 0;
+	while (i < token.length) {
+		const ansi = extractAnsiCode(token, i);
+		if (ansi) {
+			text += ansi.code;
+			tracker.process(ansi.code);
+			i += ansi.length;
+			continue;
+		}
+		const character = String.fromCodePoint(token.codePointAt(i)!);
+		const characterWidth = visibleWidth(character);
+		if (usedWidth + characterWidth <= width) {
+			text += character;
+			usedWidth += characterWidth;
+		}
+		i += character.length;
+	}
+	return { text, width: usedWidth };
+}
+
 function wrapSingleLine(line: string, width: number): string[] {
 	if (!line) {
 		return [""];
@@ -923,9 +951,19 @@ function wrapSingleLine(line: string, width: number): string[] {
 		// indentation) is still whitespace and must not start a wrapped line.
 		const isWhitespace = stripTerminalSequences(token).trim() === "";
 
+		if (isWhitespace && tokenVisibleLength > width && currentVisibleLength === 0) {
+			// Clip oversized indentation, not later text. Keep every control sequence,
+			// including resets beyond the clipped spaces and unclosed backgrounds.
+			const clipped = clipWhitespaceToken(token, width, tracker);
+			currentLine += clipped.text;
+			currentVisibleLength = clipped.width;
+			continue;
+		}
+
 		// Token itself is too long - break it character by character
 		if (tokenVisibleLength > width && !isWhitespace) {
-			if (currentLine) {
+			const word = currentVisibleLength === 0 ? currentLine + token : token;
+			if (currentVisibleLength > 0) {
 				// Add specific reset for underline only (preserves background)
 				const lineEndReset = tracker.getLineEndReset();
 				if (lineEndReset) {
@@ -937,7 +975,7 @@ function wrapSingleLine(line: string, width: number): string[] {
 			}
 
 			// Break long token - breakLongWord handles its own resets
-			const broken = breakLongWord(token, width, tracker);
+			const broken = breakLongWord(word, width, tracker);
 			for (let i = 0; i < broken.length - 1; i++) {
 				wrapped.push(broken[i]!);
 			}
@@ -958,10 +996,9 @@ function wrapSingleLine(line: string, width: number): string[] {
 			}
 			wrapped.push(lineToWrap);
 			if (isWhitespace) {
-				// Don't start new line with whitespace (drop the spaces but keep
-				// any style codes the token carries for the following content).
-				updateTrackerFromText(token, tracker);
-				currentLine = tracker.getActiveCodes();
+				// Preserve the actual controls as well as inherited styles. An empty
+				// post-reset prefix cannot undo styles already emitted to the terminal.
+				currentLine = tracker.getActiveCodes() + clipWhitespaceToken(token, 0, tracker).text;
 				currentVisibleLength = 0;
 				continue;
 			} else {
@@ -978,8 +1015,9 @@ function wrapSingleLine(line: string, width: number): string[] {
 	}
 
 	if (currentLine) {
-		// No reset at end of final line - let caller handle it
-		wrapped.push(currentLine);
+		// A control-only tail belongs to the final row, not a new empty row.
+		if (currentVisibleLength === 0 && wrapped.length > 0) wrapped[wrapped.length - 1] += currentLine;
+		else wrapped.push(currentLine);
 	}
 
 	// Trailing whitespace can cause lines to exceed the requested width
@@ -1042,13 +1080,19 @@ function breakLongWord(word: string, width: number, tracker: AnsiCodeTracker): s
 			continue;
 		}
 
-		const grapheme = seg.value;
+		let grapheme = seg.value;
 		// Skip empty graphemes to avoid issues with string-width calculation
 		if (!grapheme) continue;
 
-		const graphemeWidth = visibleWidth(grapheme);
+		let graphemeWidth = visibleWidth(grapheme);
+		if (graphemeWidth > width) {
+			// A grapheme cannot be split across terminal rows. Use a one-cell
+			// visual placeholder; callers retain the original text for wider renders.
+			grapheme = "\ufffd";
+			graphemeWidth = 1;
+		}
 
-		if (currentWidth + graphemeWidth > width) {
+		if (currentWidth > 0 && currentWidth + graphemeWidth > width) {
 			// Add specific reset for underline only (preserves background)
 			const lineEndReset = tracker.getLineEndReset();
 			if (lineEndReset) {

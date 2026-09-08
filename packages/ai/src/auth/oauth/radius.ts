@@ -22,6 +22,7 @@ import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../typ
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 import { oauthErrorHtml, oauthSuccessHtml } from "./oauth-page.ts";
 import { generatePKCE } from "./pkce.ts";
+import { parseOAuthTokenResponse } from "./token-response.ts";
 
 const CALLBACK_HOST = "127.0.0.1";
 const CALLBACK_PORT = 1456;
@@ -123,12 +124,7 @@ async function requestOAuthToken(
 		throw await readOAuthResponseError(response, "Radius OAuth token request failed");
 	}
 
-	const data = (await response.json()) as {
-		access_token: string;
-		refresh_token: string;
-		expires_in: number;
-		scope?: string;
-	};
+	const data = parseOAuthTokenResponse(await response.json(), "Radius OAuth token");
 
 	return {
 		type: "oauth",
@@ -145,6 +141,7 @@ type OAuthCallbackServer = {
 };
 
 function startOAuthCallbackServer(expectedState: string, signal: AbortSignal): Promise<OAuthCallbackServer> {
+	signal.throwIfAborted();
 	if (!_http) {
 		throw new Error("Radius OAuth is only available in Node.js environments");
 	}
@@ -237,14 +234,15 @@ async function loginWithBrowser(
 	}).toString();
 
 	const callbackServer = await startOAuthCallbackServer(state, interaction.signal);
-	interaction.notify({ type: "progress", message: `Listening for OAuth callback on ${REDIRECT_URI}` });
-	interaction.notify({
-		type: "auth_url",
-		url: authorizeUrl.toString(),
-		instructions: "Continue in your browser.",
-	});
-
 	try {
+		interaction.signal.throwIfAborted();
+		interaction.notify({ type: "progress", message: `Listening for OAuth callback on ${REDIRECT_URI}` });
+		interaction.notify({
+			type: "auth_url",
+			url: authorizeUrl.toString(),
+			instructions: "Continue in your browser.",
+		});
+
 		const code = await callbackServer.waitForCode();
 		if (!code) {
 			if (interaction.signal.aborted) {
@@ -252,6 +250,7 @@ async function loginWithBrowser(
 			}
 			throw new Error("OAuth callback did not complete.");
 		}
+		interaction.signal.throwIfAborted();
 		return await requestOAuthToken(
 			gateway,
 			new URLSearchParams({
@@ -361,6 +360,7 @@ export function createRadiusOAuth(options: RadiusOAuthOptions): OAuthAuth {
 		name: options.name,
 
 		async login(interaction): Promise<OAuthCredential> {
+			interaction.signal.throwIfAborted();
 			const loginMethod = await interaction.prompt({
 				type: "select",
 				message: `Sign in to ${options.name}:`,
@@ -372,6 +372,7 @@ export function createRadiusOAuth(options: RadiusOAuthOptions): OAuthAuth {
 					},
 				],
 			});
+			interaction.signal.throwIfAborted();
 
 			if (loginMethod === LOGIN_METHOD_DEVICE_CODE) {
 				return loginWithDeviceCode(gateway, interaction);

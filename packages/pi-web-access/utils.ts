@@ -1,8 +1,9 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { spawn } from "node:child_process";
+import { fetchWithResponseErrors } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { homedir, hostname, tmpdir } from "node:os";
+import { homedir, hostname } from "node:os";
+// Select the pinned npm transport, not Bun's bare-specifier compatibility shim.
+import { Agent, Pool, ProxyAgent, Request as UndiciRequest, fetch as undiciFetch, type Dispatcher, type RequestInit as UndiciRequestInit } from "undici/index.js";
 import { join } from "node:path";
 
 export function getWebSearchConfigDir(): string {
@@ -76,6 +77,7 @@ export async function fetchWithCredentialRedirects(
 
 		const location = response.headers.get("location");
 		if (!location) return response;
+		await response.body?.cancel();
 		if (redirects === MAX_API_REDIRECTS) {
 			throw new Error(`Too many API redirects from ${url}`);
 		}
@@ -214,13 +216,6 @@ export function normalizeProxyUrl(value: unknown, source: string): string | null
 	return parsed.toString();
 }
 
-function redactProxyUrl(value: string): string {
-	const parsed = new URL(value);
-	if (parsed.username) parsed.username = "redacted";
-	if (parsed.password) parsed.password = "redacted";
-	return parsed.toString();
-}
-
 function loadConfiguredProxy(): string | null {
 	let configured: unknown;
 	const path = getWebSearchConfigPath();
@@ -253,29 +248,50 @@ export function hasScopedProxyDecision(): boolean {
 	return proxyStorage.getStore() !== undefined;
 }
 
-function noProxyEntryMatches(hostname: string, entry: string): boolean {
+function noProxyEntryMatches(url: URL, entry: string): boolean {
 	if (!entry) return false;
 	if (entry === "*") return true;
 	let host = entry;
+	let port: string | undefined;
 	if (host.startsWith("[")) {
 		const close = host.indexOf("]");
-		if (close > 0) host = host.slice(0, close + 1);
+		if (close > 0) {
+			if (/^:\d+$/.test(host.slice(close + 1))) port = host.slice(close + 2);
+			host = host.slice(0, close + 1);
+		}
 	} else {
 		const colon = host.lastIndexOf(":");
-		if (colon > -1 && /^\d+$/.test(host.slice(colon + 1))) host = host.slice(0, colon);
+		if (colon > -1 && /^\d+$/.test(host.slice(colon + 1))) {
+			port = host.slice(colon + 1);
+			host = host.slice(0, colon);
+		}
 	}
-	host = host.toLowerCase().replace(/^\[|\]$/g, "");
-	if (!host) return false;
-	return hostname === host || hostname.endsWith(host.startsWith(".") ? host : `.${host}`);
+	if (port && port !== (url.port || (url.protocol === "https:" ? "443" : "80"))) return false;
+	host = host.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "").replace(/^\*\./, ".");
+	const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+	return Boolean(host) && (hostname === host.replace(/^\./, "") || hostname.endsWith(host.startsWith(".") ? host : `.${host}`));
 }
 
 /** True when a URL must NOT be sent through the active proxy. */
 export function isProxyBypassedUrl(url: URL): boolean {
-	const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+	const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
 	if (hostname === "localhost" || hostname.endsWith(".localhost") || hostname === "127.0.0.1" || hostname === "::1") return true;
 	const noProxy = process.env.NO_PROXY || process.env.no_proxy;
-	if (noProxy && noProxy.split(",").some((entry) => noProxyEntryMatches(hostname, entry.trim()))) return true;
-	return false;
+	return Boolean(noProxy?.split(",").some(entry => noProxyEntryMatches(url, entry.trim())));
+}
+
+/** One proxy decision shared by validation and transport, including explicit direct overrides. */
+export function getProxyForUrl(url: URL, explicit?: string): string | null {
+	const selected = explicit !== undefined ? normalizeProxyUrl(explicit, "proxy") : getActiveProxy();
+	if (isProxyBypassedUrl(url)) return null;
+	if (explicit !== undefined || hasScopedProxyDecision() || selected) return selected;
+	const candidates = url.protocol === "https:"
+		? [process.env.HTTPS_PROXY, process.env.https_proxy, process.env.HTTP_PROXY, process.env.http_proxy, process.env.ALL_PROXY, process.env.all_proxy]
+		: [process.env.HTTP_PROXY, process.env.http_proxy, process.env.ALL_PROXY, process.env.all_proxy];
+	for (const candidate of candidates) {
+		if (candidate?.trim()) return normalizeProxyUrl(candidate, "environment proxy");
+	}
+	return null;
 }
 
 export interface ProxiedRequestInit extends RequestInit {
@@ -288,209 +304,58 @@ interface ProxiedFetch {
 	__piWebAccessProxyFetch?: boolean;
 }
 
-/** Wraps globalThis.fetch so every http(s) call routes through curl while a proxy is active. Idempotent. */
+/**
+ * Uses the imported transport, never a possibly dispatcher-ignoring global fetch.
+ * Each dispatcher is request-owned; close drains the streaming response, including cancellation.
+ */
+export async function fetchWithDispatcher(url: string | URL | UndiciRequest, init: RequestInit, dispatcher: Dispatcher): Promise<Response> {
+	try {
+		const signal = init.signal !== undefined ? init.signal : typeof url === "string" || url instanceof URL ? undefined : url.signal;
+		const response = await fetchWithResponseErrors(dispatcher, async (observed) =>
+			await undiciFetch(url, { ...init, dispatcher: observed } as UndiciRequestInit) as Response, signal);
+		// close is nonblocking until this response ends/cancels; no body buffering or tee.
+		void dispatcher.close();
+		return response as Response;
+	} catch (error) {
+		await dispatcher.destroy();
+		throw error;
+	}
+}
+
+/** Wrap global fetch only for configured/scoped proxies; provider calls are not SSRF-gated. */
 export function installGlobalProxyFetch(): void {
 	const current = globalThis.fetch as ProxiedFetch;
 	if (typeof current !== "function" || current.__piWebAccessProxyFetch === true) return;
-	const nativeFetch = current;
-	const wrapped: ProxiedFetch = ((input: RequestInfo | URL, init?: ProxiedRequestInit) => {
-		// Prefer caller-attached __proxy (survives pLimit context loss) over AsyncLocalStorage.
-		const proxy = init?.__proxy ?? getActiveProxy();
-		if (!proxy) return nativeFetch(input, init);
-		let url: URL | null = null;
+	const wrapped: ProxiedFetch = async (input, init) => {
+		const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
+		const proxy = init?.__proxy !== undefined ? normalizeProxyUrl(init.__proxy, "proxy") : getActiveProxy();
+		const hasDecision = init?.__proxy !== undefined || hasScopedProxyDecision() || proxy !== null;
+		if (!hasDecision || (url.protocol !== "http:" && url.protocol !== "https:")) return current(input, init);
+		const dispatcher = new Agent({
+			// Fetch handles redirects and credentials; transport rechecks bypass on every origin.
+			// A direct decision must not fall through to the host's environment proxy dispatcher.
+			factory: origin => !proxy || isProxyBypassedUrl(new URL(origin)) ? new Pool(origin) : new ProxyAgent(proxy),
+		});
+		if (typeof input === "string" || input instanceof URL || input instanceof UndiciRequest) {
+			return fetchWithDispatcher(input, init ?? {}, dispatcher);
+		}
 		try {
-			url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
-		} catch {
-			url = null;
+			// Preserve the original Request's opaque replayable body and keepalive
+			// metadata through its compatible captured fetch, including different npm
+			// Undici versions. Native Bun honors proxy; npm/Node honor dispatcher.
+			// Supplying both avoids guessing which implementation the host installed.
+			const signal = init?.signal !== undefined ? init.signal : input.signal;
+			const response = await fetchWithResponseErrors(dispatcher, (observed) => {
+				const requestInit = { ...init, dispatcher: observed, proxy: proxy && !isProxyBypassedUrl(url) ? proxy : "" };
+				return current(input, requestInit);
+			}, signal);
+			void dispatcher.close();
+			return response;
+		} catch (error) {
+			await dispatcher.destroy();
+			throw error;
 		}
-		if (!url || (url.protocol !== "http:" && url.protocol !== "https:") || isProxyBypassedUrl(url)) {
-			return nativeFetch(input, init);
-		}
-		return fetchViaCurl(url, init ?? {}, proxy);
-	});
+	};
 	wrapped.__piWebAccessProxyFetch = true;
 	globalThis.fetch = wrapped;
-}
-
-function parseHeaderDump(dump: string): { status: number; statusText: string; headers: Array<[string, string]> } {
-	const blocks = dump.split(/\r?\n\r?\n/).filter((block) => /^HTTP\/[\d.]+\s+\d{3}/.test(block.trim()));
-	const block = (blocks.length > 0 ? blocks[blocks.length - 1] : "").trim();
-	const lines = block.split(/\r?\n/);
-	let status = 0;
-	let statusText = "";
-	const headers: Array<[string, string]> = [];
-	for (const line of lines) {
-		const match = /^HTTP\/[\d.]+\s+(\d{3})(?:\s+(.*))?$/.exec(line.trim());
-		if (match) {
-			status = Number(match[1]);
-			statusText = match[2] ?? "";
-			headers.length = 0;
-			continue;
-		}
-		const separator = line.indexOf(":");
-		if (separator > 0) {
-			const name = line.slice(0, separator).trim();
-			if (name.toLowerCase() === "content-encoding" || name.toLowerCase() === "content-length") continue;
-			headers.push([name, line.slice(separator + 1).trim()]);
-		}
-	}
-	return { status, statusText, headers };
-}
-
-class CurlTransportError extends Error {}
-
-async function fetchViaCurl(url: URL, init: RequestInit, proxyUrl: string): Promise<Response> {
-	let current = url;
-	let currentInit = init;
-	for (let redirects = 0; ; redirects++) {
-		const response = await fetchViaCurlOnce(current, currentInit, proxyUrl);
-		const location = response.headers.get("location");
-		if (!location || ![301, 302, 303, 307, 308].includes(response.status)) {
-			if (redirects > 0) Object.defineProperty(response, "redirected", { value: true, configurable: true });
-			return response;
-		}
-		if (currentInit.redirect === "manual") return response;
-		if (currentInit.redirect === "error") throw new TypeError(`Proxy fetch redirect blocked from ${current.toString()}`);
-		if (redirects === 20) throw new Error(`Too many proxy redirects from ${url.toString()}`);
-
-		const next = new URL(location, current);
-		if (next.protocol !== "http:" && next.protocol !== "https:") throw new Error(`Proxy redirect from ${current.origin} must use HTTP(S)`);
-
-		let headers = new Headers(currentInit.headers);
-		let nextInit: RequestInit;
-		const method = currentInit.method?.toUpperCase() ?? "GET";
-		if (((response.status === 301 || response.status === 302) && method === "POST") || (response.status === 303 && method !== "GET" && method !== "HEAD")) {
-			for (const name of ["Content-Encoding", "Content-Language", "Content-Location", "Content-Type"]) headers.delete(name);
-			const { body: _body, ...withoutBody } = currentInit;
-			nextInit = { ...withoutBody, method: "GET", headers };
-		} else {
-			nextInit = { ...currentInit, headers };
-		}
-
-		if (next.origin !== current.origin) {
-			headers = new Headers();
-			nextInit = { ...nextInit, headers };
-		}
-		current = next;
-		currentInit = nextInit;
-	}
-}
-
-async function fetchViaCurlOnce(url: URL, init: RequestInit, proxyUrl: string): Promise<Response> {
-	const method = (init.method ?? "GET").toUpperCase();
-	const headers = new Headers(init.headers);
-
-	const dir = await mkdtemp(join(tmpdir(), "pi-ext-web-access-proxy-"));
-	const headerFile = join(dir, "headers");
-	const bodyFile = join(dir, "body");
-	const requestBodyFile = join(dir, "request-body");
-
-	const args: string[] = [
-		"--silent",
-		"--show-error",
-		"--compressed",
-		"--connect-timeout", "20",
-		"-x", proxyUrl,
-		"-D", headerFile,
-		"--output", bodyFile,
-		"--write-out", "%{json}",
-	];
-
-	if (method !== "GET" && method !== "HEAD") args.push("-X", method);
-
-	for (const [name, value] of headers.entries()) {
-		if (value === "") continue;
-		args.push("-H", `${name}: ${value}`);
-	}
-
-	const body = init.body;
-	if (body !== undefined && body !== null) {
-		let buffer: Buffer;
-		if (typeof body === "string") buffer = Buffer.from(body, "utf-8");
-		else if (body instanceof URLSearchParams) buffer = Buffer.from(body.toString(), "utf-8");
-		else if (body instanceof ArrayBuffer) buffer = Buffer.from(body);
-		else if (ArrayBuffer.isView(body)) buffer = Buffer.from(body.buffer, body.byteOffset, body.byteLength);
-		else throw new Error(`Unsupported request body type for proxy fetch: ${typeof body}`);
-		await writeFile(requestBodyFile, buffer);
-		args.push("--data-binary", `@${requestBodyFile}`);
-		if (method === "GET") args.unshift("-X", "GET");
-	}
-
-	args.push(url.toString());
-
-	const signal = init.signal ?? null;
-	let stdout: string;
-	try {
-		stdout = await new Promise<string>((resolve, reject) => {
-			if (signal?.aborted) {
-				reject(new DOMException("The operation was aborted.", "AbortError"));
-				return;
-			}
-			const child = spawn("curl", args, { windowsHide: true });
-			let out = "";
-			let stderr = "";
-			const onAbort = () => { try { child.kill(); } catch {} };
-			if (signal) {
-				signal.addEventListener("abort", onAbort, { once: true });
-			}
-			child.stdout?.on("data", (chunk: Buffer) => { out += chunk.toString("utf-8"); });
-			child.stderr?.on("data", (chunk: Buffer) => { if (stderr.length < 4096) stderr += chunk.toString("utf-8"); });
-			child.once("error", (err: NodeJS.ErrnoException) => {
-				signal?.removeEventListener("abort", onAbort);
-				reject(new CurlTransportError(err.code === "ENOENT"
-					? "curl executable not found on PATH; proxy transport requires curl"
-					: `curl failed to start: ${err.message}`));
-			});
-			child.once("close", (code) => {
-				signal?.removeEventListener("abort", onAbort);
-				if (signal?.aborted) return reject(new DOMException("The operation was aborted.", "AbortError"));
-				if (code !== 0 && !out.trim()) {
-					return reject(new CurlTransportError(`curl exited with code ${code ?? "unknown"} via ${redactProxyUrl(proxyUrl)}${stderr.trim() ? `: ${stderr.trim()}` : ""}`));
-				}
-				resolve(out);
-			});
-		});
-	} catch (err) {
-		await rm(dir, { recursive: true, force: true }).catch(() => {});
-		if (err instanceof CurlTransportError) throw new Error(err.message);
-		throw err;
-	}
-
-	let bodyBuffer = Buffer.alloc(0);
-	let dump = "";
-	try {
-		[dump, bodyBuffer] = await Promise.all([readFile(headerFile, "utf-8"), readFile(bodyFile)]);
-	} catch {
-		// HEAD or empty responses may not produce output files.
-	} finally {
-		await rm(dir, { recursive: true, force: true }).catch(() => {});
-	}
-
-	const { status, statusText, headers: responseHeaders } = parseHeaderDump(dump);
-	if (status === 0) {
-		throw new Error(`Proxy fetch to ${url.toString()} via ${redactProxyUrl(proxyUrl)} returned no HTTP status`);
-	}
-
-	let finalUrl = url.toString();
-	let redirected = false;
-	try {
-		const trimmed = stdout.trim();
-		if (trimmed.startsWith("{")) {
-			const writeOut = JSON.parse(trimmed) as { url_effective?: string; num_redirects?: number };
-			if (writeOut.url_effective) finalUrl = writeOut.url_effective;
-			redirected = (writeOut.num_redirects ?? 0) > 0;
-		}
-	} catch {
-		// Older curl without %{json}; the header dump already provided the status.
-	}
-
-	const nullBody = status === 204 || status === 205 || status === 304;
-	const response = new Response(nullBody ? null : new Uint8Array(bodyBuffer), {
-		status,
-		statusText: statusText || undefined,
-		headers: new Headers(responseHeaders),
-	});
-	Object.defineProperty(response, "url", { value: finalUrl, configurable: true });
-	Object.defineProperty(response, "redirected", { value: redirected, configurable: true });
-	return response;
 }

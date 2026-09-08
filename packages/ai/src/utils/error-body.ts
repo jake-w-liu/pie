@@ -179,6 +179,10 @@ export function safeJsonStringify(value: unknown): string {
 		const serialized = JSON.stringify(value);
 		return serialized === undefined ? String(value) : serialized;
 	} catch {
-		return String(value);
+		try {
+			return String(value);
+		} catch {
+			return "Unserializable thrown value";
+		}
 	}
 }

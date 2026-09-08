@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { finished } from "node:stream/promises";
 import type { ExternalProcessStatus } from "../../shared/types.ts";
+import { attachPostExitStdioGuard } from "../../shared/post-exit-stdio-guard.ts";
 import { createOwnedProcessTreeController, type OwnedProcessTreeController } from "../background/owned-process-tree.ts";
 import { omitExtensionBindingsEnv } from "./extension-bindings.ts";
 import {
@@ -335,6 +336,7 @@ export function runExternalCli(input: {
 			windowsHide: true,
 			detached: process.platform !== "win32",
 		}) as ChildProcessWithoutNullStreams;
+		const clearStdioGuard = attachPostExitStdioGuard(child, { idleMs: 2000, hardMs: 8000 });
 		if (typeof child.pid === "number") {
 			processPid = child.pid;
 			processTree = createOwnedProcessTreeController(child.pid, { termGraceMs: 2_000 });
@@ -364,7 +366,10 @@ export function runExternalCli(input: {
 		child.stdin.end(input.promptFilePath ? undefined : input.prompt);
 		let spawnError: Error | undefined;
 		child.once("error", (error) => { spawnError = error; });
-		child.stdout.once("end", () => {
+		let parserFinished = false;
+		const finishParser = () => {
+			if (parserFinished) return;
+			parserFinished = true;
 			if (!input.parser || parserError) return;
 			if (pendingLineBytes > 0) finishPendingLine();
 			try {
@@ -373,8 +378,12 @@ export function runExternalCli(input: {
 				else if (Buffer.byteLength(parserTerminal.output ?? "", "utf-8") > limits.parserOutputBytes) failParser(new Error("External CLI parser terminal output exceeded its byte limit."));
 				else if (Buffer.byteLength(parserTerminal.error ?? "", "utf-8") > 4 * 1024) failParser(new Error("External CLI parser terminal error exceeded its byte limit."));
 			} catch (error) { failParser(error); }
-		});
+		};
+		child.stdout.once("end", finishParser);
 		child.once("close", (exitCode, signal) => {
+			clearStdioGuard();
+			// A guarded pipe is destroyed, not ended; finalize its bounded tail too.
+			finishParser();
 			settled = true;
 			if (progressTimer) clearTimeout(progressTimer);
 			flushProgress();

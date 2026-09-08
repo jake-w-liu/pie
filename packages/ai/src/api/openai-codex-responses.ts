@@ -20,6 +20,7 @@ import type {
 	StreamOptions,
 	Usage,
 } from "../types.ts";
+import { operationSignal } from "../utils/abort.ts";
 import { combineAbortSignals } from "../utils/abort-signals.ts";
 import { splitDeferredTools } from "../utils/deferred-tools.ts";
 import {
@@ -30,8 +31,11 @@ import {
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
+import { cancelResponseBody } from "../utils/http-response.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
+import { sleep as abortableSleep } from "../utils/sleep.ts";
+import { iterateSseMessages } from "../utils/sse.ts";
 import { uuidv7 } from "../utils/uuid.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
@@ -168,18 +172,13 @@ function validateRetryDelayMs(delayMs: number, options?: StreamOptions): number 
 	return delayMs;
 }
 
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-	return new Promise((resolve, reject) => {
-		if (signal?.aborted) {
-			reject(new Error("Request was aborted"));
-			return;
-		}
-		const timeout = setTimeout(resolve, ms);
-		signal?.addEventListener("abort", () => {
-			clearTimeout(timeout);
-			reject(new Error("Request was aborted"));
-		});
-	});
+async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+	try {
+		await abortableSleep(ms, operationSignal(signal));
+	} catch (error) {
+		if (signal?.aborted) throw new Error("Request was aborted");
+		throw error;
+	}
 }
 
 function normalizeTimeoutMs(value: number | undefined): number | undefined {
@@ -432,6 +431,8 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					const info = await parseErrorResponse(fakeResponse);
 					throw new Error(info.friendlyMessage || info.message);
 				} catch (error) {
+					await cancelResponseBody(response);
+					response = undefined;
 					if (error instanceof Error) {
 						if (error.name === "AbortError" || error.message === "Request was aborted") {
 							throw new Error("Request was aborted");
@@ -765,59 +766,14 @@ function normalizeCodexStatus(status: unknown): CodexResponseStatus | undefined 
 async function* parseSSE(response: Response, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {
 	if (!response.body) return;
 
-	const reader = response.body.getReader();
-	const decoder = new TextDecoder();
-	let buffer = "";
-	const onAbort = () => {
-		void reader.cancel().catch(() => {});
-	};
-	signal?.addEventListener("abort", onAbort, { once: true });
-
-	try {
-		while (true) {
-			if (signal?.aborted) {
-				throw new Error("Request was aborted");
-			}
-			const { done, value } = await reader.read();
-			if (signal?.aborted) {
-				throw new Error("Request was aborted");
-			}
-			if (done) break;
-			buffer += decoder.decode(value, { stream: true });
-
-			let idx = buffer.indexOf("\n\n");
-			while (idx !== -1) {
-				const chunk = buffer.slice(0, idx);
-				buffer = buffer.slice(idx + 2);
-
-				const dataLines = chunk
-					.split("\n")
-					.filter((l) => l.startsWith("data:"))
-					.map((l) => l.slice(5).trim());
-				if (dataLines.length > 0) {
-					const data = dataLines.join("\n").trim();
-					if (data && data !== "[DONE]") {
-						try {
-							yield JSON.parse(data) as Record<string, unknown>;
-						} catch (cause) {
-							throw new CodexProtocolError(`Invalid Codex SSE JSON: ${formatThrownValue(cause)}`, {
-								cause,
-								payload: data,
-							});
-						}
-					}
-				}
-				idx = buffer.indexOf("\n\n");
-			}
+	for await (const sse of iterateSseMessages(response.body, signal)) {
+		const data = sse.data.trim();
+		if (!data || data === "[DONE]") continue;
+		try {
+			yield JSON.parse(data) as Record<string, unknown>;
+		} catch (cause) {
+			throw new CodexProtocolError(`Invalid Codex SSE JSON: ${formatThrownValue(cause)}`, { cause, payload: data });
 		}
-	} finally {
-		signal?.removeEventListener("abort", onAbort);
-		try {
-			await reader.cancel();
-		} catch {}
-		try {
-			reader.releaseLock();
-		} catch {}
 	}
 }
 
@@ -847,6 +803,7 @@ interface CachedWebSocketContinuationState {
 
 interface CachedWebSocketConnection {
 	socket: WebSocketLike;
+	requestKey: string;
 	busy: boolean;
 	createdAt: number;
 	idleTimer?: ReturnType<typeof setTimeout>;
@@ -1143,6 +1100,8 @@ async function acquireWebSocket(
 		};
 	}
 
+	const proxyUrl = resolveHttpProxyUrlForTarget(url.replace(/^wss:/, "https:").replace(/^ws:/, "http:"), env);
+	const requestKey = JSON.stringify([url, [...headers.entries()], proxyUrl?.toString()]);
 	let accountEntries = websocketSessionCache.get(sessionId);
 	const cached = accountEntries?.get(accountId);
 	if (cached) {
@@ -1150,8 +1109,12 @@ async function acquireWebSocket(
 			clearTimeout(cached.idleTimer);
 			cached.idleTimer = undefined;
 		}
-		if (!cached.busy && isWebSocketSessionExpired(cached)) {
-			closeWebSocketSilently(cached.socket, 1000, "connection_age_limit");
+		if (!cached.busy && (cached.requestKey !== requestKey || isWebSocketSessionExpired(cached))) {
+			closeWebSocketSilently(
+				cached.socket,
+				1000,
+				cached.requestKey !== requestKey ? "request_changed" : "connection_age_limit",
+			);
 			accountEntries?.delete(accountId);
 			if (accountEntries?.size === 0) websocketSessionCache.delete(sessionId);
 		} else if (!cached.busy && isWebSocketReusable(cached.socket)) {
@@ -1191,7 +1154,7 @@ async function acquireWebSocket(
 	}
 
 	const socket = await connectWebSocket(url, headers, signal, connectTimeoutMs, env);
-	const entry: CachedWebSocketConnection = { socket, busy: true, createdAt: Date.now() };
+	const entry: CachedWebSocketConnection = { socket, requestKey, busy: true, createdAt: Date.now() };
 	accountEntries = websocketSessionCache.get(sessionId);
 	if (!accountEntries) {
 		accountEntries = new Map();

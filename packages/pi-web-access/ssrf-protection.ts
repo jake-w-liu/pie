@@ -1,7 +1,8 @@
 import { lookup as dnsLookup } from "node:dns/promises";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import net from "node:net";
-import { getActiveProxy, getWebSearchConfigPath, hasScopedProxyDecision, isProxyBypassedUrl } from "./utils.ts";
+import { Agent, ProxyAgent } from "undici/index.js";
+import { fetchWithDispatcher, getProxyForUrl, getWebSearchConfigPath, type ProxiedRequestInit } from "./utils.ts";
 
 const DEFAULT_MAX_REDIRECTS = 5;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
@@ -9,7 +10,6 @@ const LOOPBACK_ALLOW_RANGES = ["127.0.0.0/8", "::1", "::ffff:127.0.0.0/104"];
 
 export type LookupAddress = { address: string; family: number };
 export type Lookup = (hostname: string) => Promise<LookupAddress[]>;
-type Fetch = typeof fetch;
 
 const WEB_SEARCH_CONFIG_PATH = getWebSearchConfigPath();
 
@@ -147,12 +147,14 @@ interface ValidationOptions {
 	 */
 	allowRanges?: string[];
 	/**
-	 * When true, trust an explicitly-configured HTTP(S) proxy for hostname
-	 * resolution instead of performing local DNS lookups inside the sandbox.
-	 * Literal IPs and localhost remain blocked, and NO_PROXY hosts still use
-	 * the local SSRF preflight. This does not configure proxy transport.
+	 * Explicitly trust remote DNS at the actually selected configured, scoped,
+	 * or environment HTTP(S) proxy. Untrusted proxy routes fail closed: local
+	 * preflight cannot constrain proxy-side resolution. Literal IPs/localhost
+	 * remain checked; direct overrides and NO_PROXY use pinned local DNS.
 	 */
 	trustEnvProxy?: boolean;
+	/** Explicit transport proxy, including an empty-string direct override. */
+	proxy?: string;
 	/** Allow loopback URLs for explicit provider base endpoints, not fetched targets. */
 	allowLoopback?: boolean;
 }
@@ -171,7 +173,8 @@ interface RedirectRequestInitArgs {
 }
 
 interface FetchRemoteOptions extends ValidationOptions {
-	fetch?: Fetch;
+	/** Called only after target validation; e.g. resolve host-scoped cookies. */
+	beforeRequest?: (url: URL, init: RequestInit) => Promise<RequestInit>;
 	maxRedirects?: number;
 	onRedirect?: (args: RedirectRequestInitArgs) => RequestInit;
 }
@@ -181,77 +184,94 @@ async function defaultLookup(hostname: string): Promise<LookupAddress[]> {
 }
 
 export async function validateRemoteUrl(rawUrl: string | URL, options: ValidationOptions = {}): Promise<URL> {
-	const url = rawUrl instanceof URL ? rawUrl : new URL(rawUrl);
-	if (url.protocol !== "http:" && url.protocol !== "https:") {
-		throw new Error("Only HTTP and HTTPS URLs can be fetched remotely");
-	}
+	return (await resolveRemoteTarget(rawUrl, options)).url;
+}
 
+async function resolveRemoteTarget(rawUrl: string | URL, options: ValidationOptions): Promise<{ url: URL; addresses: LookupAddress[]; proxy: string | null }> {
+	// Copy caller URLs so mutation during DNS resolution cannot change the destination.
+	const url = new URL(rawUrl);
+	if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Only HTTP and HTTPS URLs can be fetched remotely");
 	const hostname = normalizeHostname(url.hostname);
 	if (!hostname) throw new Error("URL must include a hostname");
-	if (hostname === "localhost") {
-		if (options.allowLoopback === true) return url;
-		throw new Error(`Blocked internal hostname: ${hostname}`);
-	}
-	if (hostname.endsWith(".localhost")) {
-		throw new Error(`Blocked internal hostname: ${hostname}`);
-	}
+	assertDomainPolicy(hostname, options.domainPolicy);
+	if ((hostname === "localhost" && options.allowLoopback !== true) || hostname.endsWith(".localhost")) throw new Error(`Blocked internal hostname: ${hostname}`);
 
 	const allowRanges = parseAllowRanges(options.allowRanges);
-	assertDomainPolicy(hostname, options.domainPolicy);
-
+	if (options.allowLoopback === true) allowRanges.push(...parseAllowRanges(LOOPBACK_ALLOW_RANGES));
+	const proxy = getProxyForUrl(url, options.proxy);
 	if (net.isIP(hostname)) {
-		const addressAllowRanges = options.allowLoopback === true
-			? [...allowRanges, ...parseAllowRanges(LOOPBACK_ALLOW_RANGES)]
-			: allowRanges;
-		assertPublicAddress(hostname, hostname, addressAllowRanges);
-		return url;
+		assertPublicAddress(hostname, hostname, allowRanges);
 	}
-
-	if (shouldTrustEnvProxy(url, options.trustEnvProxy === true)) return url;
-
+	if (proxy) {
+		if (!options.trustEnvProxy) throw new Error("Proxy DNS requires ssrf.trustEnvProxy: true for the selected proxy");
+		return { url, addresses: [], proxy };
+	}
 	let addresses: LookupAddress[];
 	try {
-		addresses = await (options.lookup ?? defaultLookup)(hostname);
+		addresses = net.isIP(hostname)
+			? [{ address: hostname, family: net.isIP(hostname) }]
+			: await (options.lookup ?? defaultLookup)(hostname);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		throw new Error(`Failed to resolve ${hostname}: ${message}`);
 	}
-
 	if (addresses.length === 0) throw new Error(`Failed to resolve ${hostname}: no addresses returned`);
-	for (const { address } of addresses) {
-		assertPublicAddress(address, hostname, allowRanges);
-	}
-	return url;
+	for (const { address } of addresses) assertPublicAddress(address, hostname, allowRanges);
+	// Copy the resolver's answers, too: only these values may reach the socket lookup.
+	return { url, addresses: addresses.map(({ address }) => ({ address, family: net.isIP(address) })), proxy: null };
 }
 
 export async function fetchRemoteUrl(
 	url: string | URL,
-	init: RequestInit = {},
+	init: ProxiedRequestInit = {},
 	options: FetchRemoteOptions = {},
 ): Promise<Response> {
-	const fetchImpl = options.fetch ?? fetch;
 	const maxRedirects = options.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
-	let current = await validateRemoteUrl(url, options);
-	let requestInit = init;
+	let current = new URL(url);
+	let requestInit: RequestInit = init;
 
-	for (let redirects = 0; redirects <= maxRedirects; redirects++) {
-		const response = await fetchImpl(current, { ...requestInit, redirect: "manual" });
+	for (let redirects = 0; ; redirects++) {
+		requestInit.signal?.throwIfAborted();
+		const target = await resolveRemoteTarget(current, { ...options, proxy: init.__proxy ?? options.proxy });
+		current = target.url;
+		if (options.beforeRequest) requestInit = await options.beforeRequest(new URL(current), requestInit);
+		requestInit.signal?.throwIfAborted();
+		const dispatcher = target.proxy ? new ProxyAgent(target.proxy) : new Agent({
+			connect: {
+				lookup: (hostname, lookupOptions, callback) => {
+					if (normalizeHostname(hostname) !== normalizeHostname(target.url.hostname)) {
+						callback(new Error("Connection hostname differs from validated target"), []);
+						return;
+					}
+					const addresses = target.addresses.filter(address => !lookupOptions.family || lookupOptions.family === address.family);
+					if (addresses.length === 0) { callback(new Error("No validated address for connection family"), []); return; }
+					if (lookupOptions.all) callback(null, addresses);
+					else callback(null, addresses[0].address, addresses[0].family);
+				},
+			},
+		});
+		const response = await fetchWithDispatcher(current, { ...requestInit, redirect: "manual" }, dispatcher);
 		if (!REDIRECT_STATUSES.has(response.status)) return response;
-
 		const location = response.headers.get("location");
 		if (!location) return response;
-		if (redirects === maxRedirects) throw new Error(`Too many redirects fetching ${current.toString()}`);
-
+		// Headers are all the redirect needs; release the old stream even when policy rejects.
+		await response.body?.cancel();
+		if (redirects >= maxRedirects) throw new Error(`Too many redirects fetching ${current.toString()}`);
 		const from = current;
-		current = await validateRemoteUrl(new URL(location, current), options);
-		if (response.status === 303 || ((response.status === 301 || response.status === 302) && requestInit.method?.toUpperCase() === "POST")) {
+		current = new URL(location, current);
+		const headers = new Headers(requestInit.headers);
+		const method = requestInit.method?.toUpperCase() ?? "GET";
+		if ((response.status === 303 && method !== "GET" && method !== "HEAD") || ((response.status === 301 || response.status === 302) && method === "POST")) {
+			for (const name of ["content-encoding", "content-language", "content-location", "content-type", "content-length"]) headers.delete(name);
 			const { body: _body, ...nextInit } = requestInit;
 			requestInit = { ...nextInit, method: "GET" };
 		}
+		if (from.origin !== current.origin) {
+			for (const name of ["authorization", "proxy-authorization", "cookie", "host"]) headers.delete(name);
+		}
+		requestInit = { ...requestInit, headers };
 		if (options.onRedirect) requestInit = options.onRedirect({ from, to: current, init: requestInit, response });
 	}
-
-	throw new Error(`Too many redirects fetching ${current.toString()}`);
 }
 
 function normalizeHostname(hostname: string): string {
@@ -270,72 +290,6 @@ function assertDomainPolicy(hostname: string, policy?: DomainPolicy): void {
 
 function domainMatches(hostname: string, entry: string): boolean {
 	return hostname === entry || hostname.endsWith(`.${entry}`);
-}
-
-function getProxyForProtocol(protocol: string): string {
-	const candidates = protocol === "http:"
-		? [process.env.HTTP_PROXY, process.env.http_proxy, process.env.ALL_PROXY, process.env.all_proxy]
-		: protocol === "https:"
-			? [process.env.HTTPS_PROXY, process.env.https_proxy, process.env.HTTP_PROXY, process.env.http_proxy, process.env.ALL_PROXY, process.env.all_proxy]
-			: [];
-	for (const candidate of candidates) {
-		const value = candidate?.trim();
-		if (!value) continue;
-		try {
-			const proxyUrl = new URL(value);
-			if ((proxyUrl.protocol === "http:" || proxyUrl.protocol === "https:") && proxyUrl.hostname) return value;
-		} catch {
-			// Invalid proxy env vars should not weaken local DNS SSRF checks.
-		}
-	}
-	return "";
-}
-
-function hostnameMatchesNoProxy(hostname: string, port: string, entry: string): boolean {
-	const trimmed = entry.trim();
-	if (!trimmed) return false;
-	if (trimmed === "*") return true;
-
-	// NO_PROXY entries may include a port. Strip it only after handling
-	// bracketed IPv6 literals, which can contain several colons.
-	let hostEntry = trimmed;
-	let entryPort: string | undefined;
-	if (hostEntry.startsWith("[")) {
-		const closingBracket = hostEntry.indexOf("]");
-		if (closingBracket >= 0) {
-			const suffix = hostEntry.slice(closingBracket + 1);
-			if (/^:\\d+$/.test(suffix)) entryPort = suffix.slice(1);
-			hostEntry = hostEntry.slice(0, closingBracket + 1);
-		}
-	} else {
-		const colon = hostEntry.lastIndexOf(":");
-		if (colon > -1 && /^\d+$/.test(hostEntry.slice(colon + 1))) {
-			entryPort = hostEntry.slice(colon + 1);
-			hostEntry = hostEntry.slice(0, colon);
-		}
-	}
-	if (entryPort !== undefined && entryPort !== port) return false;
-
-	const normalizedEntry = normalizeHostname(hostEntry);
-	if (!normalizedEntry) return false;
-	if (normalizedEntry === hostname) return true;
-	const suffix = normalizedEntry.startsWith("*.")
-		? normalizedEntry.slice(1)
-		: normalizedEntry.startsWith(".")
-			? normalizedEntry
-			: `.${normalizedEntry}`;
-	return hostname.endsWith(suffix);
-}
-
-function shouldTrustEnvProxy(url: URL, enabled: boolean): boolean {
-	if (!enabled || !getProxyForProtocol(url.protocol)) return false;
-	if (hasScopedProxyDecision()) return false;
-	const activeProxy = getActiveProxy();
-	if (activeProxy && !isProxyBypassedUrl(url)) return false;
-	const hostname = normalizeHostname(url.hostname);
-	const port = url.port || (url.protocol === "https:" ? "443" : "80");
-	const noProxy = process.env.NO_PROXY || process.env.no_proxy || "";
-	return !noProxy.split(",").some(entry => hostnameMatchesNoProxy(hostname, port, entry));
 }
 
 function assertPublicAddress(address: string, hostname: string, allowRanges: ParsedCidr[] = []): void {

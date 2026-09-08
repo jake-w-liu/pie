@@ -29,6 +29,36 @@ afterEach(() => {
 });
 
 describe("streamProxy", () => {
+	it("settles an actual Fetch abort with a non-Error reason", async () => {
+		const controller = new AbortController();
+		controller.abort(Object.create(null));
+		// Already aborted: the actual runtime Fetch rejects before any connection.
+		const stream = streamProxy(
+			model,
+			{ messages: [] },
+			{
+				authToken: "fixture",
+				proxyUrl: "https://example.invalid",
+				signal: controller.signal,
+			},
+		);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			const result = await Promise.race([
+				stream.result(),
+				new Promise<never>((_resolve, reject) => {
+					timer = setTimeout(() => reject(new Error("Proxy terminal event was not published")), 2000);
+				}),
+			]);
+			expect(result).toMatchObject({ stopReason: "aborted", errorMessage: "{}" });
+			const events: AssistantMessageEvent[] = [];
+			for await (const event of stream) events.push(event);
+			expect(events.at(-1)).toMatchObject({ type: "error", reason: "aborted" });
+		} finally {
+			clearTimeout(timer);
+		}
+	});
+
 	it("preserves tool-call metadata received only on toolcall_end", async () => {
 		const proxyEvents: ProxyAssistantMessageEvent[] = [
 			{ type: "start" },

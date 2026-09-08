@@ -255,6 +255,8 @@ An empty array starts with no built-in tools while preserving extension and SDK 
 
 When multiple sources specify a session directory, precedence is `--session-dir`, `PI_CODING_AGENT_SESSION_DIR`, then `sessionDir` in settings.json.
 
+Project `sessionDir` is used only when the startup folder is already trusted through `--approve`, a saved trust decision, or global `defaultProjectTrust: "always"` (explicit denial and saved denial take precedence). Unknown trust ignores project settings during session selection. Approval from a later startup prompt or extension does not move the selected session; a remembered approval applies to storage selection on the next invocation. Explicit CLI/environment directories remain usable regardless of project trust. Resuming a session resolves runtime resources and trust for its stored working directory, without reselecting its storage.
+
 ### Model Cycling
 
 | Setting | Type | Default | Description |

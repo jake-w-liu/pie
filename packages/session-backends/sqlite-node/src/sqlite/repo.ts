@@ -801,61 +801,64 @@ export class SqliteSessionRepository
 		return this.operations.enqueue(async () => {
 			const db = await this.getDatabase();
 			const path = await this.getDatabasePath();
-			const sourceMetadata = decodeSessionMetadata(requireSessionRow(db, source.id), path);
 			const id = options.id ?? uuidv7();
-			if (sessionExists(db, id)) throw new SessionError("already_exists", `Session already exists: ${id}`);
-
-			const entries: EntryRow[] = [];
-			const lanes: { lane: string; leafId: string | null }[] = [];
-			const branchTips: string[] = [];
-			let branchForkTargetId: string | null = null;
-
-			if (options.scope === "tree") {
-				entries.push(...readEntryRows(db, source.id, { order: "oldestFirst" }));
-				lanes.push(...readLanes(db, source.id).map((row) => ({ lane: row.lane, leafId: row.leaf_id })));
-				branchTips.push(...readBranchTipIds(db, source.id));
-			} else {
-				const main = readLane(db, source.id, "main");
-				if (!main) throw new SessionError("invalid_lane", "Lane not found: main");
-				const selectedEntryId = options.entryId ?? main.leaf_id;
-				if (selectedEntryId !== null) {
-					const target = readEntryRow(db, source.id, selectedEntryId);
-					if (!target || target.type !== "message") {
-						throw new SessionError(
-							"invalid_fork_target",
-							`Fork target is not a message entry: ${selectedEntryId}`,
-						);
-					}
-					const position = options.position ?? (options.entryId === undefined ? "at" : "before");
-					branchForkTargetId = position === "at" ? target.id : target.parent_id;
-				}
-				lanes.push({ lane: "main", leafId: branchForkTargetId });
-				if (branchForkTargetId !== null) {
-					const cached = readCachedBranch(db, source.id, branchForkTargetId);
-					if (!cached) {
-						throw new SessionError(
-							"invalid_fork_target",
-							`Fork target is not on a cached branch: ${branchForkTargetId}`,
-						);
-					}
-					const rows = queryCachedBranchRows(db, source.id, cached, { order: "oldestFirst" });
-					entries.push(...rows.map(entryRowFromCached));
-					branchTips.push(branchForkTargetId);
-				}
-			}
-
-			const copiedIds = new Set(entries.map((entry) => entry.id));
-			const latestName = readLatestFact(db, source.id, "name", null);
-			const latestLabels = readLatestLabelFacts(db, source.id);
-			const labelsToCopy = latestLabels.filter(
-				(row) => options.scope === "tree" || (row.key !== null && copiedIds.has(row.key)),
-			);
-			const createdAt = Date.now();
-			const metadata = options.metadata ?? sourceMetadata.metadata;
 			let lease: WriterLease;
 
 			try {
 				lease = db.transaction(() => {
+					// Source reads and destination publication share one snapshot, including
+					// metadata, lanes, branch tips and facts, even across other connections.
+					const sourceMetadata = decodeSessionMetadata(requireSessionRow(db, source.id), path);
+					if (sessionExists(db, id)) throw new SessionError("already_exists", `Session already exists: ${id}`);
+
+					const entries: EntryRow[] = [];
+					const lanes: { lane: string; leafId: string | null }[] = [];
+					const branchTips: string[] = [];
+					let branchForkTargetId: string | null = null;
+
+					if (options.scope === "tree") {
+						entries.push(...readEntryRows(db, source.id, { order: "oldestFirst" }));
+						lanes.push(...readLanes(db, source.id).map((row) => ({ lane: row.lane, leafId: row.leaf_id })));
+						branchTips.push(...readBranchTipIds(db, source.id));
+					} else {
+						const main = readLane(db, source.id, "main");
+						if (!main) throw new SessionError("invalid_lane", "Lane not found: main");
+						const selectedEntryId = options.entryId ?? main.leaf_id;
+						if (selectedEntryId !== null) {
+							const target = readEntryRow(db, source.id, selectedEntryId);
+							if (!target || target.type !== "message") {
+								throw new SessionError(
+									"invalid_fork_target",
+									`Fork target is not a message entry: ${selectedEntryId}`,
+								);
+							}
+							const position = options.position ?? (options.entryId === undefined ? "at" : "before");
+							branchForkTargetId = position === "at" ? target.id : target.parent_id;
+						}
+						lanes.push({ lane: "main", leafId: branchForkTargetId });
+						if (branchForkTargetId !== null) {
+							const cached = readCachedBranch(db, source.id, branchForkTargetId);
+							if (!cached) {
+								throw new SessionError(
+									"invalid_fork_target",
+									`Fork target is not on a cached branch: ${branchForkTargetId}`,
+								);
+							}
+							const rows = queryCachedBranchRows(db, source.id, cached, { order: "oldestFirst" });
+							entries.push(...rows.map(entryRowFromCached));
+							branchTips.push(branchForkTargetId);
+						}
+					}
+
+					const copiedIds = new Set(entries.map((entry) => entry.id));
+					const latestName = readLatestFact(db, source.id, "name", null);
+					const latestLabels = readLatestLabelFacts(db, source.id);
+					const labelsToCopy = latestLabels.filter(
+						(row) => options.scope === "tree" || (row.key !== null && copiedIds.has(row.key)),
+					);
+					const createdAt = Date.now();
+					const metadata = options.metadata ?? sourceMetadata.metadata;
+
 					insertSessionRow(db, {
 						id,
 						createdAt,

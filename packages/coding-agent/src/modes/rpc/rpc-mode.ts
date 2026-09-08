@@ -12,6 +12,7 @@
  */
 
 import * as crypto from "node:crypto";
+import { Check } from "typebox/value";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type {
 	ExtensionUIContext,
@@ -30,13 +31,14 @@ import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { toJsonEvent } from "../json-event.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
-import type {
-	RpcCommand,
-	RpcExtensionUIRequest,
-	RpcExtensionUIResponse,
-	RpcResponse,
-	RpcSessionState,
-	RpcSlashCommand,
+import {
+	type RpcCommand,
+	type RpcExtensionUIRequest,
+	type RpcExtensionUIResponse,
+	type RpcResponse,
+	type RpcSessionState,
+	type RpcSlashCommand,
+	rpcCommandSchema,
 } from "./rpc-types.ts";
 
 // Re-export types for consumers
@@ -386,8 +388,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		}
 	};
 
-	await rebindSession();
-	registerSignalHandlers();
+	let initialization: Promise<void>;
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse | undefined> => {
@@ -444,9 +445,6 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			case "new_session": {
 				const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
 				const result = await runtimeHost.newSession(options);
-				if (!result.cancelled) {
-					await rebindSession();
-				}
 				return success(id, "new_session", result);
 			}
 
@@ -611,17 +609,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 			case "switch_session": {
 				const result = await runtimeHost.switchSession(command.sessionPath);
-				if (!result.cancelled) {
-					await rebindSession();
-				}
 				return success(id, "switch_session", result);
 			}
 
 			case "fork": {
 				const result = await runtimeHost.fork(command.entryId);
-				if (!result.cancelled) {
-					await rebindSession();
-				}
 				return success(id, "fork", { text: result.selectedText, cancelled: result.cancelled });
 			}
 
@@ -631,9 +623,6 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					return error(id, "clone", "Cannot clone session: no current entry selected");
 				}
 				const result = await runtimeHost.fork(leafId, { position: "at" });
-				if (!result.cancelled) {
-					await rebindSession();
-				}
 				return success(id, "clone", { cancelled: result.cancelled });
 			}
 
@@ -778,13 +767,25 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			return;
 		}
 
-		// Handle extension UI responses
+		// Validate the envelope before dispatch or error reporting dereferences it.
 		if (
-			typeof parsed === "object" &&
-			parsed !== null &&
-			"type" in parsed &&
-			parsed.type === "extension_ui_response"
+			typeof parsed !== "object" ||
+			parsed === null ||
+			Array.isArray(parsed) ||
+			!("type" in parsed) ||
+			typeof parsed.type !== "string" ||
+			parsed.type.length === 0 ||
+			("id" in parsed && typeof parsed.id !== "string")
 		) {
+			output(
+				error(undefined, "parse", "Invalid command: expected an object with a string type and optional string id"),
+			);
+			await waitForRawStdoutBackpressure();
+			return;
+		}
+
+		// UI responses must remain available while session_start is awaiting a dialog.
+		if (parsed.type === "extension_ui_response") {
 			const response = parsed as RpcExtensionUIResponse;
 			const pending = pendingExtensionRequests.get(response.id);
 			if (pending) {
@@ -794,8 +795,20 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			return;
 		}
 
-		const command = parsed as RpcCommand;
+		if (!Check(rpcCommandSchema, parsed)) {
+			output(
+				error(
+					"id" in parsed && typeof parsed.id === "string" ? parsed.id : undefined,
+					parsed.type,
+					`Invalid command: ${parsed.type}`,
+				),
+			);
+			await waitForRawStdoutBackpressure();
+			return;
+		}
+		const command = parsed;
 		try {
+			await initialization;
 			const response = await handleCommand(command);
 			if (response) {
 				output(response);
@@ -828,6 +841,12 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			process.stdin.off("end", onInputEnd);
 		};
 	})();
+
+	registerSignalHandlers();
+	// Input must be attached before extension initialization can request a dialog.
+	initialization = rebindSession();
+	await initialization;
+	await checkShutdownRequested();
 
 	// Keep process alive forever
 	return new Promise(() => {});

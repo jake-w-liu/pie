@@ -142,39 +142,47 @@ describe("PiClient", () => {
 		expect(server.clientCloseCount).toBe(1);
 	});
 
-	test("does not restore a stale connection when a snapshot listener reconnects during handshake", async () => {
-		const first = new MemoryByteServer();
-		const second = new MemoryByteServer();
-		let connection = 0;
-		for (const server of [first, second]) {
-			server.onMessage((message) => {
-				if (message.type !== "hello") return;
-				server.send({
-					type: "hello",
-					version: PROTOCOL_VERSION,
-					connectionId: `connection-${connection}`,
-					snapshot: { ...baseServerSnapshot, revision: connection },
+	test.each([false, true])(
+		"does not restore a stale connection when a snapshot listener reconnects during handshake (coalesced=%s)",
+		async (coalesced) => {
+			const first = new MemoryByteServer();
+			const second = new MemoryByteServer();
+			let connection = 0;
+			for (const server of [first, second]) {
+				server.onMessage((message) => {
+					if (message.type !== "hello") return;
+					server.sendTogether([
+						{
+							type: "hello",
+							version: PROTOCOL_VERSION,
+							connectionId: `connection-${connection}`,
+							snapshot: { ...baseServerSnapshot, revision: connection },
+						},
+						...(coalesced && server === first
+							? [{ type: "event" as const, event: { type: "session_removed" as const, sessionId: "stale" } }]
+							: []),
+					]);
 				});
+			}
+			const client = new PiClient({
+				transportFactory: (handlers) => (connection++ === 0 ? first : second).connect(handlers),
 			});
-		}
-		const client = new PiClient({
-			transportFactory: (handlers) => (connection++ === 0 ? first : second).connect(handlers),
-		});
-		let reconnect: Promise<ServerSnapshot> | undefined;
-		let reconnectRequested = false;
-		client.subscribe(() => {
-			if (reconnectRequested) return;
-			reconnectRequested = true;
-			client.disconnect();
-			reconnect = client.reconnect();
-		});
+			let reconnect: Promise<ServerSnapshot> | undefined;
+			let reconnectRequested = false;
+			client.subscribe(() => {
+				if (reconnectRequested) return;
+				reconnectRequested = true;
+				client.disconnect();
+				reconnect = client.reconnect();
+			});
 
-		await expect(client.connect()).rejects.toBeInstanceOf(PiDisconnectedError);
-		expect(reconnect).toBeDefined();
-		await expect(reconnect).resolves.toMatchObject({ revision: 2 });
-		expect(client.connectionState).toBe("connected");
-		expect(first.clientCloseCount).toBe(1);
-	});
+			await expect(client.connect()).rejects.toBeInstanceOf(PiDisconnectedError);
+			expect(reconnect).toBeDefined();
+			await expect(reconnect).resolves.toMatchObject({ revision: 2 });
+			expect(client.connectionState).toBe("connected");
+			expect(first.clientCloseCount).toBe(1);
+		},
+	);
 
 	test("rejects a typed handshake version error", async () => {
 		const server = new MemoryByteServer();

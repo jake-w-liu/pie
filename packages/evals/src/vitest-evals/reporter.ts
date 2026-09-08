@@ -72,10 +72,14 @@ function collectHarnessObservations(modules: ReadonlyArray<TestModule>): Harness
 				...(run.timings?.totalMs === undefined ? {} : { totalMs: run.timings.totalMs }),
 				...(estimatedCostUsd === undefined ? {} : { estimatedCostUsd }),
 			};
-			if (run.errors.length > 0) observations.push({ ...observation, outcome: "errored" });
-			else if (score !== undefined) observations.push({ ...observation, outcome: "scored", score });
+			const state = test.result().state;
+			const thresholdFailed = test.meta().eval?.thresholdFailed === true;
+			if (run.errors.length > 0 || (state === "failed" && !thresholdFailed)) {
+				observations.push({ ...observation, outcome: "errored" });
+			} else if (state === "skipped" || state === "pending") {
+				observations.push({ ...observation, outcome: state });
+			} else if (score !== undefined) observations.push({ ...observation, outcome: "scored", score });
 			else {
-				const state = test.result().state;
 				const outcome = state === "passed" ? "unscored" : state === "failed" ? "errored" : state;
 				observations.push({ ...observation, outcome });
 			}

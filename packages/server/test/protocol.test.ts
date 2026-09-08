@@ -1,5 +1,11 @@
 import type { Api, AssistantMessage, Model, ToolCall, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
-import { encodeServerMessage, PROTOCOL_VERSION } from "@earendil-works/pi-protocol";
+import {
+	decodeCbor,
+	encodeCbor,
+	encodeServerMessage,
+	PROTOCOL_VERSION,
+	ServerMessageDecoder,
+} from "@earendil-works/pi-protocol";
 import { describe, expect, test } from "vitest";
 import {
 	sanitizeProtocolDetails,
@@ -28,7 +34,7 @@ type ProtocolTranscriptItem =
 	| ReturnType<typeof toProtocolUserMessage>
 	| ReturnType<typeof toProtocolToolResultMessage>;
 
-function assertValidServerPayload(item: ProtocolTranscriptItem): void {
+function assertValidServerPayload(item: ProtocolTranscriptItem): ProtocolTranscriptItem {
 	expect(() =>
 		encodeServerMessage({
 			type: "hello",
@@ -52,29 +58,36 @@ function assertValidServerPayload(item: ProtocolTranscriptItem): void {
 		}),
 	).not.toThrow();
 
-	expect(() =>
-		encodeServerMessage({
-			type: "event",
-			event: {
-				type: "session_snapshot",
-				snapshot: {
-					id: "session-1",
-					cwd: "/workspace",
-					createdAt: 1,
-					updatedAt: 1,
-					phase: "idle",
-					model: { provider: "test-provider", id: "model-1" },
-					thinkingLevel: "off",
-					attached: true,
-					locked: true,
-					revision: 1,
-					transcript: [item],
-					queuedSteer: [],
-					queuedSteerCount: 0,
-				},
+	const frame = encodeServerMessage({
+		type: "event",
+		event: {
+			type: "session_snapshot",
+			snapshot: {
+				id: "session-1",
+				cwd: "/workspace",
+				createdAt: 1,
+				updatedAt: 1,
+				phase: "idle",
+				model: { provider: "test-provider", id: "model-1" },
+				thinkingLevel: "off",
+				attached: true,
+				locked: true,
+				revision: 1,
+				transcript: [item],
+				queuedSteer: [],
+				queuedSteerCount: 0,
 			},
-		}),
-	).not.toThrow();
+		},
+	});
+	const decoder = new ServerMessageDecoder();
+	const messages = [...decoder.push(frame.subarray(0, 7)), ...decoder.push(frame.subarray(7))];
+	decoder.end();
+	const message = messages[0];
+	if (messages.length !== 1 || message.type !== "event" || message.event.type !== "session_snapshot") {
+		throw new Error("Expected one complete session snapshot envelope");
+	}
+	expect(message.event.snapshot.transcript).toEqual([item]);
+	return message.event.snapshot.transcript[0];
 }
 
 describe("pi-ai protocol bridge", () => {
@@ -173,6 +186,37 @@ describe("pi-ai protocol bridge", () => {
 			status: "complete",
 		});
 		assertValidServerPayload(toolResult);
+	});
+
+	test("lossily preserves invalid Date diagnostics through a complete tool-result envelope", () => {
+		const valid = new Date("2024-01-02T03:04:05.000Z");
+		const invalid = new Date(Number.NaN);
+		const details = Object.defineProperty({ valid, nested: [invalid] }, "__proto__", {
+			value: invalid,
+			enumerable: true,
+		});
+		const call: ToolCall = { type: "toolCall", id: "date-call", name: "inspect", arguments: {} };
+		const result = toProtocolToolResultMessage(
+			{
+				role: "toolResult",
+				toolCallId: call.id,
+				toolName: call.name,
+				content: [{ type: "text", text: "completed" }],
+				details,
+				isError: false,
+				timestamp: 1,
+			},
+			{ id: "date-result", call },
+		);
+		expect(sanitizeProtocolDetails(invalid)).toBe("Invalid Date");
+		expect(result.details).toEqual(
+			JSON.parse('{"valid":"2024-01-02T03:04:05.000Z","nested":["Invalid Date"],"__proto__":"Invalid Date"}'),
+		);
+		expect(result.status).toBe("complete");
+		expect(Object.hasOwn(result.details as object, "__proto__")).toBe(true);
+		assertValidServerPayload(result);
+		expect(Number.isNaN(invalid.getTime())).toBe(true);
+		for (const date of [valid, invalid]) expect(() => toProtocolJsonValue(date)).toThrow("plain objects");
 	});
 
 	test("rejects tool results associated with a different call", () => {
@@ -279,6 +323,71 @@ describe("pi-ai protocol bridge", () => {
 		expect(() =>
 			toProtocolUserMessage({ role: "user", content: "hello", timestamp: Number.NaN }, { id: "user-1" }),
 		).toThrow(/timestamp/i);
+	});
+
+	test.each([
+		["execution input", toProtocolJsonValue],
+		["diagnostic details", sanitizeProtocolDetails],
+	] as const)("preserves prototype-named JSON keys in %s", (_name, convert) => {
+		const input: unknown = JSON.parse(
+			'{"__proto__":{"polluted":true},"nested":[{"__proto__":null}],"constructor":"data","prototype":7}',
+		);
+		const result = convert(input);
+		expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+		expect(Object.hasOwn(result as object, "__proto__")).toBe(true);
+		expect(result).toEqual(input);
+		expect(decodeCbor(encodeCbor(result))).toEqual(input);
+		expect(toProtocolJsonValue(result)).toEqual(input);
+	});
+
+	test("roundtrips dangerous JSON keys through converted tool inputs/details and a full protocol envelope", () => {
+		const input: Record<string, unknown> = JSON.parse(
+			'{"__proto__":{"nested":{"__proto__":7}},"constructor":{"prototype":true},"list":[{"__proto__":null}]}',
+		);
+		const call: ToolCall = { type: "toolCall", id: "call-1", name: "read", arguments: input };
+		const tool = toProtocolToolResultMessage(
+			{
+				role: "toolResult",
+				toolCallId: call.id,
+				toolName: call.name,
+				content: [{ type: "text", text: "done" }],
+				details: input,
+				isError: false,
+				timestamp: 1,
+			},
+			{ id: "tool-1", call },
+		);
+		const assistant = toProtocolAssistantMessage(
+			{
+				role: "assistant",
+				content: [call],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "toolUse",
+				timestamp: 0,
+			},
+			{ id: "assistant-1" },
+		);
+		const decodedTool = assertValidServerPayload(tool);
+		const decodedAssistant = assertValidServerPayload(assistant);
+		if (decodedTool.role !== "tool" || decodedAssistant.role !== "assistant")
+			throw new Error("Wrong transcript roles");
+		const decodedCall = decodedAssistant.content[0];
+		if (decodedCall.type !== "toolCall") throw new Error("Wrong assistant content");
+		for (const value of [decodedTool.input, decodedTool.details, decodedCall.input]) {
+			expect(value).toEqual(input);
+			expect(Object.getPrototypeOf(value)).toBe(Object.prototype);
+			expect(Object.hasOwn(value as object, "__proto__")).toBe(true);
+		}
 	});
 
 	test("rejects lossy tool input conversions", () => {

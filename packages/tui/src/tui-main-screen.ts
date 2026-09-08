@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getKeybindings } from "./keybindings.ts";
-import { matchesKey } from "./keys.ts";
+import { isKeyRelease, matchesKey } from "./keys.ts";
 import type { Terminal } from "./terminal.ts";
 import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
 import {
@@ -707,6 +707,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	protected override consumeViewportKey(data: string): boolean {
+		// Releases still reach raw listeners and opted-in components, but never act on the viewport.
+		if (isKeyRelease(data)) return false;
 		// Overlays own their keys.
 		if (this.hasOverlay()) return false;
 		// Explicit copy of the active transcript selection (Cmd+C where the

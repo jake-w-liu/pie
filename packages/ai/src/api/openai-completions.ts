@@ -36,10 +36,11 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
-import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
+import { formatProviderError, normalizeProviderError, safeJsonStringify } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { headersToRecord } from "../utils/headers.ts";
+import { cancelResponseBody } from "../utils/http-response.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
@@ -338,6 +339,8 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			}
 		};
 
+		let response: Response | undefined;
+		let requestController: AbortController | undefined;
 		try {
 			const apiKey = getClientApiKey(model.provider, options?.apiKey, options?.headers);
 			const compat = getCompat(model);
@@ -358,7 +361,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 				maxRetries: 0,
 			};
-			const { data: openaiStream, response } = await retryProviderRequest(
+			const { data: openaiStream, response: rawResponse } = await retryProviderRequest(
 				() => client.chat.completions.create(params, requestOptions).withResponse(),
 				{
 					maxRetries: options?.maxRetries,
@@ -366,6 +369,8 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 					signal: options?.signal,
 				},
 			);
+			response = rawResponse;
+			requestController = openaiStream.controller;
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
@@ -690,6 +695,8 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
+			requestController?.abort();
+			await cancelResponseBody(response);
 			for (const block of output.content) {
 				if (block.type === "thinking") {
 					applyStreamedReasoningDetails(block);
@@ -706,9 +713,11 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			// normalizeProviderError already stringifies the parsed body (error.error)
 			// into errorMessage, so only append the raw metadata when it is not already
 			// present to avoid double-printing it.
-			const rawMetadata = (error as any)?.error?.metadata?.raw;
-			if (rawMetadata && !output.errorMessage.includes(String(rawMetadata))) {
-				output.errorMessage += `\n${rawMetadata}`;
+			const rawMetadata = (error as { error?: { metadata?: { raw?: unknown } } } | undefined | null)?.error?.metadata
+				?.raw;
+			if (rawMetadata) {
+				const rawText = typeof rawMetadata === "string" ? rawMetadata : safeJsonStringify(rawMetadata);
+				if (!output.errorMessage.includes(rawText)) output.errorMessage += `\n${rawText}`;
 			}
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();

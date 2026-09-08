@@ -1,6 +1,6 @@
 import net from "node:net";
 import tls from "node:tls";
-import * as undici from "undici";
+import * as undici from "undici/index.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyHttpProxySettings, configureHttpDispatcher } from "../src/core/http-dispatcher.ts";
 

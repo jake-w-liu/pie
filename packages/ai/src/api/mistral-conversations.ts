@@ -13,12 +13,15 @@ import type {
 	Tool,
 	ToolCall,
 } from "../types.ts";
+import { safeJsonStringify } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { headersToRecord } from "../utils/headers.ts";
+import { cancelResponseBody } from "../utils/http-response.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
+import { iterateSseMessages } from "../utils/sse.ts";
 import { getJsonSchemaToolParameters, resolveJsonSchemaStrictSampling } from "./constrained-sampling.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
@@ -275,15 +278,6 @@ function truncateErrorText(text: string, maxChars: number): string {
 	return `${text.slice(0, maxChars)}... [truncated ${text.length - maxChars} chars]`;
 }
 
-function safeJsonStringify(value: unknown): string {
-	try {
-		const serialized = JSON.stringify(value);
-		return serialized === undefined ? String(value) : serialized;
-	} catch {
-		return String(value);
-	}
-}
-
 async function requestMistralStream(
 	model: Model<"mistral-conversations">,
 	payload: MistralChatPayload,
@@ -308,17 +302,22 @@ async function requestMistralStream(
 		signal,
 	});
 
-	await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+	try {
+		await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 
-	if (!response.ok) {
-		const body = await response.text();
-		throw new MistralHttpError(response.status, body, response.statusText);
-	}
-	if (!response.body) {
-		throw new Error("Mistral response has no body");
-	}
+		if (!response.ok) {
+			const body = await response.text();
+			throw new MistralHttpError(response.status, body, response.statusText);
+		}
+		if (!response.body) {
+			throw new Error("Mistral response has no body");
+		}
 
-	return readMistralEvents(response.body, signal);
+		return readMistralEvents(response.body, signal);
+	} catch (error) {
+		await cancelResponseBody(response);
+		throw error;
+	}
 }
 
 class MistralHttpError extends Error {
@@ -435,74 +434,19 @@ function isMistralRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-const MISTRAL_STREAM_DONE = Symbol("mistral-stream-done");
-
 async function* readMistralEvents(
 	body: ReadableStream<Uint8Array>,
 	signal?: AbortSignal,
 ): AsyncGenerator<MistralCompletionEvent> {
-	const reader = body.getReader();
-	const decoder = new TextDecoder();
-	let buffer = "";
-	const onAbort = () => {
-		void reader.cancel().catch(() => {});
-	};
-	signal?.addEventListener("abort", onAbort, { once: true });
-
-	try {
-		while (true) {
-			if (signal?.aborted) throw signal.reason;
-			const { done, value } = await reader.read();
-			if (signal?.aborted) throw signal.reason;
-			buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
-
-			let boundary = findMistralEventBoundary(buffer);
-			while (boundary) {
-				const event = parseMistralEvent(buffer.slice(0, boundary.index));
-				buffer = buffer.slice(boundary.index + boundary.length);
-				if (event === MISTRAL_STREAM_DONE) return;
-				if (event) yield event;
-				boundary = findMistralEventBoundary(buffer);
-			}
-
-			if (done) break;
-		}
-
-		if (buffer.trim()) {
-			const event = parseMistralEvent(buffer);
-			if (event !== MISTRAL_STREAM_DONE && event) yield event;
-		}
-	} finally {
-		signal?.removeEventListener("abort", onAbort);
-		try {
-			await reader.cancel();
-		} catch {}
-		try {
-			reader.releaseLock();
-		} catch {}
+	for await (const event of iterateSseMessages(body, signal)) {
+		const data = event.data.trim();
+		if (!data) continue;
+		if (data === "[DONE]") return;
+		const parsed: unknown = JSON.parse(data);
+		if (!isMistralRecord(parsed) || !Array.isArray(parsed.choices))
+			throw new Error("Invalid Mistral streaming event");
+		yield { data: parsed as MistralCompletionEvent["data"] };
 	}
-}
-
-function findMistralEventBoundary(buffer: string): { index: number; length: number } | undefined {
-	const match = /\r\n\r\n|\r\n\r|\r\n\n|\r\r\n|\n\r\n|\r\r|\n\r|\n\n/u.exec(buffer);
-	return match?.index === undefined ? undefined : { index: match.index, length: match[0].length };
-}
-
-function parseMistralEvent(raw: string): MistralCompletionEvent | typeof MISTRAL_STREAM_DONE | undefined {
-	const data = raw
-		.split(/\r\n|\r|\n/u)
-		.filter((line) => line.startsWith("data:"))
-		.map((line) => line.slice(5).trimStart())
-		.join("\n")
-		.trim();
-	if (!data) return undefined;
-	if (data === "[DONE]") return MISTRAL_STREAM_DONE;
-
-	const parsed: unknown = JSON.parse(data);
-	if (!isMistralRecord(parsed) || !Array.isArray(parsed.choices)) {
-		throw new Error("Invalid Mistral streaming event");
-	}
-	return { data: parsed as MistralCompletionEvent["data"] };
 }
 
 function buildChatPayload(

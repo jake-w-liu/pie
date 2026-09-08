@@ -1,5 +1,5 @@
 import { join, resolve } from "node:path";
-import { Text, type TUI } from "@earendil-works/pi-tui";
+import { Text, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { beforeAll, describe, expect, test } from "vitest";
 import { getReadmePath } from "../src/config.ts";
@@ -488,6 +488,14 @@ describe("ToolExecutionComponent parity", () => {
 			absent: undefined,
 		},
 		{
+			title: "long outside AGENTS.md",
+			path: resolve(process.cwd(), "..", "long-fixture-directory-".repeat(10), "AGENTS.md"),
+			content: "Hidden long-path resource instructions",
+			compact: `read resource ${resolve(process.cwd(), "..", "long-fixture-directory-".repeat(10), "AGENTS.md").replace(/\\/g, "/")}`,
+			hidden: "Hidden long-path resource instructions",
+			absent: undefined,
+		},
+		{
 			title: "Pi documentation",
 			path: getReadmePath(),
 			content: "Hidden docs content",
@@ -511,9 +519,17 @@ describe("ToolExecutionComponent parity", () => {
 				false,
 			);
 
-			const collapsed = stripAnsi(component.render(120).join("\n"));
+			// This assertion is about the complete compact title, not its wrapping.
+			// Account for the real content Box's one-cell padding on each side.
+			const width = Math.max(120, visibleWidth(scenario.compact) + 2);
+			const lines = component.render(width);
+			expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
+			const collapsed = stripAnsi(lines.join("\n"));
 			expect(collapsed).toContain(scenario.compact);
 			expect(collapsed).not.toContain(scenario.hidden);
+			const narrowLines = component.render(120);
+			expect(narrowLines.every((line) => visibleWidth(line) <= 120)).toBe(true);
+			expect(stripAnsi(narrowLines.join("")).replace(/\s/g, "")).toContain(scenario.compact.replace(/\s/g, ""));
 			if (scenario.absent) {
 				expect(collapsed).not.toContain(scenario.absent);
 			}

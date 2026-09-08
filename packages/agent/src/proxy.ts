@@ -9,6 +9,7 @@ import {
 	type AssistantMessageEvent,
 	type Context,
 	EventStream,
+	formatThrownValue,
 	type Model,
 	parseStreamingJson,
 	type SimpleStreamOptions,
@@ -231,7 +232,7 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 
 			stream.end();
 		} catch (error) {
-			const errorMessage = error instanceof Error ? error.message : String(error);
+			const errorMessage = formatThrownValue(error);
 			const reason = options.signal?.aborted ? "aborted" : "error";
 			partial.stopReason = reason;
 			partial.errorMessage = errorMessage;

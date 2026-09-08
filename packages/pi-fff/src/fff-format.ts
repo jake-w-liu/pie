@@ -35,9 +35,17 @@ export function cropMatchLine(line: string, ranges: [number, number][] | undefin
 		return { text: truncated.text, wasTruncated: truncated.wasTruncated };
 	}
 
+	// Native ranges count UTF-8 bytes; the display window counts UTF-16 code units.
 	const [start, end] = first;
-	const matchStart = Math.max(0, Math.min(normalized.length, start));
-	const matchEnd = Math.max(matchStart, Math.min(normalized.length, end));
+	let bytes = 0;
+	let matchStart = 0;
+	let matchEnd = 0;
+	for (const char of normalized) {
+		if (bytes >= end) break;
+		bytes += Buffer.byteLength(char, "utf8");
+		matchEnd += char.length;
+		if (bytes <= start) matchStart = matchEnd;
+	}
 	const matchLength = Math.max(1, matchEnd - matchStart);
 	const available = Math.max(0, maxLen - matchLength);
 	const before = Math.floor(available / 3);
@@ -52,6 +60,9 @@ export function cropMatchLine(line: string, ranges: [number, number][] | undefin
 		windowEnd = Math.min(normalized.length, windowStart + maxLen);
 	}
 
+	// Rounding the context window must not split a surrogate pair.
+	if (windowStart > 0 && /[\uDC00-\uDFFF]/.test(normalized[windowStart] ?? "")) windowStart--;
+	if (windowEnd < normalized.length && /[\uDC00-\uDFFF]/.test(normalized[windowEnd] ?? "")) windowEnd++;
 	let text = normalized.slice(windowStart, windowEnd);
 	if (windowStart > 0) text = `…${text}`;
 	if (windowEnd < normalized.length) text = `${text}…`;

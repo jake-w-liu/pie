@@ -39,10 +39,33 @@ describe("Viewport chaos robustness", () => {
 			tui.start();
 			await terminal.waitForRender();
 
+			let transcriptLen = 30;
+			// A completed drag must recover by itself before the randomized escape
+			// actions below can mask a stuck selection hold.
+			terminal.sendInput("\x1b[<0;2;2M");
+			terminal.sendInput("\x1b[<32;2;3M");
+			await terminal.waitForRender();
+			const held = await terminal.flushAndGetViewport();
+			transcriptLen = 34;
+			transcript.setText(transcriptLines(transcriptLen));
+			tui.requestRender();
+			await terminal.waitForRender();
+			assert.deepStrictEqual(await terminal.flushAndGetViewport(), held);
+			terminal.sendInput("\x1b[<0;2;3m");
+			await terminal.waitForRender();
+			const released = await terminal.flushAndGetViewport();
+			assert.ok(
+				released.some((line) => line.includes("line 34")),
+				"release did not resume live follow",
+			);
+			assert.ok(
+				released.some((line) => line.includes("foot")),
+				"release did not restore the input zone",
+			);
+
 			const rand = mulberry32(1234);
 			const pick = (n: number): number => Math.floor(rand() * n);
 			let overlay: { hide: () => void } | undefined;
-			let transcriptLen = 30;
 
 			const driveToBottom = async (): Promise<void> => {
 				for (let i = 0; i < 60; i++) {

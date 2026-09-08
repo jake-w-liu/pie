@@ -64,6 +64,11 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedSequences, [upArrow]);
 		});
 
+		it("should split terminal focus-in and focus-out reports", () => {
+			processInput("\x1b[I\x1b[O");
+			assert.deepStrictEqual(emittedSequences, ["\x1b[I", "\x1b[O"]);
+		});
+
 		it("should pass through complete function key sequences", () => {
 			const f1 = "\x1b[11~";
 			processInput(f1);

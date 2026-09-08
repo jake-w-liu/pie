@@ -2,7 +2,13 @@ import assert from "node:assert";
 import { describe, it } from "node:test";
 import { Editor } from "../src/components/editor.ts";
 import { Text } from "../src/components/text.ts";
-import { Container, isMouseDragMotion, isPrimaryMousePress, parseSgrMouseEvent } from "../src/tui.ts";
+import {
+	Container,
+	isMouseDragMotion,
+	isPrimaryMousePress,
+	isPrimaryMouseRelease,
+	parseSgrMouseEvent,
+} from "../src/tui.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
 import { defaultEditorTheme } from "./test-themes.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
@@ -57,6 +63,15 @@ describe("SGR mouse parsing", () => {
 		assert.strictEqual(isMouseDragMotion({ button: 32, x: 1, y: 1, press: false }), false);
 		assert.strictEqual(isMouseDragMotion({ button: 0, x: 1, y: 1, press: true }), false);
 		assert.strictEqual(isMouseDragMotion({ button: 64, x: 1, y: 1, press: true }), false);
+	});
+
+	it("detects specific and generic primary-button releases", () => {
+		assert.strictEqual(isPrimaryMouseRelease({ button: 0, x: 0, y: 0, press: false }), true);
+		assert.strictEqual(isPrimaryMouseRelease({ button: 3, x: 0, y: 0, press: false }), true);
+		assert.strictEqual(isPrimaryMouseRelease({ button: 7, x: 0, y: 0, press: false }), true);
+		assert.strictEqual(isPrimaryMouseRelease({ button: 1, x: 0, y: 0, press: false }), false);
+		assert.strictEqual(isPrimaryMouseRelease({ button: 2, x: 0, y: 0, press: false }), false);
+		assert.strictEqual(isPrimaryMouseRelease({ button: 0, x: 0, y: 0, press: true }), false);
 	});
 });
 

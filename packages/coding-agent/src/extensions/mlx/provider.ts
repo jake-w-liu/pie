@@ -205,13 +205,13 @@ export async function discoverLocalMlxModels(): Promise<string[]> {
  */
 const DEFAULT_CONTEXT_WINDOW = 32768;
 
-// The MLX server's KV cache (--max-kv-size) is shared between the prompt and the
-// generation: a request is rejected outright when prompt tokens + max_tokens
-// exceed it. Cap the reported context below a typical 65536-token KV cache so
-// requests never overflow, and cap generation at the server's --max-tokens
-// default (4096). Reading the model's native max_position_embeddings directly is
-// not safe here because it can far exceed what the running server actually allows.
-const MAX_CONTEXT_WINDOW = 32768;
+// Upper bound for locally-read context windows. The server enforces the model's
+// own limit request-side; pie stays at or below it so long sessions compact before
+// the server would reject them. 131072 (128k) is the largest window verified
+// against a 32 GiB local machine (27B hybrid-attention 4-bit: ~13 GiB weights +
+// ~64 KiB KV per full-attention token -> ~8 GiB KV at 128k). Larger native
+// windows (e.g. 262144) do not fit alongside the weights there and are clamped.
+const MAX_CONTEXT_WINDOW = 131072;
 const MAX_GENERATION_TOKENS = 4096;
 
 function toPiModel(entry: MlxModelEntry, serverUrl: string, contextWindow?: number): Model<"openai-completions"> {

@@ -33,6 +33,7 @@
 - Changed interactive model selections and cycling to become the next startup model, and changed auto-compaction to trigger between agent tool turns at the earlier of 87% context usage or the configured response-token reserve.
 - Changed the default OpenAI and OpenAI Codex model to GPT-5.6 Sol.
 - Removed upstream application update checks, release notifications, self-update commands, and managed-installer update code; `pie update` now updates installed packages by default.
+- Raised the MLX provider local-model context ceiling from 32k to 128k so models with large native windows and a capable local server (e.g. 27B hybrid-attention 4-bit) are reported with up to 131072 tokens; models without a readable local config still default to 32k.
 
 ### Fixed
 

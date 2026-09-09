@@ -91,4 +91,33 @@ describe("SettingsList", () => {
 		alphaDone(undefined, { navigateTo: "beta" });
 		assert.deepStrictEqual(opened, ["alpha", "beta"]);
 	});
+
+	it("renders without throwing at boundary widths below 5 columns", () => {
+		// Regression coverage for B1: at terminal widths < 5 the value column
+		// collapses (valueMaxWidth <= 0) and the description wraps at width - 4
+		// (<= 0). Both helpers degrade gracefully (empty truncation / FFFD
+		// fallback), so rendering must neither throw nor hang — output is
+		// cosmetic-only at these widths. The TUI framework itself guarantees
+		// width >= 1 for component renders (tui.ts resolveOverlayLayout clamps).
+		const narrowItems = [
+			{
+				id: "tui-mode",
+				label: "TUI mode with a long label",
+				description: "A description that must wrap even when almost no columns remain",
+				currentValue: "regular",
+				values: ["regular", "fullscreen"],
+			},
+		];
+		for (const width of [1, 2, 3, 4]) {
+			const list = new SettingsList(
+				narrowItems.map((item) => ({ ...item })),
+				10,
+				testTheme,
+				() => {},
+				() => {},
+			);
+			const lines = list.render(width);
+			assert.ok(lines.length > 0, `expected lines at width ${width}`);
+		}
+	});
 });

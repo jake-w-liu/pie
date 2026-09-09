@@ -98,15 +98,30 @@ export async function resizeImage(
 	// release binary uses the embedded worker instead of falling back in-process.
 	if (typeof process.versions.bun === "string") {
 		try {
-			return await resizeImageInWorker("./src/utils/image-resize-worker.ts", inputBytes, mimeType, options);
+			const bunWorkerResult = await resizeImageInWorker(
+				"./src/utils/image-resize-worker.ts",
+				inputBytes,
+				mimeType,
+				options,
+			);
+			if (bunWorkerResult) {
+				return bunWorkerResult;
+			}
 		} catch {}
 	}
 
 	try {
-		return await resizeImageInWorker(workerUrl, inputBytes, mimeType, options);
+		const workerResult = await resizeImageInWorker(workerUrl, inputBytes, mimeType, options);
+		if (workerResult) {
+			return workerResult;
+		}
 	} catch {
-		return resizeImageInProcess(inputBytes, mimeType, options);
+		// Fall through to in-process resizing below.
 	}
+	// A worker that runs but returns null (e.g. its image backend failed to load
+	// after a release swap) must not veto the in-process path. Genuinely
+	// unfittable images simply fail here a second time and still return null.
+	return resizeImageInProcess(inputBytes, mimeType, options);
 }
 
 /**

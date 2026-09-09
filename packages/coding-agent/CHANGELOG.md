@@ -38,6 +38,7 @@
 
 - Fixed the model catalog overlay keeping stale models in memory after the remote catalog reports a provider as unavailable (404/501).
 - Fixed `PI_OFFLINE=0/false/no` disabling model networking while the package manager stayed online; all layers now share one offline check.
+- Fixed image reads failing with a size-limit message when the resize worker ran but its image backend was unavailable: `resizeImage` now falls back to in-process resizing on a worker null (not just on worker errors), and `processImage` reports an unavailable image engine instead of blaming the inline image size limit.
 - Fixed single-provider availability failures polluting the global models error, and credential operations reporting cancellation as synchronization failure.
 - Fixed extension-defined models dropping models.json provider-level compat routing.
 - Fixed non-content grep modes retaining every match in memory; only file paths are kept now.

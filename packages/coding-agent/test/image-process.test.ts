@@ -50,4 +50,14 @@ describe("image processing pipeline", () => {
 		expect(result.hints).toContain("[Image converted from image/bmp to image/png.]");
 		expectPngMagic(result.data);
 	});
+
+	it("still blames the size limit when the backend works but the image cannot fit", async () => {
+		const result = await processImage(createTinyBmp1x1Red24bpp(), "image/bmp", {
+			resizeOptions: { maxBytes: 1 },
+		});
+
+		expect(result.ok).toBe(false);
+		if (result.ok) return;
+		expect(result.message).toContain("could not be resized below the inline image size limit");
+	});
 });

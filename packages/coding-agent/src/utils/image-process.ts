@@ -1,5 +1,6 @@
 import { convertImageBytesToPng } from "./image-convert.ts";
 import { formatDimensionNote, type ImageResizeOptions, resizeImage } from "./image-resize.ts";
+import { loadPhoton } from "./photon.ts";
 
 export interface ProcessImageOptions {
 	/** Whether to resize images to inline provider limits. Default: true */
@@ -86,9 +87,15 @@ export async function processImage(
 	if (autoResizeImages) {
 		const resized = await resizeImage(normalized.bytes, normalized.mimeType, options?.resizeOptions);
 		if (!resized) {
+			// resizeImage intentionally returns null for every failure mode. Blaming
+			// the size limit when the backend itself is missing sends reporters down
+			// the wrong path, so distinguish the two before giving up.
+			const engineAvailable = await loadPhoton();
 			return {
 				ok: false,
-				message: "[Image omitted: could not be resized below the inline image size limit.]",
+				message: engineAvailable
+					? "[Image omitted: could not be resized below the inline image size limit.]"
+					: "[Image omitted: image engine unavailable in this session.]",
 			};
 		}
 

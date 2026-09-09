@@ -296,14 +296,14 @@ const SubagentParamProperties = {
 	timezone: Type.Optional(Type.String({ description: "IANA timezone reserved for a later calendar schedule slice." })),
 	overlap: Type.Optional(Type.String({ enum: ["skip"], description: "Overlap policy. This slice supports skip only." })),
 	catchUp: Type.Optional(Type.String({ enum: ["none", "latest"], description: "Missed occurrence policy for recurring schedules. Defaults to latest." })),
-	missionId: Type.Optional(Type.String({ description: "Mission id." })),
-	mission: Type.Optional(Type.Unsafe({ ...MissionLaunchOverride, description: "Mission object, or false for no mission. Set exactly one non-empty title or summary; objective and labels are optional. goal may only be true and then requires budget.tokens." })),
-	missionUpdate: Type.Optional(Type.Unsafe({ ...MissionUpdateOverride, description: "Mission update: objective, goal false or {paused:boolean}, budget, summary, labels, decisions, artifacts, or delivery receipts." })),
-	missionStatus: Type.Optional(Type.String({ description: "Mission status." })),
+	missionId: Type.Optional(Type.String({ description: "Existing mission id: pass at launch to attach (mutually exclusive with mission), or to target with action:'mission.*'." })),
+	mission: Type.Optional(Type.Unsafe({ ...MissionLaunchOverride, description: "Mission object, or false for no mission. Set exactly one non-empty title or summary; objective and labels are optional. goal may only be true and then requires budget:{tokens:<positive-integer token count>} (a bare integer, not the usageBudget {hard,soft} shape). mission alone only applies at launch; later management requires action:'mission.*'." })),
+	missionUpdate: Type.Optional(Type.Unsafe({ ...MissionUpdateOverride, description: "Mission update for action:'mission.update': objective, goal false or {paused:boolean}, budget:{tokens:<positive-integer>}, summary, labels, decisions, artifacts, or delivery receipts." })),
+	missionStatus: Type.Optional(Type.String({ description: "Mission status for action:'mission.close': completed, failed, or cancelled." })),
 	missionScope: Type.Optional(Type.String({ description: "Mission list scope: project (default) or global pointer index." })),
-	runMode: Type.Optional(Type.String({ description: "Attached run mode." })),
-	runStatus: Type.Optional(Type.String({ description: "Attached run status." })),
-	summary: Type.Optional(Type.String({ description: "Mission close summary." })),
+	runMode: Type.Optional(Type.String({ description: "Attached run mode for action:'mission.attach-run': single, parallel, chain, workflow, scheduled, or external (default)." })),
+	runStatus: Type.Optional(Type.String({ description: "Attached run status for action:'mission.attach-run'." })),
+	summary: Type.Optional(Type.String({ description: "Mission close summary for action:'mission.close' (non-empty string when provided)." })),
 	// Agent configuration for create/update (nested to avoid conflicts with execution fields)
 	config: Type.Optional(Type.Unsafe({
 		anyOf: [

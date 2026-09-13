@@ -3,7 +3,7 @@ import { fetchWithResponseErrors } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 // Select the pinned npm transport, not Bun's bare-specifier compatibility shim.
-import { Agent, Pool, ProxyAgent, Request as UndiciRequest, fetch as undiciFetch, type Dispatcher, type RequestInit as UndiciRequestInit } from "undici/index.js";
+import { Agent, Dispatcher1Wrapper, Pool, ProxyAgent, Request as UndiciRequest, fetch as undiciFetch, type Dispatcher, type RequestInit as UndiciRequestInit } from "undici/index.js";
 import { join } from "node:path";
 
 export function getWebSearchConfigDir(): string {
@@ -322,6 +322,19 @@ export async function fetchWithDispatcher(url: string | URL | UndiciRequest, ini
 	}
 }
 
+/**
+ * npm Undici requires onRequestStart/onResponseError while older handlers
+ * (Node <=22's native fetch) speak onConnect/onHeaders/onData/onComplete/onError.
+ * Without translation dispatch throws UND_ERR_INVALID_ARG ("invalid onRequestStart
+ * method"). Undici's official Dispatcher1Wrapper translates legacy handlers (with
+ * raw-header/trailer preservation, upgrade/body progress forwarding, header
+ * backpressure, and HTTP/2 disabled for legacy consumers) and passes modern
+ * handlers through untouched.
+ */
+function withLegacyHandlerSupport(dispatcher: Dispatcher): Dispatcher {
+	return new Dispatcher1Wrapper(dispatcher);
+}
+
 /** Wrap global fetch only for configured/scoped proxies; provider calls are not SSRF-gated. */
 export function installGlobalProxyFetch(): void {
 	const current = globalThis.fetch as ProxiedFetch;
@@ -331,11 +344,11 @@ export function installGlobalProxyFetch(): void {
 		const proxy = init?.__proxy !== undefined ? normalizeProxyUrl(init.__proxy, "proxy") : getActiveProxy();
 		const hasDecision = init?.__proxy !== undefined || hasScopedProxyDecision() || proxy !== null;
 		if (!hasDecision || (url.protocol !== "http:" && url.protocol !== "https:")) return current(input, init);
-		const dispatcher = new Agent({
+		const dispatcher = withLegacyHandlerSupport(new Agent({
 			// Fetch handles redirects and credentials; transport rechecks bypass on every origin.
 			// A direct decision must not fall through to the host's environment proxy dispatcher.
 			factory: origin => !proxy || isProxyBypassedUrl(new URL(origin)) ? new Pool(origin) : new ProxyAgent(proxy),
-		});
+		}));
 		if (typeof input === "string" || input instanceof URL || input instanceof UndiciRequest) {
 			return fetchWithDispatcher(input, init ?? {}, dispatcher);
 		}

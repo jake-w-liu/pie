@@ -446,15 +446,17 @@ export function calculateImageCellSize(
 	const maxHeight = maxHeightCells === undefined ? undefined : Math.max(1, Math.floor(maxHeightCells));
 	const imageWidth = Math.max(1, imageDimensions.widthPx);
 	const imageHeight = Math.max(1, imageDimensions.heightPx);
+	const cellWidthPx = Number.isFinite(cellDimensions.widthPx) ? Math.max(1, cellDimensions.widthPx) : 1;
+	const cellHeightPx = Number.isFinite(cellDimensions.heightPx) ? Math.max(1, cellDimensions.heightPx) : 1;
 
-	const widthScale = (maxWidth * cellDimensions.widthPx) / imageWidth;
-	const heightScale = maxHeight === undefined ? widthScale : (maxHeight * cellDimensions.heightPx) / imageHeight;
+	const widthScale = (maxWidth * cellWidthPx) / imageWidth;
+	const heightScale = maxHeight === undefined ? widthScale : (maxHeight * cellHeightPx) / imageHeight;
 	const scale = Math.min(widthScale, heightScale);
 
 	const scaledWidthPx = imageWidth * scale;
 	const scaledHeightPx = imageHeight * scale;
-	const columns = Math.ceil(scaledWidthPx / cellDimensions.widthPx);
-	const rows = Math.ceil(scaledHeightPx / cellDimensions.heightPx);
+	const columns = Math.ceil(scaledWidthPx / cellWidthPx);
+	const rows = Math.ceil(scaledHeightPx / cellHeightPx);
 
 	return {
 		columns: Math.max(1, Math.min(maxWidth, columns)),
@@ -657,17 +659,44 @@ export function renderImage(
 }
 
 /**
+ * Strip characters that can break out of an OSC 8 hyperlink sequence.
+ * ESC (\x1b) starts new escape sequences (including the ST terminator ESC \),
+ * BEL (\x07) is an alternate OSC terminator, and ST (\x9c) terminates OSC 8.
+ * Legitimate URLs never contain these, so they are removed outright.
+ */
+function sanitizeOsc8Url(value: string): string {
+	return value.replace(/[\x1b\x07\x9c]/g, "");
+}
+
+/**
+ * Sanitize hyperlink display text. SGR styling sequences (ESC [ ... m) are
+ * preserved so themed link colors survive; every other escape sequence
+ * (OSC, non-SGR CSI such as ESC [ 2 J) and stray ESC/BEL/ST bytes are
+ * removed so untrusted text cannot break out of the hyperlink or drive
+ * the terminal.
+ */
+function sanitizeOsc8Text(value: string): string {
+	return value
+		.replace(/\x1b\][^\x1b\x07]*?(?:\x1b\\|\x07|\x9c|$)/g, "")
+		.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, (seq) => (/^\x1b\[[0-9;]*m$/.test(seq) ? seq : ""))
+		.replace(/\x1b(?!\[[0-9;]*m)|[\x07\x9c]/g, "");
+}
+
+/**
  * Wrap text in an OSC 8 hyperlink sequence.
  * The text is rendered as a clickable hyperlink in terminals that support OSC 8
  * (Ghostty, Kitty, WezTerm, iTerm2, VSCode, and others).
  * In terminals that do not support OSC 8, the escape sequences are ignored
  * and only the plain text is displayed.
  *
+ * The URL is strictly sanitized and the display text keeps only SGR styling,
+ * so untrusted input cannot break out of the sequence (ESC/ST/BEL injection).
+ *
  * @param text - The visible text to display
  * @param url - The URL to link to
  */
 export function hyperlink(text: string, url: string): string {
-	return `\x1b]8;;${url}\x1b\\${text}\x1b]8;;\x1b\\`;
+	return `\x1b]8;;${sanitizeOsc8Url(url)}\x1b\\${sanitizeOsc8Text(text)}\x1b]8;;\x1b\\`;
 }
 
 /** Shorten home-prefixed absolute paths to ~/... for compact display. */
@@ -687,7 +716,7 @@ function shortenImagePath(filename: string): string {
 export function imageFallback(mimeType: string, dimensions?: ImageDimensions, filename?: string): string {
 	const parts: string[] = [];
 	if (filename) {
-		const display = shortenImagePath(filename);
+		const display = sanitizeOsc8Text(shortenImagePath(filename));
 		if (getCapabilities().hyperlinks && isAbsolute(filename)) {
 			parts.push(hyperlink(display, pathToFileURL(filename).href));
 		} else {

@@ -48,9 +48,20 @@ export function agentLoop(
 		},
 		signal,
 		streamFn,
-	).then((messages) => {
-		stream.end(messages);
-	});
+	)
+		.then((messages) => {
+			stream.end(messages);
+		})
+		.catch(() => {
+			// The run failed before producing a terminal agent_end (e.g. a
+			// listener, transformContext, or convertToLlm threw). End the
+			// stream so async iteration terminates and result() settles
+			// instead of hanging forever, and swallow the rejection so
+			// there is no unhandled promise rejection. This mirrors
+			// Agent.runWithLifecycle/handleRunFailure closing out the run
+			// lifecycle on failure without changing StreamFn contracts.
+			stream.end([]);
+		});
 
 	return stream;
 }
@@ -87,9 +98,15 @@ export function agentLoopContinue(
 		},
 		signal,
 		streamFn,
-	).then((messages) => {
-		stream.end(messages);
-	});
+	)
+		.then((messages) => {
+			stream.end(messages);
+		})
+		.catch(() => {
+			// Same failure close-out as agentLoop above: terminate the
+			// stream so consumers never hang on a run that rejected.
+			stream.end([]);
+		});
 
 	return stream;
 }

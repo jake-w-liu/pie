@@ -285,9 +285,10 @@ export class Markdown implements Component {
 	}
 
 	render(width: number): string[] {
+		width = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
 		// Check cache
 		if (this.cachedLines && this.cachedText === this.text && this.cachedWidth === width) {
-			return this.cachedLines;
+			return [...this.cachedLines];
 		}
 
 		// Reduce margins when necessary so content and padding fit within the
@@ -304,7 +305,7 @@ export class Markdown implements Component {
 			this.cachedText = this.text;
 			this.cachedWidth = width;
 			this.cachedLines = result;
-			return result;
+			return [...result];
 		}
 
 		// Replace tabs with 3 spaces for consistent rendering
@@ -377,7 +378,11 @@ export class Markdown implements Component {
 		this.cachedWidth = width;
 		this.cachedLines = result;
 
-		return result.length > 0 ? result : [""];
+		const finalResult = result.length > 0 ? result : [""];
+		if (finalResult !== result) {
+			this.cachedLines = finalResult;
+		}
+		return [...finalResult];
 	}
 
 	/**

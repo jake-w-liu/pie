@@ -23,7 +23,10 @@ function asFiniteNumber(value: unknown): number | undefined {
 export function buildCompletionKey(data: CompletionDataLike, fallback: string): string {
 	const sessionId = asNonEmptyString(data.sessionId) ?? "no-session";
 	const id = asNonEmptyString(data.id);
-	const state = asNonEmptyString(data.state);
+	// The codebase emits both "complete" and "completed" for the same terminal
+	// condition; normalize so spelling variants of one completion share a key.
+	const rawState = asNonEmptyString(data.state);
+	const state = rawState === "complete" ? "completed" : rawState;
 	if (id) return state
 		? `session:${sessionId}:id:${id}:state:${state}`
 		: `session:${sessionId}:id:${id}`;

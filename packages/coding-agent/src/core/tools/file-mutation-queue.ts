@@ -49,13 +49,30 @@ export async function withFileMutationQueue<T>(filePath: string, fn: () => Promi
 	);
 
 	const { key, currentQueue, chainedQueue, releaseNext } = await registration;
-	await currentQueue;
-	try {
-		return await fn();
-	} finally {
+	const release = () => {
 		releaseNext();
 		if (fileMutationQueues.get(key) === chainedQueue) {
 			fileMutationQueues.delete(key);
 		}
+	};
+	await currentQueue;
+	// The path may have been replaced (rename-swap) or repointed (symlink flip)
+	// while this operation was queued. Re-resolve and forward to the current
+	// key's queue instead of running in parallel with writers that registered
+	// against the new target. A swap between this check and `fn()`'s open is
+	// still racy (only OS-level file locking would close it).
+	try {
+		const freshKey = await getMutationQueueKey(filePath);
+		if (freshKey !== key) {
+			release();
+			return withFileMutationQueue(filePath, fn);
+		}
+	} catch {
+		// Resolution failed; fall through and run on the original queue.
+	}
+	try {
+		return await fn();
+	} finally {
+		release();
 	}
 }

@@ -32,8 +32,10 @@ export function resolveSubagentResultStatus(input: {
 	if (input.stopped || input.state === "stopped") return "stopped";
 	if (input.interrupted || input.state === "paused") return "paused";
 	if (input.success === true) return "completed";
-	if (isUnexplainedProcessSignal(input) && input.exitCode !== 0) return "stopped";
+	// An explicit failure verdict wins over an unexplained signal: reporting
+	// "stopped" here would mask a genuine failure as an infrastructure stop.
 	if (input.success === false) return "failed";
+	if (isUnexplainedProcessSignal(input) && input.exitCode !== 0) return "stopped";
 	if (input.state === "complete") return "completed";
 	if (input.state === "failed") return "failed";
 	if (typeof input.exitCode === "number") return input.exitCode === 0 ? "completed" : "failed";
@@ -85,8 +87,10 @@ function resolveGroupedStatus(children: SubagentResultIntercomChild[]): Subagent
 	if (counts.failed > 0) return "failed";
 	if (counts.stopped > 0) return "stopped";
 	if (counts.paused > 0) return "paused";
-	if (counts.completed > 0) return "completed";
+	// A still-detached child is live elsewhere; surfacing "completed" while it
+	// runs would hide that liveness.
 	if (counts.detached > 0) return "detached";
+	if (counts.completed > 0) return "completed";
 	return "failed";
 }
 

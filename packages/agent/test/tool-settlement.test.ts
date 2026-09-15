@@ -510,3 +510,38 @@ describe("tool settlement", () => {
 		},
 	);
 });
+
+describe("parallel sibling settlement on entry failure", () => {
+	it("parallel publishes sibling toolResults before surfacing the first failure", async () => {
+		const failure = new Error("sibling listener failure");
+		const events: AgentEvent[] = [];
+		const agent = new Agent({
+			initialState: {
+				model,
+				tools: [tool(async () => result)],
+			},
+			toolExecution: "parallel",
+			streamFn: streamCalls(["slow", "fast"]),
+			shouldStopAfterTurn: () => true,
+		});
+		agent.subscribe(async (event) => {
+			events.push(event);
+			if (event.type === "tool_execution_end" && event.toolCallId === "slow") {
+				throw failure;
+			}
+		});
+		await agent.prompt(prompt);
+		await agent.waitForIdle();
+		// The successful sibling's toolResult must still be paired in the transcript
+		// even though the slow entry failed in its end listener.
+		const toolResults = agent.state.messages.filter((message) => message.role === "toolResult");
+		expect(toolResults.map((message) => (message as { toolCallId: string }).toolCallId)).toContain("fast");
+		expect(toolResults.find((message) => (message as { toolCallId: string }).toolCallId === "fast")).toMatchObject({
+			isError: false,
+			content: [{ type: "text", text: "done" }],
+		});
+		// The failure still fails the run loudly instead of a partial success.
+		expect(agent.state.errorMessage).toContain("sibling listener failure");
+		expect(events.at(-1)?.type).toBe("agent_end");
+	});
+});

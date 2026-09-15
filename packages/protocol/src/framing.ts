@@ -12,6 +12,12 @@ export const DEFAULT_MAX_FRAME_LENGTH = 16 * 1024 * 1024;
 
 export interface FrameDecoderOptions {
 	maxFrameLength?: number;
+	/** Maximum number of elements in a decoded CBOR array or entries in a map.
+	 * Defaults to the CBOR decoder default; configuring it ties container
+	 * amplification to the frame budget for hostile-peer hardening. */
+	maxContainerLength?: number;
+	/** Maximum decoded CBOR nesting depth. Defaults to the CBOR decoder default. */
+	maxDepth?: number;
 }
 
 export class FrameError extends Error {

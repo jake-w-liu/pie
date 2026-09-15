@@ -189,6 +189,23 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 			const decoder = new TextDecoder();
 			let buffer = "";
 
+			// Parse one SSE line. Servers vary: some omit the space after "data:"
+			// or terminate lines with CRLF, so tolerate both. JSON errors
+			// propagate to the stream error path below.
+			const processLine = (rawLine: string) => {
+				const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+				if (!line.startsWith("data:")) return;
+				// SSE strips a single leading space from the field value.
+				const data = line.slice(5).replace(/^ /, "").trim();
+				if (!data) return;
+				const proxyEvent = JSON.parse(data) as ProxyAssistantMessageEvent;
+				const event = processProxyEvent(proxyEvent, partial);
+				if (event) {
+					if (event.type === "done" || event.type === "error") terminalPushed = true;
+					stream.push(event);
+				}
+			};
+
 			while (true) {
 				const { done, value } = await reader.read();
 				if (done) break;
@@ -201,18 +218,19 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 				const lines = buffer.split("\n");
 				buffer = lines.pop() || "";
 
-				for (const line of lines) {
-					if (line.startsWith("data: ")) {
-						const data = line.slice(6).trim();
-						if (data) {
-							const proxyEvent = JSON.parse(data) as ProxyAssistantMessageEvent;
-							const event = processProxyEvent(proxyEvent, partial);
-							if (event) {
-								if (event.type === "done" || event.type === "error") terminalPushed = true;
-								stream.push(event);
-							}
-						}
-					}
+				for (const line of lines) processLine(line);
+			}
+
+			// Flush decoder-carried bytes, then process a final data line stranded
+			// without its trailing newline. A truncated tail is not valid JSON;
+			// ignore it and fall through to the missing-terminal error below
+			// rather than masking it with a parse error.
+			buffer += decoder.decode();
+			if (buffer.trim()) {
+				try {
+					processLine(buffer);
+				} catch {
+					// Handled as a missing terminal event below.
 				}
 			}
 
@@ -227,7 +245,7 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 			if (!terminalPushed) {
 				partial.stopReason = "error";
 				partial.errorMessage = "Proxy stream ended without a terminal event";
-				stream.push({ type: "error", reason: "error", error: partial });
+				stream.push({ type: "error", reason: "error", error: snapshotPartial(partial) });
 			}
 
 			stream.end();
@@ -239,7 +257,7 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 			stream.push({
 				type: "error",
 				reason,
-				error: partial,
+				error: snapshotPartial(partial),
 			});
 			stream.end();
 		} finally {
@@ -253,9 +271,43 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 }
 
 /**
+ * Isolated copy of a reconstructed partial for event delivery.
+ *
+ * The live `partial` is mutated in place as deltas arrive, but emitted events
+ * must not alias it: listeners (and the agent transcript) may retain payloads
+ * while later deltas keep mutating the live object. Each block is copied, and
+ * the staging-only `partialJson` accumulator (see `toolcall_start`) is stripped
+ * so it can never leak into transcripts on abort/error paths.
+ */
+function snapshotPartial(partial: AssistantMessage): AssistantMessage {
+	return {
+		...partial,
+		content: partial.content.map((block) => {
+			if (block.type === "toolCall" && "partialJson" in block) {
+				const copy = { ...block } as unknown as Record<string, unknown>;
+				delete copy.partialJson;
+				return copy as unknown as (typeof partial.content)[number];
+			}
+			return { ...block };
+		}),
+	};
+}
+
+function processProxyEvent(
+	proxyEvent: ProxyAssistantMessageEvent,
+	partial: AssistantMessage,
+): AssistantMessageEvent | undefined {
+	const event = processProxyEventInner(proxyEvent, partial);
+	if (event && "partial" in event && event.partial) {
+		return { ...event, partial: snapshotPartial(event.partial) };
+	}
+	return event;
+}
+
+/**
  * Process a proxy event and update the partial message.
  */
-function processProxyEvent(
+function processProxyEventInner(
 	proxyEvent: ProxyAssistantMessageEvent,
 	partial: AssistantMessage,
 ): AssistantMessageEvent | undefined {
@@ -371,13 +423,15 @@ function processProxyEvent(
 		case "done":
 			partial.stopReason = proxyEvent.reason;
 			partial.usage = proxyEvent.usage;
-			return { type: "done", reason: proxyEvent.reason, message: partial };
+			// Snapshot: the catch path below may mutate the live partial again,
+			// which must not alias the terminal payload already delivered.
+			return { type: "done", reason: proxyEvent.reason, message: snapshotPartial(partial) };
 
 		case "error":
 			partial.stopReason = proxyEvent.reason;
 			partial.errorMessage = proxyEvent.errorMessage;
 			partial.usage = proxyEvent.usage;
-			return { type: "error", reason: proxyEvent.reason, error: partial };
+			return { type: "error", reason: proxyEvent.reason, error: snapshotPartial(partial) };
 
 		default: {
 			const _exhaustiveCheck: never = proxyEvent;

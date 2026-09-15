@@ -390,6 +390,8 @@ function addNestedCost(total: NonNullable<Details["totalCost"]>, children: Neste
 			total.inputTokens += child.totalCost.inputTokens;
 			total.outputTokens += child.totalCost.outputTokens;
 			total.costUsd += child.totalCost.costUsd;
+			total.cacheReadTokens = (total.cacheReadTokens ?? 0) + (child.totalCost.cacheReadTokens ?? 0);
+			total.cacheWriteTokens = (total.cacheWriteTokens ?? 0) + (child.totalCost.cacheWriteTokens ?? 0);
 			continue;
 		}
 		addNestedCost(total, child.children);
@@ -397,13 +399,15 @@ function addNestedCost(total: NonNullable<Details["totalCost"]>, children: Neste
 	}
 }
 
-/** Sum input tokens, output tokens, and cost across a set of SingleResults. */
+/** Sum input tokens, output tokens, cache tokens, and cost across a set of SingleResults. */
 export function sumResultsCost(results: SingleResult[]): NonNullable<Details["totalCost"]> {
-	const total = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
+	const total: NonNullable<Details["totalCost"]> = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
 	for (const result of results) {
 		total.inputTokens += result.usage.input;
 		total.outputTokens += result.usage.output;
 		total.costUsd += result.usage.cost;
+		total.cacheReadTokens = (total.cacheReadTokens ?? 0) + (result.usage.cacheRead ?? 0);
+		total.cacheWriteTokens = (total.cacheWriteTokens ?? 0) + (result.usage.cacheWrite ?? 0);
 		addNestedCost(total, result.children);
 	}
 	return total;

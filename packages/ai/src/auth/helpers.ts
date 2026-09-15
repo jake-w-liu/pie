@@ -16,7 +16,7 @@ export function envApiKeyAuth(name: string, envVars: readonly string[]): ApiKeyA
 			if (!key.trim()) {
 				throw new Error(`No ${name} provided`);
 			}
-			return { type: "api_key", key };
+			return { type: "api_key", key: key.trim() };
 		},
 		resolve: async ({ ctx, credential, signal }) => {
 			signal.throwIfAborted();
@@ -47,9 +47,16 @@ export function lazyOAuth(input: {
 	load: () => Promise<OAuthAuth>;
 }): OAuthAuth {
 	let promise: Promise<OAuthAuth> | undefined;
-	const loaded = () => {
-		promise ??= input.load();
-		return promise;
+	const loaded = (): Promise<OAuthAuth> => {
+		const current = promise;
+		if (current) return current;
+		const next = input.load();
+		promise = next;
+		next.catch(() => {
+			// A transient load failure must not poison later calls.
+			if (promise === next) promise = undefined;
+		});
+		return next;
 	};
 	return {
 		name: input.name,

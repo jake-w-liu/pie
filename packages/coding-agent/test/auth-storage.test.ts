@@ -145,14 +145,15 @@ describe("AuthStorage", () => {
 		expect(statSync(authJsonPath).mode & 0o777).toBe(0o600);
 	});
 
-	test.skipIf(process.platform === "win32")("preserves the mode of an existing auth file", async () => {
+	test.skipIf(process.platform === "win32")("tightens the mode of an existing permissive auth file", async () => {
 		writeAuthJson({ anthropic: { type: "api_key", key: "old" } });
 		chmodSync(authJsonPath, 0o660);
 		const storage = AuthStorage.create(authJsonPath);
 
 		await storage.modify("anthropic", async () => ({ type: "api_key", key: "new" }));
 
-		expect(statSync(authJsonPath).mode & 0o777).toBe(0o660);
+		// Group-readable credentials left by older code are repaired to owner-only.
+		expect(statSync(authJsonPath).mode & 0o777).toBe(0o600);
 	});
 
 	test("modify persists a credential while preserving unrelated external edits", async () => {

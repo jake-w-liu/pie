@@ -70,7 +70,7 @@ import { applyIntercomBridgeToAgent, INTERCOM_BRIDGE_MARKER, resolveIntercomBrid
 import { formatControlIntercomMessage, formatControlNoticeMessage, resolveControlConfig, shouldNotifyControlEvent } from "../shared/subagent-control.ts";
 import { resolveTurnBudgetConfig } from "../shared/turn-budget.ts";
 import { formatSpawnBudget, getSpawnBudgetSnapshot, grantSpawnBudget, preflightSpawnBudget, preflightSpawnBudgetGrant, reserveSpawnBudget } from "../shared/spawn-budget.ts";
-import { claimRunFanoutBatch, claimRunFanoutBatchWithCommit, createRunFanoutBudget, decodeRunFanoutBudgetDescriptor, formatRunFanoutBudget, getRunFanoutBudgetSnapshot, readRunFanoutBudgetDescriptor, RunFanoutLimitError, RUN_FANOUT_BUDGET_ENV, writeRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
+import { claimRunFanoutBatch, claimRunFanoutBatchWithCommit, createRunFanoutBudget, decodeRunFanoutBudgetDescriptor, formatRunFanoutBudget, getRunFanoutBudgetSnapshot, readRunFanoutBudgetDescriptor, releaseRunFanoutBatch, RunFanoutLimitError, RUN_FANOUT_BUDGET_ENV, writeRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
 import { usageBudgetExceededMessage, usageBudgetState, validateUsageBudgetConfig } from "../shared/usage-budget.ts";
 import { intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
@@ -6020,6 +6020,13 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			if (error instanceof RunFanoutLimitError) return runFanoutErrorResult(error, foregroundMode);
 			return buildRequestedModeError(effectiveParams, error instanceof Error ? error.message : String(error));
 		}
+		// Slots claimed above belong to this launch attempt only. Every early return
+		// below (before children actually launch) must release them so a rejected
+		// launch does not permanently consume shared fan-out budget.
+		const claimedStaticFanoutPaths = effectiveParams.runFanoutAdmitted ? [] : staticRunFanoutPaths(effectiveParams);
+		const releaseClaimedFanout = (): void => {
+			releaseRunFanoutBatch(runFanoutBudget, claimedStaticFanoutPaths);
+		};
 		const nestedRoute = inheritedNestedRoute ?? createNestedRoute(runId);
 
 		const artifactConfig: ArtifactConfig = omitUndefinedProperties({
@@ -6047,6 +6054,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			fs.mkdirSync(sessionRoot, { recursive: true });
 		} catch (error) {
 			activeAsyncCapacity?.rollback();
+			releaseClaimedFanout();
 			const message = error instanceof Error ? error.message : String(error);
 			return toExecutionErrorResult(
 				effectiveParams,
@@ -6083,11 +6091,13 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			}
 		} catch (error) {
 			activeAsyncCapacity?.rollback();
+			releaseClaimedFanout();
 			return toExecutionErrorResult(effectiveParams, error, contextPolicy.contextSummary);
 		}
 		const chainBindingsError = validateExecutionChainBindings(effectiveParams, deps.config.chain?.dynamicFanout?.maxItems);
 		if (chainBindingsError) {
 			activeAsyncCapacity?.rollback();
+			releaseClaimedFanout();
 			return withResolvedContext(chainBindingsError, contextPolicy.contextSummary);
 		}
 
@@ -6111,6 +6121,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		} catch (error) {
 			if (explicitMission) {
 				activeAsyncCapacity?.rollback();
+				releaseClaimedFanout();
 				return toExecutionErrorResult(effectiveParams, error, contextPolicy.contextSummary);
 			}
 			missionWarning = `Mission tracking unavailable: ${error instanceof Error ? error.message : String(error)}`;
@@ -6142,6 +6153,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		);
 		if (reservation.error) {
 			activeAsyncCapacity?.rollback();
+			releaseClaimedFanout();
 			return attachMission(spawnBudgetErrorResult(reservation.error, foregroundMode));
 		}
 

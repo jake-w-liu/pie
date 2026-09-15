@@ -15,8 +15,8 @@ let rawStdoutWriteTail: Promise<void> = Promise.resolve();
  * (e.g. EPIPE when the client closed the pipe). Modes register this so detached
  * children / runtime resources are released instead of orphaning them.
  */
-let fatalStdoutCleanup: (() => void) | undefined;
-export function setFatalStdoutCleanup(fn: (() => void) | undefined): void {
+let fatalStdoutCleanup: (() => undefined | Promise<unknown>) | undefined;
+export function setFatalStdoutCleanup(fn: (() => undefined | Promise<unknown>) | undefined): void {
 	fatalStdoutCleanup = fn;
 }
 
@@ -97,9 +97,9 @@ export function writeRawStdout(text: string): void {
 		return;
 	}
 	rawStdoutWriteTail = rawStdoutWriteTail.then(() => writeRawStdoutChunk(text));
-	void rawStdoutWriteTail.catch(() => {
+	void rawStdoutWriteTail.catch(async () => {
 		try {
-			fatalStdoutCleanup?.();
+			await fatalStdoutCleanup?.();
 		} catch {
 			// Cleanup must never mask the exit.
 		}

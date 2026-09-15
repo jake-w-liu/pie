@@ -27,6 +27,7 @@
 		"LICENSE"
 	],
 	"scripts": {
+		"test": "vitest --run",
 		"clean": "shx rm -rf dist",
 		"build": "tsgo -p tsconfig.build.json",
 		"typecheck": "tsgo -p tsconfig.build.json"

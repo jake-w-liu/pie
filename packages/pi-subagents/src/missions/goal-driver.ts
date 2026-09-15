@@ -54,7 +54,9 @@ function refreshGoalMission(location: MissionStoreLocation, record: MissionRecor
 	if (!changed) return record;
 	const active = runs.some((run) => run.status && ACTIVE_RUN_STATUSES.has(run.status));
 	return updateMission(location, record.id, {
-		status: active ? "active" : record.goal ? "active" : record.status,
+		// Never force a goal mission back to active when no runs are live: that
+		// would resurrect terminal missions and clobber needs_decision/waiting.
+		status: active ? "active" : record.status,
 		addRuns: runs,
 	});
 }

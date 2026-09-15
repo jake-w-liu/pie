@@ -11,13 +11,13 @@ import {
 	readdirSync,
 	readSync,
 	statSync,
-	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
 import { join, resolve } from "path";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
+import { atomicWriteFileExclusiveSync, atomicWriteFileSync } from "../utils/atomic-write.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import {
 	type BashExecutionMessage,
@@ -513,12 +513,30 @@ function parseSessionEntryLine(line: string): FileEntry | null {
 }
 
 /** Exported for testing */
-export function loadEntriesFromFile(filePath: string): FileEntry[] {
+export interface LoadEntriesOptions {
+	/** Called once per skipped malformed (non-blank, unparseable) line. Defaults to a stderr warning. */
+	onMalformedLine?: (info: { filePath: string; lineNumber: number; line: string }) => void;
+	/** When true, malformed lines are skipped without any report. */
+	silent?: boolean;
+}
+
+export function loadEntriesFromFile(filePath: string, options?: LoadEntriesOptions): FileEntry[] {
 	const resolvedFilePath = normalizePath(filePath);
 	if (!existsSync(resolvedFilePath)) return [];
 
+	const reportMalformed =
+		options?.silent === true
+			? undefined
+			: (options?.onMalformedLine ??
+				((info: { filePath: string; lineNumber: number; line: string }) => {
+					console.warn(
+						`Skipping malformed line ${info.lineNumber} in session file ${info.filePath}: ${info.line.slice(0, 120)}`,
+					);
+				}));
+
 	const entries: FileEntry[] = [];
 	let pending = "";
+	let lineNumber = 0;
 	const fd = openSync(resolvedFilePath, "r");
 	try {
 		const decoder = new StringDecoder("utf8");
@@ -532,8 +550,14 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 			let lineStart = 0;
 			let newlineIndex = pending.indexOf("\n", lineStart);
 			while (newlineIndex !== -1) {
-				const entry = parseSessionEntryLine(pending.slice(lineStart, newlineIndex));
-				if (entry) entries.push(entry);
+				lineNumber += 1;
+				const rawLine = pending.slice(lineStart, newlineIndex);
+				const entry = parseSessionEntryLine(rawLine);
+				if (entry) {
+					entries.push(entry);
+				} else if (rawLine.trim() && reportMalformed) {
+					reportMalformed({ filePath: resolvedFilePath, lineNumber, line: rawLine });
+				}
 				lineStart = newlineIndex + 1;
 				newlineIndex = pending.indexOf("\n", lineStart);
 			}
@@ -541,8 +565,15 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 		}
 
 		pending += decoder.end();
-		const finalEntry = parseSessionEntryLine(pending);
-		if (finalEntry) entries.push(finalEntry);
+		if (pending.trim()) {
+			lineNumber += 1;
+			const finalEntry = parseSessionEntryLine(pending);
+			if (finalEntry) {
+				entries.push(finalEntry);
+			} else if (reportMalformed) {
+				reportMalformed({ filePath: resolvedFilePath, lineNumber, line: pending });
+			}
+		}
 	} finally {
 		closeSync(fd);
 	}
@@ -567,7 +598,7 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
  * directly would glue the entry onto the previous line. Reads must stay
  * side-effect free, so the repair happens here, only when writing.
  */
-function appendSessionLine(filePath: string, entry: SessionEntry): void {
+function appendSessionLine(filePath: string, entry: FileEntry): void {
 	try {
 		const { size } = statSync(filePath);
 		if (size > 0) {
@@ -1012,14 +1043,8 @@ export class SessionManager {
 
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
-		const fd = openSync(this.sessionFile, "w");
-		try {
-			for (const entry of this.fileEntries) {
-				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
-			}
-		} finally {
-			closeSync(fd);
-		}
+		// Atomic tmp+rename: a crash never leaves a truncated session file behind.
+		atomicWriteFileSync(this.sessionFile, this.fileEntries.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
 	}
 
 	isPersisted(): boolean {
@@ -1065,17 +1090,42 @@ export class SessionManager {
 		}
 
 		if (!this.flushed) {
-			const fd = openSync(this.sessionFile, "wx");
 			try {
-				for (const e of this.fileEntries) {
-					writeFileSync(fd, `${JSON.stringify(e)}\n`);
+				atomicWriteFileExclusiveSync(
+					this.sessionFile,
+					this.fileEntries.map((e) => `${JSON.stringify(e)}\n`).join(""),
+				);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException)?.code === "EEXIST") {
+					// Another process (or a migration) created the file first. The
+					// entries still exist in memory; append them instead of dropping
+					// the current entry with an EEXIST error. Readers require a valid
+					// leading session header, so write ours unless the existing file
+					// already has one (a headerless file would otherwise load as empty).
+					const header = this.fileEntries.find((e): e is SessionHeader => e.type === "session");
+					if (header && !this.existingFileHasSessionHeader(this.sessionFile)) {
+						appendSessionLine(this.sessionFile, header);
+					}
+					for (const e of this.fileEntries) {
+						if (e.type === "session") continue;
+						appendSessionLine(this.sessionFile, e);
+					}
+				} else {
+					throw error;
 				}
-			} finally {
-				closeSync(fd);
 			}
 			this.flushed = true;
 		} else {
 			appendSessionLine(this.sessionFile, entry);
+		}
+	}
+
+	private existingFileHasSessionHeader(sessionFile: string): boolean {
+		try {
+			return readSessionHeader(sessionFile) !== null;
+		} catch {
+			// Unreadable/scan-limited file: writing our header keeps the file loadable.
+			return false;
 		}
 	}
 
@@ -1667,14 +1717,14 @@ export class SessionManager {
 			cwd: resolvedTargetCwd,
 			parentSession: resolvedSourcePath,
 		};
-		writeFileSync(newSessionFile, `${JSON.stringify(newHeader)}\n`, { flag: "wx" });
-
-		// Copy all non-header entries from source
+		// Single atomic exclusive create: a crash never leaves a header-only fork behind.
+		const forkedLines = [`${JSON.stringify(newHeader)}\n`];
 		for (const entry of sourceEntries) {
 			if (entry.type !== "session") {
-				appendSessionLine(newSessionFile, entry);
+				forkedLines.push(`${JSON.stringify(entry)}\n`);
 			}
 		}
+		atomicWriteFileExclusiveSync(newSessionFile, forkedLines.join(""));
 
 		return new SessionManager(resolvedTargetCwd, dir, newSessionFile, true);
 	}

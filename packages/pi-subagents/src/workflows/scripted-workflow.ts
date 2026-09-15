@@ -1,6 +1,7 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 
 const KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -1106,7 +1107,17 @@ function resolveWorkflowParserEntry(): string {
 			const entry = typeof manifest.main === "string" && manifest.main ? manifest.main : "./dist/acorn.js";
 			return resolvePath(dirname(manifestPath), entry);
 		} catch {
-			throw primaryError;
+			// Long-lived sessions can outlive their Pie release: refresh
+			// activates a new release and removes the old directory while
+			// this process keeps running from it, so package-relative
+			// resolution fails even though dependencies are intact.
+			// Fall back to the invocation cwd (repo checkouts carry acorn).
+			try {
+				const cwdRequire = createRequire(resolvePath(process.cwd(), "package.json"));
+				return cwdRequire.resolve("acorn");
+			} catch {
+				throw primaryError;
+			}
 		}
 	}
 }
@@ -1154,7 +1165,15 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	try {
 		acornPath = resolveWorkflowParserEntry();
 	} catch (error) {
-		throw new Error("Workflow parser dependency 'acorn' is unavailable from pi-subagents. Reinstall pi-subagents dependencies before launching workflowScript.", { cause: error });
+		let staleHint = "";
+		try {
+			if (!existsSync(fileURLToPath(import.meta.url))) {
+				staleHint = " This session is running from a Pie release directory that no longer exists (refresh activates a new install and removes the old one); restart the session so it loads from the active release.";
+			}
+		} catch {
+			// Hint is best effort; fall through to the base error.
+		}
+		throw new Error(`Workflow parser dependency 'acorn' is unavailable from pi-subagents.${staleHint} Reinstall pi-subagents dependencies before launching workflowScript.`, { cause: error });
 	}
 	const worker = new Worker(WORKER_SOURCE, { eval: true, workerData: { acornPath } });
 	const emits: unknown[] = [];

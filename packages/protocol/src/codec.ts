@@ -66,7 +66,13 @@ function encodeProtocolMessage<T>(
 	const validated = parse(value);
 	try {
 		const maxFrameLength = options?.maxFrameLength ?? DEFAULT_MAX_FRAME_LENGTH;
-		const frame = encodeFrame(encodeCbor(validated, { maxByteLength: maxFrameLength }));
+		const frame = encodeFrame(
+			encodeCbor(validated, {
+				maxByteLength: maxFrameLength,
+				maxContainerLength: options?.maxContainerLength,
+				maxDepth: options?.maxDepth,
+			}),
+		);
 		assertCompleteFrame(frame, { maxFrameLength });
 		return frame;
 	} catch (error) {
@@ -90,12 +96,16 @@ class ValidatedMessageDecoder<T> {
 	private readonly frames: FrameDecoder;
 	private readonly kind: string;
 	private readonly maxFrameLength: number;
+	private readonly maxContainerLength: number | undefined;
+	private readonly maxDepth: number | undefined;
 	private readonly parse: (candidate: unknown) => T;
 
 	constructor(kind: string, parse: (candidate: unknown) => T, options?: FrameDecoderOptions) {
 		this.frames = new FrameDecoder(options);
 		this.kind = kind;
 		this.maxFrameLength = options?.maxFrameLength ?? DEFAULT_MAX_FRAME_LENGTH;
+		this.maxContainerLength = options?.maxContainerLength;
+		this.maxDepth = options?.maxDepth;
 		this.parse = parse;
 	}
 
@@ -104,7 +114,15 @@ class ValidatedMessageDecoder<T> {
 		try {
 			const messages: T[] = [];
 			for (const frame of this.frames.push(chunk)) {
-				messages.push(this.parse(decodeCbor(frame, { maxByteLength: this.maxFrameLength })));
+				messages.push(
+					this.parse(
+						decodeCbor(frame, {
+							maxByteLength: this.maxFrameLength,
+							maxContainerLength: this.maxContainerLength,
+							maxDepth: this.maxDepth,
+						}),
+					),
+				);
 			}
 			return messages;
 		} catch (error) {

@@ -850,11 +850,15 @@ let wrapCacheChars = 0;
 function wrapCacheEvict(): void {
 	const oldest = wrapCache.keys().next();
 	if (!oldest.done) {
-		const lines = wrapCache.get(oldest.value);
+		const key = oldest.value;
+		const lines = wrapCache.get(key);
 		if (lines) {
+			// Account for both the cached lines and the key (which duplicates the
+			// full input text) so the char budget reflects real heap usage.
+			wrapCacheChars -= key.length;
 			for (const line of lines) wrapCacheChars -= line.length;
 		}
-		wrapCache.delete(oldest.value);
+		wrapCache.delete(key);
 	}
 }
 
@@ -868,13 +872,16 @@ export function wrapTextWithAnsi(text: string, width: number): string[] {
 		if (cached) return cached as string[];
 		const result = Object.freeze(wrapTextWithAnsiUncached(text, width));
 		const resultChars = result.reduce((total, line) => total + line.length, 0);
+		// Count the key as well as the result: the key duplicates the full input
+		// text, so counting only results understates heap by ~2x at the cap.
+		const entryChars = key.length + resultChars;
 		// Reopened ANSI hyperlinks can expand short input beyond the entire cache budget.
-		if (resultChars > WRAP_CACHE_MAX_CHARS) return result as string[];
-		while (wrapCache.size >= WRAP_CACHE_MAX_ENTRIES || wrapCacheChars + resultChars > WRAP_CACHE_MAX_CHARS) {
+		if (entryChars > WRAP_CACHE_MAX_CHARS) return result as string[];
+		while (wrapCache.size >= WRAP_CACHE_MAX_ENTRIES || wrapCacheChars + entryChars > WRAP_CACHE_MAX_CHARS) {
 			wrapCacheEvict();
 		}
 		wrapCache.set(key, result);
-		wrapCacheChars += resultChars;
+		wrapCacheChars += entryChars;
 		return result as string[];
 	}
 	return wrapTextWithAnsiUncached(text, width);

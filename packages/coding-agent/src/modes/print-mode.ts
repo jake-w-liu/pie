@@ -40,7 +40,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 	// and the runtime instead of exiting and orphaning them.
 	setFatalStdoutCleanup(() => {
 		killTrackedDetachedChildren();
-		void runtimeHost.dispose();
+		return runtimeHost.dispose();
 	});
 
 	const { mode, messages = [], initialMessage, initialImages } = options;
@@ -60,7 +60,9 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 	};
 
 	const registerSignalHandlers = (): void => {
-		const signals: NodeJS.Signals[] = ["SIGTERM"];
+		// SIGINT (Ctrl-C) must clean up like SIGTERM; otherwise detached bash
+		// children survive and the runtime is never disposed.
+		const signals: NodeJS.Signals[] = ["SIGTERM", "SIGINT"];
 		if (process.platform !== "win32") {
 			signals.push("SIGHUP");
 		}
@@ -69,7 +71,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			const handler = () => {
 				killTrackedDetachedChildren();
 				void disposeRuntime().finally(() => {
-					process.exit(signal === "SIGHUP" ? 129 : 143);
+					process.exit(signal === "SIGHUP" ? 129 : signal === "SIGINT" ? 130 : 143);
 				});
 			};
 			process.on(signal, handler);

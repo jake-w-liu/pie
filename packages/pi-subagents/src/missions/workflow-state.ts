@@ -152,7 +152,7 @@ function reclaimStaleStateLock(lockPath: string, reclaimPath: string): boolean {
 	}
 }
 
-function withStateFileLock<T>(filePath: string, operation: () => T): T {
+export function withStateFileLock<T>(filePath: string, operation: () => T): T {
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
 	const lockPath = `${filePath}.lock`;
 	const reclaimPath = `${lockPath}.reclaim`;
@@ -207,8 +207,6 @@ function validateStateKey(value: unknown): string {
 
 export function createMissionWorkflowState(location: MissionStoreLocation, missionId: string): MissionWorkflowState {
 	const filePath = missionStatePath(location, missionId);
-	let loaded = false;
-	let values: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
 
 	const readStateFile = (): Record<string, unknown> => {
 		let raw: string;
@@ -230,18 +228,15 @@ export function createMissionWorkflowState(location: MissionStoreLocation, missi
 		}
 	};
 
-	const load = (): Record<string, unknown> => {
-		if (loaded) return values;
-		values = readStateFile();
-		loaded = true;
-		return values;
-	};
-
 	return {
 		path: filePath,
 		get(key) {
 			const validKey = validateStateKey(key);
-			const current = load();
+			// Always re-read instead of serving a cached snapshot: external
+			// writers between this handle's first load and the get would
+			// otherwise be invisible. State files are size-capped, so the
+			// re-read is cheap; writes stay atomic via writePrivateAtomicJson.
+			const current = readStateFile();
 			return Object.hasOwn(current, validKey) ? current[validKey] : undefined;
 		},
 		set(key, value) {
@@ -252,8 +247,6 @@ export function createMissionWorkflowState(location: MissionStoreLocation, missi
 				const bytes = Buffer.byteLength(JSON.stringify(next, null, 2));
 				if (bytes > MISSION_STATE_MAX_BYTES) throw new Error(`Mission state exceeds the 256 KiB limit (${bytes} bytes; maximum ${MISSION_STATE_MAX_BYTES} bytes).`);
 				writePrivateAtomicJson(filePath, next);
-				values = next;
-				loaded = true;
 			});
 		},
 	};

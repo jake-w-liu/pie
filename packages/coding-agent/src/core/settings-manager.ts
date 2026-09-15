@@ -2,10 +2,11 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Transport } from "@earendil-works/pi-ai";
 import type { TuiMode as RendererTuiMode, ScrollViewScrollbar, TerminalCapabilities } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync } from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
+import { atomicWriteFileSync } from "../utils/atomic-write.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
@@ -239,10 +240,9 @@ export class FileSettingsStorage implements SettingsStorage {
 					throw error;
 				}
 				lastError = error;
-				const start = Date.now();
-				while (Date.now() - start < delayMs) {
-					// Sleep synchronously to avoid changing callers to async.
-				}
+				// Block without busy-spinning the CPU. The event loop stays blocked
+				// for up to delayMs, which is inherent to the synchronous lock API.
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
 			}
 		}
 
@@ -274,7 +274,8 @@ export class FileSettingsStorage implements SettingsStorage {
 					next = fn(existsSync(path) ? readFileSync(path, "utf-8") : undefined);
 				}
 				if (next !== undefined) {
-					writeFileSync(path, next, "utf-8");
+					// Atomic tmp+rename: a crash never leaves a truncated settings file.
+					atomicWriteFileSync(path, next);
 				}
 			}
 		} finally {

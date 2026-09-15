@@ -674,6 +674,7 @@ export class SqliteSessionRepository
 	private databasePath: string | undefined;
 	private database: SqliteDatabase | undefined;
 	private databasePromise: Promise<SqliteDatabase> | undefined;
+	private closePromise: Promise<void> | undefined;
 	private readonly operations = new SerialOperationQueue();
 	private readonly activeStorages = new Set<SqliteSessionStorage>();
 	private readonly options: SqliteSessionRepositoryOptions;
@@ -912,11 +913,16 @@ export class SqliteSessionRepository
 	}
 
 	async close(): Promise<void> {
-		await this.operations.drain();
-		for (const storage of [...this.activeStorages]) await storage.release();
-		if (this.database) this.database.close();
-		this.database = undefined;
-		this.databasePromise = undefined;
+		// Idempotent and safe under concurrency: concurrent callers share one
+		// close sequence so storages are released and the handle closed once.
+		this.closePromise ??= (async () => {
+			await this.operations.drain();
+			for (const storage of [...this.activeStorages]) await storage.release();
+			if (this.database) this.database.close();
+			this.database = undefined;
+			this.databasePromise = undefined;
+		})();
+		await this.closePromise;
 	}
 
 	async [Symbol.asyncDispose](): Promise<void> {

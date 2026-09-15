@@ -11,7 +11,9 @@ export function registerSessionResourceCleanup(cleanup: SessionResourceCleanup):
 
 export function cleanupSessionResources(sessionId?: string): void {
 	const errors: unknown[] = [];
-	for (const cleanup of sessionResourceCleanups) {
+	// Snapshot: a cleanup may register/unregister entries (including itself)
+	// while running; those take effect on the next call, not mid-iteration.
+	for (const cleanup of [...sessionResourceCleanups]) {
 		try {
 			cleanup(sessionId);
 		} catch (error) {

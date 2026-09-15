@@ -23,5 +23,17 @@ export function flattenModelCatalog<const TProvider extends ProviderId, const TG
 	_provider: TProvider,
 	groups: TGroups,
 ): ModelCatalog<TGroups, TProvider> {
-	return Object.assign({}, ...Object.values(groups)) as ModelCatalog<TGroups, TProvider>;
+	const flat: Record<string, object> = {};
+	const seenIn = new Map<string, string>();
+	for (const [api, models] of Object.entries(groups)) {
+		for (const id of Object.keys(models)) {
+			const first = seenIn.get(id);
+			if (first !== undefined) {
+				throw new Error(`Duplicate model id "${id}" in model catalog groups "${first}" and "${api}"`);
+			}
+			seenIn.set(id, api);
+			flat[id] = (models as Record<string, object>)[id];
+		}
+	}
+	return flat as ModelCatalog<TGroups, TProvider>;
 }

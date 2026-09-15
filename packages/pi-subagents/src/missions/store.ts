@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { writePrivateAtomicJson } from "../shared/atomic-json.ts";
+import { withStateFileLock } from "./workflow-state.ts";
 import { getAgentDir } from "../shared/utils.ts";
 import {
 	MISSION_STATUSES,
@@ -436,7 +437,17 @@ export function listMissions(location: MissionStoreLocation): MissionListResult 
 	return { records, warnings };
 }
 
+/**
+ * Serialize the read-modify-write cycle so concurrent processes completing
+ * against the same mission cannot interleave read/read/write/write and lose
+ * runs, artifacts, or usage totals. Atomic single writes alone do not cover RMW.
+ */
 export function updateMission(location: MissionStoreLocation, missionId: string, update: MissionUpdateInput, now = new Date(), retainTerminal = location.retainTerminal ?? DEFAULT_TERMINAL_MISSION_RETENTION): MissionRecord {
+	const validatedId = validateMissionId(missionId, "missionId");
+	return withStateFileLock(missionRecordPath(location, validatedId), () => updateMissionInner(location, validatedId, update, now, retainTerminal));
+}
+
+function updateMissionInner(location: MissionStoreLocation, missionId: string, update: MissionUpdateInput, now = new Date(), retainTerminal = location.retainTerminal ?? DEFAULT_TERMINAL_MISSION_RETENTION): MissionRecord {
 	const current = readMission(location, missionId);
 	const runs = [...current.runs];
 	for (const candidate of update.addRuns ?? []) {
@@ -527,7 +538,15 @@ export function updateMission(location: MissionStoreLocation, missionId: string,
 			: update.resolveDecision && current.status === "needs_decision" && !hasOpenDecisions
 				? "active"
 				: current.status);
-	const decisionStatus = hasOpenDecisions && (candidateStatus === "active" || candidateStatus === "completed") ? "needs_decision" : candidateStatus;
+	// An explicitly requested status is honored as-is; only implicitly derived
+	// statuses are coerced to needs_decision while decisions are open. Coercing
+	// an explicit close would silently discard the caller's intent.
+	const decisionStatus = update.status === undefined && hasOpenDecisions && (candidateStatus === "active" || candidateStatus === "completed") ? "needs_decision" : candidateStatus;
+	// Terminal missions stay terminal: launching or attaching against a closed
+	// mission must fail loudly instead of silently resurrecting it to active.
+	if (TERMINAL_MISSION_STATUSES.has(current.status) && !TERMINAL_MISSION_STATUSES.has(decisionStatus)) {
+		throw new Error(`Cannot move mission '${missionId}' from terminal status '${current.status}' to '${decisionStatus}'.`);
+	}
 	const next: MissionRecord = {
 		...current,
 		updatedAt: createdAt,

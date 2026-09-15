@@ -25,6 +25,11 @@ const DEFAULT_SEQUENCE_TIMEOUT_MS = 50;
 const DEFAULT_ESCAPE_TIMEOUT_MS = 10;
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
+/** Upper bound for one bracketed paste payload. Without a cap a peer that
+ * sends ESC[200~ and never terminates can grow pasteBuffer without bound (OOM).
+ * Pastes beyond the cap are truncated; the overflow is discarded while still
+ * scanning for the terminator so the stream resynchronizes. */
+const MAX_BRACKETED_PASTE_CHARS = 1_000_000;
 
 /**
  * Check if a string is a complete escape sequence or needs more data
@@ -294,6 +299,8 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private readonly escapeTimeoutMs: number;
 	private pasteMode: boolean = false;
 	private pasteBuffer: string = "";
+	private pasteTruncated: boolean = false;
+	private pasteOverflowTail: string = "";
 	private pendingKittyPrintableCodepoint: number | undefined;
 
 	constructor(options: StdinBufferOptions = {}) {
@@ -331,16 +338,45 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.buffer += str;
 
 		if (this.pasteMode) {
+			if (this.pasteTruncated) {
+				// Over-cap: discard content, keep only a small tail to detect the
+				// terminator (which may split across chunks) so the stream
+				// resynchronizes without growing memory.
+				const combined = this.pasteOverflowTail + this.buffer;
+				this.buffer = "";
+				const endIndex = combined.indexOf(BRACKETED_PASTE_END);
+				if (endIndex !== -1) {
+					const pastedContent = this.pasteBuffer;
+					const remaining = combined.slice(endIndex + BRACKETED_PASTE_END.length);
+					this.pasteMode = false;
+					this.pasteBuffer = "";
+					this.pasteTruncated = false;
+					this.pasteOverflowTail = "";
+					this.pendingKittyPrintableCodepoint = undefined;
+					this.emit("paste", pastedContent);
+					if (remaining.length > 0) {
+						this.process(remaining);
+					}
+				} else {
+					this.pasteOverflowTail = combined.slice(-(BRACKETED_PASTE_END.length - 1));
+				}
+				return;
+			}
 			this.pasteBuffer += this.buffer;
 			this.buffer = "";
 
 			const endIndex = this.pasteBuffer.indexOf(BRACKETED_PASTE_END);
 			if (endIndex !== -1) {
-				const pastedContent = this.pasteBuffer.slice(0, endIndex);
+				let pastedContent = this.pasteBuffer.slice(0, endIndex);
+				if (pastedContent.length > MAX_BRACKETED_PASTE_CHARS) {
+					pastedContent = pastedContent.slice(0, MAX_BRACKETED_PASTE_CHARS);
+				}
 				const remaining = this.pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
 
 				this.pasteMode = false;
 				this.pasteBuffer = "";
+				this.pasteTruncated = false;
+				this.pasteOverflowTail = "";
 				this.pendingKittyPrintableCodepoint = undefined;
 
 				this.emit("paste", pastedContent);
@@ -348,6 +384,13 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				if (remaining.length > 0) {
 					this.process(remaining);
 				}
+			} else if (this.pasteBuffer.length > MAX_BRACKETED_PASTE_CHARS + BRACKETED_PASTE_END.length) {
+				// No terminator and over budget: keep the capped prefix, discard the
+				// middle, retain a small tail so a terminator split across the
+				// truncation point is still detected.
+				this.pasteOverflowTail = this.pasteBuffer.slice(-(BRACKETED_PASTE_END.length - 1));
+				this.pasteBuffer = this.pasteBuffer.slice(0, MAX_BRACKETED_PASTE_CHARS);
+				this.pasteTruncated = true;
 			}
 			return;
 		}
@@ -366,15 +409,22 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.buffer = this.buffer.slice(startIndex + BRACKETED_PASTE_START.length);
 			this.pasteMode = true;
 			this.pasteBuffer = this.buffer;
+			this.pasteTruncated = false;
+			this.pasteOverflowTail = "";
 			this.buffer = "";
 
 			const endIndex = this.pasteBuffer.indexOf(BRACKETED_PASTE_END);
 			if (endIndex !== -1) {
-				const pastedContent = this.pasteBuffer.slice(0, endIndex);
+				let pastedContent = this.pasteBuffer.slice(0, endIndex);
+				if (pastedContent.length > MAX_BRACKETED_PASTE_CHARS) {
+					pastedContent = pastedContent.slice(0, MAX_BRACKETED_PASTE_CHARS);
+				}
 				const remaining = this.pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
 
 				this.pasteMode = false;
 				this.pasteBuffer = "";
+				this.pasteTruncated = false;
+				this.pasteOverflowTail = "";
 				this.pendingKittyPrintableCodepoint = undefined;
 
 				this.emit("paste", pastedContent);
@@ -382,6 +432,10 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				if (remaining.length > 0) {
 					this.process(remaining);
 				}
+			} else if (this.pasteBuffer.length > MAX_BRACKETED_PASTE_CHARS + BRACKETED_PASTE_END.length) {
+				this.pasteOverflowTail = this.pasteBuffer.slice(-(BRACKETED_PASTE_END.length - 1));
+				this.pasteBuffer = this.pasteBuffer.slice(0, MAX_BRACKETED_PASTE_CHARS);
+				this.pasteTruncated = true;
 			}
 			return;
 		}
@@ -440,6 +494,8 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.buffer = "";
 		this.pasteMode = false;
 		this.pasteBuffer = "";
+		this.pasteTruncated = false;
+		this.pasteOverflowTail = "";
 		this.pendingKittyPrintableCodepoint = undefined;
 	}
 

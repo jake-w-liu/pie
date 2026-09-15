@@ -4,7 +4,7 @@
  */
 
 import type { AuthOperationOptions, Credential, CredentialInfo, CredentialStore } from "@earendil-works/pi-ai";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { setTimeout as sleep } from "timers/promises";
@@ -71,6 +71,21 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 		}
 	}
 
+	/**
+	 * Tighten an overly-permissive auth.json left behind by older code or manual
+	 * creation (e.g. mode 0644). Already-restrictive modes are left untouched so
+	 * administrator-managed permissions stay intact.
+	 */
+	private enforceRestrictiveMode(): void {
+		try {
+			if ((statSync(this.authPath).mode & 0o077) !== 0) {
+				chmodSync(this.authPath, 0o600);
+			}
+		} catch {
+			// Best effort: the credential write itself already succeeded.
+		}
+	}
+
 	private acquireLockSyncWithRetry(path: string): () => void {
 		const maxAttempts = 10;
 		const delayMs = 20;
@@ -88,10 +103,9 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 					throw error;
 				}
 				lastError = error;
-				const start = Date.now();
-				while (Date.now() - start < delayMs) {
-					// Sleep synchronously to avoid changing callers to async.
-				}
+				// Block without busy-spinning the CPU. The event loop stays blocked
+				// for up to delayMs, which is inherent to the synchronous lock API.
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
 			}
 		}
 
@@ -111,6 +125,7 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			const { result, next } = fn(current);
 			if (next !== undefined) {
 				writeFileSync(this.authPath, next, AUTH_FILE_WRITE_OPTIONS);
+				this.enforceRestrictiveMode();
 			}
 			return result;
 		} finally {
@@ -192,6 +207,7 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			options?.signal?.throwIfAborted();
 			if (next !== undefined) {
 				writeFileSync(this.authPath, next, AUTH_FILE_WRITE_OPTIONS);
+				this.enforceRestrictiveMode();
 			}
 			throwIfCompromised();
 			return result;

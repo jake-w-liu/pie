@@ -93,6 +93,10 @@ export function turnBudgetDecision(
 ): "continue" | "defer" | "abort" {
 	const hardLimit = budget.maxTurns + budget.graceTurns;
 	if (terminalAssistantStop || turnCount < hardLimit) return "continue";
-	if (toolWorkActiveOrStarting && !enforceHardLimit) return "defer";
+	// Deferral only waits for in-flight tool work to reach a safe assistant
+	// boundary. Without a bound, a child that starts tool work on every turn
+	// would defer forever, so termination is enforced once the run exceeds the
+	// hard limit by another full grace window.
+	if (toolWorkActiveOrStarting && !enforceHardLimit && turnCount <= hardLimit + budget.graceTurns) return "defer";
 	return "abort";
 }

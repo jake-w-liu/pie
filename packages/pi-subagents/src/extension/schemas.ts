@@ -117,7 +117,7 @@ const ToolBudgetOverride = Type.Object({
 	soft: Type.Optional(Type.Integer({ minimum: 1 })),
 	hard: Type.Integer({ minimum: 1 }),
 	block: Type.Optional(ToolBudgetBlock),
-}, { additionalProperties: false, description: "Optional child tool-call budget. soft nudges the child; after hard, block tools (default read/grep/find/ls, or '*' for all tools) are blocked so the child can finalize." });
+}, { additionalProperties: false, description: "Optional child tool-call budget. soft nudges the child; after hard, block tools (default '*' for all tools, or a list to block only those) are blocked so the child can finalize." });
 
 const UsageBudgetLimitOverride = Type.Object({
 	soft: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),

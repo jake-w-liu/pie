@@ -45,7 +45,10 @@ export function usageBudgetState(config: UsageBudgetConfig | undefined, totals: 
 	if (!config) return undefined;
 	const inputTokens = totals?.inputTokens ?? 0;
 	const outputTokens = totals?.outputTokens ?? 0;
-	const tokens = metricState(config.tokens, inputTokens + outputTokens);
+	// Prompt-cache tokens are billed context too; ignoring them lets cache-heavy
+	// runs sail past token limits.
+	const cacheTokens = (totals?.cacheReadTokens ?? 0) + (totals?.cacheWriteTokens ?? 0);
+	const tokens = metricState(config.tokens, inputTokens + outputTokens + cacheTokens);
 	const costUsd = metricState(config.costUsd, totals?.costUsd ?? 0);
 	const reason = tokens?.outcome === "hard-exceeded" ? "tokens" : costUsd?.outcome === "hard-exceeded" ? "costUsd" : undefined;
 	return {

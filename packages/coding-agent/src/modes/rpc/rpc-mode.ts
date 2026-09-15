@@ -50,6 +50,43 @@ export type {
 	RpcSessionState,
 } from "./rpc-types.ts";
 
+/** Conventional exit code for a given termination signal. */
+export function exitCodeForSignal(signal: NodeJS.Signals): number {
+	if (signal === "SIGHUP") return 129;
+	if (signal === "SIGINT") return 130;
+	return 143;
+}
+
+/** Extract a protocol-safe message from any thrown value (including `throw null`). */
+export function toProtocolErrorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+export interface PendingExtensionRequest {
+	resolve: (value: unknown) => void;
+	reject: (error: Error) => void;
+}
+
+/**
+ * Settle every outstanding extension UI request (e.g. `editor()`) so shutdown
+ * never hangs on a dialog whose client vanished.
+ */
+export function rejectPendingExtensionRequests(
+	pending: Map<string, PendingExtensionRequest>,
+	reason = "Shutdown",
+): void {
+	if (pending.size === 0) return;
+	const error = new Error(reason);
+	for (const [id, request] of pending) {
+		pending.delete(id);
+		try {
+			request.reject(error);
+		} catch {
+			// One bad reject handler must not break the drain loop.
+		}
+	}
+}
+
 /**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
@@ -59,7 +96,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	// and the runtime instead of exiting and orphaning them.
 	setFatalStdoutCleanup(() => {
 		killTrackedDetachedChildren();
-		void runtimeHost.dispose();
+		return runtimeHost.dispose();
 	});
 	takeOverStdout();
 	let session = runtimeHost.session;
@@ -261,22 +298,22 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		},
 
 		async editor(title: string, prefill?: string): Promise<string | undefined> {
-			const id = crypto.randomUUID();
-			return new Promise((resolve, reject) => {
-				pendingExtensionRequests.set(id, {
-					resolve: (response: RpcExtensionUIResponse) => {
-						if ("cancelled" in response && response.cancelled) {
-							resolve(undefined);
-						} else if ("value" in response) {
-							resolve(response.value);
-						} else {
-							resolve(undefined);
-						}
-					},
-					reject,
-				});
-				output({ type: "extension_ui_request", id, method: "editor", title, prefill } as RpcExtensionUIRequest);
-			});
+			// Routed through the shared dialog path so the request is tracked like
+			// every other dialog and is settled (not leaked) on shutdown.
+			return createDialogPromise(
+				undefined,
+				undefined,
+				{ method: "editor", title, prefill },
+				(response: RpcExtensionUIResponse) => {
+					if ("cancelled" in response && response.cancelled) {
+						return undefined;
+					}
+					if ("value" in response) {
+						return response.value;
+					}
+					return undefined;
+				},
+			);
 		},
 
 		addAutocompleteProvider(): void {
@@ -373,7 +410,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	};
 
 	const registerSignalHandlers = (): void => {
-		const signals: NodeJS.Signals[] = ["SIGTERM"];
+		// SIGINT (Ctrl-C) must clean up like SIGTERM; otherwise detached bash
+		// children survive and the session never emits its shutdown event.
+		const signals: NodeJS.Signals[] = ["SIGTERM", "SIGINT"];
 		if (process.platform !== "win32") {
 			signals.push("SIGHUP");
 		}
@@ -381,7 +420,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		for (const signal of signals) {
 			const handler = () => {
 				killTrackedDetachedChildren();
-				void shutdown(signal === "SIGHUP" ? 129 : 143, signal);
+				void shutdown(exitCodeForSignal(signal), signal);
 			};
 			process.on(signal, handler);
 			signalCleanupHandlers.push(() => process.off(signal, handler));
@@ -417,7 +456,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					})
 					.catch((e) => {
 						if (!preflightSucceeded) {
-							output(error(id, "prompt", e.message));
+							output(error(id, "prompt", toProtocolErrorMessage(e)));
 						}
 					});
 				return undefined;
@@ -731,6 +770,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		}
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
+		// Settle outstanding extension UI dialogs first: an extension awaiting
+		// editor() (or a dialog whose client vanished) must not hang shutdown.
+		rejectPendingExtensionRequests(pendingExtensionRequests);
 		await runtimeHost.dispose();
 		detachInput();
 		process.stdin.pause();

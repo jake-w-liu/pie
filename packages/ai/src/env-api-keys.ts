@@ -1,5 +1,6 @@
 // NEVER convert to top-level imports - breaks browser/Vite builds
 let _existsSync: typeof import("node:fs").existsSync | null = null;
+let _statSync: typeof import("node:fs").statSync | null = null;
 let _homedir: typeof import("node:os").homedir | null = null;
 let _join: typeof import("node:path").join | null = null;
 
@@ -14,6 +15,7 @@ const NODE_PATH_SPECIFIER = "node:" + "path";
 if (typeof process !== "undefined" && (process.versions?.node || process.versions?.bun)) {
 	dynamicImport(NODE_FS_SPECIFIER).then((m) => {
 		_existsSync = (m as typeof import("node:fs")).existsSync;
+		_statSync = (m as typeof import("node:fs")).statSync;
 	});
 	dynamicImport(NODE_OS_SPECIFIER).then((m) => {
 		_homedir = (m as typeof import("node:os")).homedir;
@@ -32,10 +34,22 @@ export const ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY";
 
 let cachedVertexAdcCredentialsExists: boolean | null = null;
 
+function pathIsFile(path: string): boolean {
+	if (!_existsSync?.(path)) return false;
+	// A directory at an ADC path must not count as credentials. If the stat
+	// binding is unavailable, fall back to existence (startup race only).
+	if (!_statSync) return true;
+	try {
+		return _statSync(path).isFile();
+	} catch {
+		return false;
+	}
+}
+
 function hasVertexAdcCredentials(env?: ProviderEnv): boolean {
 	const explicitCredentialsPath = env?.GOOGLE_APPLICATION_CREDENTIALS;
 	if (explicitCredentialsPath) {
-		return _existsSync ? _existsSync(explicitCredentialsPath) : false;
+		return _existsSync ? pathIsFile(explicitCredentialsPath) : false;
 	}
 
 	if (cachedVertexAdcCredentialsExists === null) {
@@ -54,10 +68,10 @@ function hasVertexAdcCredentials(env?: ProviderEnv): boolean {
 		// Check GOOGLE_APPLICATION_CREDENTIALS env var first (standard way)
 		const gacPath = getProviderEnvValue("GOOGLE_APPLICATION_CREDENTIALS", env);
 		if (gacPath) {
-			cachedVertexAdcCredentialsExists = _existsSync(gacPath);
+			cachedVertexAdcCredentialsExists = pathIsFile(gacPath);
 		} else {
 			// Fall back to default ADC path (lazy evaluation)
-			cachedVertexAdcCredentialsExists = _existsSync(
+			cachedVertexAdcCredentialsExists = pathIsFile(
 				_join(_homedir(), ".config", "gcloud", "application_default_credentials.json"),
 			);
 		}

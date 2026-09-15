@@ -2713,11 +2713,15 @@ async function runSubagent(
 			inputTokens: sum.inputTokens + (result.totalCost?.inputTokens ?? result.usage?.input ?? 0),
 			outputTokens: sum.outputTokens + (result.totalCost?.outputTokens ?? result.usage?.output ?? 0),
 			costUsd: sum.costUsd + (result.totalCost?.costUsd ?? result.usage?.cost ?? 0),
+			cacheReadTokens: (sum.cacheReadTokens ?? 0) + (result.totalCost?.cacheReadTokens ?? result.usage?.cacheRead ?? 0),
+			cacheWriteTokens: (sum.cacheWriteTokens ?? 0) + (result.totalCost?.cacheWriteTokens ?? result.usage?.cacheWrite ?? 0),
 		}), { inputTokens: pendingParallelUsageCost.inputTokens, outputTokens: pendingParallelUsageCost.outputTokens, costUsd: pendingParallelUsageCost.costUsd });
 		return {
 			inputTokens: Math.max(cost.inputTokens, statusPayload.totalTokens?.input ?? 0),
 			outputTokens: Math.max(cost.outputTokens, statusPayload.totalTokens?.output ?? 0),
 			costUsd: cost.costUsd,
+			cacheReadTokens: cost.cacheReadTokens ?? 0,
+			cacheWriteTokens: cost.cacheWriteTokens ?? 0,
 		};
 	};
 	const refreshUsageBudget = () => {

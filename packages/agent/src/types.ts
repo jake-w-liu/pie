@@ -390,6 +390,10 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	/**
 	 * Optional compatibility shim for raw tool-call arguments before schema validation.
 	 * Must return an object that matches `TParameters`.
+	 *
+	 * Only the validated (possibly prepared) arguments are executed. The transcript
+	 * and `beforeToolCall.toolCall` keep the original streamed arguments, while hooks
+	 * also receive the prepared `args`.
 	 */
 	prepareArguments?: (args: unknown) => Static<TParameters>;
 	/** Execute the tool call. Throw on failure instead of encoding errors in `content`. */

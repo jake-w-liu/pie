@@ -3,7 +3,17 @@
  */
 
 import chalk from "chalk";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
+import {
+	copyFileSync,
+	existsSync,
+	constants as fsConstants,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "fs";
 import { dirname, join } from "path";
 import { CONFIG_DIR_NAME, getAgentDir, getBinDir } from "./config.ts";
 import { migrateKeybindingsConfig } from "./core/keybindings.ts";
@@ -25,13 +35,35 @@ export function migrateAuthToAuthJson(): string[] {
 	const oauthPath = join(agentDir, "oauth.json");
 	const settingsPath = join(agentDir, "settings.json");
 
-	// Skip if auth.json already exists
-	if (existsSync(authPath)) return [];
+	// Existing credentials are preserved and win on conflict. An empty, missing,
+	// or unparseable auth.json is treated as "no credentials yet" so a prior
+	// interrupted migration can be retried instead of blocking oauth recovery
+	// forever; unparseable files are backed up for manual repair first.
+	let existing: Record<string, unknown> = {};
+	if (existsSync(authPath)) {
+		try {
+			const parsed: unknown = JSON.parse(stripBom(readFileSync(authPath, "utf-8")));
+			if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+				existing = parsed as Record<string, unknown>;
+			} else {
+				throw new Error("auth.json is not an object");
+			}
+		} catch {
+			try {
+				renameSync(authPath, `${authPath}.corrupt-${Date.now()}`);
+			} catch {
+				return [];
+			}
+			existing = {};
+		}
+	}
 
 	const migrated: Record<string, unknown> = {};
 	const providers: string[] = [];
+	let consumedOauth = false;
+	let settingsNeedsStrip = false;
 
-	// Migrate oauth.json
+	// Collect oauth.json credentials (in memory only for now).
 	if (existsSync(oauthPath)) {
 		try {
 			const oauth = JSON.parse(stripBom(readFileSync(oauthPath, "utf-8")));
@@ -39,13 +71,13 @@ export function migrateAuthToAuthJson(): string[] {
 				migrated[provider] = { type: "oauth", ...(cred as object) };
 				providers.push(provider);
 			}
-			renameSync(oauthPath, `${oauthPath}.migrated`);
+			consumedOauth = true;
 		} catch {
 			// Skip on error
 		}
 	}
 
-	// Migrate settings.json apiKeys
+	// Collect settings.json apiKeys (in memory only for now).
 	if (existsSync(settingsPath)) {
 		try {
 			const content = readFileSync(settingsPath, "utf-8");
@@ -57,20 +89,44 @@ export function migrateAuthToAuthJson(): string[] {
 						providers.push(provider);
 					}
 				}
-				delete settings.apiKeys;
-				writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+				settingsNeedsStrip = true;
 			}
 		} catch {
 			// Skip on error
 		}
 	}
 
-	if (Object.keys(migrated).length > 0) {
-		mkdirSync(dirname(authPath), { recursive: true });
-		writeFileSync(authPath, JSON.stringify(migrated, null, 2), { mode: 0o600 });
+	if (Object.keys(migrated).length === 0) return providers;
+
+	// Only providers not already in auth.json count as newly migrated.
+	const newlyMigrated = providers.filter((provider) => !(provider in existing));
+
+	// Persist auth.json BEFORE removing the legacy sources, so a crash between
+	// the two steps duplicates credentials instead of losing them.
+	mkdirSync(dirname(authPath), { recursive: true });
+	writeFileSync(authPath, JSON.stringify({ ...migrated, ...existing }, null, 2), { mode: 0o600 });
+
+	if (consumedOauth) {
+		try {
+			renameSync(oauthPath, `${oauthPath}.migrated`);
+		} catch {
+			// The credentials are safe in auth.json; the stale oauth.json will be
+			// re-merged (not duplicated) on the next run.
+		}
 	}
 
-	return providers;
+	if (settingsNeedsStrip) {
+		try {
+			const content = readFileSync(settingsPath, "utf-8");
+			const settings = JSON.parse(stripBom(content));
+			delete settings.apiKeys;
+			writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+		} catch {
+			// The credentials are safe in auth.json; stripping is retried next run.
+		}
+	}
+
+	return newlyMigrated;
 }
 
 /**
@@ -122,13 +178,59 @@ export function migrateSessionsFromAgentRoot(): void {
 			const fileName = file.split("/").pop() || file.split("\\").pop();
 			const newPath = join(correctDir, fileName!);
 
-			if (existsSync(newPath)) continue; // Skip if target exists
+			if (existsSync(newPath)) {
+				// Never strand the source silently: identical content means the
+				// migration already happened, so drop the duplicate; divergent
+				// content is preserved under a unique name.
+				try {
+					const sourceContent = readFileSync(file);
+					const targetContent = readFileSync(newPath);
+					if (sourceContent.equals(targetContent)) {
+						rmSync(file);
+						continue;
+					}
+				} catch {
+					// Fall through to the uniquified move below.
+				}
+				const duplicatePath = findAvailablePath(correctDir, `${fileName}.duplicate`);
+				moveSessionFile(file, duplicatePath);
+				console.log(
+					chalk.yellow(
+						`Session migration: ${fileName} already exists in ${safePath}; moved divergent copy to ${duplicatePath.split("/").pop()}`,
+					),
+				);
+				continue;
+			}
 
-			renameSync(file, newPath);
+			moveSessionFile(file, newPath);
 		} catch {
 			// Skip files that can't be migrated
 		}
 	}
+}
+
+/**
+ * Move a session file, falling back to copy+delete when the source and target
+ * live on different devices (EXDEV, e.g. a symlinked agent dir).
+ */
+function moveSessionFile(source: string, target: string): void {
+	try {
+		renameSync(source, target);
+		return;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException)?.code !== "EXDEV") throw error;
+	}
+	copyFileSync(source, target, fsConstants.COPYFILE_EXCL);
+	rmSync(source);
+}
+
+/** Find a non-existing path by appending a numeric suffix. */
+function findAvailablePath(dir: string, baseName: string): string {
+	let candidate = join(dir, baseName);
+	for (let n = 1; existsSync(candidate); n++) {
+		candidate = join(dir, `${baseName}-${n}`);
+	}
+	return candidate;
 }
 
 /**

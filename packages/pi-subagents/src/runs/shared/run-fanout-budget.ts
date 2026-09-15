@@ -267,6 +267,49 @@ export function claimRunFanoutBatch(descriptor: RunFanoutBudgetDescriptor, paths
 	return commitRunFanoutBatch(descriptor, paths, (snapshot) => snapshot);
 }
 
+/**
+ * Best-effort release of claim slots previously taken by {@link claimRunFanoutBatch}
+ * for the same logical admission batch. Used when a launch is rejected *after*
+ * its fan-out claim was committed (e.g. spawn-budget reservation failure) so the
+ * shared budget does not permanently lose slots to a run that never started.
+ * Matching is by qualified claim path; callers must pass the same paths object
+ * they claimed with.
+ */
+export function releaseRunFanoutBatch(descriptor: RunFanoutBudgetDescriptor, paths: string[]): void {
+	if (paths.length === 0) return;
+	let valid: RunFanoutBudgetDescriptor;
+	try {
+		valid = validateRunFanoutBudgetDescriptor(descriptor);
+	} catch {
+		return;
+	}
+	const qualified = new Set(qualifyRunFanoutPaths(valid, paths));
+	try {
+		withAdmissionLock(valid.directory, () => {
+			const claimsDir = path.join(valid.directory, "claims");
+			let entries: string[];
+			try {
+				entries = fs.readdirSync(claimsDir);
+			} catch {
+				return;
+			}
+			for (const name of entries) {
+				if (!/^\d{6}\.json$/.test(name)) continue;
+				const slotPath = path.join(claimsDir, name);
+				try {
+					const claim = JSON.parse(fs.readFileSync(slotPath, "utf-8")) as Partial<ClaimV1>;
+					if (claim.version === 1 && typeof claim.path === "string" && qualified.has(claim.path)) fs.unlinkSync(slotPath);
+				} catch {
+					// A concurrent admission may have removed or replaced the slot; skip it.
+				}
+			}
+		});
+	} catch {
+		// Release is best-effort; a failed release only strands slots until the
+		// budget directory is reclaimed, never blocks the rejection itself.
+	}
+}
+
 export function claimRunFanoutBatchWithCommit<T>(descriptor: RunFanoutBudgetDescriptor, paths: string[], commit: () => T): T {
 	return commitRunFanoutBatch(descriptor, paths, commit);
 }

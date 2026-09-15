@@ -164,6 +164,33 @@ remove_managed_release() {
 	remove_owned_directory "$directory" ".pie-refresh-release"
 }
 
+# Best-effort check: true when a live process still holds files open under
+# $1. Used to avoid deleting the previous release out from under running Pie
+# sessions (long-lived sessions keep running from the old directory after
+# activation, and Node module resolution from a deleted path fails). When
+# lsof is unavailable the check reports "not in use" and behavior is
+# unchanged apart from the restart reminder at the end of refresh.
+release_in_use() {
+	local directory="$1"
+	command -v lsof >/dev/null 2>&1 || return 1
+	# Resolve symlinks (/tmp -> /private/tmp on macOS) so the prefix match hits.
+	# Match both the raw and resolved forms: lsof prints the path as opened,
+	# which may differ from the canonical directory path via symlinks.
+	local resolved="$directory"
+	if command -v realpath >/dev/null 2>&1; then
+		resolved="$(realpath "$directory" 2>/dev/null || printf '%s' "$directory")"
+	fi
+	if [[ "$resolved" == "$directory" ]]; then
+		lsof -F n 2>/dev/null | grep -qF "n$directory"
+	else
+		lsof -F n 2>/dev/null | grep -qF -e "n$directory" -e "n$resolved"
+	fi
+}
+
+retain_in_use_release() {
+	printf 'warning: retaining in-use previous release: %s (restart sessions using it, then remove manually)\n' "$1" >&2
+}
+
 restore_original_activation() {
 	local failed=false
 	if [[ "$install_committed" == true || "$bin_switched" != true ]]; then
@@ -496,14 +523,22 @@ if [[ -n "$backup_dir" ]]; then
 	backup_dir=""
 fi
 if [[ "$original_canonical_type" == "symlink" && "$original_canonical_target" != "$release_dir" ]]; then
-	remove_managed_release "$original_canonical_target"
+	if release_in_use "$original_canonical_target"; then
+		retain_in_use_release "$original_canonical_target"
+	else
+		remove_managed_release "$original_canonical_target"
+	fi
 fi
 if [[ "$original_bin_exists" == true ]]; then
 	case "$original_bin_target" in
 		"$releases_dir"/release.*/node_modules/.bin/pie)
 			previous_bin_release="${original_bin_target%/node_modules/.bin/pie}"
 			if [[ "$previous_bin_release" != "$release_dir" && "$previous_bin_release" != "$original_canonical_target" ]]; then
-				remove_managed_release "$previous_bin_release"
+				if release_in_use "$previous_bin_release"; then
+					retain_in_use_release "$previous_bin_release"
+				else
+					remove_managed_release "$previous_bin_release"
+				fi
 			fi
 			;;
 	esac

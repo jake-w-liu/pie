@@ -13,7 +13,10 @@ function anthropicApiKeyAuth(): ApiKeyAuth {
 			interaction.signal.throwIfAborted();
 			const key = await interaction.prompt({ type: "secret", message: "Enter Anthropic API key" });
 			interaction.signal.throwIfAborted();
-			return { type: "api_key", key };
+			if (!key.trim()) {
+				throw new Error("No Anthropic API key provided");
+			}
+			return { type: "api_key", key: key.trim() };
 		},
 		resolve: async ({ ctx, credential, signal }) => {
 			signal.throwIfAborted();

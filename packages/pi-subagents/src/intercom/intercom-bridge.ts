@@ -171,9 +171,10 @@ export function applyIntercomBridgeToAgent(agent: AgentConfig, bridge: IntercomB
 	if (!bridge.active || !bridge.orchestratorTarget) return agent;
 
 	const bridgeTools = ["contact_supervisor"];
-	const tools = agent.tools && agent.tools.length > 0
-		? [...agent.tools, ...bridgeTools.filter((tool) => !agent.tools?.includes(tool))]
-		: agent.tools;
+	// Always grant the bridge tool while the bridge is active: the injected
+	// instruction orders the child to use contact_supervisor first, so leaving
+	// tool-less agents without it would demand a tool they were not granted.
+	const tools = [...(agent.tools ?? []), ...bridgeTools.filter((tool) => !agent.tools?.includes(tool))];
 	const instruction = bridge.instruction;
 	const trimmedPrompt = agent.systemPrompt?.trim() || "";
 	const systemPrompt = trimmedPrompt.includes(INTERCOM_BRIDGE_MARKER)

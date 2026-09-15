@@ -53,7 +53,7 @@ describe("FileModelsStore", () => {
 		expect((await reloaded.read("two"))?.models.map((entry) => entry.id)).toEqual(["m2"]);
 	});
 
-	it.skipIf(process.platform === "win32")("preserves the mode of an existing models file", async () => {
+	it.skipIf(process.platform === "win32")("tightens the mode of an existing permissive models file", async () => {
 		const managedModelsPath = join(sharedTempDir, "managed-mode.json");
 		writeFileSync(managedModelsPath, "{}");
 		chmodSync(managedModelsPath, 0o660);
@@ -61,7 +61,8 @@ describe("FileModelsStore", () => {
 
 		await store.write("one", { models: [model("one", "m1")], checkedAt: 100 });
 
-		expect(statSync(managedModelsPath).mode & 0o777).toBe(0o660);
+		// Group-readable credential-adjacent files left by older code are repaired to owner-only.
+		expect(statSync(managedModelsPath).mode & 0o777).toBe(0o600);
 	});
 
 	it("coalesces file reloads across concurrent readers and interleaved storage instances", async () => {

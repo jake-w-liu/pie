@@ -568,13 +568,31 @@ async function executeToolCallsParallel(
 	}
 
 	const executions = finalizedCalls.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry)));
-	let orderedFinalizedCalls: FinalizedToolCallOutcome[];
-	try {
-		orderedFinalizedCalls = await Promise.all(executions);
-	} finally {
-		// Preserve the first failure, but never publish idle/terminal lifecycle while
-		// admitted siblings (including finalizers and listeners) can still emit events.
-		await Promise.allSettled(executions);
+	// Settle every sibling before publishing: a single entry failure (e.g. a
+	// listener throwing in tool_execution_end) must not discard the successful
+	// siblings' toolResults, or toolCalls would be left unpaired in the transcript.
+	// Promise.all over non-rejecting wrappers preserves tool-call order while the
+	// rejection callback records the temporally-first failure (previous Promise.all
+	// semantics) and also waits for admitted siblings (previously the finally below).
+	let firstError: unknown;
+	let hasError = false;
+	const settled = await Promise.all(
+		executions.map((execution) =>
+			execution.then(
+				(value) => ({ status: "fulfilled", value }) as const,
+				(reason) => {
+					if (!hasError) {
+						hasError = true;
+						firstError = reason;
+					}
+					return { status: "rejected" } as const;
+				},
+			),
+		),
+	);
+	const orderedFinalizedCalls: FinalizedToolCallOutcome[] = [];
+	for (const entry of settled) {
+		if (entry.status === "fulfilled") orderedFinalizedCalls.push(entry.value);
 	}
 	const messages: ToolResultMessage[] = [];
 	for (const finalized of orderedFinalizedCalls) {
@@ -582,6 +600,9 @@ async function executeToolCallsParallel(
 		await emitToolResultMessage(toolResultMessage, emit);
 		messages.push(toolResultMessage);
 	}
+	// Surface the first failure after siblings are published so the run still
+	// fails loudly instead of masquerading as a partial success.
+	if (hasError) throw firstError;
 
 	return {
 		messages,

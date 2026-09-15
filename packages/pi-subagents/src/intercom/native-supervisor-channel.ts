@@ -223,6 +223,13 @@ async function waitForReply(channelDir: string, requestId: string, deadline: num
 		if (fs.existsSync(file)) {
 			const parsed = JSON.parse(fs.readFileSync(file, "utf-8")) as Partial<SupervisorReply>;
 			if (parsed.type === "subagent.supervisor.reply" && parsed.requestId === requestId && typeof parsed.message === "string") {
+				// Consume the reply so it does not linger as an orphan; the
+				// periodic sweeper reaps any leftovers from crashed readers.
+				try {
+					fs.rmSync(file, { force: true });
+				} catch {
+					// Delivery already succeeded; stale-file cleanup is best-effort.
+				}
 				return parsed as SupervisorReply;
 			}
 		}
@@ -284,7 +291,10 @@ async function sendSupervisorRequest(params: ContactSupervisorParams, signal?: A
 			details,
 		};
 	} catch (error) {
+		// A reply may have landed just as we gave up; remove it too so a late
+		// parent write cannot orphan a reply file nobody will ever consume.
 		removeRequestFile(requestPath(metadata.channelDir, requestId));
+		removeRequestFile(replyPath(metadata.channelDir, requestId));
 		throw error;
 	}
 }
@@ -401,6 +411,62 @@ function removeStaleEmptySupervisorChannel(channelDir: string, nowMs: number): b
 	return true;
 }
 
+function fileMtimeMs(file: string): number | undefined {
+	try {
+		return fs.statSync(file).mtimeMs;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Reap channel files no waiter can still consume: replies whose request is gone
+ * and whose waiter deadline has passed, and expectsReply requests whose own
+ * expiry has passed. Fire-and-forget progress updates are never reaped here;
+ * they are drained on the next ingest with UI context.
+ */
+function reapOrphanedSupervisorFiles(channelDir: string, nowMs: number): void {
+	const requestsDir = path.join(channelDir, REQUESTS_DIR);
+	const repliesDir = path.join(channelDir, REPLIES_DIR);
+	const requestNames = new Set((readDirectoryEntries(requestsDir) ?? []).map((entry) => entry.name));
+	for (const entry of readDirectoryEntries(repliesDir) ?? []) {
+		if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+		if (requestNames.has(entry.name)) continue;
+		const file = path.join(repliesDir, entry.name);
+		const mtime = fileMtimeMs(file);
+		// The waiter polls until request.createdAt + askTimeout; a reply older
+		// than a full ask timeout with no request left cannot be consumed.
+		if (mtime === undefined || nowMs - mtime <= askTimeoutMs()) continue;
+		try {
+			fs.rmSync(file, { force: true });
+		} catch {
+			// Opportunistic; retried on the next pass.
+		}
+	}
+	for (const entry of readDirectoryEntries(requestsDir) ?? []) {
+		if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+		const file = path.join(requestsDir, entry.name);
+		let parsed: Record<string, unknown>;
+		try {
+			parsed = JSON.parse(fs.readFileSync(file, "utf-8")) as Record<string, unknown>;
+		} catch {
+			continue;
+		}
+		if (parsed.type !== "subagent.supervisor.request" || parsed.expectsReply !== true) continue;
+		const expiresAt = typeof parsed.expiresAt === "number" && Number.isFinite(parsed.expiresAt)
+			? parsed.expiresAt
+			: typeof parsed.createdAt === "number" && Number.isFinite(parsed.createdAt)
+				? parsed.createdAt + askTimeoutMs()
+				: undefined;
+		if (expiresAt === undefined || nowMs <= expiresAt) continue;
+		try {
+			fs.rmSync(file, { force: true });
+		} catch {
+			// Opportunistic; retried on the next pass.
+		}
+	}
+}
+
 function cleanupStaleEmptySupervisorChannels(nowMs = Date.now()): number {
 	let channelEntries: fs.Dirent[];
 	try {
@@ -413,6 +479,11 @@ function cleanupStaleEmptySupervisorChannels(nowMs = Date.now()): number {
 	let removed = 0;
 	for (const entry of channelEntries) {
 		if (!entry.isDirectory()) continue;
+		try {
+			reapOrphanedSupervisorFiles(path.join(SUPERVISOR_CHANNEL_ROOT, entry.name), nowMs);
+		} catch {
+			// Reaping is opportunistic; the empty-channel pass below still runs.
+		}
 		try {
 			if (removeStaleEmptySupervisorChannel(path.join(SUPERVISOR_CHANNEL_ROOT, entry.name), nowMs)) removed++;
 		} catch {
@@ -491,15 +562,20 @@ function requestExpiresAt(request: SupervisorRequest, now: number): number {
 }
 
 function requestRunInactive(request: SupervisorRequest, state: SubagentState): boolean {
-	if (state.foregroundControls.has(request.runId)) return false;
+	// A remembered foreground child is authoritative about liveness: only a
+	// still-detached child can consume a reply. Check it before the control
+	// map, whose entry can linger after the run itself has ended.
 	const foreground = rememberedForegroundChild(request, state);
 	if (foreground) return foreground.child.status !== "detached";
+	if (state.foregroundControls.has(request.runId)) return false;
 
-	const asyncJob = state.asyncJobs.get(request.runId);
-	if (!asyncJob) return false;
-	if (asyncJob.status === "complete" || asyncJob.status === "failed" || asyncJob.status === "paused") return true;
+	const asyncJob = state.asyncJobs.get(request.runId) ?? state.fleetJobs?.get(request.runId);
+	// An untracked run id means the run (and any waiter) is already gone;
+	// leaving the request pending would wait forever.
+	if (!asyncJob) return true;
+	if (asyncJob.status === "complete" || asyncJob.status === "failed" || asyncJob.status === "paused" || asyncJob.status === "stopped" || asyncJob.status === "rejected") return true;
 	const stepStatus = asyncJob.steps?.[request.childIndex]?.status;
-	return stepStatus === "complete" || stepStatus === "completed" || stepStatus === "failed" || stepStatus === "paused";
+	return stepStatus === "complete" || stepStatus === "completed" || stepStatus === "failed" || stepStatus === "paused" || stepStatus === "stopped" || stepStatus === "rejected";
 }
 
 function requestLifecycle(request: PendingSupervisorRequest, state: SubagentState, ctx: ExtensionContext | undefined, now: number): SupervisorRequestLifecycle {

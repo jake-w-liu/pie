@@ -55,9 +55,18 @@ export function cloudflareWorkersAIAuth(): ApiKeyAuth {
 	return {
 		name: "Cloudflare API key",
 		login: async (interaction) => {
+			interaction.signal.throwIfAborted();
 			const key = await interaction.prompt({ type: "secret", message: "Enter Cloudflare API key" });
+			interaction.signal.throwIfAborted();
 			const accountId = await interaction.prompt({ type: "text", message: "Enter Cloudflare account ID" });
-			return { type: "api_key", key, env: { CLOUDFLARE_ACCOUNT_ID: accountId } };
+			interaction.signal.throwIfAborted();
+			if (!key.trim()) {
+				throw new Error("No Cloudflare API key provided");
+			}
+			if (!accountId.trim()) {
+				throw new Error("No Cloudflare account ID provided");
+			}
+			return { type: "api_key", key: key.trim(), env: { CLOUDFLARE_ACCOUNT_ID: accountId.trim() } };
 		},
 		resolve: async ({ ctx, credential, signal }) => {
 			const resolved = await resolveCloudflareEnv("workers-ai", ctx, credential, signal);
@@ -75,13 +84,26 @@ export function cloudflareAIGatewayAuth(): ApiKeyAuth {
 	return {
 		name: "Cloudflare API key",
 		login: async (interaction) => {
+			interaction.signal.throwIfAborted();
 			const key = await interaction.prompt({ type: "secret", message: "Enter Cloudflare API key" });
+			interaction.signal.throwIfAborted();
 			const accountId = await interaction.prompt({ type: "text", message: "Enter Cloudflare account ID" });
+			interaction.signal.throwIfAborted();
 			const gatewayId = await interaction.prompt({ type: "text", message: "Enter Cloudflare AI Gateway ID" });
+			interaction.signal.throwIfAborted();
+			if (!key.trim()) {
+				throw new Error("No Cloudflare API key provided");
+			}
+			if (!accountId.trim()) {
+				throw new Error("No Cloudflare account ID provided");
+			}
+			if (!gatewayId.trim()) {
+				throw new Error("No Cloudflare AI Gateway ID provided");
+			}
 			return {
 				type: "api_key",
-				key,
-				env: { CLOUDFLARE_ACCOUNT_ID: accountId, CLOUDFLARE_GATEWAY_ID: gatewayId },
+				key: key.trim(),
+				env: { CLOUDFLARE_ACCOUNT_ID: accountId.trim(), CLOUDFLARE_GATEWAY_ID: gatewayId.trim() },
 			};
 		},
 		resolve: async ({ ctx, credential, signal }) => {

@@ -187,10 +187,10 @@ export class ScrollView extends Container {
 		} else {
 			// The content did not shrink; only the viewport changed (e.g. the dock,
 			// a status indicator, or the editor/autocomplete resized the transcript's
-			// height). Preserve the user's scroll position so the text they are
-			// reading does not jump up/down, instead of clamping down to a maxScrollTop
-			// that shrank purely because the viewport changed.
-			this.currentScrollTop = Math.max(0, Math.min(this.currentScrollTop, Math.max(0, this.contentHeight - 1)));
+			// height). Preserve the user's scroll position, but never beyond
+			// maxScrollTop: otherwise the viewport renders blank rows past the
+			// end of content when the viewport grows while scrolled near the end.
+			this.currentScrollTop = Math.max(0, Math.min(this.currentScrollTop, maxScrollTop));
 		}
 		if (this.contentHeight <= this.currentViewportHeight) this.hideTransientScrollbar();
 	}

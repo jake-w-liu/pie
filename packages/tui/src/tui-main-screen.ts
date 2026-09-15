@@ -187,6 +187,10 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	private selectionCopyScheduled = false;
 	private selectionCopyGeneration = 0;
 	private selectionCopyRequest = 0;
+	// Throttle for over-wide line crash reports: a persistent 1-column width
+	// disagreement would otherwise append to pi-crash.log on every frame.
+	private lastOverwideLogKey = "";
+	private lastOverwideLogAt = 0;
 
 	constructor(
 		terminal: Terminal,
@@ -225,6 +229,18 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		} catch {
 			// Diagnostics must never break input handling.
 		}
+	}
+
+	/** Rate-limit identical over-wide line reports (60s) so one persistent width
+	 * disagreement cannot append to pi-crash.log on every frame. Distinct lines
+	 * still log immediately. Never throws. */
+	private shouldLogOverwideLine(width: number, lineWidth: number, line: string): boolean {
+		const key = `${width}:${lineWidth}:${line.slice(0, 200)}`;
+		const now = Date.now();
+		if (key === this.lastOverwideLogKey && now - this.lastOverwideLogAt < 60_000) return false;
+		this.lastOverwideLogKey = key;
+		this.lastOverwideLogAt = now;
+		return true;
 	}
 
 	captureRenderState(): TuiMainScreenRenderState {
@@ -1234,19 +1250,23 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				if (lineWidth > width) {
 					// Same guard as the differential path: a width disagreement must
 					// never kill the session. Truncate, record, and fall through.
-					try {
-						const crashLogPath = path.join(this.logDirectory, "pi-crash.log");
-						const crashData = [
-							`Truncated over-wide line at ${new Date().toISOString()}`,
-							`Terminal width: ${width}`,
-							`Line ${i} visible width: ${lineWidth}`,
-							`Line content: ${line.slice(0, 500)}`,
-							"",
-						].join("\n");
-						fs.mkdirSync(path.dirname(crashLogPath), { recursive: true });
-						fs.appendFileSync(crashLogPath, `${crashData}\n`);
-					} catch {
-						// Diagnostics must never break rendering.
+					// Identical reports are throttled so a persistent disagreement
+					// cannot spam pi-crash.log once per frame.
+					if (this.shouldLogOverwideLine(width, lineWidth, line)) {
+						try {
+							const crashLogPath = path.join(this.logDirectory, "pi-crash.log");
+							const crashData = [
+								`Truncated over-wide line at ${new Date().toISOString()}`,
+								`Terminal width: ${width}`,
+								`Line ${i} visible width: ${lineWidth}`,
+								`Line content: ${line.slice(0, 500)}`,
+								"",
+							].join("\n");
+							fs.mkdirSync(path.dirname(crashLogPath), { recursive: true });
+							fs.appendFileSync(crashLogPath, `${crashData}\n`);
+						} catch {
+							// Diagnostics must never break rendering.
+						}
 					}
 					line = truncateToWidth(line, width);
 					newLines[i] = line;
@@ -1342,20 +1362,23 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				// An over-wide line must never kill the session: a 1-column
 				// width disagreement (new emoji, custom component bug) would
 				// otherwise crash the agent mid-run. Truncate, record, and
-				// fall through to the normal write path below.
-				try {
-					const crashLogPath = path.join(this.logDirectory, "pi-crash.log");
-					const crashData = [
-						`Truncated over-wide line at ${new Date().toISOString()}`,
-						`Terminal width: ${width}`,
-						`Line ${i} visible width: ${lineWidth}`,
-						`Line content: ${line.slice(0, 500)}`,
-						"",
-					].join("\n");
-					fs.mkdirSync(path.dirname(crashLogPath), { recursive: true });
-					fs.appendFileSync(crashLogPath, `${crashData}\n`);
-				} catch {
-					// Diagnostics must never break rendering.
+				// fall through to the normal write path below. Identical reports
+				// are throttled so a persistent disagreement cannot spam the log.
+				if (this.shouldLogOverwideLine(width, lineWidth, line)) {
+					try {
+						const crashLogPath = path.join(this.logDirectory, "pi-crash.log");
+						const crashData = [
+							`Truncated over-wide line at ${new Date().toISOString()}`,
+							`Terminal width: ${width}`,
+							`Line ${i} visible width: ${lineWidth}`,
+							`Line content: ${line.slice(0, 500)}`,
+							"",
+						].join("\n");
+						fs.mkdirSync(path.dirname(crashLogPath), { recursive: true });
+						fs.appendFileSync(crashLogPath, `${crashData}\n`);
+					} catch {
+						// Diagnostics must never break rendering.
+					}
 				}
 				line = truncateToWidth(line, width);
 				newLines[i] = line;

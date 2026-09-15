@@ -78,24 +78,7 @@ const EXTENSION_LOAD_FAILURE_HINT = `Hint: Start without extensions using "${APP
  * Read all content from piped stdin.
  * Returns undefined if stdin is a TTY (interactive terminal).
  */
-async function readPipedStdin(): Promise<string | undefined> {
-	// If stdin is a TTY, we're running interactively - don't read stdin
-	if (process.stdin.isTTY) {
-		return undefined;
-	}
-
-	return new Promise((resolve) => {
-		let data = "";
-		process.stdin.setEncoding("utf8");
-		process.stdin.on("data", (chunk) => {
-			data += chunk;
-		});
-		process.stdin.on("end", () => {
-			resolve(data.trim() || undefined);
-		});
-		process.stdin.resume();
-	});
-}
+import { readPipedStdin } from "./utils/stdin.ts";
 
 function reportDiagnostics(diagnostics: readonly AgentSessionRuntimeDiagnostic[]): void {
 	for (const diagnostic of diagnostics) {

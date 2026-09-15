@@ -683,6 +683,9 @@ export type CostSummary = {
 	inputTokens: number;
 	outputTokens: number;
 	costUsd: number;
+	/** Prompt-cache tokens consumed; counted toward usage-budget token limits. */
+	cacheReadTokens?: number;
+	cacheWriteTokens?: number;
 };
 
 export type PublicNestedRunSummary = Pick<

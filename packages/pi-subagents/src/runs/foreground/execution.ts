@@ -1161,9 +1161,12 @@ async function runSingleAttempt(
 				}
 				result.messages!.push(evt.message);
 				const resultText = extractTextFromContent(evt.message.content);
-				if (options.toolBudget && pendingToolResult && resultText.includes("Tool budget hard limit reached")) {
+				// Attribute the block to the tool call this result actually closes
+				// (resolved via toolCallId), not the single-slot pendingToolResult which
+				// a concurrent tool start may have overwritten.
+				if (options.toolBudget && resultText.includes("Tool budget hard limit reached")) {
 					result.toolBudgetBlocked = true;
-					result.toolBudget = toolBudgetState(options.toolBudget, progress.toolCount, pendingToolResult.tool);
+					result.toolBudget = toolBudgetState(options.toolBudget, progress.toolCount, endedTool?.tool ?? pendingToolResult?.tool);
 				}
 				appendRecentOutput(progress, resultText.split("\n").slice(-10));
 				const toolSnapshot = pendingToolResult;

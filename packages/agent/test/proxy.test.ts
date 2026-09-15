@@ -155,3 +155,100 @@ describe("streamProxy", () => {
 		expect(events.some((event) => event.type === "error")).toBe(true);
 	});
 });
+
+describe("streamProxy framing robustness", () => {
+	it("processes a terminal data line stranded without a trailing newline", async () => {
+		const done = JSON.stringify({ type: "done", reason: "stop", usage });
+		const body = `data: ${JSON.stringify({ type: "start" })}\n\n${`data: ${done}`}`;
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => new Response(body, { status: 200 })),
+		);
+		const stream = streamProxy(
+			model,
+			{ systemPrompt: "", messages: [] },
+			{
+				authToken: "test-token",
+				proxyUrl: "https://proxy.example.com",
+			},
+		);
+		const result = await stream.result();
+		expect(result.stopReason).toBe("stop");
+		expect(result.errorMessage).toBeUndefined();
+	});
+
+	it("tolerates data fields without a space and CRLF line endings", async () => {
+		const done = JSON.stringify({ type: "done", reason: "stop", usage });
+		const body = `data:${JSON.stringify({ type: "start" })}\r\n\r\ndata:${done}\r\n`;
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => new Response(body, { status: 200 })),
+		);
+		const stream = streamProxy(
+			model,
+			{ systemPrompt: "", messages: [] },
+			{
+				authToken: "test-token",
+				proxyUrl: "https://proxy.example.com",
+			},
+		);
+		const result = await stream.result();
+		expect(result.stopReason).toBe("stop");
+	});
+
+	it("strips the partialJson staging field when the stream aborts mid-tool-call", async () => {
+		const proxyEvents: ProxyAssistantMessageEvent[] = [
+			{ type: "start" },
+			{ type: "toolcall_start", contentIndex: 0, id: "call_abort|fc_abort", toolName: "lookup" },
+			{ type: "toolcall_delta", contentIndex: 0, delta: '{"value":' },
+		];
+		const body = proxyEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => new Response(body, { status: 200 })),
+		);
+		const stream = streamProxy(
+			model,
+			{ systemPrompt: "", messages: [] },
+			{
+				authToken: "test-token",
+				proxyUrl: "https://proxy.example.com",
+			},
+		);
+		const result = await stream.result();
+		expect(result.stopReason).toBe("error");
+		expect(result.content[0]).toMatchObject({ type: "toolCall" });
+		expect("partialJson" in (result.content[0] as unknown as Record<string, unknown>)).toBe(false);
+	});
+
+	it("does not retroactively mutate previously emitted partials", async () => {
+		const proxyEvents: ProxyAssistantMessageEvent[] = [
+			{ type: "start" },
+			{ type: "text_start", contentIndex: 0 },
+			{ type: "text_delta", contentIndex: 0, delta: "hello" },
+			{ type: "text_delta", contentIndex: 0, delta: " world" },
+			{ type: "done", reason: "stop", usage },
+		];
+		const body = proxyEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => new Response(body, { status: 200 })),
+		);
+		const stream = streamProxy(
+			model,
+			{ systemPrompt: "", messages: [] },
+			{
+				authToken: "test-token",
+				proxyUrl: "https://proxy.example.com",
+			},
+		);
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const deltas = events.filter((event) => event.type === "text_delta");
+		expect(deltas).toHaveLength(2);
+		const first = deltas[0];
+		if (first.type !== "text_delta") throw new Error("expected text_delta");
+		expect(first.partial.content[0]).toMatchObject({ type: "text", text: "hello" });
+		await stream.result();
+	});
+});

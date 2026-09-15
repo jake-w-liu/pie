@@ -44,7 +44,14 @@ export class ServerSnapshotPublisher {
 	broadcast(): Promise<void> {
 		const broadcast = this.broadcastQueue.then(() => this.performBroadcast());
 		this.broadcastQueue = broadcast.catch((error: unknown) => this.options.reportError(error));
-		return broadcast;
+		// Every in-repo caller fires and forgets broadcast(). Return a promise that
+		// settles with this broadcast but never rejects: otherwise a transient
+		// service failure (e.g. listModels) would surface as an unhandled rejection
+		// and crash the server process. Failures still reach reportError via the queue.
+		return broadcast.then(
+			() => undefined,
+			() => undefined,
+		);
 	}
 
 	private async performBroadcast(): Promise<void> {

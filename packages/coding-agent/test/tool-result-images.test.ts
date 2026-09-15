@@ -92,7 +92,9 @@ describe("normalizeToolResultImages", () => {
 		expect(note.type).toBe("text");
 		if (note.type !== "text") return;
 		expect(note.text).toContain("original 2400x4800");
-	});
+		// In-process PNG resampling of an 11.5MP image is CPU-heavy; generous
+		// budget so parallel-suite load cannot flake it (timed out at 30s once).
+	}, 120_000);
 
 	it("leaves oversized images alone when auto-resize is disabled", async () => {
 		const content: ToolResultContent[] = [imageBlock(createPng(2400, 4800), "image/png")];

@@ -59,7 +59,9 @@ async function run(f: ReturnType<typeof setup>, args: string[] = [], envSessionD
 		stderr += chunk.toString();
 	});
 	const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
-		const timeout = setTimeout(() => child.kill("SIGKILL"), 25000);
+		// Guard against CLI hangs. Generous: cold-start module loading alone can
+		// exceed 10s here (measured 12s+), multiplied under parallel-suite load.
+		const timeout = setTimeout(() => child.kill("SIGKILL"), 60_000);
 		child.once("error", (error) => {
 			clearTimeout(timeout);
 			reject(error);
@@ -78,34 +80,46 @@ it.each([
 	{ label: "saved denial", flags: [], policy: "always", saved: false },
 	{ label: "unknown noninteractive trust", flags: [], policy: "ask", saved: undefined },
 	{ label: "global never", flags: [], policy: "never", saved: undefined },
-])("does not use project sessionDir for $label", async ({ flags, policy, saved }) => {
-	const f = setup(policy, saved);
-	await run(f, flags);
-	expect(existsSync(f.projectSessions)).toBe(false);
-	expect(existsSync(f.globalSessions)).toBe(true);
-});
+])(
+	"does not use project sessionDir for $label",
+	async ({ flags, policy, saved }) => {
+		const f = setup(policy, saved);
+		await run(f, flags);
+		expect(existsSync(f.projectSessions)).toBe(false);
+		expect(existsSync(f.globalSessions)).toBe(true);
+	},
+	120_000,
+);
 
 it.each([
 	{ label: "saved approval", flags: [], policy: "never", saved: true },
 	{ label: "explicit approval", flags: ["--approve"], policy: "never", saved: false },
 	{ label: "global always", flags: [], policy: "always", saved: undefined },
-])("uses project sessionDir for $label", async ({ flags, policy, saved }) => {
-	const f = setup(policy, saved);
-	await run(f, flags);
-	expect(existsSync(f.projectSessions)).toBe(true);
-	expect(existsSync(f.globalSessions)).toBe(false);
-});
+])(
+	"uses project sessionDir for $label",
+	async ({ flags, policy, saved }) => {
+		const f = setup(policy, saved);
+		await run(f, flags);
+		expect(existsSync(f.projectSessions)).toBe(true);
+		expect(existsSync(f.globalSessions)).toBe(false);
+	},
+	120_000,
+);
 
-it.each([false, true])("preserves explicit environment/CLI storage precedence (CLI=%s)", async (cli) => {
-	const f = setup("ask", false);
-	const envDir = join(f.dir, "env-sessions");
-	const cliDir = join(f.dir, "cli-sessions");
-	await run(f, ["--no-approve", ...(cli ? ["--session-dir", cliDir] : [])], envDir);
-	expect(existsSync(cli ? cliDir : envDir)).toBe(true);
-	expect(existsSync(cli ? envDir : cliDir)).toBe(false);
-	expect(existsSync(f.projectSessions)).toBe(false);
-	expect(existsSync(f.globalSessions)).toBe(false);
-});
+it.each([false, true])(
+	"preserves explicit environment/CLI storage precedence (CLI=%s)",
+	async (cli) => {
+		const f = setup("ask", false);
+		const envDir = join(f.dir, "env-sessions");
+		const cliDir = join(f.dir, "cli-sessions");
+		await run(f, ["--no-approve", ...(cli ? ["--session-dir", cliDir] : [])], envDir);
+		expect(existsSync(cli ? cliDir : envDir)).toBe(true);
+		expect(existsSync(cli ? envDir : cliDir)).toBe(false);
+		expect(existsSync(f.projectSessions)).toBe(false);
+		expect(existsSync(f.globalSessions)).toBe(false);
+	},
+	120_000,
+);
 
 it("resumes a foreign-cwd session without applying either project's storage redirection", async () => {
 	const f = setup("ask", false);
@@ -131,7 +145,7 @@ it("resumes a foreign-cwd session without applying either project's storage redi
 	expect(readFileSync(path, "utf8")).toContain('"name":"resumed"');
 	expect(existsSync(f.projectSessions)).toBe(false);
 	expect(existsSync(targetSessions)).toBe(false);
-});
+}, 120_000);
 
 it("later extension approval does not retroactively redirect initial storage", async () => {
 	const f = setup();
@@ -139,7 +153,7 @@ it("later extension approval does not retroactively redirect initial storage", a
 	expect(realpathSync(readFileSync(join(f.dir, "trust-log"), "utf8").trim())).toBe(realpathSync(f.cwd));
 	expect(existsSync(f.projectSessions)).toBe(false);
 	expect(existsSync(f.globalSessions)).toBe(true);
-});
+}, 120_000);
 
 it("continuation ignores a transcript offered through denied project settings", async () => {
 	const f = setup("ask", false);
@@ -149,4 +163,4 @@ it("continuation ignores a transcript offered through denied project settings", 
 	writeFileSync(path, bytes);
 	await run(f, ["--continue", "--name", "must-not-rename-offered"]);
 	expect(readFileSync(path, "utf8")).toBe(bytes);
-});
+}, 120_000);

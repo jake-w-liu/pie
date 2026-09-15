@@ -280,14 +280,11 @@ cleanup() {
 		fi
 	fi
 
-	# Remove nested node_modules that npm hoisting can leave inside the vendored
-	# extension packages; their dependencies resolve from the monorepo root, so
-	# these per-package node_modules are pure build garbage.
-	for ext_dir in "$repo_dir"/packages/pi-fff "$repo_dir"/packages/pi-web-access "$repo_dir"/packages/pi-subagents; do
-		if [[ -d "$ext_dir/node_modules" ]]; then
-			rm -rf -- "$ext_dir/node_modules" || cleanup_failed=true
-		fi
-	done
+	# NOTE: nested node_modules under extension packages are intentionally kept.
+	# npm workspaces nest dependencies there when versions conflict with the
+	# hoisted root (e.g. pi-web-access pins undici 8.10.0 over the root 8.9.0);
+	# deleting them silently downgrades those packages at runtime and in tests.
+	# (npm pack never includes node_modules, so keeping them costs nothing.)
 
 	if [[ "$lock_owned" == true ]]; then
 		rm -f -- "$lock_dir/owner"

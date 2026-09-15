@@ -115,6 +115,12 @@ export class LiveSessionManager {
 				);
 				return { command: "set_thinking" as const, session };
 			}
+			default: {
+				// Closed Command union: a future variant without a case is a
+				// compile error here instead of a silent undefined result.
+				const _exhaustive: never = command;
+				throw new PiServerError("invalid_request", `Unsupported command: ${JSON.stringify(_exhaustive)}`);
+			}
 		}
 	}
 

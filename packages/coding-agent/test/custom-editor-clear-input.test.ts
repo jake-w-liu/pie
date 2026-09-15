@@ -22,9 +22,33 @@ describe("clear input without interruption", () => {
 		editor.setText("first line\nsecond line\nlast line");
 		editor.handleInput("\x1b");
 		expect(editor.getText()).toBe("");
-		editor.handleInput("\x1b");
 		expect(interrupt).not.toHaveBeenCalled();
 		expect(exit).not.toHaveBeenCalled();
+	});
+
+	it("routes Escape to the interrupt handler when the editor is empty", () => {
+		const editor = createEditor();
+		const interrupt = vi.fn();
+		const exit = vi.fn();
+		editor.onEscape = interrupt;
+		editor.onCtrlD = exit;
+		editor.handleInput("\x1b");
+		expect(interrupt).toHaveBeenCalledTimes(1);
+		expect(exit).not.toHaveBeenCalled();
+	});
+
+	it("falls back to the registered interrupt action when onEscape is unset", () => {
+		const editor = createEditor();
+		const interrupt = vi.fn();
+		editor.onAction("app.interrupt", interrupt);
+		editor.handleInput("\x1b");
+		expect(interrupt).toHaveBeenCalledTimes(1);
+	});
+
+	it("ignores empty-input Escape when no interrupt handler is installed", () => {
+		const editor = createEditor();
+		expect(() => editor.handleInput("\x1b")).not.toThrow();
+		expect(editor.getText()).toBe("");
 	});
 
 	it("preserves the separate interrupt binding", () => {

@@ -4,7 +4,7 @@
 
 ### Breaking Changes
 
-- Changed the default interrupt shortcut from Escape to Ctrl+Alt+C. Escape now clears all editor input without aborting; when a completion menu is open, it closes the menu first. Both shortcuts remain configurable.
+- Changed the default interrupt shortcut from Escape to Ctrl+Alt+C. Escape now clears all editor input without aborting; when a completion menu is open, it closes the menu first. With empty editor input, Escape acts as interrupt again (aborts streaming turns, bash execution, compaction, and retry). Both shortcuts remain configurable.
 
 ### Added
 

@@ -121,7 +121,7 @@ This routing remains configurable through the ordinary action bindings. For exam
 | Keybinding id | Default | Description |
 |--------|---------|-------------|
 | `app.interrupt` | `ctrl+alt+c` | Cancel / abort |
-| `app.editor.clear` | `escape` | Clear all input without aborting (closes a completion menu first) |
+| `app.editor.clear` | `escape` | Clear all input (closes a completion menu first); with empty input, acts as interrupt |
 | `app.clear` | `ctrl+c` | Clear editor (first) / exit (second) |
 | `app.exit` | `ctrl+d` | Exit (when editor empty) |
 | `app.suspend` | `ctrl+z` (none on Windows) | Suspend to background |

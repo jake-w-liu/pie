@@ -43,9 +43,17 @@ export class CustomEditor extends Editor {
 
 		// Input clearing is separate from interrupt handlers installed by active
 		// turns, compaction, and retry. Escape closes a visible menu first.
+		// With empty input there is nothing to clear, so Escape acts as
+		// interrupt (same handler as app.interrupt) to abort a streaming
+		// turn, bash execution, compaction, or retry.
 		if (this.keybindings.matches(data, "app.editor.clear")) {
 			if (this.isShowingAutocomplete() && this.keybindings.matches(data, "tui.select.cancel")) {
 				super.handleInput(data);
+			} else if (this.getText().length === 0) {
+				const handler = this.onEscape ?? this.actionHandlers.get("app.interrupt");
+				if (handler) {
+					handler();
+				}
 			} else {
 				this.setText("");
 			}

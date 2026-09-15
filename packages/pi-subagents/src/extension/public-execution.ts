@@ -146,9 +146,44 @@ export function normalizePublicSubagentExecution<T extends PublicSubagentExecuti
 		};
 	}
 	if (!hasValidWorkflowInput) {
-		const waitOnly = params as { all?: unknown; nonBlocking?: unknown; stopOnAttention?: unknown };
-		if (waitOnly.all !== undefined || waitOnly.nonBlocking !== undefined || waitOnly.stopOnAttention !== undefined) {
+		const maybe = params as {
+			all?: unknown;
+			nonBlocking?: unknown;
+			stopOnAttention?: unknown;
+			id?: unknown;
+			runId?: unknown;
+			dir?: unknown;
+			view?: unknown;
+			lines?: unknown;
+			index?: unknown;
+			childId?: unknown;
+			timeoutMs?: unknown;
+			maxRuntimeMs?: unknown;
+		};
+		if (maybe.all !== undefined || maybe.nonBlocking !== undefined || maybe.stopOnAttention !== undefined) {
 			return { ok: false, error: "Parameters { all, nonBlocking, stopOnAttention } belong to the subagent_wait tool, not subagent. Call subagent_wait to block until background runs finish.", mode: "workflow" };
+		}
+		if (
+			maybe.id !== undefined ||
+			maybe.runId !== undefined ||
+			maybe.dir !== undefined ||
+			maybe.view !== undefined ||
+			maybe.lines !== undefined ||
+			maybe.index !== undefined ||
+			maybe.childId !== undefined
+		) {
+			return {
+				ok: false,
+				error: "Got run-targeting fields (id/runId/dir/view/lines/index/childId) without a management action. To inspect a run use subagent({ action: 'status', id: '...' }) (add view: 'transcript' for the transcript); to block until it finishes use subagent_wait({ id: '...' }). To launch work omit these fields and pass { agent, task? } or workflowScript.",
+				mode: "management",
+			};
+		}
+		if (maybe.timeoutMs !== undefined || maybe.maxRuntimeMs !== undefined) {
+			return {
+				ok: false,
+				error: "Got timeoutMs/maxRuntimeMs without execution fields. Execution requires either { agent, task? } for one child or a non-empty workflowScript or workflowScriptPath for orchestration. To wait for an existing run use subagent_wait({ id: '...' , timeoutMs: ... }) instead of subagent.",
+				mode: "workflow",
+			};
 		}
 		return { ok: false, error: "Execution requires either { agent, task? } for one child or a non-empty workflowScript or workflowScriptPath for orchestration.", mode: "workflow" };
 	}

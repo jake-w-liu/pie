@@ -232,7 +232,7 @@ function workflowLaneKeys(script: string): string[] {
 			index = literal.end;
 			continue;
 		}
-		if (!isIdentifier(script[index - 1]) && script.startsWith("runs.run", index) && !isIdentifier(script[index + 8])) {
+		if (!isIdentifier(script[index - 1]) && script[index - 1] !== "." && script.startsWith("runs.run", index) && !isIdentifier(script[index + 8])) {
 			const open = skipTrivia(index + 8);
 			const key = script[open] === "(" ? readLiteral(skipTrivia(open + 1)) : undefined;
 			if (key) {
@@ -242,7 +242,7 @@ function workflowLaneKeys(script: string): string[] {
 				continue;
 			}
 		}
-		if (!isIdentifier(script[index - 1]) && script.startsWith("runs.all", index) && !isIdentifier(script[index + 8])) {
+		if (!isIdentifier(script[index - 1]) && script[index - 1] !== "." && script.startsWith("runs.all", index) && !isIdentifier(script[index + 8])) {
 			index = collectRunsAllKeys(index + 8);
 			continue;
 		}

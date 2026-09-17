@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { AgentConfig } from "../src/agents/agents.ts";
 import { applyIntercomBridgeToAgent, type IntercomBridgeState } from "../src/intercom/intercom-bridge.ts";
+import { resolvePiLaunchToolPlan } from "../src/runs/shared/pi-args.ts";
 
 function activeBridge(): IntercomBridgeState {
 	return {
@@ -35,9 +36,20 @@ describe("B14: bridged agents are always granted contact_supervisor", () => {
 		expect(result.systemPrompt).toContain("contact_supervisor");
 	});
 
-	it("grants the tool to agents with no tool list", () => {
+	it("keeps the all-tools default for agents with no tool list", () => {
 		const result = applyIntercomBridgeToAgent(agent({}), activeBridge());
-		expect(result.tools).toContain("contact_supervisor");
+		// `tools: undefined` means "all builtin tools". The bridge must not rewrite it
+		// into a strict ["contact_supervisor"] allowlist, which would emit
+		// `--tools contact_supervisor` and hide read/bash/edit from the child.
+		expect(result.tools).toBeUndefined();
+		expect(result.systemPrompt).toContain("contact_supervisor");
+	});
+
+	it("does not emit a contact_supervisor-only launch allowlist for a tool-less agent", () => {
+		const result = applyIntercomBridgeToAgent(agent({}), activeBridge());
+		const plan = resolvePiLaunchToolPlan({ tools: result.tools, cwd: process.cwd() });
+		expect(plan.explicitToolAllowlist).toBe(false);
+		expect(plan.effectiveToolAllowlist).not.toEqual(["contact_supervisor"]);
 	});
 
 	it("still appends for agents that already have tools, without duplicates", () => {

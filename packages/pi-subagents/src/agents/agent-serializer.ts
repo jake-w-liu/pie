@@ -49,6 +49,19 @@ function joinComma(values: string[] | undefined): string | undefined {
 	return values.join(", ");
 }
 
+/**
+ * Emit a string scalar that round-trips through {@link parseFrontmatter}.
+ * `parseFrontmatter` does not decode YAML escape sequences, so quoted one-liners are
+ * used only when the YAML encoder produces them (comments, leading punctuation),
+ * and multi-line values are emitted as an indented block scalar.
+ */
+function pushYamlScalar(lines: string[], key: string, value: string): void {
+	const encoded = stringifyYaml(value).trimEnd();
+	const [first = "", ...rest] = encoded.split("\n");
+	lines.push(`${key}: ${first}`);
+	for (const line of rest) lines.push(`  ${line}`);
+}
+
 interface SerializeAgentOptions {
 	preserveFrontmatterFields?: ReadonlySet<string>;
 }
@@ -60,7 +73,7 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	lines.push("---");
 	lines.push(`name: ${frontmatterNameForConfig(config)}`);
 	if (config.packageName) lines.push(`package: ${config.packageName}`);
-	lines.push(`description: ${config.description}`);
+	pushYamlScalar(lines, "description", config.description);
 	const aliasesValue = joinComma(config.aliases);
 	if (aliasesValue || preserve("alias", "aliases")) lines.push(`aliases: ${aliasesValue ?? ""}`);
 

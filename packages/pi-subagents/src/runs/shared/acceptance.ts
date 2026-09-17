@@ -1162,6 +1162,22 @@ export function quoteExecutableForShell(command: string, platform: string = proc
 	if (trimmed.startsWith("\"")) return command;
 	const firstToken = trimmed.match(/^\S+/)?.[0];
 	if (/\.(?:exe|bat|cmd|com|ps1)$/i.test(firstToken ?? "")) return command;
+	// Primary heuristic: a drive-qualified path whose directory component contains a
+	// space, where the executable is the token immediately after the LAST backslash.
+	// This must run before the regex fallbacks below: their lazy groups can stop at an
+	// early directory segment (`C:\Program Files\my` in `...\my tool\node script.js`)
+	// or swallow the arguments into the executable token.
+	const leading = command.slice(0, command.length - trimmed.length);
+	const drivePath = trimmed.match(/^([A-Za-z]:\\[^"<>|&*?\r\n]*)/)?.[1];
+	if (drivePath && /\s/.test(drivePath)) {
+		const lastSlash = drivePath.lastIndexOf("\\");
+		const filename = drivePath.slice(lastSlash + 1).match(/^\S+/)?.[0] ?? "";
+		const directory = drivePath.slice(0, lastSlash);
+		if (directory.includes(" ") && filename.length > 0) {
+			const executable = drivePath.slice(0, lastSlash + 1 + filename.length);
+			return `${leading}"${executable}"${trimmed.slice(executable.length)}`;
+		}
+	}
 	const match = trimmed.match(/^([A-Za-z]:\\[^"<>|&*?\r\n]*?\s[^"<>|&*?\r\n]*?\\[^"<>|&*?\r\n]*?\.(?:exe|bat|cmd|com|ps1))(?=\s|$)/i);
 	const executable = match?.[1];
 	if (executable && /\s/.test(executable) && !/[A-Za-z]:\\/.test(executable.slice(3))) {

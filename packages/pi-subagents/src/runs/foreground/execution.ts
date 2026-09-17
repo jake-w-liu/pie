@@ -1408,8 +1408,15 @@ async function runSingleAttempt(
 			const kill = () => {
 				if (processClosed || lifecycleFinished) return;
 				abortedBySignal = true;
-				proc.kill("SIGTERM");
-				setTimeout(() => !proc.killed && proc.kill("SIGKILL"), 3000);
+				trySignalChild(proc, "SIGTERM");
+				// Node marks `child.killed === true` as soon as kill() is called, even when
+				// the process ignores SIGTERM, so it must not gate the escalation. Mirror the
+				// timeout path's lifecycle guard instead.
+				const hardKill = setTimeout(() => {
+					if (lifecycleFinished || processClosed) return;
+					trySignalChild(proc, "SIGKILL");
+				}, 3000);
+				hardKill.unref?.();
 			};
 			if (options.signal.aborted) kill();
 			else {

@@ -541,7 +541,10 @@ function updateMissionInner(location: MissionStoreLocation, missionId: string, u
 	// An explicitly requested status is honored as-is; only implicitly derived
 	// statuses are coerced to needs_decision while decisions are open. Coercing
 	// an explicit close would silently discard the caller's intent.
-	const decisionStatus = update.status === undefined && hasOpenDecisions && (candidateStatus === "active" || candidateStatus === "completed") ? "needs_decision" : candidateStatus;
+	// A terminal mission is never coerced: late decisions/runs are recorded without
+	// reviving it, and coercing would trip the terminal guard below and reject the
+	// whole update.
+	const decisionStatus = update.status === undefined && hasOpenDecisions && !TERMINAL_MISSION_STATUSES.has(current.status) && (candidateStatus === "active" || candidateStatus === "completed") ? "needs_decision" : candidateStatus;
 	// Terminal missions stay terminal: launching or attaching against a closed
 	// mission must fail loudly instead of silently resurrecting it to active.
 	if (TERMINAL_MISSION_STATUSES.has(current.status) && !TERMINAL_MISSION_STATUSES.has(decisionStatus)) {

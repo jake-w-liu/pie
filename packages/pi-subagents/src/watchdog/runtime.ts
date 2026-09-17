@@ -394,6 +394,9 @@ export class MainWatchdogRuntime {
 			});
 			if (this.activeAgentEndAbortController === lspAbortController) this.activeAgentEndAbortController = undefined;
 			if (!this.isAgentEndCurrent(agentEndEpoch, agentEndId)) return;
+			// The LSP boundary pass is an independent review from the model pass; giving it
+			// the update budget first would suppress a distinct model warning entirely.
+			this.guard.startModelUpdate();
 			const delta = this.buildReviewInput(changeSignature, lspBlock);
 			this.clearPendingDeltas();
 			if (!delta.trim()) {
@@ -539,6 +542,9 @@ export class MainWatchdogRuntime {
 	private async reviewMidRunDelta(delta: string): Promise<void> {
 		if (this.midRunReviewing || this.reviewing || this.waitingAtAgentEnd || this.disposed) return;
 		this.midRunReviewing = true;
+		// Each cadence review is independent; without its own update budget a second
+		// distinct concern in the same turn is silently dropped as "update-budget".
+		this.guard.startModelUpdate();
 		const generation = this.midRunGeneration;
 		try {
 			const outcome = await this.reviewDelta(delta, this.configResult.config.agentEndTimeoutMs, { correction: true });

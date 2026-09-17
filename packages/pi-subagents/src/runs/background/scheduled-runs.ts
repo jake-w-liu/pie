@@ -604,6 +604,21 @@ export class ScheduledRunManager {
 				store.write(schedule);
 				fs.rmSync(path.join(store.directory(schedule.id), "active.lock"), { force: true });
 			}
+		} else {
+			// Recover an orphaned launch claim: a crash between creating active.lock and
+			// persisting activeRunId leaves the lock behind, and every later launch then
+			// records skipped forever. Clear it only when no running history entry claims it.
+			const lockPath = path.join(store.directory(schedule.id, true), "active.lock");
+			if (fs.existsSync(lockPath)) {
+				let claimedRunId = "";
+				try {
+					claimedRunId = fs.readFileSync(lockPath, "utf-8").trim();
+				} catch {
+					claimedRunId = "";
+				}
+				const claimed = claimedRunId ? store.history(schedule.id).find((item) => item.id === claimedRunId) : undefined;
+				if (!claimed || claimed.state !== "running") fs.rmSync(lockPath, { force: true });
+			}
 		}
 		if (!rearm || schedule.paused) return;
 		const next = nextRunAt(schedule);
@@ -661,6 +676,13 @@ export class ScheduledRunManager {
 		const planned = duePlannedAt(schedule, this.now());
 		if (planned === undefined || schedule.paused) return;
 		if (planned > this.now()) return this.arm(schedule, store);
+		// Mirror restoreOne/runDue: a missed occurrence must not run when catchUp is
+		// "none". Only this timer path used to launch regardless of catchUp.
+		if (!schedule.activeRunId && schedule.catchUp === "none" && planned < this.now()) {
+			this.recordMissed(store, schedule, planned, "timer");
+			this.arm(schedule, store);
+			return;
+		}
 		await this.launch(store, schedule, planned, "timer", true);
 	}
 

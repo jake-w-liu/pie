@@ -172,9 +172,19 @@ export function applyIntercomBridgeToAgent(agent: AgentConfig, bridge: IntercomB
 
 	const bridgeTools = ["contact_supervisor"];
 	// Always grant the bridge tool while the bridge is active: the injected
-	// instruction orders the child to use contact_supervisor first, so leaving
-	// tool-less agents without it would demand a tool they were not granted.
-	const tools = [...(agent.tools ?? []), ...bridgeTools.filter((tool) => !agent.tools?.includes(tool))];
+	// instruction orders the child to use contact_supervisor first, so an agent
+	// with an explicit allowlist must be able to call it.
+	//
+	// An undefined `tools` means "all builtin tools", not "no tools". Turning it
+	// into ["contact_supervisor"] made the launch plan treat the agent as having an
+	// explicit one-tool allowlist and emit `--tools contact_supervisor`, hiding
+	// read/bash/edit/grep from every tool-less builtin agent (worker, delegate,
+	// researcher, scout, ...). The runtime supervisor channel registers
+	// contact_supervisor independently of the allowlist, so tool-less agents still
+	// get it without rewriting `tools`.
+	const tools = agent.tools === undefined
+		? undefined
+		: [...agent.tools, ...bridgeTools.filter((tool) => !agent.tools?.includes(tool))];
 	const instruction = bridge.instruction;
 	const trimmedPrompt = agent.systemPrompt?.trim() || "";
 	const systemPrompt = trimmedPrompt.includes(INTERCOM_BRIDGE_MARKER)

@@ -61,6 +61,8 @@ interface OverflowItem extends PrunedForkRecoveryRecord {
 	order: number;
 	priority: number;
 	apply(summary: string, ref: string): void;
+	/** Model-facing strings at this item's own location, read after {@link apply}. */
+	probe(): string[];
 }
 
 type SummaryFunction = (payload: string) => Promise<string>;
@@ -115,33 +117,6 @@ function stringsInValue(value: unknown): string[] {
 	return [];
 }
 
-function modelFacingStrings(entries: SessionEntry[]): string[] {
-	const strings: string[] = [];
-	for (const entry of entries) {
-		const message = entry.type === "message" && entry.message && typeof entry.message === "object" ? entry.message : undefined;
-		if (message?.role === "toolResult") strings.push(...textBlocks(message.content).map(({ block }) => block.text as string));
-		if (message?.role === "assistant" && Array.isArray(message.content)) {
-			for (const blockValue of message.content) {
-				if (!blockValue || typeof blockValue !== "object" || Array.isArray(blockValue)) continue;
-				const block = blockValue as Record<string, unknown>;
-				if (block.type === "text" && typeof block.text === "string") strings.push(block.text);
-				else if (block.type === "thinking" && typeof block.thinking === "string") strings.push(block.thinking);
-				else if (block.type === "toolCall") strings.push(stableJson(block.arguments ?? {}), ...stringsInValue(block.arguments));
-			}
-		}
-		if (message?.role === "user") {
-			if (typeof message.content === "string") strings.push(message.content);
-			else strings.push(...textBlocks(message.content).map(({ block }) => block.text as string));
-		}
-		if (entry.type === "custom_message") {
-			if (typeof entry.content === "string") strings.push(entry.content);
-			else strings.push(...textBlocks(entry.content).map(({ block }) => block.text as string));
-		}
-		if ((entry.type === "compaction" || entry.type === "branch_summary") && typeof entry.summary === "string") strings.push(entry.summary);
-	}
-	return strings;
-}
-
 function itemPrefix(kind: OverflowKind): string {
 	if (kind === "tool-result") return "tr";
 	if (kind === "tool-call") return "tc";
@@ -166,6 +141,7 @@ function collectOverflowItems(entries: SessionEntry[]): OverflowItem[] {
 		label: string,
 		body: string,
 		apply: OverflowItem["apply"],
+		probe: OverflowItem["probe"],
 		metadata: Pick<Partial<PrunedForkRecoveryRecord>, "toolCallId" | "toolName" | "isError"> = {},
 	): void => {
 		if (!body || Buffer.byteLength(body, "utf8") < MIN_USEFUL_SPILL_BYTES) return;
@@ -181,9 +157,10 @@ function collectOverflowItems(entries: SessionEntry[]): OverflowItem[] {
 			utf8Bytes: Buffer.byteLength(body, "utf8"),
 			utf16CodeUnits: body.length,
 			...metadata,
+			apply,
+			probe,
 			order: items.length,
 			priority: itemPriority(kind),
-			apply,
 		});
 	};
 
@@ -197,7 +174,7 @@ function collectOverflowItems(entries: SessionEntry[]): OverflowItem[] {
 				const body = block.text as string;
 				add(entry, "tool-result", `Tool result: ${toolName ?? "unknown"}${toolCallId ? ` ${toolCallId}` : ""}${message.isError === true ? " (error)" : ""}`, body, (summary, ref) => {
 					block.text = `${summary}\nRecovery ref: ${ref}`;
-				}, { toolCallId, toolName, isError: message.isError === true });
+				}, () => [block.text as string], { toolCallId, toolName, isError: message.isError === true });
 			}
 			continue;
 		}
@@ -207,15 +184,15 @@ function collectOverflowItems(entries: SessionEntry[]): OverflowItem[] {
 				const block = blockValue as Record<string, unknown>;
 				if (block.type === "text" && typeof block.text === "string") {
 					const body = block.text;
-					add(entry, "assistant-text", "Assistant:", body, (summary, ref) => { block.text = `${summary}\nRecovery ref: ${ref}`; });
+					add(entry, "assistant-text", "Assistant:", body, (summary, ref) => { block.text = `${summary}\nRecovery ref: ${ref}`; }, () => [block.text as string]);
 				} else if (block.type === "thinking" && typeof block.thinking === "string") {
 					const body = block.thinking;
-					add(entry, "assistant-thinking", "Assistant thinking:", body, (summary, ref) => { block.thinking = `${summary}\nRecovery ref: ${ref}`; });
+					add(entry, "assistant-thinking", "Assistant thinking:", body, (summary, ref) => { block.thinking = `${summary}\nRecovery ref: ${ref}`; }, () => [block.thinking as string]);
 				} else if (block.type === "toolCall" && typeof block.id === "string" && typeof block.name === "string") {
 					const body = stableJson(block.arguments ?? {});
 					add(entry, "tool-call", `Tool call: ${block.name} ${block.id}`, body, (summary, ref) => {
 						block.arguments = { prunedForkSummary: summary, recoveryRef: JSON.parse(ref) };
-					}, { toolCallId: block.id, toolName: block.name });
+					}, () => [stableJson(block.arguments ?? {}), ...stringsInValue(block.arguments)], { toolCallId: block.id, toolName: block.name });
 				}
 			}
 			continue;
@@ -223,11 +200,11 @@ function collectOverflowItems(entries: SessionEntry[]): OverflowItem[] {
 		if (role === "user" && message) {
 			if (typeof message.content === "string") {
 				const body = message.content;
-				add(entry, "user-text", "User:", body, (summary, ref) => { message.content = `${summary}\nRecovery ref: ${ref}`; });
+				add(entry, "user-text", "User:", body, (summary, ref) => { message.content = `${summary}\nRecovery ref: ${ref}`; }, () => [message.content as string]);
 			} else {
 				for (const { block } of textBlocks(message.content)) {
 					const body = block.text as string;
-					add(entry, "user-text", "User:", body, (summary, ref) => { block.text = `${summary}\nRecovery ref: ${ref}`; });
+					add(entry, "user-text", "User:", body, (summary, ref) => { block.text = `${summary}\nRecovery ref: ${ref}`; }, () => [block.text as string]);
 				}
 			}
 			continue;
@@ -235,18 +212,18 @@ function collectOverflowItems(entries: SessionEntry[]): OverflowItem[] {
 		if (entry.type === "custom_message") {
 			if (typeof entry.content === "string") {
 				const body = entry.content;
-				add(entry, "user-text", `Extension message: ${String(entry.customType ?? "unknown")}`, body, (summary, ref) => { entry.content = `${summary}\nRecovery ref: ${ref}`; });
+				add(entry, "user-text", `Extension message: ${String(entry.customType ?? "unknown")}`, body, (summary, ref) => { entry.content = `${summary}\nRecovery ref: ${ref}`; }, () => [entry.content as string]);
 			} else {
 				for (const { block } of textBlocks(entry.content)) {
 					const body = block.text as string;
-					add(entry, "user-text", `Extension message: ${String(entry.customType ?? "unknown")}`, body, (summary, ref) => { block.text = `${summary}\nRecovery ref: ${ref}`; });
+					add(entry, "user-text", `Extension message: ${String(entry.customType ?? "unknown")}`, body, (summary, ref) => { block.text = `${summary}\nRecovery ref: ${ref}`; }, () => [block.text as string]);
 				}
 			}
 			continue;
 		}
 		if ((entry.type === "compaction" || entry.type === "branch_summary") && typeof entry.summary === "string") {
 			const body = entry.summary;
-			add(entry, "summary-text", entry.type === "compaction" ? "Prior compaction summary:" : "Prior branch summary:", body, (summary, ref) => { entry.summary = `${summary}\nRecovery ref: ${ref}`; });
+			add(entry, "summary-text", entry.type === "compaction" ? "Prior compaction summary:" : "Prior branch summary:", body, (summary, ref) => { entry.summary = `${summary}\nRecovery ref: ${ref}`; }, () => [entry.summary as string]);
 		}
 	}
 	return items;
@@ -259,17 +236,23 @@ function previewBody(body: string, maxChars: number): string {
 }
 
 function serializeSummaryRequest(items: OverflowItem[]): string {
-	const perItem = Math.max(200, Math.floor(MAX_SUMMARY_INPUT_CHARS / Math.max(1, items.length)) - 180);
-	const payload = stableJson({
-		items: items.map((item) => ({
-			itemId: item.itemId,
-			kind: item.kind,
-			label: item.label,
-			body: previewBody(item.body, perItem),
-		})),
-	});
-	if (payload.length > MAX_SUMMARY_INPUT_CHARS) throw new Error(`Pruned fork summary input exceeds the ${MAX_SUMMARY_INPUT_CHARS}-character budget.`);
-	return payload;
+	// The per-item allowance must account for the itemId/kind/label JSON envelope and
+	// must not floor so high that a large candidate list can never fit; otherwise
+	// pruning (the feature aimed at the largest forks) always aborts.
+	let perItem = Math.max(1, Math.floor(MAX_SUMMARY_INPUT_CHARS / Math.max(1, items.length)) - 180);
+	for (;;) {
+		const payload = stableJson({
+			items: items.map((item) => ({
+				itemId: item.itemId,
+				kind: item.kind,
+				label: item.label,
+				body: previewBody(item.body, perItem),
+			})),
+		});
+		if (payload.length <= MAX_SUMMARY_INPUT_CHARS) return payload;
+		if (perItem <= 1) throw new Error(`Pruned fork summary input exceeds the ${MAX_SUMMARY_INPUT_CHARS}-character budget.`);
+		perItem = Math.max(1, Math.floor(perItem / 2));
+	}
 }
 
 function parseSummaries(raw: string, items: OverflowItem[]): Map<string, string> {
@@ -366,12 +349,15 @@ export async function pruneForkSessionFile(sessionFile: string, summarize: Summa
 	}
 	const renderedText = serializedEntries(entries);
 	if (Buffer.byteLength(renderedText, "utf8") > MAX_INHERITED_SESSION_BYTES) throw new Error(`Pruned fork transcript still exceeds the ${MAX_INHERITED_SESSION_BYTES}-byte budget after spilling all eligible overflow.`);
-	const visibleStrings = modelFacingStrings(entries);
 	for (const item of spilled) {
 		const rawValues = item.kind === "tool-call"
 			? [item.body, ...stringsInValue(JSON.parse(item.body)).filter((value) => Buffer.byteLength(value, "utf8") >= MIN_USEFUL_SPILL_BYTES)]
 			: [item.body];
-		if (renderedText.includes(item.body) || visibleStrings.some((value) => rawValues.some((raw) => value.includes(raw)))) throw new Error(`Pruned fork raw overflow leak detected for ${item.itemId}.`);
+		// Scope the leak check to the item's own (now-rewritten) location. Checking the
+		// whole transcript false-positives whenever the same text legitimately appears in
+		// another retained entry (for example the same file read twice).
+		const probeStrings = item.probe();
+		if (probeStrings.some((value) => rawValues.some((raw) => value.includes(raw)))) throw new Error(`Pruned fork raw overflow leak detected for ${item.itemId}.`);
 		if (!renderedText.includes(batchId) || !renderedText.includes(item.itemId)) throw new Error(`Pruned fork visible recovery ref is missing for ${item.itemId}.`);
 	}
 	const payload: PrunedForkRecoveryPayload = {
@@ -379,7 +365,7 @@ export async function pruneForkSessionFile(sessionFile: string, summarize: Summa
 		batchId,
 		parentSession: header.parentSession,
 		sourceHeadEntryId: sourceHead.id,
-		records: spilled.map(({ order: _order, priority: _priority, apply: _apply, ...record }) => record),
+		records: spilled.map(({ order: _order, priority: _priority, apply: _apply, probe: _probe, ...record }) => record),
 	};
 	const validateRecovery = options.validateRecovery ?? recoveryPayloadValid;
 	if (!validateRecovery(payload)) throw new Error("Pruned fork recovery payload failed validation.");

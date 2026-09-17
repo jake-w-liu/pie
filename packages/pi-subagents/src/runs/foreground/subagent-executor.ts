@@ -5437,7 +5437,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				let sessionError: string | undefined;
 				try {
 					currentSessionFile = ctx.sessionManager.getSessionFile() ?? null;
-					currentSessionId = ctx.sessionManager.getSessionId();
+					// Match the id used by every launch path (resolveCurrentSessionId prefers the
+					// persisted session file). Using the bare getSessionId() here made the
+					// destructive sessionState() reset the live spawn/async-capacity buckets.
+					currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
 				} catch (error) {
 					sessionError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 				}

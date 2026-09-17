@@ -60,12 +60,16 @@ type CursorOperation =
 	| { type: "set-pending"; session: string; value: string }
 	| { type: "delete-pending"; session: string };
 
+interface DiscoveredResultCandidate extends Omit<ResultCandidate, "path"> {
+	name: string;
+}
+
 interface RetentionDiscovery {
 	discoveryDurationMs: number;
 	rawReads: number;
 	sourceExhausted: Record<string, boolean>;
 	runCandidates: DiscoveredRunCandidate[];
-	resultCandidates: Array<Omit<ResultCandidate, "path">>;
+	resultCandidates: DiscoveredResultCandidate[];
 	cursorOps: CursorOperation[];
 }
 
@@ -638,6 +642,111 @@ function applyCursorOperations(cursor: RetentionCursor, operations: CursorOperat
 	}
 }
 
+/**
+ * In-process fallback for the retention discovery worker.
+ *
+ * The worker asset is the primary path, but it is an optional runtime file that can
+ * be missing from a packaged install. Discovery only enumerates candidates with
+ * keyset cursors; the commit loop re-validates every candidate (cutoff, resumable
+ * sessions, wait references, protected ids) before deleting anything, so an
+ * imperfect page here can never delete live state.
+ */
+function discoverRetentionInProcess(input: {
+	asyncDirRoot: string;
+	resultsDir: string;
+	cursor: RetentionCursor;
+	runBudget: number;
+	resultBudget: number;
+}): RetentionDiscovery {
+	const startedAt = Date.now();
+	const runCandidates: DiscoveredRunCandidate[] = [];
+	const resultCandidates: DiscoveredResultCandidate[] = [];
+	const cursorOps: CursorOperation[] = [];
+	const sourceExhausted: Record<string, boolean> = {};
+	let rawReads = 0;
+
+	const runNames = listDir(input.asyncDirRoot)
+		.filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+		.map((entry) => entry.name)
+		.filter((name) => validRunId(name))
+		.sort();
+	const runStart = input.cursor.runAfter === undefined ? runNames : runNames.filter((name) => name > input.cursor.runAfter!);
+	const runPage = runStart.slice(0, Math.max(0, input.runBudget));
+	for (const name of runPage) runCandidates.push({ name, relative: name });
+	rawReads += runPage.length;
+	sourceExhausted.runs = runStart.length <= runPage.length;
+	if (runPage.length > 0) cursorOps.push({ type: "set", key: "runAfter", value: runPage[runPage.length - 1]! });
+	else if (input.cursor.runAfter !== undefined) cursorOps.push({ type: "delete", key: "runAfter" });
+
+	let remaining = Math.max(0, input.resultBudget);
+	const resultSources: Array<{ relativeDir: string; kind: "public" | "replay" | "archive"; cursorKey: ResultCursorKey }> = [
+		{ relativeDir: "", kind: "public", cursorKey: "resultPublicAfter" },
+		{ relativeDir: "completion-replay", kind: "replay", cursorKey: "resultReplayAfter" },
+		{ relativeDir: "output-archives", kind: "archive", cursorKey: "resultArchiveAfter" },
+	];
+	const isResultEntry = (name: string): boolean => name.endsWith(".json") || name.startsWith(RESULT_TOMBSTONE_PREFIX);
+	for (const source of resultSources) {
+		const dir = source.relativeDir ? path.join(input.resultsDir, source.relativeDir) : input.resultsDir;
+		const names = listDir(dir).filter((entry) => entry.isFile() || entry.isSymbolicLink()).map((entry) => entry.name).filter(isResultEntry).sort();
+		const after = input.cursor[source.cursorKey];
+		const start = after === undefined ? names : names.filter((name) => name > after);
+		const page = start.slice(0, remaining);
+		for (const name of page) {
+			resultCandidates.push({
+				name,
+				relative: source.relativeDir ? path.join(source.relativeDir, name) : name,
+				kind: name.startsWith(RESULT_TOMBSTONE_PREFIX) ? "tombstone" : source.kind,
+				cursor: { type: "result", key: source.cursorKey },
+			});
+		}
+		remaining -= page.length;
+		rawReads += page.length;
+		sourceExhausted[source.kind] = start.length <= page.length;
+		if (page.length > 0) cursorOps.push({ type: "set", key: source.cursorKey, value: page[page.length - 1]! });
+		else if (after !== undefined) cursorOps.push({ type: "delete", key: source.cursorKey });
+	}
+
+	const pendingRoot = path.join(input.resultsDir, "result-pending");
+	const sessions = listDir(pendingRoot).filter((entry) => entry.isDirectory()).map((entry) => entry.name).filter((name) => validRunId(name)).sort();
+	const afterSession = input.cursor.pendingSessionAfter;
+	const sessionStart = afterSession === undefined ? sessions : sessions.filter((name) => name > afterSession);
+	let completedThrough = afterSession;
+	for (const session of sessionStart) {
+		if (remaining <= 0) break;
+		const dir = path.join(pendingRoot, session);
+		const names = listDir(dir).filter((entry) => entry.isFile() || entry.isSymbolicLink()).map((entry) => entry.name).filter(isResultEntry).sort();
+		const after = input.cursor.resultPendingAfterBySession?.[session];
+		const start = after === undefined ? names : names.filter((name) => name > after);
+		const page = start.slice(0, remaining);
+		for (const name of page) {
+			resultCandidates.push({
+				name,
+				relative: path.join("result-pending", session, name),
+				kind: name.startsWith(RESULT_TOMBSTONE_PREFIX) ? "tombstone" : "pending",
+				cursor: { type: "pending", session },
+			});
+		}
+		remaining -= page.length;
+		rawReads += page.length;
+		if (page.length > 0) cursorOps.push({ type: "set-pending", session, value: page[page.length - 1]! });
+		else if (after !== undefined) cursorOps.push({ type: "delete-pending", session });
+		if (start.length > page.length || remaining <= 0) break;
+		completedThrough = session;
+	}
+	sourceExhausted.pending = sessionStart.length === 0 || completedThrough === sessions[sessions.length - 1];
+	if (completedThrough === undefined && afterSession !== undefined && sessionStart.length === 0) cursorOps.push({ type: "delete", key: "pendingSessionAfter" });
+	else if (completedThrough !== undefined && completedThrough !== afterSession) cursorOps.push({ type: "set", key: "pendingSessionAfter", value: completedThrough });
+
+	return {
+		discoveryDurationMs: Math.max(0, Date.now() - startedAt),
+		rawReads,
+		sourceExhausted,
+		runCandidates,
+		resultCandidates,
+		cursorOps,
+	};
+}
+
 export async function cleanupAsyncRetention(options: AsyncRetentionOptions): Promise<AsyncRetentionResult> {
 	const startedWall = Date.now();
 	const now = options.now ?? Date.now;
@@ -703,17 +812,28 @@ export async function cleanupAsyncRetention(options: AsyncRetentionOptions): Pro
 		const resultBudget = batchSize - runBudget;
 		const discoveryStartedAt = Date.now();
 		let discovery: RetentionDiscovery;
+		const workerUrl = options.discoveryWorkerUrl ?? new URL("../../../async-retention-discovery-worker.mjs", import.meta.url);
 		try {
-			discovery = await runRetentionDiscovery({
-				passId: randomUUID(),
-				asyncDirRoot: options.asyncDirRoot,
-				resultsDir: options.resultsDir,
-				cursor,
-				runBudget,
-				resultBudget,
-				workerUrl: options.discoveryWorkerUrl ?? new URL("../../../async-retention-discovery-worker.mjs", import.meta.url),
-				signal: options.signal,
-			});
+			// The packaged worker is optional; fall back to an in-process pass when the
+			// default asset is absent so retention never becomes a silent no-op.
+			discovery = options.discoveryWorkerUrl === undefined && workerUrl.protocol === "file:" && !fs.existsSync(workerUrl)
+				? discoverRetentionInProcess({
+					asyncDirRoot: options.asyncDirRoot,
+					resultsDir: options.resultsDir,
+					cursor,
+					runBudget,
+					resultBudget,
+				})
+				: await runRetentionDiscovery({
+					passId: randomUUID(),
+					asyncDirRoot: options.asyncDirRoot,
+					resultsDir: options.resultsDir,
+					cursor,
+					runBudget,
+					resultBudget,
+					workerUrl,
+					signal: options.signal,
+				});
 		} catch (error) {
 			result.discoveryDurationMs = Math.max(0, Date.now() - discoveryStartedAt);
 			if (error instanceof RetentionCancelledError) {

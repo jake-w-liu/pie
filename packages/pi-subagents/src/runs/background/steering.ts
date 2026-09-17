@@ -91,6 +91,7 @@ export function updateSteeringTarget(
 		if (fields.replacementRunId) target.replacementRunId = fields.replacementRunId;
 		return target;
 	}
+	if (target.state === "scheduled" && state !== "scheduled") status.scheduled = Math.max(0, status.scheduled - 1);
 	if ((target.state === "routed" || target.state === "queued") && state !== "routed" && state !== "queued") status.pending = Math.max(0, status.pending - 1);
 	target.state = state;
 	if (state === "routed") target.routedAt = now;

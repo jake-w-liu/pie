@@ -100,7 +100,10 @@ export class WatchdogEmissionGuard {
 			const updateEscalation = this.updateAcceptedUnderlyingIdentity === underlyingIdentity
 				&& this.updateAcceptedSeverity === "concern"
 				&& warning.severity === "blocker";
-			if (!updateEscalation) return { accepted: false, reason: "update-budget", identity, underlyingIdentity };
+			// A higher-severity warning displaces an accepted concern even when it is a
+			// different underlying identity; silently dropping a blocker is never safe.
+			const displacesConcern = this.updateAcceptedSeverity === "concern" && warning.severity === "blocker";
+			if (!updateEscalation && !displacesConcern) return { accepted: false, reason: "update-budget", identity, underlyingIdentity };
 		}
 		if (priorSeverity !== undefined && !escalation) return { accepted: false, reason: "duplicate", identity, underlyingIdentity };
 		if (this.maxWarnings !== null && this.acceptedCount >= this.maxWarnings && !escalation) {

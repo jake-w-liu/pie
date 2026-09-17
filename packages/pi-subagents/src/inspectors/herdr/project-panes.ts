@@ -646,7 +646,7 @@ function createProjectPaneManagerInternal(options: InternalProjectPaneManagerOpt
 					projectRoot, bindingPath: projectPaneBindingPath(projectRoot), details: runtime,
 				});
 			}
-			if (runtime.agentStatus !== "idle") {
+			if (input.requireIdle !== false && runtime.agentStatus !== "idle") {
 				return projectPaneError("PANE_NOT_IDLE", `Project pane '${existing.paneId}' is '${runtime.agentStatus}', not explicitly idle.`, {
 					projectRoot, bindingPath: projectPaneBindingPath(projectRoot), details: runtime,
 				});

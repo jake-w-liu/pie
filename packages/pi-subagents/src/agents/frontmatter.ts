@@ -119,9 +119,13 @@ export function parseFrontmatter(content: string): { frontmatter: Record<string,
 			if (key === undefined || rawValueValue === undefined) continue;
 			const rawValue = rawValueValue.trim();
 			const isQuoted = (rawValue.startsWith('"') && rawValue.endsWith('"')) || (rawValue.startsWith("'") && rawValue.endsWith("'"));
-			const value = isQuoted ? rawValue.slice(1, -1) : rawValue;
-			const isFolded = !isQuoted && (rawValue === ">" || rawValue === ">-");
-			const isLiteral = !isQuoted && (rawValue === "|" || rawValue === "|-");
+			// YAML comments start at whitespace + '#'. Strip them from unquoted scalars so
+			// `description: d # note` yields "d" rather than "d # note", which would otherwise
+			// become part of tool/alias lists and can break child launches.
+			const scalarValue = isQuoted ? rawValue : rawValue.replace(/\s+#.*$/, "").trimEnd();
+			const value = isQuoted ? rawValue.slice(1, -1) : scalarValue;
+			const isFolded = !isQuoted && (scalarValue === ">" || scalarValue === ">-");
+			const isLiteral = !isQuoted && (scalarValue === "|" || scalarValue === "|-");
 
 			if (value === "" || isFolded || isLiteral) {
 				// Key with empty value or block scalar indicator — defer storing until we see indent

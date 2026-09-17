@@ -73,8 +73,19 @@ describe("B9: explicit status is honored with open decisions", () => {
 		expect(closed.status).toBe("completed");
 	});
 
-	it("still derives needs_decision implicitly when decisions open", () => {
+	it("applies non-status updates to a mission closed with an open decision", () => {
 		const location = testLocation();
+		const mission = createMission(location, { title: "t", objective: "o", status: "active" });
+		updateMission(location, mission.id, { addDecisions: [{ title: "decide" }] });
+		updateMission(location, mission.id, { status: "completed" });
+		const updated = updateMission(location, mission.id, { summary: "notes" });
+		expect(updated.status).toBe("completed");
+		expect(updated.summary).toBe("notes");
+		const withRun = updateMission(location, mission.id, { addRuns: [runLink("late", 5)] });
+		expect(withRun.status).toBe("completed");
+	});
+
+	it("still derives needs_decision implicitly when decisions open", () => {		const location = testLocation();
 		const mission = createMission(location, { title: "t", objective: "o", status: "active" });
 		const updated = updateMission(location, mission.id, { addDecisions: [{ title: "decide" }] });
 		expect(updated.status).toBe("needs_decision");

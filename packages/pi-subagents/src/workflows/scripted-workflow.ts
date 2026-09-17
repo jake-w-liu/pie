@@ -1,6 +1,7 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, resolve as resolvePath } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 
@@ -1093,16 +1094,16 @@ function workflowStringMetadata(params: Record<string, unknown>): Pick<WorkflowS
 	};
 }
 
-function resolveWorkflowParserEntry(): string {
+function resolveAcornEntry(requireFn: NodeRequire = requireFromPackage, cwd: string = process.cwd()): string {
 	try {
-		return requireFromPackage.resolve("acorn");
+		return requireFn.resolve("acorn");
 	} catch (primaryError) {
 		// Some runtimes (e.g. Bun-compiled single-file binaries) fail bare
 		// package-specifier resolution through createRequire while subpath
 		// resolution still works. Resolve the manifest and derive the
 		// CommonJS entry from its "main" field instead.
 		try {
-			const manifestPath = requireFromPackage.resolve("acorn/package.json");
+			const manifestPath = requireFn.resolve("acorn/package.json");
 			const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { main?: unknown };
 			const entry = typeof manifest.main === "string" && manifest.main ? manifest.main : "./dist/acorn.js";
 			return resolvePath(dirname(manifestPath), entry);
@@ -1113,13 +1114,67 @@ function resolveWorkflowParserEntry(): string {
 			// resolution fails even though dependencies are intact.
 			// Fall back to the invocation cwd (repo checkouts carry acorn).
 			try {
-				const cwdRequire = createRequire(resolvePath(process.cwd(), "package.json"));
+				const cwdRequire = createRequire(resolvePath(cwd, "package.json"));
 				return cwdRequire.resolve("acorn");
 			} catch {
 				throw primaryError;
 			}
 		}
 	}
+}
+
+// The workflow worker requires the acorn entry from disk on every validation
+// and run, but refresh deletes the previous release under long-lived
+// sessions. Cache the entry source in memory (warmed below while the files
+// necessarily exist) and materialize it under os.tmpdir() — which refresh
+// never touches — when disk resolution fails. The content is the pinned
+// acorn dependency, so a planted file with different bytes is overwritten.
+let cachedAcornEntry: { path: string; source: string } | undefined;
+
+function readAcornEntrySource(path: string): string | undefined {
+	try {
+		return readFileSync(path, "utf8");
+	} catch {
+		return undefined;
+	}
+}
+
+function cacheAcornEntry(path: string): void {
+	if (cachedAcornEntry?.path === path) return;
+	const source = readAcornEntrySource(path);
+	if (source !== undefined) cachedAcornEntry = { path, source };
+}
+
+function materializeCachedAcornEntry(): string | undefined {
+	if (!cachedAcornEntry) return undefined;
+	try {
+		const directory = join(tmpdir(), "pie-workflow-parser");
+		mkdirSync(directory, { recursive: true });
+		const entry = join(directory, "acorn.js");
+		if (readAcornEntrySource(entry) !== cachedAcornEntry.source) writeFileSync(entry, cachedAcornEntry.source);
+		return entry;
+	} catch {
+		return undefined;
+	}
+}
+
+export function resolveWorkflowParserEntry(requireFn: NodeRequire = requireFromPackage, cwd: string = process.cwd()): string {
+	try {
+		const found = resolveAcornEntry(requireFn, cwd);
+		cacheAcornEntry(found);
+		return found;
+	} catch (primaryError) {
+		const fallback = materializeCachedAcornEntry();
+		if (fallback) return fallback;
+		throw primaryError;
+	}
+}
+
+try {
+	cacheAcornEntry(resolveAcornEntry());
+} catch {
+	// Module load must never fail because of parser pre-resolution; per-call
+	// resolution keeps its existing error semantics.
 }
 
 const AUTO_RESUME_PARAM_KEYS = ["acceptance", "agentContract", "index", "intercomBridge", "label", "maxRuntimeMs", "output", "outputMode", "outputSchema", "phase", "skill", "skills", "task", "timeoutMs", "toolBudget", "turnBudget", "worktree"] as const;

@@ -1,6 +1,7 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { atomicWriteFile } from "@earendil-works/pi-agent-core/node";
 import { Container, Text } from "@earendil-works/pi-tui";
-import { mkdir as fsMkdir, writeFile as fsWriteFile } from "fs/promises";
+import { mkdir as fsMkdir } from "fs/promises";
 import { dirname } from "path";
 import { type Static, Type } from "typebox";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
@@ -36,7 +37,9 @@ export interface WriteOperations {
 }
 
 const defaultWriteOperations: WriteOperations = {
-	writeFile: (path, content) => fsWriteFile(path, content, "utf-8"),
+	// Atomic: a failed or partial write leaves the previous contents intact
+	// instead of a truncated target, which is what an in-place O_TRUNC write does.
+	writeFile: (path, content) => atomicWriteFile(path, content),
 	mkdir: (dir) => fsMkdir(dir, { recursive: true }).then(() => {}),
 };
 
@@ -226,7 +229,12 @@ export function createWriteToolDefinition(
 				throwIfAborted();
 
 				return {
-					content: [{ type: "text", text: `Successfully wrote ${content.length} bytes to ${path}` }],
+					content: [
+						{
+							type: "text",
+							text: `Successfully wrote ${new TextEncoder().encode(content).byteLength} bytes to ${path}`,
+						},
+					],
 					details: undefined,
 				};
 			});

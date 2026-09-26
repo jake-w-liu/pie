@@ -172,3 +172,142 @@ describe("watchdog emission guard update budget", () => {
 		expect(guard.evaluate(warn("concern", "second"))).toMatchObject({ accepted: false, reason: "update-budget" });
 	});
 });
+
+import { evaluateAcceptance } from "../src/runs/shared/acceptance.ts";
+import type { ResolvedAcceptanceConfig } from "../src/shared/types.ts";
+
+function verifiedAcceptance(verify: ResolvedAcceptanceConfig["verify"]): ResolvedAcceptanceConfig {
+	return { level: "verified", explicit: true, inferredReason: [], criteria: [], evidence: [], verify, stopRules: [] };
+}
+
+/** Build a verify command whose Node child writes the given expression to stdout. */
+function emitStdoutCommand(cwd: string, expression: string): string {
+	const script = path.join(cwd, "emit-stdout.mjs");
+	fs.writeFileSync(script, `process.stdout.write(${expression});\n`, "utf-8");
+	return `${process.execPath} ${JSON.stringify(script)}`;
+}
+
+describe("acceptance verify output capture", () => {
+	it("caps runaway verify output and reports the dropped byte count", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "verify-cap-audit-"));
+		const ledger = await evaluateAcceptance({
+			acceptance: verifiedAcceptance([{ id: "flood", command: emitStdoutCommand(cwd, '"x".repeat(300000)') }]),
+			output: "",
+			cwd,
+			reportOptional: true,
+		});
+		const stdout = ledger.verifyRuns[0]?.stdout ?? "";
+		expect(stdout.startsWith("[verify output truncated at 131072 bytes; 168928 further byte(s) not captured]\n")).toBe(true);
+		expect(stdout).toContain("x");
+		expect(stdout.length).toBeLessThanOrEqual(12_000 + "\n...[truncated]".length);
+	}, 30_000);
+
+	it("never decodes a half-captured multi-byte character at the cap boundary", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "verify-utf8-audit-"));
+		const ledger = await evaluateAcceptance({
+			acceptance: verifiedAcceptance([{ id: "euro", command: emitStdoutCommand(cwd, '"€".repeat(200000)') }]),
+			output: "",
+			cwd,
+			reportOptional: true,
+		});
+		const stdout = ledger.verifyRuns[0]?.stdout ?? "";
+		expect(stdout).toContain("€");
+		expect(stdout.includes("\uFFFD")).toBe(false);
+		// 200_000 three-byte characters: 600_000 bytes emitted, 131_072 retained.
+		expect(stdout.startsWith("[verify output truncated at 131072 bytes; 468928 further byte(s) not captured]\n")).toBe(true);
+	}, 30_000);
+
+	it("leaves ordinary verify output untouched", async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "verify-plain-audit-"));
+		const ledger = await evaluateAcceptance({
+			acceptance: verifiedAcceptance([{ id: "ok", command: emitStdoutCommand(cwd, '"hello verify"') }]),
+			output: "",
+			cwd,
+			reportOptional: true,
+		});
+		expect(ledger.verifyRuns[0]?.status).toBe("passed");
+		expect(ledger.verifyRuns[0]?.stdout).toBe("hello verify");
+	}, 30_000);
+});
+
+import { loadRunsForAgent, recordRun } from "../src/runs/shared/run-history.ts";
+
+describe("run history file writes", () => {
+	function withAgentDir(fn: (dir: string) => void): void {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "run-history-audit-"));
+		const pieDir = process.env.PIE_CODING_AGENT_DIR;
+		const piDir = process.env.PI_CODING_AGENT_DIR;
+		delete process.env.PIE_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = dir;
+		try {
+			fn(dir);
+		} finally {
+			if (pieDir === undefined) delete process.env.PIE_CODING_AGENT_DIR;
+			else process.env.PIE_CODING_AGENT_DIR = pieDir;
+			if (piDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = piDir;
+		}
+	}
+
+	function historyPath(dir: string): string {
+		return path.join(dir, "run-history.jsonl");
+	}
+
+	function seedLegacyHistory(dir: string, count: number): void {
+		const lines = Array.from({ length: count }, (_unused, index) => JSON.stringify({
+			agent: "worker",
+			task: `legacy task ${index}`,
+			ts: index,
+			status: "ok",
+			duration: 1,
+		}));
+		fs.writeFileSync(historyPath(dir), `${lines.join("\n")}\n`);
+	}
+
+	it("records a run and reads it back", () => {
+		withAgentDir((dir) => {
+			recordRun("worker", "do the thing", 0, 5);
+			const runs = loadRunsForAgent("worker");
+			expect(runs).toHaveLength(1);
+			expect(runs[0]).toMatchObject({ agent: "worker", task: "[redacted]", status: "ok" });
+		});
+	});
+
+	it("a read never rewrites the file", () => {
+		withAgentDir((dir) => {
+			seedLegacyHistory(dir, 1300);
+			const before = fs.readFileSync(historyPath(dir), "utf-8");
+			expect(loadRunsForAgent("worker")).toHaveLength(1300);
+			expect(fs.readFileSync(historyPath(dir), "utf-8")).toBe(before);
+		});
+	});
+
+	it("the writer sanitizes and rotates without leaving temp files", () => {
+		withAgentDir((dir) => {
+			seedLegacyHistory(dir, 1300);
+			recordRun("worker", "newest", 0, 5);
+			const lines = fs.readFileSync(historyPath(dir), "utf-8").trim().split("\n");
+			// 1000 retained legacy lines plus the newly appended run.
+			expect(lines).toHaveLength(1001);
+			expect(lines.every((line) => (JSON.parse(line) as { task: string }).task === "[redacted]")).toBe(true);
+			expect(fs.readdirSync(dir)).toEqual(["run-history.jsonl"]);
+		});
+	});
+
+	it("keeps the file bounded across many single-writer appends", () => {
+		withAgentDir((dir) => {
+			seedLegacyHistory(dir, 1300);
+			let peak = 0;
+			for (let index = 0; index < 500; index++) {
+				recordRun("worker", `task ${index}`, 0, 1);
+				const count = fs.readFileSync(historyPath(dir), "utf-8").trim().split("\n").length;
+				peak = Math.max(peak, count);
+			}
+			// The rotate threshold plus the one line appended after the rewrite.
+			expect(peak).toBeLessThanOrEqual(1201);
+			const lines = fs.readFileSync(historyPath(dir), "utf-8").trim().split("\n");
+			expect(lines.length).toBeGreaterThanOrEqual(1001);
+			expect(lines.every((line) => (JSON.parse(line) as { task: string }).task === "[redacted]")).toBe(true);
+		});
+	}, 30_000);
+});

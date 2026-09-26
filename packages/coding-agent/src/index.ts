@@ -249,6 +249,8 @@ export {
 	type SessionEntry,
 	type SessionEntryBase,
 	type SessionHeader,
+	type SessionHeaderInfo,
+	type SessionHeaderListOptions,
 	type SessionInfo,
 	type SessionInfoEntry,
 	SessionManager,

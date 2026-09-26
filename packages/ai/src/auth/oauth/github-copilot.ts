@@ -90,6 +90,11 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 	return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
 }
 
+/** Model ids stored on a credential, or undefined when the stored value is unusable. */
+function stringArray(value: unknown): string[] | undefined {
+	return Array.isArray(value) && value.every((entry) => typeof entry === "string") ? (value as string[]) : undefined;
+}
+
 function parseGitHubCopilotModelCatalog(raw: unknown, allowPolicyFallback: boolean) {
 	const data = asRecord(raw)?.data;
 	if (!Array.isArray(data)) {
@@ -348,22 +353,29 @@ async function refreshGitHubCopilotAccessToken(
 }
 
 /**
- * Refresh GitHub Copilot token
+ * Refresh GitHub Copilot token.
+ *
+ * The `/models` catalog only narrows the model picker, so it must not be able to
+ * fail the refresh: a rate-limited or unavailable catalog would otherwise throw
+ * out of the store lock, leaving the stored credential with the stale access
+ * token. The last known model list is carried over instead; only abort
+ * propagates.
  */
-async function refreshGitHubCopilotToken(
-	refreshToken: string,
-	enterpriseDomain: string | undefined,
-	signal: AbortSignal,
-): Promise<OAuthCredential> {
-	const credentials = await refreshGitHubCopilotAccessToken(refreshToken, enterpriseDomain, signal);
-	const { availableModelIds } = await fetchGitHubCopilotModels(credentials.access, enterpriseDomain, signal, {
-		maxRetries: 0,
-		maxElapsedMs: 0,
-	});
-	return {
-		...credentials,
-		availableModelIds,
-	};
+async function refreshGitHubCopilotToken(credential: OAuthCredential, signal: AbortSignal): Promise<OAuthCredential> {
+	const enterpriseDomain = copilotEnterpriseDomain(credential);
+	const credentials = await refreshGitHubCopilotAccessToken(credential.refresh, enterpriseDomain, signal);
+
+	let availableModelIds = stringArray(credential.availableModelIds);
+	try {
+		const catalog = await fetchGitHubCopilotModels(credentials.access, enterpriseDomain, signal, {
+			maxRetries: 0,
+			maxElapsedMs: 0,
+		});
+		availableModelIds = catalog.availableModelIds;
+	} catch (error) {
+		if (signal.aborted) throw error;
+	}
+	return availableModelIds === undefined ? credentials : { ...credentials, availableModelIds };
 }
 
 /**
@@ -494,8 +506,7 @@ export const githubCopilotOAuth: OAuthAuth = {
 	name: "GitHub Copilot",
 	isSubscription: true,
 	login: loginGitHubCopilot,
-	refresh: (credential, signal) =>
-		refreshGitHubCopilotToken(credential.refresh, copilotEnterpriseDomain(credential), signal),
+	refresh: refreshGitHubCopilotToken,
 
 	/** Derive the credential-specific proxy endpoint for each request. */
 	async toAuth(credential) {

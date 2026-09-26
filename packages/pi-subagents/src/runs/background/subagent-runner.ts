@@ -2446,6 +2446,19 @@ function combinedAbortSignal(signals: Array<AbortSignal | undefined>): AbortSign
 	return controller.signal;
 }
 
+/**
+ * The run-level tool budget slot describes the whole run, not one child: steering
+ * recovery subtracts `status.toolBudget.toolCount` from the run's initial budget
+ * (async-execution.ts records that initial budget from the resolved run budget), so a
+ * per-step count in this slot would hand a replacement run the last step's budget
+ * instead of what the run has left. `statusPayload.toolCount` is the run-wide total.
+ * Per-step budgets stay on `step.toolBudget`.
+ */
+function syncRunToolBudgetState(statusPayload: RunnerStatusPayload, runToolBudget: ResolvedToolBudget | undefined, blockedTool?: string): void {
+	if (!runToolBudget) return;
+	statusPayload.toolBudget = toolBudgetState(runToolBudget, statusPayload.toolCount ?? 0, blockedTool);
+}
+
 async function runSingleStepWithTimeout(
 	step: SubagentStep,
 	ctx: SingleStepContext,
@@ -3573,13 +3586,11 @@ async function runSubagent(
 			const blocksSupervisor = isBlockingSupervisorTool(event.toolName, event.args);
 			step.toolCount = (step.toolCount ?? 0) + 1;
 			const configuredToolBudget = flatSteps[flatIndex]?.toolBudget;
-			if (configuredToolBudget) {
-				step.toolBudget = toolBudgetState(configuredToolBudget, step.toolCount);
-				statusPayload.toolBudget = step.toolBudget;
-			}
+			if (configuredToolBudget) step.toolBudget = toolBudgetState(configuredToolBudget, step.toolCount);
 			recordActiveToolCall(flatIndex, { toolCallId: (event as { toolCallId?: unknown }).toolCallId, toolName: event.toolName }, { argsPreview, currentPath, blocksSupervisor, now });
 			pendingToolResults[flatIndex] = omitUndefinedProperties({ tool: event.toolName, path: currentPath, mutates, startedAt: now });
 			statusPayload.toolCount = (statusPayload.toolCount ?? 0) + 1;
+			syncRunToolBudgetState(statusPayload, config.toolBudget);
 			syncTopLevelCurrentTool();
 			if (controlConfig.enabled && blocksSupervisor && step.activityState !== "needs_attention") {
 				const previous = step.activityState;
@@ -3629,7 +3640,7 @@ async function runSubagent(
 				if (configuredToolBudget) {
 					step.toolBudget = toolBudgetState(configuredToolBudget, step.toolCount ?? 0, toolSnapshot.tool);
 					step.toolBudgetBlocked = true;
-					statusPayload.toolBudget = step.toolBudget;
+					syncRunToolBudgetState(statusPayload, config.toolBudget, toolSnapshot.tool);
 					statusPayload.toolBudgetBlocked = true;
 				}
 			}
@@ -4264,7 +4275,7 @@ async function runSubagent(
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "wrapUpRequested", singleResult.wrapUpRequested);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "toolBudget", singleResult.toolBudget);
 				setOptionalProperty(requiredStatusStep(statusPayload, fi), "toolBudgetBlocked", singleResult.toolBudgetBlocked);
-				if (singleResult.toolBudget) statusPayload.toolBudget = singleResult.toolBudget;
+				syncRunToolBudgetState(statusPayload, config.toolBudget);
 				if (singleResult.toolBudgetBlocked) statusPayload.toolBudgetBlocked = true;
 				if (singleResult.turnBudget) statusPayload.turnBudget = singleResult.turnBudget;
 				if (singleResult.turnBudgetExceeded) statusPayload.turnBudgetExceeded = true;
@@ -4666,7 +4677,7 @@ async function runSubagent(
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "wrapUpRequested", singleResult.wrapUpRequested);
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "toolBudget", singleResult.toolBudget);
 						setOptionalProperty(requiredStatusStep(statusPayload, fi), "toolBudgetBlocked", singleResult.toolBudgetBlocked);
-						if (singleResult.toolBudget) statusPayload.toolBudget = singleResult.toolBudget;
+						syncRunToolBudgetState(statusPayload, config.toolBudget);
 						if (singleResult.toolBudgetBlocked) statusPayload.toolBudgetBlocked = true;
 						if (singleResult.turnBudget) statusPayload.turnBudget = singleResult.turnBudget;
 						if (singleResult.turnBudgetExceeded) statusPayload.turnBudgetExceeded = true;
@@ -5110,7 +5121,7 @@ async function runSubagent(
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "wrapUpRequested", singleResult.wrapUpRequested);
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "toolBudget", singleResult.toolBudget);
 			setOptionalProperty(requiredStatusStep(statusPayload, flatIndex), "toolBudgetBlocked", singleResult.toolBudgetBlocked);
-			if (singleResult.toolBudget) statusPayload.toolBudget = singleResult.toolBudget;
+			syncRunToolBudgetState(statusPayload, config.toolBudget);
 			if (singleResult.toolBudgetBlocked) statusPayload.toolBudgetBlocked = true;
 			if (singleResult.turnBudget) statusPayload.turnBudget = singleResult.turnBudget;
 			if (singleResult.turnBudgetExceeded) statusPayload.turnBudgetExceeded = true;

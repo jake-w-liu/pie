@@ -9,6 +9,8 @@ import type { PiServerListener } from "../../listener.ts";
 import type { UnixListenerOptions } from "./types.ts";
 
 const DEFAULT_SOCKET_MODE = 0o600;
+/** Socket files are created 0777 & ~umask, so this is the only bit set of every permission. */
+const SOCKET_PERMISSION_BITS = 0o777;
 const DEFAULT_GRACEFUL_CLOSE_TIMEOUT_MS = 5_000;
 const MAX_UINT32 = 0xffff_ffff;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
@@ -82,7 +84,18 @@ class UnixListener implements PiServerListener {
 				};
 				server.once("error", onError);
 				server.once("listening", onListening);
-				server.listen(ownedBindPath);
+				// bind(2) happens synchronously inside listen(), so a umask that
+				// clears exactly the bits the requested mode does not use creates
+				// the socket already at its final mode. Without it the inode starts
+				// at 0777 & ~umask and stays group/world connectable until the
+				// chmod below - and chmod(2) does not revoke connections that were
+				// already accepted in that window.
+				const previousUmask = process.umask(SOCKET_PERMISSION_BITS & ~this.mode);
+				try {
+					server.listen(ownedBindPath);
+				} finally {
+					process.umask(previousUmask);
+				}
 			});
 			// A failed listen has no ownership, even if another starter bound this path.
 			this.ownedBindPath = ownedBindPath;

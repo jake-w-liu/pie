@@ -20,6 +20,7 @@ if (typeof process !== "undefined" && (process.versions?.node || process.version
 import { raceWithAbortSignal } from "../../utils/abort.ts";
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
+import { OAuthCallbackServerError } from "./callback-server.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 import { oauthErrorHtml, oauthSuccessHtml } from "./oauth-page.ts";
 import { generatePKCE } from "./pkce.ts";
@@ -29,7 +30,8 @@ const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTH_BASE_URL = "https://auth.openai.com";
 const AUTHORIZE_URL = `${AUTH_BASE_URL}/oauth/authorize`;
 const TOKEN_URL = `${AUTH_BASE_URL}/oauth/token`;
-const REDIRECT_URI = "http://localhost:1455/auth/callback";
+const CALLBACK_PORT = 1455;
+const REDIRECT_URI = `http://localhost:${CALLBACK_PORT}/auth/callback`;
 const DEVICE_USER_CODE_URL = `${AUTH_BASE_URL}/api/accounts/deviceauth/usercode`;
 const DEVICE_TOKEN_URL = `${AUTH_BASE_URL}/api/accounts/deviceauth/token`;
 const DEVICE_VERIFICATION_URI = `${AUTH_BASE_URL}/codex/device`;
@@ -359,9 +361,11 @@ function startLocalOAuthServer(state: string): Promise<OAuthServerInfo> {
 		}
 	});
 
-	return new Promise((resolve) => {
+	return new Promise((resolve, reject) => {
+		let listening = false;
 		server
-			.listen(1455, getCallbackHost(), () => {
+			.listen(CALLBACK_PORT, getCallbackHost(), () => {
+				listening = true;
 				resolve({
 					close: () => server.close(),
 					cancelWait: () => {
@@ -370,19 +374,22 @@ function startLocalOAuthServer(state: string): Promise<OAuthServerInfo> {
 					waitForCode: () => waitForCodePromise,
 				});
 			})
-			.on("error", (_err: NodeJS.ErrnoException) => {
+			.on("error", (error: NodeJS.ErrnoException) => {
+				if (listening) {
+					// Already handed to the caller: end the wait so the manual-paste
+					// fallback takes over instead of hanging on a dead server.
+					settleWait?.(null);
+					return;
+				}
+				// Nothing is listening on the port we own: a foreign listener would
+				// receive the OAuth callback, so fail instead of pretending to serve it.
 				settleWait?.(null);
-				resolve({
-					close: () => {
-						try {
-							server.close();
-						} catch {
-							// ignore
-						}
-					},
-					cancelWait: () => {},
-					waitForCode: async () => null,
-				});
+				try {
+					server.close();
+				} catch {
+					// ignore
+				}
+				reject(new OAuthCallbackServerError(REDIRECT_URI, error));
 			});
 	});
 }
@@ -439,11 +446,20 @@ async function loginOpenAICodexDeviceCode(interaction: ProviderAuthInteraction):
 async function loginOpenAICodex(interaction: ProviderAuthInteraction): Promise<OAuthCredential> {
 	interaction.signal.throwIfAborted();
 	const { verifier, state, url } = await createAuthorizationFlow();
-	const server = await startLocalOAuthServer(state);
+	// A bind failure is reported, not swallowed: the browser callback is unusable
+	// without the server, so the flow falls back to the always-available manual paste.
+	let server: OAuthServerInfo | undefined;
+	let serverError: OAuthCallbackServerError | undefined;
+	try {
+		server = await startLocalOAuthServer(state);
+	} catch (error) {
+		if (!(error instanceof OAuthCallbackServerError)) throw error;
+		serverError = error;
+	}
 	const manualAbort = new AbortController();
 	const onAbort = () => {
 		manualAbort.abort(interaction.signal.reason);
-		server.cancelWait();
+		server?.cancelWait();
 	};
 	interaction.signal.addEventListener("abort", onAbort, { once: true });
 	if (interaction.signal.aborted) onAbort();
@@ -453,6 +469,12 @@ async function loginOpenAICodex(interaction: ProviderAuthInteraction): Promise<O
 
 	try {
 		interaction.signal.throwIfAborted();
+		if (serverError) {
+			interaction.notify({
+				type: "info",
+				message: `${serverError.message} Paste the redirect URL or authorization code to finish signing in.`,
+			});
+		}
 		interaction.notify({
 			type: "auth_url",
 			url,
@@ -468,14 +490,14 @@ async function loginOpenAICodex(interaction: ProviderAuthInteraction): Promise<O
 			})
 			.then((input) => {
 				manualCode = input;
-				server.cancelWait();
+				server?.cancelWait();
 			})
 			.catch((error) => {
 				manualError = error instanceof Error ? error : new Error(String(error));
-				server.cancelWait();
+				server?.cancelWait();
 			});
 
-		const result = await server.waitForCode();
+		const result = server ? await server.waitForCode() : null;
 		interaction.signal.throwIfAborted();
 		if (manualError) throw manualError;
 		if (result?.code) {
@@ -496,12 +518,12 @@ async function loginOpenAICodex(interaction: ProviderAuthInteraction): Promise<O
 			}
 		}
 
-		if (!code) throw new Error("Missing authorization code");
+		if (!code) throw serverError ?? new Error("Missing authorization code");
 		return exchangeAuthorizationCodeForCredentials(code, verifier, REDIRECT_URI, interaction.signal);
 	} finally {
 		interaction.signal.removeEventListener("abort", onAbort);
 		manualAbort.abort();
-		server.close();
+		server?.close();
 	}
 }
 

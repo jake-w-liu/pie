@@ -7,7 +7,7 @@ import { InMemoryCredentialStore } from "../src/auth/credential-store.ts";
 import { anthropicOAuth } from "../src/auth/oauth/anthropic.ts";
 import { openaiCodexOAuth } from "../src/auth/oauth/openai-codex.ts";
 import { createRadiusOAuth } from "../src/auth/oauth/radius.ts";
-import type { OAuthAuth, OAuthCredential } from "../src/auth/types.ts";
+import type { AuthEvent, OAuthAuth, OAuthCredential } from "../src/auth/types.ts";
 import { createModels, createProvider } from "../src/models.ts";
 
 const ownedServers = vi.hoisted(() => [] as Http.Server[]);
@@ -262,5 +262,94 @@ describe.each([
 		);
 		expect((await setup(oauth, credentials).getAuth("test"))?.auth.apiKey).toBe(token);
 		expect(await credentials.read("test")).toMatchObject({ access: token, refresh: "new-refresh" });
+	});
+});
+
+/** Hold a fixed callback port the way a foreign process would. */
+async function occupyPort(port: number): Promise<() => Promise<void>> {
+	const blocker = createServer();
+	await new Promise<void>((resolve, reject) => {
+		blocker.once("error", reject);
+		blocker.listen(port, "127.0.0.1", resolve);
+	});
+	return async () => {
+		await new Promise<void>((resolve) => blocker.close(() => resolve()));
+	};
+}
+
+describe("busy OAuth callback ports", () => {
+	it("reports the Codex bind failure and still finishes through a pasted code", async () => {
+		const release = await occupyPort(1455);
+		try {
+			const events: AuthEvent[] = [];
+			const fetchMock = vi.fn(async (input: unknown) => {
+				expect(String(input)).toBe("https://auth.openai.com/oauth/token");
+				return new Response(JSON.stringify(validToken));
+			});
+			vi.stubGlobal("fetch", fetchMock);
+
+			const credential = await openaiCodexOAuth.login({
+				signal: new AbortController().signal,
+				notify: (event) => events.push(event),
+				prompt: async (prompt) => (prompt.type === "select" ? "browser" : "authorization-code"),
+			});
+
+			expect(credential).toMatchObject({ access: token, refresh: "new-refresh" });
+			expect(events).toContainEqual({
+				type: "info",
+				message: expect.stringContaining(
+					"Could not start the OAuth callback server on http://localhost:1455/auth/callback: listen EADDRINUSE",
+				),
+			});
+			expect(fetchMock).toHaveBeenCalledOnce();
+		} finally {
+			await release();
+		}
+	});
+
+	it("fails the Codex login with the bind failure when no code is pasted", async () => {
+		const release = await occupyPort(1455);
+		try {
+			const fetchMock = vi.fn(async () => {
+				throw new Error("must not exchange tokens");
+			});
+			vi.stubGlobal("fetch", fetchMock);
+
+			await expect(
+				openaiCodexOAuth.login({
+					signal: new AbortController().signal,
+					notify: () => {},
+					prompt: async (prompt) => (prompt.type === "select" ? "browser" : ""),
+				}),
+			).rejects.toThrow(
+				/^Could not start the OAuth callback server on http:\/\/localhost:1455\/auth\/callback: .*EADDRINUSE/,
+			);
+			expect(fetchMock).not.toHaveBeenCalled();
+		} finally {
+			await release();
+		}
+	});
+
+	it("fails the Radius browser login with the bind failure", async () => {
+		const release = await occupyPort(1456);
+		try {
+			const fetchMock = vi.fn(
+				async () => new Response(JSON.stringify({ authorizationEndpoint: "https://radius.test/authorize" })),
+			);
+			vi.stubGlobal("fetch", fetchMock);
+			const notify = vi.fn();
+			const controller = new AbortController();
+
+			await expect(
+				radius.login({ signal: controller.signal, prompt: async () => "browser", notify }),
+			).rejects.toThrow(
+				/^Could not start the OAuth callback server on http:\/\/127\.0\.0\.1:1456\/oauth\/callback: .*EADDRINUSE/,
+			);
+			expect(notify).not.toHaveBeenCalled();
+			expect(fetchMock).toHaveBeenCalledOnce();
+			expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+		} finally {
+			await release();
+		}
 	});
 });

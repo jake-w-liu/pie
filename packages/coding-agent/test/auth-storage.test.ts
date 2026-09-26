@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CredentialStore, createModels, type Provider } from "@earendil-works/pi-ai";
@@ -548,5 +548,41 @@ describe("AuthStorage", () => {
 		writeFileSync(authJsonPath, "{invalid-json", "utf8");
 		await expect(storage.modify("openai", async () => ({ type: "api_key", key: "new" }))).rejects.toThrow();
 		expect(readFileSync(authJsonPath, "utf8")).toBe("{invalid-json");
+	});
+
+	test("modifies credentials by replacing the file instead of truncating it in place", async () => {
+		writeAuthJson({ anthropic: { type: "api_key", key: "stored" } });
+		const storage = AuthStorage.create(authJsonPath);
+		const before = statSync(authJsonPath).ino;
+
+		await storage.modify("openai", async () => ({ type: "api_key", key: "new" }));
+
+		const after = statSync(authJsonPath);
+		// rename(2) over the target swaps the inode; an in-place truncate+write keeps it.
+		expect(after.ino).not.toBe(before);
+		expect(after.mode & 0o777).toBe(0o600);
+		expect(JSON.parse(readFileSync(authJsonPath, "utf8"))).toEqual({
+			anthropic: { type: "api_key", key: "stored" },
+			openai: { type: "api_key", key: "new" },
+		});
+		expect(readdirSync(tempDir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+	});
+
+	test("file backend replaces auth.json atomically on the synchronous path", () => {
+		writeAuthJson({ anthropic: { type: "api_key", key: "stored" } });
+		const backend = new FileAuthStorageBackend(authJsonPath);
+		const before = statSync(authJsonPath).ino;
+
+		const result = backend.withLock(() => ({
+			result: "rotated" as string,
+			next: JSON.stringify({ anthropic: { type: "api_key", key: "rotated" } }, null, 2),
+		}));
+
+		expect(result).toBe("rotated");
+		expect(statSync(authJsonPath).ino).not.toBe(before);
+		expect(JSON.parse(readFileSync(authJsonPath, "utf8"))).toEqual({
+			anthropic: { type: "api_key", key: "rotated" },
+		});
+		expect(readdirSync(tempDir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
 	});
 });

@@ -11,6 +11,15 @@ import { fetchWithRetry } from "./management-http.ts";
 const TOOLS_DIR = getBinDir();
 const NETWORK_TIMEOUT_MS = 10_000;
 const DOWNLOAD_TIMEOUT_MS = 120_000;
+/**
+ * Upper bound for a single archive-extraction command. These run synchronously
+ * and can stall on a wedged filesystem, on a pathological/corrupt archive, or
+ * when the archiver blocks on a dead network mount, which would pin the calling
+ * thread (and, during agent startup, the TUI) indefinitely. The archives being
+ * extracted are a couple of MB, so this is a generous ceiling rather than a
+ * performance budget.
+ */
+const EXTRACTION_TIMEOUT_MS = 30_000;
 
 interface ToolConfig {
 	name: string;
@@ -161,7 +170,12 @@ function findBinaryRecursively(rootDir: string, binaryFileName: string): string 
 	return null;
 }
 
-function formatSpawnFailure(result: SpawnSyncReturns<Buffer>): string {
+function formatSpawnFailure(result: SpawnSyncReturns<Buffer>, timeoutMs: number): string {
+	// A deadline kill reports ETIMEDOUT with a null status. Name it explicitly so
+	// the message does not read like a mysterious exit status.
+	if ((result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT") {
+		return `timed out after ${timeoutMs}ms`;
+	}
 	if (result.error?.message) {
 		return result.error.message;
 	}
@@ -176,12 +190,21 @@ function formatSpawnFailure(result: SpawnSyncReturns<Buffer>): string {
 	return `exit status ${result.status ?? "unknown"}`;
 }
 
-function runExtractionCommand(command: string, args: string[]): string | null {
-	const result = spawnSync(command, args, { stdio: "pipe" });
+/**
+ * Run one extraction command. Returns null on success, or a human-readable
+ * failure string. Any non-success - spawn failure, non-zero exit, or the
+ * deadline kill - is reported as a failure so the caller never presents a
+ * partially extracted tree as a completed install.
+ */
+function runExtractionCommand(command: string, args: string[], timeoutMs = EXTRACTION_TIMEOUT_MS): string | null {
+	const result = spawnSync(command, args, { stdio: "pipe", timeout: timeoutMs });
+	// `error` is set for a failed spawn (ENOENT) and for the deadline kill, and
+	// the deadline kill leaves `status` null, so a status check alone cannot
+	// distinguish "hung and killed" from "exited cleanly".
 	if (!result.error && result.status === 0) {
 		return null;
 	}
-	return `${command}: ${formatSpawnFailure(result)}`;
+	return `${command}: ${formatSpawnFailure(result, timeoutMs)}`;
 }
 
 function extractTarGzArchive(archivePath: string, extractDir: string, assetName: string): void {

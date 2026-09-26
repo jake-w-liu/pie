@@ -4121,6 +4121,46 @@ describe("Editor component", () => {
 			assert.strictEqual(editor.getExpandedText(), pastedText);
 		});
 
+		it("does not re-expand a marker that appears inside pasted content", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const second = bigPaste("beta");
+			// A paste whose payload quotes the other paste's marker text. The
+			// marker belongs to the payload, not to the editor.
+			const first = `${"a".repeat(1200)} [paste #2 ${second.length} chars] ${"a".repeat(1200)}`;
+
+			editor.handleInput(`\x1b[200~${first}\x1b[201~`);
+			editor.handleInput(`\x1b[200~${second}\x1b[201~`);
+
+			assert.match(editor.getText(), /^\[paste #1 \d+ chars\]\[paste #2 (\d+ chars|\+\d+ lines)\]$/);
+			assert.strictEqual(editor.getExpandedText(), first + second);
+		});
+
+		it("keeps a duplicated marker-shaped run as literal text", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const pasted = "x".repeat(1200);
+			editor.handleInput(`\x1b[200~${pasted}\x1b[201~`);
+			const marker = editor.getText();
+			assert.match(marker, /^\[paste #1 1200 chars\]$/);
+
+			// Typing (or pasting) the marker text itself must not duplicate the
+			// stored paste into the submitted prompt.
+			for (const ch of marker) editor.handleInput(ch);
+
+			assert.strictEqual(editor.getText(), marker + marker);
+			assert.strictEqual(editor.getExpandedText(), pasted + marker);
+		});
+
+		it("does not expand a marker whose size disagrees with the stored paste", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const pasted = "x".repeat(1200);
+			editor.handleInput(`\x1b[200~${pasted}\x1b[201~`);
+
+			// Same id, wrong declared size: not the marker handlePaste produced.
+			for (const ch of "[paste #1 999 chars]") editor.handleInput(ch);
+
+			assert.strictEqual(editor.getExpandedText(), `${pasted}[paste #1 999 chars]`);
+		});
+
 		it("snaps to the paste marker start when navigating down into it", () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
 

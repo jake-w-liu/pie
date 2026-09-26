@@ -30,6 +30,7 @@ import {
 	type ShellExecOptions,
 	toError,
 } from "../types.ts";
+import { atomicWriteFile } from "../utils/atomic-write.ts";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
@@ -372,6 +373,7 @@ export class NodeExecutionEnv implements ExecutionEnv {
 	private shellPath?: string;
 	private shellEnv?: NodeJS.ProcessEnv;
 	private activeChildPids = new Set<number>();
+	private tempDirs = new Set<string>();
 
 	constructor(options: { cwd: string; shellPath?: string; shellEnv?: NodeJS.ProcessEnv }) {
 		this.cwd = options.cwd;
@@ -592,7 +594,8 @@ export class NodeExecutionEnv implements ExecutionEnv {
 			await mkdir(resolve(resolved, ".."), { recursive: true });
 			const afterMkdirAbort = abortResult<void>(abortSignal, resolved);
 			if (afterMkdirAbort) return afterMkdirAbort;
-			await writeFile(resolved, content, { signal: abortSignal });
+			// Atomic: the previous contents survive a failed or partial write.
+			await atomicWriteFile(resolved, content, { signal: abortSignal });
 			return ok(undefined);
 		} catch (error) {
 			return err(toFileError(error, resolved));
@@ -707,17 +710,32 @@ export class NodeExecutionEnv implements ExecutionEnv {
 	async createTempFile(options?: { prefix?: string; suffix?: string }): Promise<Result<string, FileError>> {
 		const dir = await this.createTempDir("tmp-");
 		if (!dir.ok) return dir;
+		// createTempFile hides the directory from the caller, so track it here; otherwise
+		// the per-file directory can never be reclaimed and every spilled command leaks one.
+		this.tempDirs.add(dir.value);
 		const filePath = join(dir.value, `${options?.prefix ?? ""}${randomUUID()}${options?.suffix ?? ""}`);
 		try {
 			await writeFile(filePath, "");
 			return ok(filePath);
 		} catch (error) {
+			await this.removeTempDir(dir.value);
 			return err(toFileError(error, filePath));
+		}
+	}
+
+	/** Best effort: a temp directory that cannot be removed must not fail cleanup. */
+	private async removeTempDir(dir: string): Promise<void> {
+		this.tempDirs.delete(dir);
+		try {
+			await rm(dir, { recursive: true, force: true });
+		} catch {
+			// Best effort, per the cleanup() contract.
 		}
 	}
 
 	async cleanup(): Promise<void> {
 		for (const pid of this.activeChildPids) killProcessTree(pid);
 		this.activeChildPids.clear();
+		for (const dir of [...this.tempDirs]) await this.removeTempDir(dir);
 	}
 }

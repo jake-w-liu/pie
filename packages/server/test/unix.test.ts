@@ -1,9 +1,10 @@
 import { type ChildProcess, fork } from "node:child_process";
 import { once } from "node:events";
+import { lstatSync, readdirSync } from "node:fs";
 import { lstat, mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { dirname, join } from "node:path";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import type { PiServer } from "../src/index.ts";
 import { connectUnixTestClient, type ProtocolTestClient, TestServerService } from "../src/testing/index.ts";
 import { createUnixServer } from "../src/transports/unix/index.ts";
@@ -19,10 +20,42 @@ async function makeSocketPath(nested = false): Promise<string> {
 	return nested ? join(directory, "p", "n", "server.sock") : join(directory, "server.sock");
 }
 
-function makeServer(path: string): PiServer {
-	const server = createUnixServer(new TestServerService(), { path });
+function makeServer(path: string, options: { mode?: number } = {}): PiServer {
+	const server = createUnixServer(new TestServerService(), { path, ...options });
 	servers.add(server);
 	return server;
+}
+
+/**
+ * Start a server and report the socket inode's mode at the instant bind(2)
+ * returned, i.e. after the listener tightened the umask and restored it but
+ * before any chmod could widen or narrow it.
+ */
+async function socketModeAtBind(path: string, options: { mode?: number } = {}): Promise<number | null> {
+	const realUmask = process.umask.bind(process);
+	let umaskCalls = 0;
+	let modeAtBind: number | null = null;
+	const spy = vi.spyOn(process, "umask").mockImplementation(((mask?: string | number): number => {
+		if (mask !== undefined) {
+			umaskCalls += 1;
+			if (umaskCalls === 2) {
+				const directory = dirname(path);
+				for (const name of readdirSync(directory)) {
+					const stats = lstatSync(join(directory, name));
+					if (stats.isSocket()) modeAtBind = stats.mode & 0o777;
+				}
+			}
+		}
+		return mask === undefined ? realUmask() : realUmask(mask);
+	}) as typeof process.umask);
+	try {
+		const server = makeServer(path, options);
+		await server.start();
+	} finally {
+		spy.mockRestore();
+	}
+	expect(umaskCalls).toBe(2);
+	return modeAtBind;
 }
 
 afterEach(async () => {
@@ -78,6 +111,20 @@ describe("Unix listener filesystem lifecycle", () => {
 
 		await server.close();
 		await expect(lstat(path)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	test("creates the socket at its final mode at bind time, never world-connectable first", async () => {
+		if (process.platform === "win32") return;
+		const path = await makeSocketPath();
+		expect(await socketModeAtBind(path)).toBe(0o600);
+		expect((await lstat(path)).mode & 0o777).toBe(0o600);
+	});
+
+	test("binds a caller-requested mode directly instead of narrowing then widening it", async () => {
+		if (process.platform === "win32") return;
+		const path = await makeSocketPath();
+		expect(await socketModeAtBind(path, { mode: 0o660 })).toBe(0o660);
+		expect((await lstat(path)).mode & 0o777).toBe(0o660);
 	});
 
 	test("does not remove a replacement inode during shutdown", async () => {

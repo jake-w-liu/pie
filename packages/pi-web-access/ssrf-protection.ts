@@ -330,6 +330,46 @@ function isBlockedIPv4(address: string): boolean {
 		a >= 224;
 }
 
+/**
+ * The IPv4 address an IPv4-embedded IPv6 address stands for, or null when the
+ * address is an ordinary IPv6 address. Every form listed here is only another
+ * spelling of an IPv4 destination, so the embedded address - not the IPv6
+ * wrapper - decides whether the target is internal. Ranges are matched against
+ * the literal IPv6 form, so `ssrf.allowRanges` entries keep working per form.
+ */
+function extractEmbeddedIPv4(groups: number[]): string | null {
+	const embedded = (high: number, low: number): string => [high >> 8, high & 0xff, low >> 8, low & 0xff].join(".");
+
+	// ::ffff:0:0/96 - IPv4-mapped address (RFC 4291 2.5.5.2).
+	if (groups.slice(0, 5).every(group => group === 0) && groups[5] === 0xffff) {
+		return embedded(groups[6], groups[7]);
+	}
+	// ::/96 - deprecated IPv4-compatible address (RFC 4291 2.5.5.1). `::` and
+	// `::1` are rejected by the caller, so only a real embedded host reaches here.
+	if (groups.slice(0, 6).every(group => group === 0)) {
+		return embedded(groups[6], groups[7]);
+	}
+	// 64:ff9b::/96 - NAT64 well-known prefix (RFC 6052 2.1).
+	if (groups[0] === 0x0064 && groups[1] === 0xff9b && groups.slice(2, 6).every(group => group === 0)) {
+		return embedded(groups[6], groups[7]);
+	}
+	// 64:ff9b:1::/48 - local-use NAT64 prefix (RFC 8215), whose IPv4 sits in
+	// bits 48..79 per the RFC 6052 2.2 /48 layout.
+	if (groups[0] === 0x0064 && groups[1] === 0xff9b && groups[2] === 0x0001) {
+		return embedded(groups[3], groups[4]);
+	}
+	// 2002::/16 - 6to4, IPv4 in bits 16..47 (RFC 3056 2).
+	if (groups[0] === 0x2002) {
+		return embedded(groups[1], groups[2]);
+	}
+	// 2001:0000::/32 - Teredo, Teredo server IPv4 in bits 32..63 (RFC 4380 3.1).
+	// The client address in bits 96..127 is obfuscated and is not a destination.
+	if (groups[0] === 0x2001 && groups[1] === 0x0000) {
+		return embedded(groups[2], groups[3]);
+	}
+	return null;
+}
+
 function isBlockedIPv6(address: string): boolean {
 	const groups = parseIPv6(address);
 	if (!groups) return true;
@@ -340,11 +380,8 @@ function isBlockedIPv6(address: string): boolean {
 	if ((first & 0xfe00) === 0xfc00) return true;
 	if ((first & 0xffc0) === 0xfe80) return true;
 
-	const isMappedIPv4 = groups.slice(0, 5).every(group => group === 0) && groups[5] === 0xffff;
-	if (isMappedIPv4) {
-		const ipv4 = [groups[6] >> 8, groups[6] & 0xff, groups[7] >> 8, groups[7] & 0xff].join(".");
-		return isBlockedIPv4(ipv4);
-	}
+	const embeddedIPv4 = extractEmbeddedIPv4(groups);
+	if (embeddedIPv4 !== null) return isBlockedIPv4(embeddedIPv4);
 
 	return false;
 }

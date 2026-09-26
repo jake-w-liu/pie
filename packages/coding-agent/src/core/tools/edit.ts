@@ -1,7 +1,8 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { atomicWriteFile } from "@earendil-works/pi-agent-core/node";
 import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { constants } from "fs";
-import { access as fsAccess, readFile as fsReadFile, writeFile as fsWriteFile } from "fs/promises";
+import { access as fsAccess, readFile as fsReadFile } from "fs/promises";
 import { type Static, Type } from "typebox";
 import { renderDiff } from "../../modes/interactive/components/diff.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
@@ -104,7 +105,9 @@ export interface EditOperations {
 
 const defaultEditOperations: EditOperations = {
 	readFile: (path) => fsReadFile(path),
-	writeFile: (path, content) => fsWriteFile(path, content, "utf-8"),
+	// Atomic: a failed or partial write leaves the previous contents intact
+	// instead of a truncated target, which is what an in-place O_TRUNC write does.
+	writeFile: (path, content) => atomicWriteFile(path, content),
 	access: (path) => fsAccess(path, constants.R_OK | constants.W_OK),
 };
 

@@ -4127,6 +4127,15 @@ export class InteractiveMode {
 	 */
 	private isShuttingDown = false;
 
+	/**
+	 * Set by emergencyTerminalExit: the tty is gone, so the restore writes in
+	 * Tui.stop() would raise EIO and re-enter the same error path. Keeps the
+	 * deliberate "do not touch the terminal" decision out of the normal
+	 * shutdown path, where `isShuttingDown` alone is not enough to tell the
+	 * two apart.
+	 */
+	private terminalUnrestorable = false;
+
 	private async shutdown(options?: { fromSignal?: boolean }): Promise<void> {
 		if (this.isShuttingDown) return;
 		this.isShuttingDown = true;
@@ -4170,11 +4179,31 @@ export class InteractiveMode {
 
 	private emergencyTerminalExit(): never {
 		this.isShuttingDown = true;
+		this.terminalUnrestorable = true;
 		this.unregisterSignalHandlers();
 		killTrackedDetachedChildren();
 		// The terminal is gone. Do not run normal shutdown because TUI and
 		// extension cleanup can write restore sequences and re-trigger EIO.
 		process.exit(129);
+	}
+
+	/**
+	 * Restore the tty on the crash path. Idempotent, and skipped only when
+	 * emergencyTerminalExit has established that the tty is gone.
+	 *
+	 * Unlike emergencyTerminalExit, the terminal is still alive here, so this
+	 * restores cooked mode, the cursor, and disables bracketed paste / Kitty /
+	 * modifyOtherKeys sequences.
+	 */
+	private restoreTerminalAfterCrash(): void {
+		if (this.terminalUnrestorable) return;
+		try {
+			this.ui.stop();
+		} catch {
+			// A dead tty surfaces as EIO on the restore writes. There is nothing
+			// left to restore in that case, and the stdout/stderr error handler
+			// has already been removed above.
+		}
 	}
 
 	/**
@@ -4184,14 +4213,15 @@ export class InteractiveMode {
 	 * tears down the process while leaving the terminal in raw mode with no
 	 * cursor, requiring `stty sane && reset` to recover.
 	 *
-	 * Unlike emergencyTerminalExit, the terminal is still alive here, so we
-	 * call ui.stop() to restore cooked mode, the cursor, and disable bracketed
-	 * paste / Kitty / modifyOtherKeys sequences.
+	 * The terminal restore is not skipped when a shutdown is already in
+	 * progress: shutdown() sets `isShuttingDown` before it touches the
+	 * terminal, so a crash landing in that window (during the ~1s
+	 * drainInput, or while runtimeHost.dispose() tears down) would otherwise
+	 * exit with stdin still in raw mode and the cursor hidden. Tui.stop()
+	 * only re-writes the disable sequences, so calling it after a completed
+	 * restore is a no-op rather than a second teardown.
 	 */
 	private uncaughtCrash(error: Error): never {
-		if (this.isShuttingDown) {
-			process.exit(1);
-		}
 		this.isShuttingDown = true;
 		try {
 			this.unregisterSignalHandlers();
@@ -4199,9 +4229,7 @@ export class InteractiveMode {
 		try {
 			killTrackedDetachedChildren();
 		} catch {}
-		try {
-			this.ui.stop();
-		} catch {}
+		this.restoreTerminalAfterCrash();
 		console.error(`${APP_NAME} exiting due to uncaughtException:`);
 		console.error(error);
 		process.exit(1);

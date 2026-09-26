@@ -6,6 +6,17 @@ import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 
 const KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+/**
+ * Bound for the settlement drain in finish(). finish() must not wait forever for
+ * host promises: a steer host that ignores the child abort signal would otherwise
+ * wedge the workflow past its own timeoutMs, make the abort signal ineffective, and
+ * leak the worker thread. The drain is a bounded grace so that in-flight children
+ * can report the run ids the partial result and the workflow receipt need; anything
+ * still unsettled when it expires is reported on stderr and settled without.
+ */
+export const WORKFLOW_SETTLEMENT_DRAIN_MS = 5_000;
+
 const requireFromPackage = createRequire(import.meta.url);
 
 export interface WorkflowScriptValidationError {
@@ -572,6 +583,11 @@ parentPort.on("message", async (message) => {
   try {
     const sandbox = { runs, Promise: workflowPromise, emit(value) { const emittedValue = unwrapRunsAllResults(value); assertJsonValue(emittedValue); parentPort.postMessage({ type: "emit", value: emittedValue }); }, console: capturedConsole };
     if (message.stateEnabled) sandbox.state = state;
+    // codeGeneration only governs code created *inside* this context. It does not
+    // restrict the objects handed in from the worker realm (runs, emit, console,
+    // state, workflowPromise): a script can read their constructors and walk back
+    // to the worker realm, so a script is trusted code, not a sandbox. Keep the
+    // tool schema's trust statement in sync with this.
     const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
     contextObjectPrototype = vm.runInContext("Object.prototype", context);
     let compiled;
@@ -754,6 +770,33 @@ export interface RunWorkflowScriptOptions {
 	registerStopChild?: (stop: ((key: string, message?: string) => boolean) | undefined) => void;
 	onTrace?: (trace: WorkflowScriptTraceEntry[]) => void;
 	onEmit?: (emits: unknown[]) => void;
+}
+
+/**
+ * Waits for every pending host settlement, but never longer than boundMs. Returns
+ * the promises that were still unsettled when the bound expired so the caller can
+ * report the host contract violation instead of hanging on it.
+ */
+async function drainSettlement(pending: Array<Promise<unknown>>, boundMs: number): Promise<Array<Promise<unknown>>> {
+	if (pending.length === 0) return [];
+	const settled = new Set<Promise<unknown>>();
+	let expiry: NodeJS.Timeout | undefined;
+	try {
+		await Promise.race([
+			Promise.allSettled(pending.map((promise) => {
+				const mark = () => { settled.add(promise); };
+				promise.then(mark, mark);
+				return promise;
+			})).then(() => true as const),
+			new Promise<false>((resolve) => {
+				expiry = setTimeout(() => resolve(false), boundMs);
+				expiry.unref?.();
+			}),
+		]);
+		return pending.filter((promise) => !settled.has(promise));
+	} finally {
+		if (expiry) clearTimeout(expiry);
+	}
 }
 
 function combinedAbortSignal(signals: AbortSignal[]): AbortSignal {
@@ -1289,7 +1332,21 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			if (settled || finishing) return;
 			finishing = true;
 			childController.abort("error" in outcome ? outcome.error : new Error("Workflow script completed."));
-			void Promise.allSettled([...steers.values()].map(({ promise }) => promise)).then(() => {
+			// An abort or timeout leaves in-flight children running until the host reports
+			// their terminal result, and a steer host that ignores the child signal never
+			// settles at all. Drain both under a bound: the drain is what keeps dropped
+			// in-flight children (and their run ids) in the partial result, and the bound
+			// is what keeps a non-settling host from defeating the timeout or the abort.
+			const pendingSettlements: Array<Promise<unknown>> = [...steers.values()].map(({ promise }) => promise);
+			if ("error" in outcome) for (const { promise } of launches.values()) pendingSettlements.push(promise);
+			void drainSettlement(pendingSettlements, WORKFLOW_SETTLEMENT_DRAIN_MS).then((unsettled) => {
+				if (unsettled.length > 0) {
+					const stalled = [
+						...[...launches].filter(([, launch]) => unsettled.includes(launch.promise)).map(([key]) => `runs.run '${key}'`),
+						...[...steers.values()].filter(({ promise }) => unsettled.includes(promise)).map(({ key }) => `runs.steer '${key}'`),
+					];
+					console.error(`Workflow settlement drain expired after ${WORKFLOW_SETTLEMENT_DRAIN_MS}ms with ${unsettled.length} unsettled host promise(s): ${stalled.join(", ")}. Settling the workflow anyway; any in-flight child run id among them is missing from the partial result.`);
+				}
 				if (settled) return;
 				settled = true;
 				options.registerStopChild?.(undefined);
@@ -1615,7 +1672,16 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					normalized = { ...normalized, continuation: { runIds: [...new Set([...resolvedResumeLineage, normalized.runId])] } };
 				}
 				childStopControllers.delete(key);
-				if (stoppedLaunches.has(key)) return children.get(key) ?? normalized;
+				if (stoppedLaunches.has(key)) {
+					// stopChild already published an authoritative stopped result for this
+					// key; a workflow abort/timeout only marked the key as stopped, so record
+					// the settled result here instead of dropping it. Without this the child
+					// vanished from the partial result and the workflow receipt lost its run id.
+					const recorded = children.get(key);
+					if (recorded) return recorded;
+					children.set(key, normalized);
+					return normalized;
+				}
 				children.set(key, normalized);
 				const state = normalized.ok ? "completed" : normalized.stopped ? "stopped" : normalized.detached ? "detached" : "failed";
 				trace.push({ operation: "run", key, state, durationMs: Date.now() - startedAt, ...workflowStringMetadata(params), ...(normalized.agent ? { agent: normalized.agent } : {}), ...(normalized.runId ? { runId: normalized.runId } : {}), ...(!normalized.ok ? { error: normalized.error ?? normalized.output } : {}) });

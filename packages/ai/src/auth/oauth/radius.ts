@@ -19,6 +19,7 @@ if (typeof process !== "undefined" && (process.versions?.node || process.version
 
 import { normalizeRadiusGatewayUrl } from "../../providers/radius-config.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
+import { OAuthCallbackServerError } from "./callback-server.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 import { oauthErrorHtml, oauthSuccessHtml } from "./oauth-page.ts";
 import { generatePKCE } from "./pkce.ts";
@@ -196,9 +197,11 @@ function startOAuthCallbackServer(expectedState: string, signal: AbortSignal): P
 		finish(code);
 	});
 
-	return new Promise((resolve) => {
+	return new Promise((resolve, reject) => {
+		let listening = false;
 		server
 			.listen(CALLBACK_PORT, CALLBACK_HOST, () => {
+				listening = true;
 				resolve({
 					waitForCode: () => wait,
 					close: () => {
@@ -207,9 +210,21 @@ function startOAuthCallbackServer(expectedState: string, signal: AbortSignal): P
 					},
 				});
 			})
-			.once("error", () => {
+			.on("error", (error: Error) => {
+				if (listening) {
+					// Already handed to the caller: end the wait instead of hanging.
+					finish(null);
+					return;
+				}
+				// A foreign listener on the fixed port would swallow the callback, and
+				// there is no manual fallback here, so report the bind failure itself.
 				finish(null);
-				resolve({ waitForCode: async () => null, close: () => {} });
+				try {
+					server.close();
+				} catch {
+					// ignore
+				}
+				reject(new OAuthCallbackServerError(REDIRECT_URI, error));
 			});
 	});
 }

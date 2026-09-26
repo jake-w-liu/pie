@@ -983,6 +983,77 @@ function trimOutput(value: string): string | undefined {
 	return trimmed.length > 12_000 ? `${trimmed.slice(0, 12_000)}\n...[truncated]` : trimmed;
 }
 
+/**
+ * Hard cap on the verify-command output retained per stream.
+ *
+ * A verify command can run for `DEFAULT_VERIFY_TIMEOUT_MS` and emit far more
+ * than the 12 000 characters `trimOutput` keeps, so an unbounded accumulator
+ * grows with the command's output for the whole run. The cap mirrors the child
+ * stream bound used elsewhere in this package (`MAX_CHILD_STDERR_BYTES` in
+ * `child-protocol.ts`) and sits well above `trimOutput`'s window, so it never
+ * changes what a reader ends up seeing — only how much is buffered to get there.
+ */
+const MAX_VERIFY_OUTPUT_BYTES = 128 * 1024;
+
+interface BoundedVerifyOutput {
+	push(chunk: Buffer | string): void;
+	text(): string;
+	droppedBytes(): number;
+}
+
+/**
+ * Drop a trailing incomplete UTF-8 sequence so decoding the kept prefix never
+ * yields U+FFFD. A truncated multi-byte sequence always ends in one to three
+ * continuation bytes (`0b10xxxxxx`); when the lead byte before them is missing
+ * the rest of its bytes, the whole sequence goes.
+ */
+function trimPartialUtf8Sequence(buffer: Buffer): Buffer {
+	let leadIndex = buffer.length;
+	while (leadIndex > 0 && (buffer[leadIndex - 1]! & 0xc0) === 0x80) leadIndex--;
+	if (leadIndex === buffer.length) return buffer;
+	if (leadIndex === 0) return buffer.subarray(0, 0);
+	const leadByte = buffer[leadIndex - 1]!;
+	const sequenceLength = leadByte >= 0xf0 ? 4 : leadByte >= 0xe0 ? 3 : leadByte >= 0xc0 ? 2 : 1;
+	return buffer.length - leadIndex + 1 >= sequenceLength ? buffer : buffer.subarray(0, leadIndex - 1);
+}
+
+/**
+ * Keep the first `maxBytes` of a verify stream (the head is what `trimOutput`
+ * reports) and remember how much was dropped so the cap is reported rather than
+ * silently applied.
+ */
+function createBoundedVerifyOutput(maxBytes: number = MAX_VERIFY_OUTPUT_BYTES): BoundedVerifyOutput {
+	if (!Number.isInteger(maxBytes) || maxBytes < 1) throw new Error("maxBytes must be a positive integer.");
+	const chunks: Buffer[] = [];
+	let keptBytes = 0;
+	let totalBytes = 0;
+	return {
+		push(chunk) {
+			const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+			totalBytes += bytes.length;
+			if (keptBytes >= maxBytes) return;
+			// Copy: the read stream only lends the chunk for the duration of this call.
+			const kept = Buffer.from(bytes.subarray(0, maxBytes - keptBytes));
+			chunks.push(kept);
+			keptBytes += kept.length;
+		},
+		text: () => trimPartialUtf8Sequence(Buffer.concat(chunks, keptBytes)).toString("utf8"),
+		droppedBytes: () => totalBytes - keptBytes,
+	};
+}
+
+function verifyStreamText(
+	stream: BoundedVerifyOutput,
+	env: Record<string, string> | undefined,
+	...fallbacks: Array<string | undefined>
+): string | undefined {
+	const droppedBytes = stream.droppedBytes();
+	const notice = droppedBytes > 0
+		? `[verify output truncated at ${MAX_VERIFY_OUTPUT_BYTES} bytes; ${droppedBytes} further byte(s) not captured]\n`
+		: "";
+	return trimOutput(redactVerifyEnv(`${notice}${stream.text() || fallbacks.find(Boolean) || ""}`, env));
+}
+
 const SENSITIVE_ENV_KEY_PATTERN = /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASS|AUTH|CREDENTIAL|COOKIE|SESSION|PRIVATE|API_KEY|ACCESS_KEY)(?:_|$)/i;
 
 function effectiveVerifyEnv(env: Record<string, string> | undefined): Record<string, string> {
@@ -1043,6 +1114,17 @@ export function aggregateAcceptanceReport(input: {
 
 const DEFAULT_VERIFY_TIMEOUT_MS = 120_000;
 
+/**
+ * Why acceptance verification was cut short. A callback reports the cause that
+ * actually fired: a stop and a run deadline can both be live, and the host only
+ * learns which one aborted after the verify command is already running.
+ */
+export type AcceptanceAbortMessage = string | (() => string);
+
+function resolveAbortMessage(message: AcceptanceAbortMessage | undefined): string | undefined {
+	return typeof message === "function" ? message() : message;
+}
+
 function hash(value: string): string {
 	return createHash("sha256").update(value).digest("hex");
 }
@@ -1071,6 +1153,23 @@ function readVerifyWorkspaceState(cwd: string): VerifyWorkspaceState | undefined
 	};
 }
 
+/**
+ * `git diff HEAD` only reports tracked paths, so a child that leaves new untracked
+ * files (a new test file, a new fixture) leaves head and diffHash byte-identical and
+ * a stale `passed` memo silently satisfies the `verified` gate. Fingerprint the
+ * untracked and ignored path state as well. `--untracked-files=all` lists every
+ * untracked file individually instead of collapsing directories, and
+ * `--ignored=matching` reports an ignored directory as one entry instead of walking
+ * it, so a dependency or build directory cannot turn this into a full tree scan.
+ * Returns undefined when the state cannot be read: a verify that cannot prove its
+ * workspace unchanged must run instead of trusting a memo.
+ */
+function readUntrackedWorkspaceHash(repoRoot: string): string | undefined {
+	const status = spawnSync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"], { cwd: repoRoot, encoding: "utf-8", maxBuffer: 50 * 1024 * 1024, windowsHide: true });
+	if (status.status !== 0 || status.error) return undefined;
+	return hash(status.stdout);
+}
+
 function isCachedVerifyResult(value: unknown): value is AcceptanceVerifyResult {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const result = value as Partial<AcceptanceVerifyResult>;
@@ -1083,7 +1182,7 @@ function isCachedVerifyResult(value: unknown): value is AcceptanceVerifyResult {
 
 async function runMemoizedVerifyCommand(command: AcceptanceVerifyCommand, defaultCwd: string, options: {
 	signal?: AbortSignal;
-	abortMessage?: string;
+	abortMessage?: AcceptanceAbortMessage;
 	artifactsDir?: string;
 	runId?: string;
 } = {}): Promise<AcceptanceVerifyResult> {
@@ -1095,6 +1194,17 @@ async function runMemoizedVerifyCommand(command: AcceptanceVerifyCommand, defaul
 		workspaceState = undefined;
 	}
 	if (!workspaceState || !options.artifactsDir || !options.runId) {
+		return runVerifyCommand(command, defaultCwd, options);
+	}
+	let untrackedHash: string | undefined;
+	try {
+		untrackedHash = readUntrackedWorkspaceHash(workspaceState.repoRoot);
+	} catch {
+		untrackedHash = undefined;
+	}
+	// Without an untracked/ignored fingerprint a memo hit cannot prove the workspace
+	// is unchanged, so the command runs.
+	if (untrackedHash === undefined) {
 		return runVerifyCommand(command, defaultCwd, options);
 	}
 	const envKeys = Object.keys(command.env ?? {}).sort();
@@ -1110,6 +1220,7 @@ async function runMemoizedVerifyCommand(command: AcceptanceVerifyCommand, defaul
 		allowFailure: command.allowFailure === true,
 		head: workspaceState.head,
 		diffHash: workspaceState.diffHash,
+		untrackedHash,
 	}));
 	const artifactPath = path.join(options.artifactsDir, "acceptance", "verify", options.runId, `${cacheKey}.json`);
 	try {
@@ -1133,6 +1244,7 @@ async function runMemoizedVerifyCommand(command: AcceptanceVerifyCommand, defaul
 			envHash,
 			timeoutMs,
 			allowFailure: command.allowFailure === true,
+			untrackedHash,
 			workspaceState,
 			result: evidenced,
 		}, null, 2), "utf-8");
@@ -1202,12 +1314,12 @@ export function quoteExecutableForShell(command: string, platform: string = proc
 	return command;
 }
 
-function runVerifyCommand(command: AcceptanceVerifyCommand, defaultCwd: string, options: { signal?: AbortSignal; abortMessage?: string } = {}): Promise<AcceptanceVerifyResult> {
+function runVerifyCommand(command: AcceptanceVerifyCommand, defaultCwd: string, options: { signal?: AbortSignal; abortMessage?: AcceptanceAbortMessage } = {}): Promise<AcceptanceVerifyResult> {
 	return new Promise((resolve) => {
 		const startedAt = Date.now();
 		const cwd = command.cwd ? path.resolve(defaultCwd, command.cwd) : defaultCwd;
-		let stdout = "";
-		let stderr = "";
+		const stdout = createBoundedVerifyOutput();
+		const stderr = createBoundedVerifyOutput();
 		let timedOut = false;
 		let settled = false;
 		let hardKill: NodeJS.Timeout | undefined;
@@ -1241,8 +1353,8 @@ function runVerifyCommand(command: AcceptanceVerifyCommand, defaultCwd: string, 
 				finish({
 					exitCode: null,
 					status: "timed-out",
-					stdout: trimOutput(redactVerifyEnv(stdout, command.env)),
-					stderr: trimOutput(redactVerifyEnv(stderr || options.abortMessage || "Acceptance verification timed out.", command.env)),
+					stdout: verifyStreamText(stdout, command.env),
+					stderr: verifyStreamText(stderr, command.env, resolveAbortMessage(options.abortMessage), "Acceptance verification timed out."),
 				});
 			}, 1000);
 			hardKill.unref?.();
@@ -1252,18 +1364,18 @@ function runVerifyCommand(command: AcceptanceVerifyCommand, defaultCwd: string, 
 		if (options.signal?.aborted) abortVerification();
 		else options.signal?.addEventListener("abort", abortVerification, { once: true });
 		child.stdout.on("data", (chunk: Buffer) => {
-			stdout += chunk.toString();
+			stdout.push(chunk);
 		});
 		child.stderr.on("data", (chunk: Buffer) => {
-			stderr += chunk.toString();
+			stderr.push(chunk);
 		});
 		child.on("close", (exitCode) => {
 			const passed = exitCode === 0 && !timedOut;
 			finish({
 				exitCode,
 				status: timedOut ? "timed-out" : passed ? "passed" : command.allowFailure ? "allowed-failure" : "failed",
-				stdout: trimOutput(redactVerifyEnv(stdout, command.env)),
-				stderr: trimOutput(redactVerifyEnv(stderr || (timedOut ? options.abortMessage ?? "" : ""), command.env)),
+				stdout: verifyStreamText(stdout, command.env),
+				stderr: verifyStreamText(stderr, command.env, timedOut ? resolveAbortMessage(options.abortMessage) ?? "" : ""),
 			});
 		});
 		child.on("error", (error) => {
@@ -1271,7 +1383,7 @@ function runVerifyCommand(command: AcceptanceVerifyCommand, defaultCwd: string, 
 				exitCode: timedOut ? null : 1,
 				status: timedOut ? "timed-out" : command.allowFailure ? "allowed-failure" : "failed",
 				stderr: timedOut
-					? trimOutput(redactVerifyEnv(stderr || options.abortMessage || "Acceptance verification timed out.", command.env))
+					? verifyStreamText(stderr, command.env, resolveAbortMessage(options.abortMessage), "Acceptance verification timed out.")
 					: redactVerifyEnv(error instanceof Error ? error.message : String(error), command.env),
 			});
 		});
@@ -1293,7 +1405,7 @@ export async function evaluateAcceptance(input: {
 	reportError?: string;
 	reviewResult?: AcceptanceReviewResult;
 	signal?: AbortSignal;
-	abortMessage?: string;
+	abortMessage?: AcceptanceAbortMessage;
 	reportOptional?: boolean;
 	artifactsDir?: string;
 	runId?: string;

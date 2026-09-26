@@ -640,6 +640,19 @@ class SessionList implements Component, Focusable {
 type SessionsLoader = (onProgress?: SessionListProgress) => Promise<SessionInfo[]>;
 
 /**
+ * Upper bound for the `trash` helper. `spawnSync` blocks the single JS thread the
+ * TUI renders and reads input on, so an unbounded call against a wedged trash
+ * service (NFS/exFAT mounts, a stalled freedesktop trash D-Bus) freezes the whole
+ * UI with no way out. Matches the deadline used by the other CLI probes in this
+ * package (utils/shell.ts).
+ */
+const TRASH_TIMEOUT_MS = 5000;
+
+function spawnErrorCode(error: Error | undefined): string | undefined {
+	return (error as NodeJS.ErrnoException | undefined)?.code;
+}
+
+/**
  * Delete a session file, trying the `trash` CLI first, then falling back to unlink
  */
 async function deleteSessionFile(
@@ -647,11 +660,17 @@ async function deleteSessionFile(
 ): Promise<{ ok: boolean; method: "trash" | "unlink"; error?: string }> {
 	// Try `trash` first (if installed)
 	const trashArgs = sessionPath.startsWith("-") ? ["--", sessionPath] : [sessionPath];
-	const trashResult = spawnSync("trash", trashArgs, { encoding: "utf-8" });
+	const trashResult = spawnSync("trash", trashArgs, { encoding: "utf-8", timeout: TRASH_TIMEOUT_MS });
+	// A deadline kill surfaces as ETIMEDOUT with a null status, which is otherwise
+	// indistinguishable from "trash is not installed" (ENOENT). The kill signal
+	// alone cannot tell them apart either, since both leave `status === null`.
+	const trashTimedOut = spawnErrorCode(trashResult.error) === "ETIMEDOUT";
 
 	const getTrashErrorHint = (): string | null => {
 		const parts: string[] = [];
-		if (trashResult.error) {
+		if (trashTimedOut) {
+			parts.push(`timed out after ${TRASH_TIMEOUT_MS}ms`);
+		} else if (trashResult.error) {
 			parts.push(trashResult.error.message);
 		}
 		const stderr = trashResult.stderr?.trim();
@@ -713,6 +732,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 	private currentLoading = false;
 	private allLoading = false;
 	private allLoadSeq = 0;
+	private currentLoadSeq = 0;
 
 	private mode: "list" | "rename" = "list";
 	private renameInput = new Input();
@@ -929,14 +949,17 @@ export class SessionSelectorComponent extends Container implements Focusable {
 			this.allLoading = true;
 		}
 
-		const seq = scope === "all" ? ++this.allLoadSeq : undefined;
+		// Monotonic per-scope sequence: a slow load that resolves after a newer one
+		// started must be discarded instead of overwriting the newer result.
+		const seq = scope === "all" ? ++this.allLoadSeq : ++this.currentLoadSeq;
+		const isStale = (): boolean => (scope === "all" ? seq !== this.allLoadSeq : seq !== this.currentLoadSeq);
 		this.header.setScope(scope);
 		this.header.setLoading(true);
 		this.requestRender();
 
 		const onProgress = (loaded: number, total: number) => {
 			if (scope !== this.scope) return;
-			if (seq !== undefined && seq !== this.allLoadSeq) return;
+			if (isStale()) return;
 			this.header.setProgress(loaded, total);
 			this.requestRender();
 		};
@@ -946,6 +969,11 @@ export class SessionSelectorComponent extends Container implements Focusable {
 				? this.currentSessionsLoader(onProgress)
 				: this.allSessionsLoader(onProgress));
 
+			if (scope !== this.scope) return;
+			if (isStale()) return;
+
+			// Cache the result only after the staleness guard, so a superseded
+			// response cannot leave the cached list holding stale entries.
 			if (scope === "current") {
 				this.currentSessions = sessions;
 				this.currentLoading = false;
@@ -954,21 +982,18 @@ export class SessionSelectorComponent extends Container implements Focusable {
 				this.allLoading = false;
 			}
 
-			if (scope !== this.scope) return;
-			if (seq !== undefined && seq !== this.allLoadSeq) return;
-
 			this.header.setLoading(false);
 			this.sessionList.setSessions(sessions, showCwd);
 			this.requestRender();
 		} catch (err) {
+			if (scope !== this.scope) return;
+			if (isStale()) return;
+
 			if (scope === "current") {
 				this.currentLoading = false;
 			} else {
 				this.allLoading = false;
 			}
-
-			if (scope !== this.scope) return;
-			if (seq !== undefined && seq !== this.allLoadSeq) return;
 
 			const message = err instanceof Error ? err.message : String(err);
 			this.header.setLoading(false);

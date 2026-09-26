@@ -10,6 +10,7 @@ import lockfile from "proper-lockfile";
 import { setTimeout as sleep } from "timers/promises";
 import { getAgentDir } from "../config.ts";
 import { raceWithAbortSignal } from "../utils/abort.ts";
+import { atomicWriteFileSync } from "../utils/atomic-write.ts";
 import { getFileRevision, normalizePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { isCommandConfigValue, resolveConfigValue } from "./resolve-config-value.ts";
@@ -124,7 +125,8 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			const current = existsSync(this.authPath) ? readFileSync(this.authPath, "utf-8") : undefined;
 			const { result, next } = fn(current);
 			if (next !== undefined) {
-				writeFileSync(this.authPath, next, AUTH_FILE_WRITE_OPTIONS);
+				// Atomic tmp+rename: a crash never leaves a truncated credential file.
+				atomicWriteFileSync(this.authPath, next, AUTH_FILE_WRITE_OPTIONS);
 				this.enforceRestrictiveMode();
 			}
 			return result;
@@ -206,7 +208,8 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 			throwIfCompromised();
 			options?.signal?.throwIfAborted();
 			if (next !== undefined) {
-				writeFileSync(this.authPath, next, AUTH_FILE_WRITE_OPTIONS);
+				// Atomic tmp+rename: a crash never leaves a truncated credential file.
+				atomicWriteFileSync(this.authPath, next, AUTH_FILE_WRITE_OPTIONS);
 				this.enforceRestrictiveMode();
 			}
 			throwIfCompromised();

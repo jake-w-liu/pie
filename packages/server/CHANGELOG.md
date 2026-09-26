@@ -15,7 +15,11 @@
 - Changed `toProtocolToolResultMessage()` to require the original `ToolCall` and verify tool result association.
 - Changed `PiServerService.listSessions()` to return durable `SessionMetadata` instead of runtime `SessionSummary` values ([#7708](https://github.com/earendil-works/pi/pull/7708)).
 
+## [Unreleased]
+
 ### Fixed
+
+- Fixed the Unix listener socket being briefly world-connectable between `listen()` and the permission change; the socket is now created at its final mode by tightening the umask around the bind, which is restored on every path.
 
 - Hardened protocol adapters against contradictory lifecycle states, invalid identifiers and timestamps, sparse execution arrays, and additive `pi-ai` contract drift.
 - Sanitized service and runtime failures into stable `not_implemented` and `internal_error` responses without exposing private error details ([#7644](https://github.com/earendil-works/pi/pull/7644)).

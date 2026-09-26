@@ -9,6 +9,10 @@
 
 ### Fixed
 
+- Fixed the OpenAI Codex and Radius OAuth flows hanging when their fixed callback port was already taken: a callback-server bind failure is now reported instead of being swallowed, which previously let a foreign listener receive the OAuth callback (Codex) or failed with a misleading "OAuth callback did not complete." (Radius).
+- Fixed a GitHub Copilot token refresh discarding a valid access token when the follow-up model catalog fetch failed.
+- Fixed the faux provider counting cache-write tokens as both cached and uncached input, roughly doubling reported `totalTokens`.
+
 - Fixed OAuth catalog refreshes accepting nearly-expired tokens and hanging on unresponsive identity providers; the refresh path now shares the request path's five-minute freshness floor and 15-second refresh timeout.
 - Fixed bearer-token export rejecting freshly refreshed tokens that satisfy the requested minimum but not the five-minute trigger window.
 - Fixed in-memory credential reads and writes sharing live references, letting any caller mutation corrupt stored auth state; credentials are now cloned across the store boundary.

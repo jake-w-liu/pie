@@ -41,8 +41,24 @@ export function validatePermissionConfig(value: unknown, label = "config.permiss
 	return { rules: validatePermissionRules(object.rules, `${label}.rules`) };
 }
 
+/** Restrictiveness order: an agent may only move a tool toward a stricter decision. */
+const DECISION_SEVERITY: Record<PermissionDecision, number> = { allow: 0, ask: 1, deny: 2 };
+
 export function resolvePermissionRules(globalConfig?: PermissionConfig, agentRules?: PermissionRules): PermissionRules | undefined {
-	const merged = { ...(globalConfig?.rules ?? {}), ...(agentRules ?? {}) };
+	const globalRules = globalConfig?.rules ?? {};
+	const merged: PermissionRules = { ...globalRules };
+	// An agent definition may only narrow the global policy, never widen it. A
+	// checked-out repository can ship an agent file (see resolveNearestProjectAgentDirs),
+	// so an agent's "allow" has to mean "no opinion" rather than "override a deny":
+	// spreading agent rules last and dropping "allow" entries would otherwise let a
+	// repo-supplied agent silently nullify a user's global deny or ask.
+	for (const [tool, decision] of Object.entries(agentRules ?? {})) {
+		const globalDecision = globalRules[tool];
+		if (globalDecision === undefined || DECISION_SEVERITY[decision] > DECISION_SEVERITY[globalDecision]) {
+			merged[tool] = decision;
+		}
+	}
+	// Absent means allow (see permissionDecision), so keep only the entries that restrict.
 	for (const [tool, decision] of Object.entries(merged)) if (decision === "allow") delete merged[tool];
 	return Object.keys(merged).length ? merged : undefined;
 }

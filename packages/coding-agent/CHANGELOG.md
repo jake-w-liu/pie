@@ -37,6 +37,13 @@
 
 ### Fixed
 
+- Fixed `write` and `edit` destroying a file's contents when a write failed partway: both now replace the target atomically, so the original survives a failed or partial write. Symlinked targets and the target's permission bits are preserved, and a read-only target is still refused.
+- Fixed a crash landing inside the shutdown window leaving the terminal in raw/alt-screen mode; terminal restoration is now idempotent and always runs unless the tty is already gone.
+- Fixed the session trash, `gh auth status`, and archive-extraction subprocesses having no timeout, so a hung helper froze the whole TUI; a timed-out extraction now fails instead of installing from a partially extracted tree.
+- Fixed a slow "current scope" session load overwriting a newer result, and the corresponding cache write.
+- Fixed session listing materializing the full text of every session file, twice, on every startup; startup now resolves session ids from headers only.
+- Fixed `auth.json` being rewritten in place while settings and sessions already used an atomic replace, so an interrupted write could leave it empty.
+- Fixed `read` silently treating `offset: 0` and negative offsets as "start of file", and `write` reporting UTF-16 code units as a byte count.
 - Fixed the model catalog overlay keeping stale models in memory after the remote catalog reports a provider as unavailable (404/501).
 - Fixed `PI_OFFLINE=0/false/no` disabling model networking while the package manager stayed online; all layers now share one offline check.
 - Fixed image reads failing with a size-limit message when the resize worker ran but its image backend was unavailable: `resizeImage` now falls back to in-process resizing on a worker null (not just on worker errors), and `processImage` reports an unavailable image engine instead of blaming the inline image size limit.

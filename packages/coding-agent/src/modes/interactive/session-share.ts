@@ -21,6 +21,14 @@ interface SessionShareContext {
 	showError: (message: string) => void;
 }
 
+/**
+ * Upper bound for the `gh auth status` probe. This runs synchronously on the
+ * TUI thread, and `gh` can block on network I/O or a credential helper
+ * (keychain prompt, GIT_ASKPASS), so it must not be able to stall input
+ * handling. Same deadline as the other CLI probes in this package.
+ */
+const GH_AUTH_TIMEOUT_MS = 5000;
+
 /** Export the current branch with presentation metadata for Radius. */
 export function exportSessionForShare(filePath: string, session: AgentSession): void {
 	exportSessionToJsonl(session.sessionManager, filePath, (parentId, timestamp) => [
@@ -57,12 +65,32 @@ export async function shareSession(context: SessionShareContext): Promise<void> 
 		if (await tryShareViaRadius(jsonlFile, context)) return;
 
 		try {
-			const authResult = spawnSync("gh", ["auth", "status"], { encoding: "utf-8" });
+			const authResult = spawnSync("gh", ["auth", "status"], {
+				encoding: "utf-8",
+				timeout: GH_AUTH_TIMEOUT_MS,
+			});
+			// A missing binary and a failed login both surface through `error`/a
+			// non-zero status rather than by throwing, so they are told apart here
+			// instead of collapsing into a single "not logged in" message.
+			const ghErrorCode = (authResult.error as NodeJS.ErrnoException | undefined)?.code;
+			if (ghErrorCode === "ENOENT") {
+				context.showError("GitHub CLI (gh) is not installed. Install it from https://cli.github.com/");
+				return;
+			}
+			if (ghErrorCode === "ETIMEDOUT") {
+				context.showError(
+					`GitHub CLI (gh) did not respond within ${GH_AUTH_TIMEOUT_MS}ms. Run 'gh auth status' in a terminal, then retry.`,
+				);
+				return;
+			}
 			if (authResult.status !== 0) {
 				context.showError("GitHub CLI is not logged in. Run 'gh auth login' first.");
 				return;
 			}
 		} catch {
+			// spawnSync only throws for malformed arguments, not for a missing
+			// binary; keep this guard so any future throw still reports something
+			// actionable instead of falling through to the gist upload.
 			context.showError("GitHub CLI (gh) is not installed. Install it from https://cli.github.com/");
 			return;
 		}

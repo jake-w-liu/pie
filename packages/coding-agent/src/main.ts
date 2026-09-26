@@ -59,7 +59,12 @@ import {
 	MissingSessionCwdError,
 	type SessionCwdIssue,
 } from "./core/session-cwd.ts";
-import { assertValidSessionId, SessionManager } from "./core/session-manager.ts";
+import {
+	assertValidSessionId,
+	getDefaultSessionDirPath,
+	type SessionHeaderInfo,
+	SessionManager,
+} from "./core/session-manager.ts";
 import { collectSettingsDiagnostics, deduplicateDiagnostics } from "./core/settings-diagnostics.ts";
 import { type PackageSource, type Settings, SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
@@ -314,9 +319,13 @@ async function findLocalSessionByExactId(
 	cwd: string,
 	sessionDir?: string,
 ): Promise<{ type: "local"; path: string } | undefined> {
-	const localSessions = await SessionManager.list(cwd, sessionDir);
+	const localSessions = await SessionManager.listHeaders(cwd, sessionDir);
 	const localMatch = localSessions.find((s) => s.id === sessionId);
 	return localMatch ? { type: "local", path: localMatch.path } : undefined;
+}
+
+function matchSessionById(sessions: SessionHeaderInfo[], sessionArg: string): SessionHeaderInfo | undefined {
+	return sessions.find((s) => s.id === sessionArg) ?? sessions.find((s) => s.id.startsWith(sessionArg));
 }
 
 async function resolveSessionPath(sessionArg: string, cwd: string, sessionDir?: string): Promise<ResolvedSession> {
@@ -325,19 +334,24 @@ async function resolveSessionPath(sessionArg: string, cwd: string, sessionDir?: 
 		return { type: "path", path: resolvePath(sessionArg, cwd) };
 	}
 
-	// Try to match as session ID in current project first
-	const localSessions = await SessionManager.list(cwd, sessionDir);
-	const localMatch =
-		localSessions.find((s) => s.id === sessionArg) ?? localSessions.find((s) => s.id.startsWith(sessionArg));
+	// Try to match as session ID in current project first. Resolving an id needs
+	// nothing but the session header, so this must not build a full SessionInfo
+	// for every session on disk: that streams the message text of the whole
+	// corpus, and with a global pass below it did so twice on every startup.
+	const localSessions = await SessionManager.listHeaders(cwd, sessionDir);
+	const localMatch = matchSessionById(localSessions, sessionArg);
 
 	if (localMatch) {
 		return { type: "local", path: localMatch.path };
 	}
 
-	// Try global search across all projects
-	const allSessions = await SessionManager.listAll(sessionDir);
-	const globalMatch =
-		allSessions.find((s) => s.id === sessionArg) ?? allSessions.find((s) => s.id.startsWith(sessionArg));
+	// Try global search across all projects. When the local pass used the default
+	// project directory it already listed that directory in full, so the global
+	// pass skips it instead of reading the same headers a second time.
+	const allSessions = await SessionManager.listAllHeaders(sessionDir, {
+		skipDir: sessionDir === undefined ? getDefaultSessionDirPath(cwd) : undefined,
+	});
+	const globalMatch = matchSessionById(allSessions, sessionArg);
 
 	if (globalMatch) {
 		return { type: "global", path: globalMatch.path, cwd: globalMatch.cwd };

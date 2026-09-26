@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir } from "../../shared/utils.ts";
@@ -22,7 +22,17 @@ const ROTATE_KEEP = 1000;
 const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const REDACTED_TASK = "[redacted]";
-const historyFileStates = new Map<string, { mtimeMs: number; ctimeMs: number; size: number; ino: number; lineCount: number }>();
+
+type HistoryFileState = { mtimeMs: number; ctimeMs: number; size: number; ino: number; lineCount: number };
+
+const historyFileStates = new Map<string, HistoryFileState>();
+
+function isSameHistoryFileState(cached: HistoryFileState, stat: fs.Stats): boolean {
+	return cached.mtimeMs === stat.mtimeMs
+		&& cached.ctimeMs === stat.ctimeMs
+		&& cached.size === stat.size
+		&& cached.ino === stat.ino;
+}
 
 function getHistoryPath(): string {
 	return path.join(getAgentDir(), "run-history.jsonl");
@@ -84,8 +94,26 @@ function sanitizeHistoryLines(raw: string): { lines: string[]; changed: boolean 
 	return { lines, changed };
 }
 
+/**
+ * Replace the whole history file atomically.
+ *
+ * `writeFileSync` opens with `O_TRUNC`, so a crash between the truncate and the
+ * write leaves a truncated (or 0-byte) history file. Write to a temp file in the
+ * same directory and `rename(2)` it over the target instead: a reader then sees
+ * either the previous file or the new one, never a partial one.
+ */
 function writePrivateHistory(historyPath: string, lines: string[]): void {
-	fs.writeFileSync(historyPath, lines.length ? `${lines.join("\n")}\n` : "", { encoding: "utf-8", mode: PRIVATE_FILE_MODE });
+	const tempPath = path.join(path.dirname(historyPath), `.${path.basename(historyPath)}.${process.pid}.${randomUUID()}.tmp`);
+	try {
+		fs.writeFileSync(tempPath, lines.length ? `${lines.join("\n")}\n` : "", { encoding: "utf-8", mode: PRIVATE_FILE_MODE });
+		// `mode` is masked by the process umask, so re-assert it on the temp file
+		// before it becomes the live history file.
+		try { fs.chmodSync(tempPath, PRIVATE_FILE_MODE); } catch {}
+		fs.renameSync(tempPath, historyPath);
+	} catch (error) {
+		try { fs.rmSync(tempPath, { force: true }); } catch {}
+		throw error;
+	}
 	try { fs.chmodSync(historyPath, PRIVATE_FILE_MODE); } catch {}
 }
 
@@ -101,6 +129,11 @@ function rememberHistoryFile(historyPath: string, lineCount: number): void {
 	if (historyFileStates.size > 8) historyFileStates.delete(historyFileStates.keys().next().value!);
 }
 
+function rotateHistoryLines(lines: string[]): { lines: string[]; changed: boolean } {
+	if (lines.length <= ROTATE_READ_THRESHOLD) return { lines, changed: false };
+	return { lines: lines.slice(-ROTATE_KEEP), changed: true };
+}
+
 function sanitizeHistoryFile(historyPath: string): number {
 	let stat: fs.Stats;
 	try {
@@ -110,18 +143,18 @@ function sanitizeHistoryFile(historyPath: string): number {
 		throw error;
 	}
 	const cached = historyFileStates.get(historyPath);
-	if (cached
-		&& cached.mtimeMs === stat.mtimeMs
-		&& cached.ctimeMs === stat.ctimeMs
-		&& cached.size === stat.size
-		&& cached.ino === stat.ino) {
+	// A single-writer process hits this cache on every recordRun, so the
+	// rotation bound has to be enforced here too: checking it only on a cache
+	// miss would let the file grow without limit.
+	if (cached && isSameHistoryFileState(cached, stat) && cached.lineCount <= ROTATE_READ_THRESHOLD) {
 		return cached.lineCount;
 	}
 	const raw = fs.readFileSync(historyPath, "utf-8");
-	const { lines, changed } = sanitizeHistoryLines(raw);
-	if (changed) writePrivateHistory(historyPath, lines);
-	rememberHistoryFile(historyPath, lines.length);
-	return lines.length;
+	const sanitized = sanitizeHistoryLines(raw);
+	const rotated = rotateHistoryLines(sanitized.lines);
+	if (rotated.changed || sanitized.changed) writePrivateHistory(historyPath, rotated.lines);
+	rememberHistoryFile(historyPath, rotated.lines.length);
+	return rotated.lines.length;
 }
 
 function appendPrivateHistoryLine(historyPath: string, line: string): void {
@@ -183,14 +216,13 @@ export function loadRunsForAgent(agent: string): RunEntry[] {
 		return [];
 	}
 
-	let { lines, changed } = sanitizeHistoryLines(raw);
-
-	if (lines.length > ROTATE_READ_THRESHOLD) {
-		lines = lines.slice(-ROTATE_KEEP);
-		changed = true;
-	}
+	// Read-only: a reader must never rewrite the file. Rewriting here would
+	// replace the whole file from a snapshot that another process may have
+	// appended to in the meantime, silently dropping those appends. Sanitizing
+	// and rotating are the writer's job (see `sanitizeHistoryFile`), which runs
+	// on every `recordRun` before the append.
+	const { lines } = sanitizeHistoryLines(raw);
 	try {
-		if (changed) writePrivateHistory(historyPath, lines);
 		rememberHistoryFile(historyPath, lines.length);
 	} catch {}
 

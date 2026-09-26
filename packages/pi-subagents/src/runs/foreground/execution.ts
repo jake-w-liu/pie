@@ -200,6 +200,61 @@ function resolveAttemptTimeout(options: RunSyncOptions): { timeoutMs: number; re
 	};
 }
 
+interface ForegroundAcceptanceAbort {
+	signal?: AbortSignal;
+	/** Why verification was cut short; only meaningful once the signal has aborted. */
+	abortMessage: () => string;
+	dispose: () => void;
+}
+
+/**
+ * Acceptance verification spawns host commands, so it must stop when the run stops.
+ * The background runner owns timeout/stop controllers for this; the foreground path
+ * only has the run signals plus a deadline, so the deadline is mirrored into a timer
+ * and every source is folded into one signal. `dispose` releases the timer and the
+ * listeners this added to the caller's long-lived signals.
+ */
+function foregroundAcceptanceAbort(options: RunSyncOptions): ForegroundAcceptanceAbort {
+	const stopMessage = "Subagent stopped by user.";
+	const timeoutMessage = options.timeoutMs === undefined ? "Subagent timed out." : formatTimeoutMessage(options.timeoutMs);
+	const deadlineAt = options.deadlineAt ?? (options.timeoutMs === undefined ? undefined : Date.now() + options.timeoutMs);
+	const sources = [options.signal, options.interruptSignal].filter((signal): signal is AbortSignal => Boolean(signal));
+	if (sources.length === 0 && deadlineAt === undefined) return { abortMessage: () => stopMessage, dispose: () => {} };
+	const controller = new AbortController();
+	let reason = timeoutMessage;
+	const abort = (message: string): void => {
+		reason = message;
+		if (!controller.signal.aborted) controller.abort(new Error(message));
+	};
+	const listeners: Array<() => void> = [];
+	for (const signal of sources) {
+		const onAbort = () => abort(stopMessage);
+		if (signal.aborted) {
+			onAbort();
+			break;
+		}
+		signal.addEventListener("abort", onAbort, { once: true });
+		listeners.push(() => signal.removeEventListener("abort", onAbort));
+	}
+	let timer: NodeJS.Timeout | undefined;
+	if (deadlineAt !== undefined && !controller.signal.aborted) {
+		const remainingMs = deadlineAt - Date.now();
+		if (remainingMs <= 0) abort(timeoutMessage);
+		else {
+			timer = setTimeout(() => abort(timeoutMessage), remainingMs);
+			timer.unref?.();
+		}
+	}
+	return {
+		signal: controller.signal,
+		abortMessage: () => reason,
+		dispose: () => {
+			if (timer) clearTimeout(timer);
+			for (const remove of listeners) remove();
+		},
+	};
+}
+
 function buildPendingAcceptanceLedger(acceptance: ResolvedAcceptanceConfig): AcceptanceLedger {
 	return {
 		status: "pending",
@@ -2160,19 +2215,26 @@ async function runSyncCompletionInner(
 		} else if (result.turnBudgetExceeded) {
 			result.acceptance = buildSkippedAcceptanceLedger(effectiveAcceptance, { id: "turn-budget", message: "Acceptance was not evaluated because the subagent exceeded its turn budget." });
 		} else {
-			result.acceptance = await evaluateAcceptance({
-				acceptance: effectiveAcceptance,
-				output: acceptanceOutputByResult.get(result) ?? result.finalOutput ?? "",
-				report: (result as SingleResult & { structuredAcceptanceReport?: import("../../shared/types.ts").AcceptanceReport; structuredAcceptanceReportError?: string }).structuredAcceptanceReport,
-				reportError: (result as SingleResult & { structuredAcceptanceReport?: import("../../shared/types.ts").AcceptanceReport; structuredAcceptanceReportError?: string }).structuredAcceptanceReportError,
-				fileOutput: childWrittenOutput !== undefined && options.outputPath
-					? { content: childWrittenOutput, path: options.outputPath, authoritative: options.outputMode === "file-only" }
-					: undefined,
-				cwd: options.cwd ?? runtimeCwd,
-				reportOptional: isAgentContractV1(options.agentContract),
-				artifactsDir: options.artifactsDir,
-				runId: options.runId,
-			});
+			const acceptanceAbort = foregroundAcceptanceAbort(options);
+			try {
+				result.acceptance = await evaluateAcceptance({
+					acceptance: effectiveAcceptance,
+					output: acceptanceOutputByResult.get(result) ?? result.finalOutput ?? "",
+					report: (result as SingleResult & { structuredAcceptanceReport?: import("../../shared/types.ts").AcceptanceReport; structuredAcceptanceReportError?: string }).structuredAcceptanceReport,
+					reportError: (result as SingleResult & { structuredAcceptanceReport?: import("../../shared/types.ts").AcceptanceReport; structuredAcceptanceReportError?: string }).structuredAcceptanceReportError,
+					fileOutput: childWrittenOutput !== undefined && options.outputPath
+						? { content: childWrittenOutput, path: options.outputPath, authoritative: options.outputMode === "file-only" }
+						: undefined,
+					cwd: options.cwd ?? runtimeCwd,
+					signal: acceptanceAbort.signal,
+					abortMessage: acceptanceAbort.abortMessage,
+					reportOptional: isAgentContractV1(options.agentContract),
+					artifactsDir: options.artifactsDir,
+					runId: options.runId,
+				});
+			} finally {
+				acceptanceAbort.dispose();
+			}
 		}
 	} catch (error) {
 		const message = `Acceptance evaluation failed: ${error instanceof Error ? error.message : String(error)}`;

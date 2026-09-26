@@ -188,6 +188,30 @@ export interface SessionInfo {
 	allMessagesText: string;
 }
 
+/**
+ * The metadata a session lookup needs, read from the session header alone.
+ *
+ * `SessionInfo` is built by streaming every entry of a session file, so listing
+ * it materializes the full message text of every session on disk. Code that only
+ * resolves a session by id (CLI `--session`/`--fork`/`--session-id` startup) must
+ * not pay for that, so it uses the header-only listings below: they read at most
+ * `MAX_SESSION_HEADER_SCAN_BYTES` per file instead of the whole file.
+ */
+export interface SessionHeaderInfo {
+	path: string;
+	id: string;
+	cwd: string;
+}
+
+/** Options for the header-only listings. */
+export interface SessionHeaderListOptions {
+	/**
+	 * Session directory to leave out because an earlier pass already listed it in
+	 * full. Prevents a local-then-global lookup from reading the same files twice.
+	 */
+	skipDir?: string;
+}
+
 export type ReadonlySessionManager = Pick<
 	SessionManager,
 	| "getCwd"
@@ -475,7 +499,7 @@ export function buildSessionContext(
  * Compute the default session directory for a cwd.
  * Encodes cwd into a safe directory name under ~/.pi/agent/sessions/.
  */
-function getDefaultSessionDirPath(cwd: string, agentDir: string = getDefaultAgentDir()): string {
+export function getDefaultSessionDirPath(cwd: string, agentDir: string = getDefaultAgentDir()): string {
 	const resolvedCwd = resolvePath(cwd);
 	const resolvedAgentDir = resolvePath(agentDir);
 	const safePath = `--${resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
@@ -903,6 +927,30 @@ async function listSessionsFromDir(
 		// Return empty list on error
 	}
 
+	return sessions;
+}
+
+/**
+ * Read the header of every `.jsonl` file in a directory. Only the leading header
+ * line of each file is read, so the cost per session is bounded by the header
+ * scan limit instead of the file size. Unreadable files and directories are
+ * skipped: discovery is best-effort and must not fail as a whole.
+ */
+function readSessionHeadersInDir(dir: string): SessionHeaderInfo[] {
+	const sessions: SessionHeaderInfo[] = [];
+	let names: string[];
+	try {
+		names = readdirSync(dir);
+	} catch {
+		return sessions;
+	}
+	for (const name of names) {
+		if (!name.endsWith(".jsonl")) continue;
+		const filePath = join(dir, name);
+		const header = readSessionHeaderForDiscovery(filePath);
+		if (!header) continue;
+		sessions.push({ path: filePath, id: header.id, cwd: getSessionHeaderCwd(header) ?? "" });
+	}
 	return sessions;
 }
 
@@ -1744,6 +1792,60 @@ export class SessionManager {
 		);
 		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 		return sessions;
+	}
+
+	/**
+	 * Header-only counterpart of {@link SessionManager.list}.
+	 *
+	 * Returns the same (path, id, cwd) triples `list()` would, but reads only
+	 * each session's header instead of streaming every entry, and is not sorted
+	 * by modification time. Use it wherever only session identity matters.
+	 * @param cwd Working directory (used to compute default session directory)
+	 * @param sessionDir Optional session directory. If omitted, uses default (~/.pi/agent/sessions/<encoded-cwd>/).
+	 */
+	static async listHeaders(cwd: string, sessionDir?: string): Promise<SessionHeaderInfo[]> {
+		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
+		const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd);
+		const resolvedCwd = resolvePath(cwd);
+		return readSessionHeadersInDir(dir).filter(
+			(session) => !filterCwd || sessionCwdMatches(session.cwd, resolvedCwd),
+		);
+	}
+
+	/**
+	 * Header-only counterpart of {@link SessionManager.listAll}.
+	 *
+	 * Pass `options.skipDir` for a directory an earlier pass already listed in
+	 * full so a local-then-global lookup does not read those files twice.
+	 * Directory order is the order of `readdir`; results are not sorted by
+	 * modification time.
+	 * @param sessionDir Optional session directory. If omitted, scans every project directory.
+	 */
+	static async listAllHeaders(sessionDir?: string, options?: SessionHeaderListOptions): Promise<SessionHeaderInfo[]> {
+		const skipDir = options?.skipDir ? resolvePath(options.skipDir) : undefined;
+		if (sessionDir !== undefined) {
+			const dir = normalizePath(sessionDir);
+			return skipDir && resolvePath(dir) === skipDir ? [] : readSessionHeadersInDir(dir);
+		}
+
+		const sessionsDir = getSessionsDir();
+		try {
+			if (!existsSync(sessionsDir)) {
+				return [];
+			}
+			const entries = await readdir(sessionsDir, { withFileTypes: true });
+			const sessions: SessionHeaderInfo[] = [];
+			for (const entry of entries) {
+				if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+				const dir = join(sessionsDir, entry.name);
+				if (skipDir && resolvePath(dir) === skipDir) continue;
+				sessions.push(...readSessionHeadersInDir(dir));
+			}
+			return sessions;
+		} catch {
+			// Return empty list on error
+			return [];
+		}
 	}
 
 	/**

@@ -506,6 +506,34 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedPaste, ["Hello 世界 🎉"]);
 			assert.deepStrictEqual(emittedSequences, []);
 		});
+
+		it("reassembles a sequence split across a paste instead of dropping it", () => {
+			// A mouse press whose report is split by the PTY right before the
+			// paste payload starts.
+			processInput("\x1b[<35");
+			assert.deepStrictEqual(emittedSequences, []);
+
+			processInput("\x1b[200~pasted\x1b[201~");
+			assert.deepStrictEqual(emittedPaste, ["pasted"]);
+
+			// The tail of the mouse report completes the queued prefix.
+			processInput(";20;5m");
+			assert.deepStrictEqual(emittedSequences, ["\x1b[<35;20;5m"]);
+		});
+
+		it("keeps a lone Escape pressed immediately before a paste", async () => {
+			const escapeBuffer = new StdinBuffer({ timeout: 10, escapeTimeout: 10 });
+			const sequences: string[] = [];
+			escapeBuffer.on("data", (sequence) => sequences.push(sequence));
+
+			escapeBuffer.process("\x1b");
+			escapeBuffer.process("\x1b[200~pasted\x1b[201~");
+
+			assert.deepStrictEqual(sequences, []);
+			await wait(25);
+			assert.deepStrictEqual(sequences, ["\x1b"]);
+			escapeBuffer.destroy();
+		});
 	});
 
 	describe("Destroy", () => {

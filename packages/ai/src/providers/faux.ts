@@ -241,14 +241,17 @@ function withUsageEstimate(
 	const sessionId = options?.sessionId;
 
 	if (sessionId && options?.cacheRetention !== "none") {
+		// Like the real APIs, the cached buckets are disjoint from `input`: prompt
+		// tokens are counted once, as a cache read, a cache write, or uncached input.
 		const previousPrompt = promptCache.get(sessionId);
 		if (previousPrompt) {
 			const cachedChars = commonPrefixLength(previousPrompt, promptText);
 			cacheRead = estimateTokens(previousPrompt.slice(0, cachedChars));
 			cacheWrite = estimateTokens(promptText.slice(cachedChars));
-			input = Math.max(0, promptTokens - cacheRead);
+			input = Math.max(0, promptTokens - cacheRead - cacheWrite);
 		} else {
 			cacheWrite = promptTokens;
+			input = 0;
 		}
 		promptCache.set(sessionId, promptText);
 	}

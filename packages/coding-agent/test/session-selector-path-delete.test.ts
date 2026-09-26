@@ -1,12 +1,25 @@
+import type * as ChildProcess from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setKeybindings } from "@earendil-works/pi-tui";
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { SessionInfo } from "../src/core/session-manager.ts";
 import { SessionSelectorComponent } from "../src/modes/interactive/components/session-selector.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+
+// Deleting a session shells out to `trash`, which runs synchronously on the TUI
+// event loop. Mock the spawn so the deadline and the timeout branch are
+// observable without a real (and possibly wedged) trash helper.
+vi.mock("node:child_process", async (importOriginal) => {
+	const actual = await importOriginal<typeof ChildProcess>();
+	return {
+		...actual,
+		spawnSync: vi.fn(() => ({ status: 0, stdout: "", stderr: "" })),
+	};
+});
 
 type Deferred<T> = {
 	promise: Promise<T>;
@@ -99,6 +112,8 @@ describe("session selector path/delete interactions", () => {
 	beforeEach(() => {
 		// Ensure test isolation: keybindings are a global singleton
 		setKeybindings(new KeybindingsManager());
+		vi.mocked(spawnSync).mockReset();
+		vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: "", stderr: "" } as never);
 	});
 
 	beforeAll(() => {
@@ -244,6 +259,123 @@ describe("session selector path/delete interactions", () => {
 
 		allDeferred.resolve([makeSession({ id: "all" })]);
 		await flushPromises();
+	});
+
+	it("discards a slow Current load that resolves after a newer one", async () => {
+		const slowRefresh = createDeferred<SessionInfo[]>();
+		const first = [
+			makeSession({ id: "a", path: "/tmp/a.jsonl", firstMessage: "first-a" }),
+			makeSession({ id: "b", path: "/tmp/b.jsonl", firstMessage: "first-b" }),
+		];
+		const second = [first[0]!, first[1]!];
+		const third = [makeSession({ id: "c", path: "/tmp/c.jsonl", firstMessage: "third-c" })];
+		const responses = [first, slowRefresh.promise, third];
+		let currentLoadCalls = 0;
+
+		const selector = new SessionSelectorComponent(
+			async () => responses[currentLoadCalls++]!,
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings },
+		);
+		await flushPromises();
+		expect(currentLoadCalls).toBe(1);
+
+		const list = selector.getSessionList();
+		// Deleting a session refreshes the current scope, so two deletes queue a
+		// second (slow) and a third (fast) load while the second is in flight.
+		list.handleInput(CTRL_D);
+		list.handleInput("\r");
+		await flushPromises();
+		expect(currentLoadCalls).toBe(2);
+
+		list.handleInput(CTRL_D);
+		list.handleInput("\r");
+		await flushPromises();
+		expect(currentLoadCalls).toBe(3);
+
+		const afterThird = stripAnsi(selector.render(120).join("\n"));
+		expect(afterThird).toContain("third-c");
+
+		// The superseded second response arrives last and must not win.
+		slowRefresh.resolve(second);
+		await flushPromises();
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+		expect(output).toContain("third-c");
+		expect(output).not.toContain("first-b");
+	});
+
+	it("bounds the trash helper with a timeout so it cannot freeze the TUI", async () => {
+		const baseDir = mkdtempSync(join(tmpdir(), "pi-trash-timeout-"));
+		tempDirs.push(baseDir);
+		const sessionPath = join(baseDir, "session.jsonl");
+		writeFileSync(sessionPath, "{}\n");
+
+		const sessions = [makeSession({ id: "trash", path: sessionPath })];
+		const selector = new SessionSelectorComponent(
+			async () => sessions,
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings },
+		);
+		await flushPromises();
+
+		const list = selector.getSessionList();
+		list.handleInput(CTRL_D);
+		list.handleInput("\r");
+		await flushPromises();
+
+		const trashCall = vi.mocked(spawnSync).mock.calls.find((call) => call[0] === "trash");
+		expect(trashCall).toBeDefined();
+		const options = trashCall?.[2] as { timeout?: number } | undefined;
+		expect(options?.timeout).toBeGreaterThan(0);
+	});
+
+	it("falls back to unlink and surfaces the timeout instead of claiming a trash move", async () => {
+		const baseDir = mkdtempSync(join(tmpdir(), "pi-trash-to-"));
+		tempDirs.push(baseDir);
+		// A directory cannot be unlinked, so both the trash and the unlink
+		// fallback fail and the user sees the reported reason.
+		const sessionPath = join(baseDir, "not-a-file");
+		mkdirSync(sessionPath);
+
+		vi.mocked(spawnSync).mockReturnValue({
+			status: null,
+			signal: "SIGTERM",
+			stdout: "",
+			stderr: "",
+			error: Object.assign(new Error("spawnSync trash ETIMEDOUT"), { code: "ETIMEDOUT" }),
+		} as never);
+
+		const sessions = [makeSession({ id: "to", path: sessionPath })];
+		const selector = new SessionSelectorComponent(
+			async () => sessions,
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings },
+		);
+		await flushPromises();
+
+		const list = selector.getSessionList();
+		list.handleInput(CTRL_D);
+		list.handleInput("\r");
+		await flushPromises();
+		await flushPromises();
+
+		const output = stripAnsi(selector.render(200).join("\n"));
+		expect(output).toContain("Failed to delete");
+		expect(output).toContain("timed out after 5000ms");
+		expect(output).not.toContain("Session moved to trash");
 	});
 
 	it("threads sessions when parent and child paths use different symlink aliases", async () => {

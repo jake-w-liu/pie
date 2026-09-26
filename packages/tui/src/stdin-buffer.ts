@@ -301,6 +301,14 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private pasteBuffer: string = "";
 	private pasteTruncated: boolean = false;
 	private pasteOverflowTail: string = "";
+	/**
+	 * Bytes that arrived before a bracketed-paste start but did not form a
+	 * complete sequence. They are not garbage: a split mouse report or a bare
+	 * Escape is still in flight, and the remaining bytes show up in a later
+	 * chunk, so they are re-queued ahead of the bytes that follow the paste
+	 * terminator instead of being dropped.
+	 */
+	private pastePrefix: string = "";
 	private pendingKittyPrintableCodepoint: number | undefined;
 
 	constructor(options: StdinBufferOptions = {}) {
@@ -354,9 +362,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 					this.pasteOverflowTail = "";
 					this.pendingKittyPrintableCodepoint = undefined;
 					this.emit("paste", pastedContent);
-					if (remaining.length > 0) {
-						this.process(remaining);
-					}
+					this.resumeAfterPaste(remaining);
 				} else {
 					this.pasteOverflowTail = combined.slice(-(BRACKETED_PASTE_END.length - 1));
 				}
@@ -380,10 +386,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				this.pendingKittyPrintableCodepoint = undefined;
 
 				this.emit("paste", pastedContent);
-
-				if (remaining.length > 0) {
-					this.process(remaining);
-				}
+				this.resumeAfterPaste(remaining);
 			} else if (this.pasteBuffer.length > MAX_BRACKETED_PASTE_CHARS + BRACKETED_PASTE_END.length) {
 				// No terminator and over budget: keep the capped prefix, discard the
 				// middle, retain a small tail so a terminator split across the
@@ -403,6 +406,11 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				for (const sequence of result.sequences) {
 					this.emitDataSequence(sequence);
 				}
+				// A trailing incomplete sequence (a lone Escape, a mouse report
+				// split across PTY reads) is a real keypress whose remaining bytes
+				// have not arrived. Queue it instead of dropping it, so the next
+				// chunk can complete it.
+				this.pastePrefix = result.remainder;
 			}
 
 			this.pendingKittyPrintableCodepoint = undefined;
@@ -428,10 +436,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				this.pendingKittyPrintableCodepoint = undefined;
 
 				this.emit("paste", pastedContent);
-
-				if (remaining.length > 0) {
-					this.process(remaining);
-				}
+				this.resumeAfterPaste(remaining);
 			} else if (this.pasteBuffer.length > MAX_BRACKETED_PASTE_CHARS + BRACKETED_PASTE_END.length) {
 				this.pasteOverflowTail = this.pasteBuffer.slice(-(BRACKETED_PASTE_END.length - 1));
 				this.pasteBuffer = this.pasteBuffer.slice(0, MAX_BRACKETED_PASTE_CHARS);
@@ -456,6 +461,20 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 					this.emitDataSequence(sequence);
 				}
 			}, timeoutMs);
+		}
+	}
+
+	/**
+	 * Re-enter normal parsing after a bracketed paste has been emitted. Bytes
+	 * queued before the paste start are prepended so a sequence split across
+	 * the paste boundary is re-assembled instead of being dropped.
+	 */
+	private resumeAfterPaste(remaining: string): void {
+		const prefix = this.pastePrefix;
+		this.pastePrefix = "";
+		const tail = prefix + remaining;
+		if (tail.length > 0) {
+			this.process(tail);
 		}
 	}
 
@@ -496,6 +515,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.pasteBuffer = "";
 		this.pasteTruncated = false;
 		this.pasteOverflowTail = "";
+		this.pastePrefix = "";
 		this.pendingKittyPrintableCodepoint = undefined;
 	}
 

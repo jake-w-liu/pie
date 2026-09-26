@@ -64,12 +64,47 @@ export class HarnessEventBus implements Events {
 
 	/** Publish an event to current event subscriptions and watch subscriptions. */
 	emit(event: HarnessEvent): void {
+		// Listeners are passive, so a failing one must not starve the listeners after it
+		// nor skip the watch pass. Collect the first synchronous failure, finish delivery,
+		// then rethrow it: the error stays visible to the caller, but every listener has
+		// already been notified.
+		let failure: unknown;
+		let failed = false;
+		const recordFailure = (error: unknown): void => {
+			if (failed) return;
+			failed = true;
+			failure = error;
+		};
+		const deliver = (listener: HarnessEventListener): void => {
+			try {
+				const result: unknown = listener(event);
+				// Async results are not awaited because emit() is synchronous. The
+				// rejection is still observed: discarding it would make it an
+				// unhandled rejection, which can terminate the process. Test for a
+				// thenable instead of calling .catch directly, so a listener that
+				// returns any other truthy value cannot raise a TypeError here.
+				if (
+					result !== null &&
+					typeof result === "object" &&
+					typeof (result as PromiseLike<void>).then === "function"
+				) {
+					void Promise.resolve(result).catch(recordFailure);
+				}
+			} catch (error) {
+				recordFailure(error);
+			}
+		};
+
 		// Deliver only to direct listeners registered for this event type.
-		// Async results are not awaited because emit() is synchronous.
-		for (const listener of this.listeners.get(event.type) ?? []) void listener(event);
+		for (const listener of this.listeners.get(event.type) ?? []) deliver(listener);
 
 		// Deliver every event to each watcher; watch() handles buffering until start().
-		for (const listener of this.watchListeners) listener(event);
+		for (const listener of this.watchListeners) deliver(listener);
+
+		// A synchronous listener failure propagates after delivery completes. An
+		// asynchronous rejection cannot propagate from here because emit() has already
+		// returned; it is contained so it cannot become an unhandled rejection.
+		if (failed) throw failure;
 	}
 
 	watch<TSnapshot>(captureSnapshot: () => TSnapshot): WatchHandle<TSnapshot> {

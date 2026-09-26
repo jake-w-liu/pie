@@ -8,6 +8,13 @@
 
 ### Fixed
 
+- Fixed `write` and `edit` destroying a file's contents when a write failed partway: both now replace the target atomically (temp file in the same directory, fsync, rename), so the original survives a failed or partial write. Symlinked targets, relative symlink chains, and the target's permission bits are preserved, a read-only target is still refused with `EACCES`, and an aborted write no longer lands the change.
+- Fixed `HarnessEventBus.emit` letting one throwing listener starve every listener after it and skip the watch pass; delivery now completes before the failure propagates.
+- Fixed rejected async event listeners becoming unhandled rejections, which can terminate the process.
+- Fixed `write` reporting UTF-16 code units as a byte count; the count is now UTF-8 bytes.
+- Fixed `read` silently treating `offset: 0` and negative offsets as "start of file"; `offset` is now validated as 1-indexed.
+- Fixed `createTempFile` leaking the temporary directory it allocated for every spilled command output; the directory is now reclaimed by `cleanup()`.
+
 - Preserved dequeued steering and follow-up input when next-turn preparation compacts context or stops the run.
 - Preserved earlier checkpoints and branch file tracking during compaction, rejected stale pre-checkpoint usage, and bounded summary inputs and visible file tags without dropping structured file metadata.
 - Included failed retry attempts in summary usage and retained tool names and call IDs in serialized results.

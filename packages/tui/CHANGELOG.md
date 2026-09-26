@@ -22,6 +22,9 @@
 
 ### Fixed
 
+- Fixed bracketed-paste expansion re-scanning substituted content, so a paste payload containing another paste marker was expanded a second time.
+- Fixed `StdinBuffer` discarding an incomplete key sequence that arrived immediately before a paste, dropping a partial escape or mouse report.
+
 - Fixed rapid main-screen text selection overwhelming terminal output or clipboard handlers and leaving live rendering frozen after release, focus loss, overlay changes, interrupted gestures, or stale resize geometry.
 - Fixed over-wide rendered lines crashing the session; they are now truncated to the terminal width with the incident recorded in `pi-crash.log`.
 - Fixed CSI escape parsing to accept the full final-byte range so cursor moves, erases, and mode sequences are no longer miscounted as visible width.

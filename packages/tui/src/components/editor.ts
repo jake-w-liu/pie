@@ -31,6 +31,16 @@ function isPasteMarker(segment: string): boolean {
 }
 
 /**
+ * The exact marker text handlePaste renders for `content`. The size suffix is
+ * derived from the stored paste, so it doubles as the ownership check that
+ * separates a marker this editor created from text that merely looks like one.
+ */
+function expectedPasteMarker(id: number, content: string): string {
+	const lineCount = content.split("\n").length;
+	return lineCount > 10 ? `[paste #${id} +${lineCount} lines]` : `[paste #${id} ${content.length} chars]`;
+}
+
+/**
  * A segmenter that wraps Intl.Segmenter and merges graphemes that fall
  * within paste markers into single atomic segments.  This makes cursor
  * movement, deletion, word-wrap, etc. treat paste markers as single units.
@@ -1094,13 +1104,37 @@ export class Editor implements Component, Focusable {
 		return this.state.lines.join("\n");
 	}
 
+	/**
+	 * Replace this editor's own paste markers with the pasted content.
+	 *
+	 * A single left-to-right pass over `text`, resolving each match against the
+	 * live registry exactly once:
+	 *  - Substituted content is never re-scanned, so a paste that itself contains
+	 *    the text `[paste #2 ...]` is not expanded again by a later marker.
+	 *  - A marker-shaped run is only the editor's marker if it is byte-identical
+	 *    to what handlePaste would render for the stored content. Anything else
+	 *    (unknown id, or a suffix that disagrees with the stored paste) is text
+	 *    the user typed or pasted and is left verbatim.
+	 *  - Each paste id has exactly one marker in the buffer (handlePaste inserts
+	 *    one, handleBackspace removes it and renumbers the rest), so only the
+	 *    first marker for an id is the editor's. Later look-alikes stay literal
+	 *    instead of duplicating the paste into the submitted prompt.
+	 */
 	private expandPasteMarkers(text: string): string {
-		let result = text;
-		for (const [pasteId, pasteContent] of this.pastes) {
-			const markerRegex = new RegExp(`\\[paste #${pasteId}( (\\+\\d+ lines|\\d+ chars))?\\]`, "g");
-			result = result.replace(markerRegex, () => pasteContent);
+		if (this.pastes.size === 0 || !text.includes("[paste #")) {
+			return text;
 		}
-		return result;
+
+		const expanded = new Set<number>();
+		return text.replace(PASTE_MARKER_REGEX, (match, idGroup: string) => {
+			const id = Number(idGroup);
+			if (expanded.has(id)) return match;
+			const content = this.pastes.get(id);
+			if (content === undefined) return match;
+			if (match !== expectedPasteMarker(id, content)) return match;
+			expanded.add(id);
+			return content;
+		});
 	}
 
 	/**

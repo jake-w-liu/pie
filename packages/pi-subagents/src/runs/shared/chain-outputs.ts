@@ -1,6 +1,5 @@
 import { isDynamicParallelStep, isParallelStep, type ChainStep, type SequentialStep } from "../../shared/settings.ts";
-import type { ChainOutputMap, ChainOutputMapEntry, SingleResult } from "../../shared/types.ts";
-import { getSingleResultOutput } from "../../shared/utils.ts";
+import type { ChainOutputMap, ChainOutputMapEntry } from "../../shared/types.ts";
 import { DynamicFanoutError, hasDynamicFanoutFields, type DynamicFanoutConfig, validateDynamicStepShape } from "./dynamic-fanout.ts";
 
 const OUTPUT_REF_PATTERN = /\{outputs\.([^}]*)\}/g;
@@ -95,15 +94,6 @@ export function resolveOutputReferences(template: string, outputs: ChainOutputMa
 
 function compactStructuredText(value: unknown): string {
 	return JSON.stringify(value);
-}
-
-export function outputEntryFromResult(result: SingleResult, stepIndex: number): ChainOutputMapEntry {
-	return {
-		text: result.structuredOutput !== undefined ? compactStructuredText(result.structuredOutput) : getSingleResultOutput(result),
-		...(result.structuredOutput !== undefined ? { structured: result.structuredOutput } : {}),
-		agent: result.agent,
-		stepIndex,
-	};
 }
 
 export function outputEntryFromAsyncResult(result: { agent: string; output: string; structuredOutput?: unknown }, stepIndex: number): ChainOutputMapEntry {

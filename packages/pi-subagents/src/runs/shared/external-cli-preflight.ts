@@ -115,8 +115,3 @@ export function invalidateExternalCliPreflight(command: string, spec: ExternalCl
 	}
 	for (const [lookupKey, cacheKey] of lookup) if (!cache.has(cacheKey)) lookup.delete(lookupKey);
 }
-
-export function clearExternalCliPreflightCacheForTests(): void {
-	cache.clear();
-	lookup.clear();
-}

@@ -1,5 +1,5 @@
 import type { ChainConfig, ChainStepConfig } from "./agents.ts";
-import { buildRuntimeName, frontmatterNameForConfig, parsePackageName } from "./identity.ts";
+import { buildRuntimeName, parsePackageName } from "./identity.ts";
 import { parseFrontmatter } from "./frontmatter.ts";
 import { ChainOutputValidationError, validateChainOutputBindings } from "../runs/shared/chain-outputs.ts";
 import { validateAcceptanceInput } from "../runs/shared/acceptance.ts";
@@ -223,58 +223,4 @@ export function parseJsonChain(content: string, source: AgentSource, filePath: s
 		steps: input.chain as ChainStepConfig[],
 		...(Object.keys(extraFields).length > 0 ? { extraFields } : {}),
 	};
-}
-
-export function serializeJsonChain(config: ChainConfig): string {
-	const root: Record<string, unknown> = {
-		name: frontmatterNameForConfig(config),
-		description: config.description,
-		chain: config.steps,
-	};
-	if (config.packageName) root.package = config.packageName;
-	if (config.extraFields) {
-		for (const [key, value] of Object.entries(config.extraFields)) {
-			if (key !== "name" && key !== "description" && key !== "package" && key !== "chain") root[key] = value;
-		}
-	}
-	return `${JSON.stringify(root, null, 2)}\n`;
-}
-
-export function serializeChain(config: ChainConfig): string {
-	const lines: string[] = [];
-	lines.push("---");
-	lines.push(`name: ${frontmatterNameForConfig(config)}`);
-	if (config.packageName) lines.push(`package: ${config.packageName}`);
-	lines.push(`description: ${config.description}`);
-	if (config.extraFields) {
-		for (const [key, value] of Object.entries(config.extraFields)) {
-			lines.push(`${key}: ${value}`);
-		}
-	}
-	lines.push("---");
-	lines.push("");
-
-	for (let i = 0; i < config.steps.length; i++) {
-		const step = config.steps[i]!;
-		lines.push(`## ${step.agent}`);
-		if (step.output === false) lines.push("output: false");
-		else if (step.output) lines.push(`output: ${step.output}`);
-		if (step.phase) lines.push(`phase: ${step.phase}`);
-		if (step.label) lines.push(`label: ${step.label}`);
-		if (step.as) lines.push(`as: ${step.as}`);
-		if (step.outputSchema) lines.push(`outputSchema: ${step.outputSchema}`);
-		if (step.outputMode) lines.push(`outputMode: ${step.outputMode}`);
-		if (step.reads === false) lines.push("reads: false");
-		else if (Array.isArray(step.reads) && step.reads.length > 0) lines.push(`reads: ${step.reads.join(", ")}`);
-		if (step.model) lines.push(`model: ${step.model}`);
-		if (step.skills === false) lines.push("skills: false");
-		else if (Array.isArray(step.skills) && step.skills.length > 0) lines.push(`skills: ${step.skills.join(", ")}`);
-		if (step.progress !== undefined) lines.push(`progress: ${step.progress ? "true" : "false"}`);
-		if (step.toolBudget !== undefined) lines.push(`toolBudget: ${JSON.stringify(step.toolBudget)}`);
-		lines.push("");
-		lines.push(step.task ?? "");
-		if (i < config.steps.length - 1) lines.push("");
-	}
-
-	return `${lines.join("\n")}\n`;
 }

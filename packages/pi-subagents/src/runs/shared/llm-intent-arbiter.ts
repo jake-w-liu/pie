@@ -6,23 +6,6 @@ import type { ProviderHeaders } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
 import { agentStreamOptions } from "../../shared/agent-stream-options.ts";
 
-/**
- * LLM intent arbiter for the completion mutation guard.
- *
- * The regex classifier (task-intent.ts) is deliberately narrow, so exotic
- * review wording can still look like an implementation task ("to fix this,
- * compare the outputs", verbs inside URLs or quoted text). When the guard is
- * about to hard-fail a run that made no edits, this arbiter asks a model
- * whether the task actually instructed file changes. It can only downgrade a
- * failure to a pass; every error, timeout, or non-read-only verdict keeps the
- * guard's original behavior.
- *
- * Enabled by default; set PI_SUBAGENTS_LLM_INTENT_ARBITER=0 to disable.
- */
-
-const COMPLETION_GUARD_ERROR_PREFIX =
-	"Subagent completed without making edits for an implementation task.";
-
 export type TaskMutationVerdict = "read-only" | "implementation" | "unavailable";
 
 export type TaskMutationArbiter = (task: string) => Promise<TaskMutationVerdict>;
@@ -242,10 +225,6 @@ export function createTaskMutationArbiter(
 	};
 }
 
-export function isCompletionGuardFailure(result: { error?: string }): boolean {
-	return result.error?.startsWith(COMPLETION_GUARD_ERROR_PREFIX) === true;
-}
-
 export async function arbitrateCompletionGuardRescue(input: {
 	guardTriggered: boolean;
 	task: string;
@@ -265,38 +244,5 @@ export async function arbitrateCompletionGuardRescue(input: {
 		return { triggered: true, rescued: false };
 	} catch {
 		return { triggered: true, rescued: false };
-	}
-}
-
-/**
- * When the completion guard hard-failed a run and the arbiter classifies the
- * task as read-only, clear the failure. Returns true when rescued. All other
- * verdicts and every failure mode keep the original guard behavior.
- *
- * Classification uses the task text only: the agent's own final message is
- * never evidence, so a child that failed to implement cannot talk its way
- * out of the guard by claiming the work was read-only.
- */
-export async function maybeRescueCompletionGuardFailure(
-	result: { exitCode?: number; error?: string },
-	task: string,
-	arbiter: TaskMutationArbiter | undefined,
-): Promise<boolean> {
-	if (!arbiter || !isCompletionGuardFailure(result)) return false;
-	const verdict = await arbitrateWithGuard(arbiter, task);
-	if (verdict !== "read-only") return false;
-	result.exitCode = 0;
-	delete result.error;
-	return true;
-}
-
-async function arbitrateWithGuard(
-	arbiter: TaskMutationArbiter,
-	task: string,
-): Promise<TaskMutationVerdict> {
-	try {
-		return await arbiter(task);
-	} catch {
-		return "unavailable";
 	}
 }

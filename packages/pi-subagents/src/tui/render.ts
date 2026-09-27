@@ -89,11 +89,11 @@ const ansiStylePattern = /\x1b\[[0-9;]*m/y;
 
 /**
  * Truncate a line to maxWidth, preserving ANSI styling through the ellipsis.
- * 
+ *
  * pi-tui's truncateToWidth adds \x1b[0m before ellipsis which resets all styling,
  * causing background color bleed in the TUI. This implementation tracks active
  * ANSI styles and re-applies them before the ellipsis.
- * 
+ *
  * Uses Intl.Segmenter for proper Unicode/emoji handling (not char-by-char).
  */
 export function truncLine(text: string, maxWidth: number): string {
@@ -1857,7 +1857,6 @@ function renderMultiCompact(d: Details, theme: Theme, layout: MainWindowRenderLa
 	const width = getTermWidth() - 4;
 	const rowIndent = mainWindowIndent(layout, 1);
 	const detailIndent = mainWindowIndent(layout, 2);
-	const continuationIndent = mainWindowIndent(layout, 3) + (layout.horizontalSpacing > 0 ? " " : "");
 	c.addChild(new Text(truncLine(`${glyph} ${theme.fg("toolTitle", theme.bold(d.mode))}${contextBadge}${stats ? ` ${theme.fg("dim", "·")} ${stats}` : ""}`, width), 0, 0));
 
 	const useResultsDirectly = multiLabel.hasParallelInChain || !d.chainAgents?.length;
@@ -2164,7 +2163,7 @@ export function renderSubagentResult(
 	const contextBadge = contextModeBadge(theme, d.context);
 	const multiLabel = buildMultiProgressLabel(d, hasRunning);
 	const itemTitle = multiLabel.itemTitle;
-	
+
 	const chainVis = d.chainAgents?.length && !multiLabel.hasParallelInChain
 		? d.chainAgents
 				.map((agent, i) => {
@@ -2230,7 +2229,7 @@ export function renderSubagentResult(
 			continue;
 		}
 
-		const progressFromArray = d.progress?.find((p) => p.index === i) 
+		const progressFromArray = d.progress?.find((p) => p.index === i)
 			|| d.progress?.find((p) => p.agent === r.agent && p.status === "running");
 		const rProg = r.progress || progressFromArray || r.progressSummary;
 		const rRunning = isResultRunning(r, rProg?.status);

@@ -1,6 +1,6 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { THINKING_LEVELS, type ThinkingLevel } from "../shared/model-info.ts";
+import { type ThinkingLevel } from "../shared/model-info.ts";
 import type { Details } from "../shared/types.ts";
 import { buildWatchdogStatus } from "./register-main.ts";
 import type { MainWatchdogRuntime } from "./runtime.ts";
@@ -152,4 +152,3 @@ export function handleWatchdogToolAction(action: string, params: WatchdogToolPar
 }
 
 export const WATCHDOG_TOOL_ACTIONS = ["watchdog.status", "watchdog.check", "watchdog.configure", "watchdog.recommend-model"] as const;
-export const WATCHDOG_THINKING_VALUES = ["inherit", ...THINKING_LEVELS] as const;

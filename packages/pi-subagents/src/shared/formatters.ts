@@ -2,10 +2,7 @@
  * Formatting utilities for display output
  */
 
-import * as fs from "node:fs";
-import * as path from "node:path";
-import type { Usage, SingleResult, TokenUsage } from "./types.ts";
-import type { ChainStep } from "./settings.ts";
+import type { Usage, TokenUsage } from "./types.ts";
 import { isDynamicParallelStep, isParallelStep } from "./settings.ts";
 import { previewDisplayText, sanitizeDisplayText } from "./display-text.ts";
 import { splitKnownThinkingSuffix, THINKING_LEVELS } from "./model-info.ts";
@@ -67,47 +64,6 @@ export function formatDuration(ms: number): string {
 	const seconds = Math.max(0, Math.round(ms / 1000));
 	if (seconds < 60) return `${seconds}s`;
 	return `${Math.floor(seconds / 60)}m${seconds % 60}s`;
-}
-
-/**
- * Build a summary string for a completed/failed chain
- */
-export function buildChainSummary(
-	steps: ChainStep[],
-	results: SingleResult[],
-	chainDir: string,
-	status: "completed" | "failed",
-	failedStep?: { index: number; error: string },
-): string {
-	const stepNames = steps
-		.map((step) => (isParallelStep(step) ? `parallel[${step.parallel.length}]` : isDynamicParallelStep(step) ? `expand:${step.parallel.agent}` : step.agent))
-		.join(" → ");
-
-	const totalDuration = results.reduce((sum, r) => sum + (r.progress?.durationMs || 0), 0);
-	const durationStr = formatDuration(totalDuration);
-
-	const progressPath = path.join(chainDir, "progress.md");
-	const hasProgress = fs.existsSync(progressPath);
-	const allSkills = new Set<string>();
-	for (const r of results) {
-		if (r.skills) r.skills.forEach((s) => allSkills.add(s));
-	}
-	const skillsLine = allSkills.size > 0 ? `🔧 Skills: ${[...allSkills].join(", ")}` : "";
-
-	if (status === "completed") {
-		const stepWord = results.length === 1 ? "step" : "steps";
-		return `✅ Chain completed: ${stepNames} (${results.length} ${stepWord}, ${durationStr})${skillsLine ? `\n${skillsLine}` : ""}
-
-📋 Progress: ${hasProgress ? progressPath : "(none)"}
-📁 Artifacts: ${chainDir}`;
-	} else {
-		const stepInfo = failedStep ? ` at step ${failedStep.index + 1}` : "";
-		const errorInfo = failedStep?.error ? `: ${failedStep.error}` : "";
-		return `❌ Chain failed${stepInfo}${errorInfo}${skillsLine ? `\n${skillsLine}` : ""}
-
-📋 Progress: ${hasProgress ? progressPath : "(none)"}
-📁 Artifacts: ${chainDir}`;
-	}
 }
 
 /**

@@ -54,15 +54,6 @@ export function resolveGitRepositoryIdentity(cwd: string): GitRepositoryIdentity
 	};
 }
 
-function isSameGitRepositoryIdentity(left: GitRepositoryIdentity | undefined, right: GitRepositoryIdentity | undefined): boolean {
-	if (!left || !right) return false;
-	return left.commonDir === right.commonDir || left.root === right.root;
-}
-
-export function isSameGitRepository(leftCwd: string, rightCwd: string): boolean {
-	return isSameGitRepositoryIdentity(resolveGitRepositoryIdentity(leftCwd), resolveGitRepositoryIdentity(rightCwd));
-}
-
 function normalizeRequestedMode(value: unknown): { mode?: WorkflowChatProgressMode; error?: string } {
 	if (value === undefined) return { mode: "auto" };
 	if (typeof value !== "string" || !WORKFLOW_CHAT_PROGRESS_MODES.includes(value as WorkflowChatProgressMode)) {

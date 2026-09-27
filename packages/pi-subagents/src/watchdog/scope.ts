@@ -55,8 +55,3 @@ export class WatchdogScopeArtifact {
 export function isWatchdogAutoFollowPromptEvent(event: unknown): boolean {
 	return Boolean(event && typeof event === "object" && (event as { [WATCHDOG_AUTO_FOLLOW_PROMPT_MARKER]?: unknown })[WATCHDOG_AUTO_FOLLOW_PROMPT_MARKER]);
 }
-
-export function markWatchdogAutoFollowPromptEvent<T extends object>(event: T): T {
-	Object.defineProperty(event, WATCHDOG_AUTO_FOLLOW_PROMPT_MARKER, { value: true });
-	return event;
-}

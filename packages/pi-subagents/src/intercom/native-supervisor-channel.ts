@@ -96,10 +96,6 @@ function safeSegment(value: string): string {
 	return value.trim().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "unknown";
 }
 
-export function resolveSupervisorChannelDir(runId: string, agent: string, childIndex: number): string {
-	return path.join(SUPERVISOR_CHANNEL_ROOT, `${safeSegment(runId)}-${safeSegment(agent)}-${childIndex}`);
-}
-
 export function ensureSupervisorChannelDir(channelDir: string): void {
 	fs.mkdirSync(path.join(channelDir, REQUESTS_DIR), { recursive: true, mode: 0o700 });
 	fs.mkdirSync(path.join(channelDir, REPLIES_DIR), { recursive: true, mode: 0o700 });

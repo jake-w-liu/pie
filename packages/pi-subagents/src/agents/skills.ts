@@ -747,8 +747,3 @@ export function discoverAvailableSkills(cwd: string): Array<{
 		}))
 		.sort((a, b) => a.name.localeCompare(b.name));
 }
-
-export function clearSkillCache(): void {
-	skillCache.clear();
-	loadSkillsCache = null;
-}

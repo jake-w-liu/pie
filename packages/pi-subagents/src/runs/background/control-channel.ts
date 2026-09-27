@@ -542,13 +542,6 @@ export function consumeTimeoutRequest(
 	return true;
 }
 
-export function consumeStopRequest(
-	asyncDir: string,
-	fsImpl: Pick<typeof fs, "existsSync" | "rmSync" | "readdirSync" | "readFileSync"> = fs,
-): boolean {
-	return consumeStopRequestPayload(asyncDir, fsImpl) !== undefined;
-}
-
 function parseStopRequest(raw: unknown): StopRequest | undefined {
 	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
 	const parsed = raw as Partial<StopRequest>;
@@ -609,13 +602,6 @@ export function consumeStopRequestPayloads(
 		if (request) requests.push(request);
 	}
 	return requests.sort((left, right) => (left.ts ?? 0) - (right.ts ?? 0));
-}
-
-export function consumeStopRequestPayload(
-	asyncDir: string,
-	fsImpl: Pick<typeof fs, "existsSync" | "rmSync" | "readdirSync" | "readFileSync"> = fs,
-): StopRequest | undefined {
-	return consumeStopRequestPayloads(asyncDir, fsImpl)[0];
 }
 
 /** Parent side: write the authoritative portable interrupt request. */

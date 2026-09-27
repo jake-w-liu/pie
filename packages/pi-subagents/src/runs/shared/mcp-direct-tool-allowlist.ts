@@ -131,14 +131,6 @@ export function resolveMcpDirectToolResolution(
 	};
 }
 
-export function resolveMcpDirectToolSelections(
-	mcpDirectTools: string[] | undefined,
-	cwd = process.cwd(),
-	runtimeSnapshotHost?: McpRuntimeSnapshotHost,
-): ResolvedMcpDirectToolSelection[] {
-	return resolveMcpDirectToolResolution(mcpDirectTools, cwd, runtimeSnapshotHost).selections;
-}
-
 export function formatUnresolvedMcpDirectToolSelectors(selectors: readonly string[]): string {
 	return `Unresolved MCP direct-tool selectors: ${selectors.join(", ")}. Direct MCP tools require a matching configured server and fresh metadata cache; runtime-registered servers require a host/pi-mcp-adapter handoff before child launch.`;
 }
@@ -350,10 +342,6 @@ function resolveDirectToolSelections(config: McpConfig, cache: MetadataCache, pr
 	}
 
 	return names;
-}
-
-export function resolveMcpDirectToolNames(mcpDirectTools: string[] | undefined, cwd = process.cwd()): string[] {
-	return resolveMcpDirectToolSelections(mcpDirectTools, cwd).map((selection) => selection.name);
 }
 
 function parseSelections(selections: string[]): { servers: Set<string>; tools: Map<string, Set<string>> } {

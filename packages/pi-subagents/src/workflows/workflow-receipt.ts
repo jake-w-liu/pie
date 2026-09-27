@@ -279,12 +279,3 @@ function assertResumableEntry(entry: WorkflowReceiptEntry, workflowRunId: string
 	if (entry.resumability.state !== "resumable") throw new Error(`Workflow receipt '${workflowRunId}' child '${key}' is not resumable: ${entry.resumability.reason}.`);
 	if (!entry.latestRunId) throw new Error(`Workflow receipt '${workflowRunId}' child '${key}' has no retained run id.`);
 }
-
-export function resolveWorkflowReceiptResume(input: {
-	reference: WorkflowReceiptResumeReference;
-	asyncDirRoot: string;
-	assertResumable?: (runId: string) => void;
-}): string {
-	const entry = resolveWorkflowReceiptResumeEntry(input);
-	return entry.latestRunId;
-}

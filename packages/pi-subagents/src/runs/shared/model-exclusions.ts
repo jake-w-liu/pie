@@ -161,24 +161,6 @@ export function recordModelFailure(options: RecordModelFailureOptions): void {
 }
 
 /**
- * Drop all expired exclusions from memory and schedule a persist.
- */
-export function clearExpiredExclusions(): void {
-	ensureLoaded();
-	prune(exclusions, Date.now());
-	schedulePersist();
-}
-
-/**
- * Remove every exclusion (e.g. after the operator fixes credentials).
- */
-export function clearExclusions(): void {
-	ensureLoaded();
-	exclusions.length = 0;
-	schedulePersist();
-}
-
-/**
  * Whether an exclusion entry matches a candidate.
  *
  * Semantics:
@@ -215,15 +197,6 @@ export function findModelExclusion(fullId: string, now = Date.now()): Readonly<M
 	ensureLoaded();
 	const { provider, modelId } = parseModelKey(fullId);
 	return exclusions.find((entry) => entryMatches(entry, modelId, provider, now));
-}
-
-/**
- * Number of live (non-expired) exclusions.
- */
-export function getExcludedCount(): number {
-	ensureLoaded();
-	clearExpiredExclusions();
-	return exclusions.length;
 }
 
 /**
@@ -267,16 +240,6 @@ export function filterFallbackCandidates(candidates: string[], opts?: {
 		filtered.push(raw);
 	}
 	return filtered;
-}
-
-/**
- * Reload exclusions from disk (for tests and config hot-reload).
- * Discards any in-memory-only exclusions that were not yet persisted.
- */
-export function reloadFromDisk(): void {
-	loaded = false;
-	exclusions = [];
-	ensureLoaded();
 }
 
 function prune(items: ModelExclusion[], now: number): void {

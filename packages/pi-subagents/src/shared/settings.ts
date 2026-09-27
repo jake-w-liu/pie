@@ -162,24 +162,6 @@ export function getStepAgents(step: ChainStep): string[] {
 	return [step.agent];
 }
 
-// =============================================================================
-// Chain Directory Management
-// =============================================================================
-
-export function createChainDir(runId: string, baseDir?: string): string {
-	const chainDir = path.join(baseDir ? path.resolve(baseDir) : CHAIN_RUNS_DIR, runId);
-	fs.mkdirSync(chainDir, { recursive: true });
-	return chainDir;
-}
-
-export function removeChainDir(chainDir: string): void {
-	try {
-		fs.rmSync(chainDir, { recursive: true });
-	} catch {
-		// Chain cleanup is best-effort. Runs can already have cleaned their temp dir.
-	}
-}
-
 export function cleanupOldChainDirs(): void {
 	if (!fs.existsSync(CHAIN_RUNS_DIR)) return;
 	const now = Date.now();
@@ -211,33 +193,6 @@ export function cleanupOldChainDirs(): void {
 
 /** Resolved templates for a chain - string for sequential, string[] for parallel */
 export type ResolvedTemplates = (string | string[])[];
-
-/**
- * Resolve templates for a chain with parallel step support.
- * Returns string for sequential steps, string[] for parallel steps.
- */
-export function resolveChainTemplates(
-	steps: ChainStep[],
-): ResolvedTemplates {
-	return steps.map((step, i) => {
-		if (isParallelStep(step)) {
-			// Parallel step: resolve each task's template
-			return step.parallel.map((task) => {
-				if (task.task) return task.task;
-				// Default for parallel tasks is {previous}
-				return "{previous}";
-			});
-		}
-		if (isDynamicParallelStep(step)) {
-			return step.parallel.task ?? "{previous}";
-		}
-		// Sequential step: existing logic
-		const seq = step as SequentialStep;
-		if (seq.task) return seq.task;
-		// Default: first step uses {task}, others use {previous}
-		return i === 0 ? "{task}" : "{previous}";
-	});
-}
 
 // =============================================================================
 // Behavior Resolution
@@ -392,10 +347,10 @@ export function buildChainInstructions(
 		suffixParts.push(`Previous step output:\n${previousSummary.trim()}`);
 	}
 
-	const prefix = prefixParts.length > 0 
+	const prefix = prefixParts.length > 0
 		? prefixParts.join("\n") + "\n\n"
 		: "";
-	
+
 	const suffix = suffixParts.length > 0
 		? "\n\n---\n" + suffixParts.join("\n")
 		: "";
@@ -482,21 +437,6 @@ export function resolveParallelBehaviors(
 		const model = task.model ?? config.model;
 		return { output, outputMode, reads, progress, skills, model };
 	});
-}
-
-/**
- * Create subdirectories for parallel step outputs
- */
-export function createParallelDirs(
-	chainDir: string,
-	stepIndex: number,
-	taskCount: number,
-	agentNames: string[],
-): void {
-	for (let i = 0; i < taskCount; i++) {
-		const subdir = path.join(chainDir, `parallel-${stepIndex}`, `${i}-${agentNames[i]}`);
-		fs.mkdirSync(subdir, { recursive: true });
-	}
 }
 
 export type { ParallelTaskResult } from "../runs/shared/parallel-utils.ts";

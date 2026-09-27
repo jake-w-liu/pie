@@ -226,32 +226,13 @@ function runHostCall(key, params, collectFailure, batch) {
   return { key, callId, promise };
 }
 
-function isArrayIndexProperty(prop) {
-  if (!/^(0|[1-9]\d*)$/.test(prop)) return false;
-  const index = Number(prop);
-  return Number.isSafeInteger(index) && index >= 0 && index < 4294967295;
-}
-
 const runsAllResultTargets = new WeakMap();
 
-function runsAllKeyAccessError(prop) {
-  return new Error("Cannot read runs.all result property '" + prop + "'. runs.all resolves to an ordered array, not a key map. Use results[0], array destructuring, or results.map((result) => result.output), not results." + prop + ".");
-}
-
-function wrapRunsAllResults(results, keys) {
-  const keySet = new Set(keys);
-  const proxy = new Proxy(results, {
-    get(target, prop, receiver) {
-      if (typeof prop !== "string") return Reflect.get(target, prop, receiver);
-      if (prop === "then" || prop === "toJSON") return undefined;
-      if (prop in target || isArrayIndexProperty(prop)) return Reflect.get(target, prop, receiver);
-      if (keySet.has(prop)) throw runsAllKeyAccessError(prop);
-      throw runsAllKeyAccessError(prop);
-    },
-  });
-  runsAllResultTargets.set(proxy, results);
-  return proxy;
-}
+// No worker-realm runs.all guard here on purpose. adopt() deep-copies whatever this
+// promise resolves into the vm context before the script can touch it, and the
+// context realm rebuilds the ordered-array guard itself (guardResultsArray), so a
+// proxy built here was unobservable: neutering it changed no script-visible behavior.
+// The key-shaped-access error the user sees comes from the context-realm guard.
 
 function formatRef(result) {
   if (!result || typeof result !== "object") throw new Error("runs.ref(result) requires a run result object.");
@@ -351,7 +332,7 @@ const runs = Object.freeze({
     runFingerprints = fingerprints;
     const batch = { id: "batch-" + (++nextCallId), calls };
     const launched = calls.map(({ key, params }) => runHostCall(key, params, true, batch));
-    return trackRunObservation(launched.map(({ key, callId }) => ({ key, operation: "run", callId })), Promise.all(launched.map(({ promise }) => promise)).then((results) => wrapRunsAllResults(results.map(decorateWorkflowChildResult), calls.map(({ key }) => key))));
+    return trackRunObservation(launched.map(({ key, callId }) => ({ key, operation: "run", callId })), Promise.all(launched.map(({ promise }) => promise)).then((results) => results.map(decorateWorkflowChildResult)));
   },
   steer(key, message, options = {}) {
     if (typeof key !== "string" || !runKeyPattern.test(key)) throw new Error("runs.steer has an invalid key.");

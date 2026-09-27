@@ -134,25 +134,6 @@ export function getProjectArtifactsDir(cwd: string): string {
 	return path.join(getProjectSubagentsDir(cwd), "artifacts");
 }
 
-export function getProjectChainRunsDir(cwd: string): string {
-	return path.join(getProjectSubagentsDir(cwd), "chain-runs");
-}
-
-export function getChainRunsDir(
-	projectCwd: string,
-	dirPreference: ArtifactDirPreference = "session",
-): string {
-	switch (dirPreference) {
-		case "project":
-			return getProjectChainRunsDir(projectCwd);
-		case "session":
-		case "temp":
-			return CHAIN_RUNS_DIR;
-		default:
-			throw new Error(`Unsupported artifactDir ${JSON.stringify(dirPreference)}; expected "project", "session", or "temp".`);
-	}
-}
-
 export function getArtifactsDir(
 	sessionFile: string | null,
 	projectCwd?: string,

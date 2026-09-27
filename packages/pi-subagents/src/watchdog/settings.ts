@@ -468,19 +468,6 @@ function parseSessionOverride(value: Record<string, unknown>): WatchdogConfigPat
 	return parseWatchdogPatch(value, "subagents.watchdog", { scope: "session" });
 }
 
-export function resolveWatchdogConfigStrict(cwd: string, options: { session?: Record<string, unknown> } = {}): ResolvedWatchdogConfig {
-	let patch: WatchdogConfigPatch = {};
-	patch = deepMerge(patch as Record<string, unknown>, parseSourceFile(getUserSettingsPath(), "user") as Record<string, unknown>) as WatchdogConfigPatch;
-	const projectSettingsPath = getProjectSettingsPath(cwd);
-	if (projectSettingsPath) {
-		patch = deepMerge(patch as Record<string, unknown>, parseSourceFile(projectSettingsPath, "project") as Record<string, unknown>) as WatchdogConfigPatch;
-	}
-	if (options.session) {
-		patch = deepMerge(patch as Record<string, unknown>, parseSessionOverride(options.session) as Record<string, unknown>) as WatchdogConfigPatch;
-	}
-	return resolvePatch(patch);
-}
-
 function ensureObjectField(parent: Record<string, unknown>, key: string, field: string, meta: ParseMeta): Record<string, unknown> {
 	if (!(key in parent)) parent[key] = {};
 	if (!isPlainObject(parent[key])) throw invalid(meta, field, "an object");

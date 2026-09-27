@@ -410,14 +410,6 @@ function resultFilesFromIndexDir(resultsDir: string, dir: string, includePending
 	return [...candidates];
 }
 
-export function resultFilesForSession(resultsDir: string, sessionId: string): string[] {
-	const files = new Set<string>();
-	for (const dir of sessionIndexDirs(resultsDir, sessionId)) {
-		for (const file of resultFilesFromIndexDir(resultsDir, dir)) files.add(file);
-	}
-	return [...files];
-}
-
 function pendingResultFilesForSession(resultsDir: string, sessionId: string): string[] {
 	const files = new Set<string>();
 	for (const dir of pendingSessionDirs(resultsDir, sessionId)) {
@@ -453,16 +445,8 @@ export function resultCandidateFilesForSession(resultsDir: string, sessionId: st
 	return [...files];
 }
 
-export function resultFilesForToolCall(resultsDir: string, toolCallId: string): string[] {
-	return resultFilesFromIndexDir(resultsDir, toolCallIndexDir(resultsDir, toolCallId));
-}
-
 export function resultCandidateFilesForToolCall(resultsDir: string, toolCallId: string): string[] {
 	return resultFilesFromIndexDir(resultsDir, toolCallIndexDir(resultsDir, toolCallId), true);
-}
-
-export function missionObserverResultFiles(resultsDir: string): string[] {
-	return resultFilesFromIndexDir(resultsDir, observerIndexDir(resultsDir, MISSION_OBSERVER));
 }
 
 export function missionObserverResultCandidateFiles(resultsDir: string): string[] {

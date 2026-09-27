@@ -189,14 +189,6 @@ export function saveConfig(config: ExtensionConfig, configPath = getConfigPath()
 	fs.writeFileSync(configPath, `${JSON.stringify(config, null, "\t")}\n`, "utf-8");
 }
 
-export function updateConfig(updater: (config: ExtensionConfig) => ExtensionConfig): ExtensionConfig {
-	const configPath = getConfigPath();
-	const next = updater(readConfigForUpdate(configPath));
-	validateConfig(next as Record<string, unknown>);
-	saveConfig(next, configPath);
-	return next;
-}
-
 /**
  * Resolve the default TTL that the process-wide exclusion store should use.
  *

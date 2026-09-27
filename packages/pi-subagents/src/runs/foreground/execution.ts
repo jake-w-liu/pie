@@ -387,7 +387,7 @@ async function runSingleAttempt(
 			childIndex: options.index ?? 0,
 		})
 		: undefined;
-	const permissionRules = resolvePermissionRules(options.permissions, agent.permissions);
+	const permissionRules = resolvePermissionRules(options.permissions, agent.permissions, agent.source);
 	const permissionAuditPath = permissionRules && options.artifactsDir
 		? path.join(options.artifactsDir, "permission-audit", `${options.runId}-${options.index ?? 0}.jsonl`)
 		: undefined;

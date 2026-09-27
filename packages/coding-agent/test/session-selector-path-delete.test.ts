@@ -104,6 +104,7 @@ describe("session selector path/delete interactions", () => {
 	const tempDirs: string[] = [];
 
 	afterEach(() => {
+		vi.useRealTimers();
 		for (const dir of tempDirs.splice(0)) {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -114,6 +115,11 @@ describe("session selector path/delete interactions", () => {
 		setKeybindings(new KeybindingsManager());
 		vi.mocked(spawnSync).mockReset();
 		vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: "", stderr: "" } as never);
+		// The delete result is shown through a status message that auto-hides after
+		// 3000ms, so a test that asserts on the rendered output races the real clock
+		// and fails on a loaded runner. Fake only setTimeout/clearTimeout so the
+		// auto-hide never fires; setImmediate stays real so flushPromises() still works.
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
 	});
 
 	beforeAll(() => {

@@ -894,7 +894,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			}
 		}
 		const agentContract = s.agentContract ?? params.agentContract;
-		const permissionRules = resolvePermissionRules(ctx.permissions, a.permissions);
+		const permissionRules = resolvePermissionRules(ctx.permissions, a.permissions, a.source);
 		const modelCandidates = externalRunner ? [] : buildModelCandidates(primaryModel, a.fallbackModels, availableModels, a.modelProvider ?? ctx.currentModelProvider, {
 			scope: modelScopes,
 			primaryModelFromParent,
@@ -1510,7 +1510,7 @@ export function executeAsyncSingle(
 	if (acceptanceErrors.length > 0) return formatAsyncStartError("single", acceptanceErrors.join(" "));
 	const externalRunner = agentConfig.runner?.type === "external-cli" || agentConfig.runner?.type === "external-job";
 	const externalRunnerType = agentConfig.runner?.type;
-	const permissionRules = resolvePermissionRules(ctx.permissions, agentConfig.permissions);
+	const permissionRules = resolvePermissionRules(ctx.permissions, agentConfig.permissions, agentConfig.source);
 	if (externalRunner) {
 		const unsupported: string[] = [];
 		if (params.modelOverride !== undefined) unsupported.push("model override");
@@ -1670,7 +1670,7 @@ export function executeAsyncSingle(
 		capabilityCeiling,
 		inheritedCapabilityCeiling: decodeSubagentCapabilityCeiling(process.env[SUBAGENT_CAPABILITY_CEILING_ENV]),
 		agentName: agentConfig.name,
-		permissionRules: resolvePermissionRules(ctx.permissions, agentConfig.permissions),
+		permissionRules: resolvePermissionRules(ctx.permissions, agentConfig.permissions, agentConfig.source),
 		runtimeSnapshotHost: ctx.pi,
 	});
 	const launchResolvedExtensions = externalRunner ? undefined : projectLaunchResolvedChildExtensions(toolPlan);

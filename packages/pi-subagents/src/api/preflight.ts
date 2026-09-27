@@ -348,7 +348,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 		}
 	}
 	let toolPlan: PiLaunchToolPlan;
-	const permissionRules = resolvePermissionRules(loadConfig().permissions, agent.permissions);
+	const permissionRules = resolvePermissionRules(loadConfig().permissions, agent.permissions, agent.source);
 	const fast = input.fast ?? agent.fast;
 	try {
 		toolPlan = resolvePiLaunchToolPlan({

@@ -220,9 +220,9 @@ async function exchangeAuthorizationCode(
 	try {
 		tokenJson = JSON.parse(responseBody);
 	} catch (error) {
-		throw new Error(
-			`Token exchange returned invalid JSON. url=${TOKEN_URL}; body=${responseBody}; details=${formatErrorDetails(error)}`,
-		);
+		// Do not echo the body: a 200 response that is not JSON can still echo a
+		// token, and ModelsError splices cause text into the user-visible message.
+		throw new Error(`Token exchange returned invalid JSON. url=${TOKEN_URL}; details=${formatErrorDetails(error)}`);
 	}
 
 	const tokenData = parseOAuthTokenResponse(tokenJson, "Anthropic token exchange");
@@ -344,8 +344,10 @@ async function refreshAnthropicToken(refreshToken: string, signal: AbortSignal):
 	try {
 		tokenJson = JSON.parse(responseBody);
 	} catch (error) {
+		// Do not echo the body: a 200 response that is not JSON can still echo a
+		// token, and ModelsError splices cause text into the user-visible message.
 		throw new Error(
-			`Anthropic token refresh returned invalid JSON. url=${TOKEN_URL}; body=${responseBody}; details=${formatErrorDetails(error)}`,
+			`Anthropic token refresh returned invalid JSON. url=${TOKEN_URL}; details=${formatErrorDetails(error)}`,
 		);
 	}
 

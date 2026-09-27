@@ -586,6 +586,31 @@ function installWorkflowApi(host) {
     return new Error(message);
   }
 
+  // Invoke a host function and hand the result to toContextPromise.
+  //
+  // The host call MUST be made inside this guard. toContextPromise only converts
+  // async failures, because it hooks .then; a synchronous throw from the host
+  // would otherwise propagate straight into the script carrying a worker-realm
+  // Error, and e.constructor.constructor hands the script a live worker Function
+  // that reaches process. Callers that pass host.runs.run(key, params) directly
+  // evaluate that call before toContextPromise is even entered, which reopened
+  // exactly the sandbox escape 5b6ecece8 closed on the async path.
+  function callHost(invoke) {
+    var result;
+    try {
+      result = invoke();
+    } catch (error) {
+      return Promise.reject(asContextError(error));
+    }
+    return result;
+  }
+
+  // Same guard for host calls that return a value rather than a promise: the
+  // script must see a context-realm Error, never the worker-realm original.
+  function syncHostError(error) {
+    return asContextError(error);
+  }
+
   function toContextPromise(hostPromise, transform) {
     let resolvePromise;
     let rejectPromise;
@@ -673,27 +698,27 @@ function installWorkflowApi(host) {
   }
 
   const runs = {
-    run: function (key, params) { return toContextPromise(host.runs.run(key, params)); },
-    all: function (items) { return toContextPromise(host.runs.all(items), guardResultsArray); },
-    steer: function (key, message, options) { return toContextPromise(host.runs.steer(key, message, options)); },
-    status: function (keyOrRunId) { return toContextPromise(host.runs.status(keyOrRunId)); },
-    ref: function (result) { return adopt(host.runs.ref(result)); },
-    refs: function (results) { return toContextPromise(host.runs.refs(results)); },
+    run: function (key, params) { return toContextPromise(callHost(function () { return host.runs.run(key, params); })); },
+    all: function (items) { return toContextPromise(callHost(function () { return host.runs.all(items); }), guardResultsArray); },
+    steer: function (key, message, options) { return toContextPromise(callHost(function () { return host.runs.steer(key, message, options); })); },
+    status: function (keyOrRunId) { return toContextPromise(callHost(function () { return host.runs.status(keyOrRunId); })); },
+    ref: function (result) { try { return adopt(host.runs.ref(result)); } catch (error) { throw syncHostError(error); } },
+    refs: function (results) { try { return adopt(host.runs.refs(results)); } catch (error) { throw syncHostError(error); } },
   };
 
   const consoleShim = {};
   for (const level of ["log", "info", "warn", "error"]) {
-    consoleShim[level] = function () { host.console[level].apply(null, arguments); };
+    consoleShim[level] = function () { try { return host.console[level].apply(null, arguments); } catch (error) { throw syncHostError(error); } };
   }
 
   const stateShim = {
-    get: function (key) { return toContextPromise(host.state.get(key)); },
-    set: function (key, value) { return toContextPromise(host.state.set(key, value)); },
+    get: function (key) { return toContextPromise(callHost(function () { return host.state.get(key); })); },
+    set: function (key, value) { return toContextPromise(callHost(function () { return host.state.set(key, value); })); },
   };
 
   globalThis.runs = runs;
   globalThis.console = consoleShim;
-  globalThis.emit = function (value) { return host.emit(value); };
+  globalThis.emit = function (value) { try { return host.emit(value); } catch (error) { throw syncHostError(error); } };
   if (host.state) globalThis.state = stateShim;
 
   // Instrument Promise.prototype.then from THIS realm. The wrapper is a

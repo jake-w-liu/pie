@@ -9,6 +9,11 @@
 
 ### Fixed
 
+- Fixed Kimi Coding and Anthropic OAuth error messages echoing the raw token-endpoint response. A partially valid response still carries a usable access token, and `ModelsError` splices cause text into the user-visible message, so the token reached logs and transcripts; the message now names the failure without the body.
+- Fixed `npx @earendil-works/pi-ai login` writing `auth.json` with default (world-readable) permissions, and silently truncating it when the existing file failed to parse so one login logged the user out of every other provider.
+- Fixed an OAuth credential whose `expires` was missing or non-finite (hand-edited, migrated, or partially written file) being treated as permanently fresh, which disabled refresh entirely and handed out a dead access token with no re-login prompt.
+- Fixed an explicit per-call `apiKey` override discarding a stored credential's provider-scoped `env` (Cloudflare account and gateway ids, Vertex ADC project/location, Bedrock profile), which made those providers report "not configured".
+- Fixed OpenAI Codex JWT decoding using `atob`, which implements standard base64 and throws on the base64url alphabet that RFC 7515 segments use; decoding is now base64url and UTF-8.
 - Fixed the OpenAI Codex and Radius OAuth flows hanging when their fixed callback port was already taken: a callback-server bind failure is now reported instead of being swallowed, which previously let a foreign listener receive the OAuth callback (Codex) or failed with a misleading "OAuth callback did not complete." (Radius).
 - Fixed a GitHub Copilot token refresh discarding a valid access token when the follow-up model catalog fetch failed.
 - Fixed the faux provider counting cache-write tokens as both cached and uncached input, roughly doubling reported `totalTokens`.

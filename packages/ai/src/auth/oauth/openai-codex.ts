@@ -109,7 +109,11 @@ function decodeJwt(token: string): JwtPayload | null {
 		const parts = token.split(".");
 		if (parts.length !== 3) return null;
 		const payload = parts[1] ?? "";
-		const decoded = atob(payload);
+		// RFC 7515 section 2 encodes segments with base64url, not standard base64.
+		// `atob` implements the standard alphabet and throws on the `-` and `_`
+		// characters base64url produces. `Buffer` also decodes as UTF-8; `atob`
+		// would mojibake any non-ASCII claim.
+		const decoded = Buffer.from(payload, "base64url").toString("utf-8");
 		return JSON.parse(decoded) as JwtPayload;
 	} catch {
 		return null;

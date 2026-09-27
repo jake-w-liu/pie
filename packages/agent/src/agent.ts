@@ -534,10 +534,22 @@ export class Agent {
 			return;
 		}
 
-		await this.processEvents({ type: "message_start", message: failureMessage }, signal);
-		await this.processEvents({ type: "message_end", message: failureMessage }, signal);
-		await this.processEvents({ type: "turn_end", message: failureMessage, toolResults: [] }, signal);
-		await this.processEvents({ type: "agent_end", messages: [failureMessage] }, signal);
+		// Best-effort close-out: a listener that throws on one of these must not
+		// strand the run without its terminal event, and the original failure is
+		// already recorded in state, so a close-out throw is not re-propagated.
+		const closeOut: Array<() => Promise<void>> = [
+			() => this.processEvents({ type: "message_start", message: failureMessage }, signal),
+			() => this.processEvents({ type: "message_end", message: failureMessage }, signal),
+			() => this.processEvents({ type: "turn_end", message: failureMessage, toolResults: [] }, signal),
+			() => this.processEvents({ type: "agent_end", messages: [failureMessage] }, signal),
+		];
+		for (const emit of closeOut) {
+			try {
+				await emit();
+			} catch {
+				// A failing listener cannot cancel the remaining close-out events.
+			}
+		}
 	}
 
 	private finishRun(): void {
@@ -603,8 +615,19 @@ export class Agent {
 				break;
 		}
 
+		// Deliver to every listener before surfacing a throw. Aborting the loop on
+		// the first failure skipped the remaining listeners, and propagated into
+		// handleRunFailure, whose close-out sequence emits message_start first --
+		// so a listener throwing on message_start/message_end skipped agent_end
+		// entirely and left consumers that gate on the terminal event unsettled.
+		let firstError: unknown;
 		for (const listener of this.listeners) {
-			await listener(event, signal);
+			try {
+				await listener(event, signal);
+			} catch (error) {
+				firstError ??= error;
+			}
 		}
+		if (firstError !== undefined) throw firstError;
 	}
 }

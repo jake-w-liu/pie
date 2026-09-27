@@ -193,6 +193,24 @@ export function registerHerdrStatusBridge(options: HerdrStatusBridgeOptions): He
 			}
 		})().finally(() => {
 			draining = false;
+			// An enqueue that lands between the loop condition going false and this
+			// microtask parks its report in `pendingReport` and returns early, because
+			// `draining` was still true. Re-arm so the report is not stranded: without
+			// it, `flush()` spins on a resolved drainPromise and starves the event loop.
+			if (pendingReport) {
+				const stranded = pendingReport;
+				pendingReport = undefined;
+				draining = true;
+				drainPromise = (async () => {
+					try {
+						await runHerdr(stranded);
+					} catch {
+						// Best effort; a later transition or TTL refresh retries.
+					}
+				})().finally(() => {
+					draining = false;
+				});
+			}
 		});
 	};
 
@@ -383,7 +401,12 @@ export function registerHerdrStatusBridge(options: HerdrStatusBridgeOptions): He
 			refresh();
 		},
 		async flush() {
-			while (draining || pendingReport) await drainPromise;
+			// Re-arm rather than only waiting: a report can be parked in `pendingReport`
+			// with no drain in flight, in which case waiting alone would never finish.
+			while (draining || pendingReport) {
+				if (!draining && pendingReport) enqueue(pendingReport);
+				await drainPromise;
+			}
 		},
 		dispose() {
 			if (disposed) return;

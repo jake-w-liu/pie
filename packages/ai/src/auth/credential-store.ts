@@ -49,6 +49,12 @@ export class InMemoryCredentialStore implements CredentialStore {
 			async () => {
 				const current = this.credentials.get(providerId);
 				const next = await fn(current === undefined ? undefined : structuredClone(current));
+				// An abort after `fn` completed discards its result: a cancelled
+				// operation must not mutate stored state (see
+				// test/models-runtime.test.ts, "passes cancellation to OAuth refresh and
+				// preserves the previous credential"). The refresh itself is passed the
+				// caller's signal, so a real provider request is cancelled rather than
+				// completing, and there is nothing to persist.
 				options?.signal?.throwIfAborted();
 				if (next !== undefined) {
 					this.credentials.set(providerId, structuredClone(next));

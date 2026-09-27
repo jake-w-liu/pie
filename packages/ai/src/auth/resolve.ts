@@ -71,6 +71,13 @@ async function resolveProviderAuthWithSignal(
 	const requestAuthContext = overrides?.env ? overlayEnvAuthContext(authContext, overrides.env) : authContext;
 
 	if (overrides?.apiKey !== undefined && provider.auth.apiKey) {
+		// An explicit key replaces the key only. A stored credential can carry
+		// provider-scoped env that process.env does not have (Cloudflare account and
+		// gateway ids, Vertex ADC project/location, Bedrock profile); dropping it
+		// makes the provider report "not configured".
+		const overrideBase = await readCredential(credentials, provider.id, signal);
+		const storedEnv = overrideBase?.type === "api_key" ? overrideBase.env : undefined;
+		const env = storedEnv || overrides.env ? { ...storedEnv, ...overrides.env } : undefined;
 		return resolveApiKey(
 			requestAuthContext,
 			provider.auth.apiKey,
@@ -78,7 +85,7 @@ async function resolveProviderAuthWithSignal(
 			{
 				type: "api_key",
 				key: overrides.apiKey,
-				env: overrides.env,
+				env,
 			},
 			signal,
 		);
@@ -119,6 +126,16 @@ function overlayEnvAuthContext(base: AuthContext, env: ProviderEnv): AuthContext
 const DEFAULT_OAUTH_MINIMUM_VALIDITY_MS = 5 * 60 * 1000;
 const DEFAULT_OAUTH_REFRESH_TIMEOUT_MS = 15_000;
 
+/**
+ * True when an OAuth credential still has at least `minimumValidityMs` left.
+ * A non-finite expiry (hand-edited, migrated, or partially written auth.json)
+ * is not fresh: the plain relational comparison would be false for undefined,
+ * null, and NaN, disabling refresh permanently.
+ */
+export function isCredentialFresh(credential: OAuthCredential, minimumValidityMs: number): boolean {
+	return Number.isFinite(credential.expires) && Date.now() + minimumValidityMs < credential.expires;
+}
+
 /** Shared OAuth freshness policy, also used by the catalog-refresh path. */
 export const OAUTH_FRESHNESS_POLICY = {
 	minimumValidityMs: DEFAULT_OAUTH_MINIMUM_VALIDITY_MS,
@@ -139,7 +156,11 @@ async function resolveStoredOAuth(
 	minOAuthValidityMs?: number,
 ): Promise<AuthResult | undefined> {
 	const minimumValidityMs = Math.max(DEFAULT_OAUTH_MINIMUM_VALIDITY_MS, minOAuthValidityMs ?? 0);
-	const expiresSoon = (credential: OAuthCredential) => Date.now() + minimumValidityMs >= credential.expires;
+	// A credential whose expiry cannot be evaluated (a hand-edited, migrated, or
+	// partially written auth.json) must be treated as expired, not fresh: the
+	// relational comparison is false for undefined/null/NaN, which would disable
+	// refresh permanently and hand out a dead access token with no re-login prompt.
+	const expiresSoon = (credential: OAuthCredential) => !isCredentialFresh(credential, minimumValidityMs);
 	let credential = stored;
 
 	if (expiresSoon(credential)) {

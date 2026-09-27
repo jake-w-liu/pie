@@ -37,6 +37,9 @@
 
 ### Fixed
 
+- Closed a remaining `workflowScript` sandbox escape. A host call that threw synchronously bypassed the context-realm error conversion entirely, because the host function was evaluated as the argument to `toContextPromise` before that helper was entered. The script could catch a worker-realm `Error`, take `e.constructor.constructor` to obtain a live worker `Function`, and from there reach `process`, the environment, and the filesystem. Every host entry point is now invoked inside a guard that converts synchronous throws the same way asynchronous ones already were.
+- Fixed `workflowScript`'s `runs.refs([...])` always throwing `TypeError: hostPromise.then is not a function`. The context-realm API wrapped the host's synchronous formatted string as if it were a promise, so every workflow using it failed; it now returns the string like `runs.ref`.
+- Fixed the Herdr status bridge stranding a pane report when a publish landed as a drain finished, which left `flush()` spinning on an already-resolved promise forever and starved the event loop, wedging session shutdown. The drain re-arms and `flush()` re-queues stranded work.
 - Fixed `write` and `edit` destroying a file's contents when a write failed partway: both now replace the target atomically, so the original survives a failed or partial write. Symlinked targets and the target's permission bits are preserved, and a read-only target is still refused.
 - Fixed a crash landing inside the shutdown window leaving the terminal in raw/alt-screen mode; terminal restoration is now idempotent and always runs unless the tty is already gone.
 - Fixed the session trash, `gh auth status`, and archive-extraction subprocesses having no timeout, so a hung helper froze the whole TUI; a timed-out extraction now fails instead of installing from a partially extracted tree.

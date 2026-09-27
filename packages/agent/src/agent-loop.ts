@@ -505,9 +505,11 @@ async function executeToolCallsSequential(
 		finalizedCalls.push(finalized);
 		messages.push(toolResultMessage);
 
-		if (signal?.aborted) {
-			break;
-		}
+		// Do not break on abort. Every toolCall in the assistant message needs a
+		// toolResult, or the persisted transcript carries an unanswered tool call
+		// and providers reject the next request. executePreparedToolCall returns a
+		// "not-executed" error result immediately once the signal is aborted, so
+		// the remaining calls settle without dispatching.
 	}
 
 	return {
@@ -543,9 +545,10 @@ async function executeToolCallsParallel(
 			} satisfies FinalizedToolCallOutcome;
 			await emitToolExecutionEnd(finalized, emit);
 			finalizedCalls.push(finalized);
-			if (signal?.aborted) {
-				break;
-			}
+			// No break on abort: prepareToolCall returns an immediate
+			// "Operation aborted" result once the signal is aborted, so the
+			// remaining calls settle without dispatching. Breaking here would
+			// leave their toolCalls unanswered in the transcript.
 			continue;
 		}
 
@@ -562,9 +565,8 @@ async function executeToolCallsParallel(
 			await emitToolExecutionEnd(finalized, emit);
 			return finalized;
 		});
-		if (signal?.aborted) {
-			break;
-		}
+		// No break on abort: see the sequential loop. Skipping the remaining
+		// entries would leave their toolCalls unanswered in the transcript.
 	}
 
 	const executions = finalizedCalls.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry)));

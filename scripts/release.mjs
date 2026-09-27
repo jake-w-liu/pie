@@ -182,6 +182,16 @@ function updateChangelogsForRelease(version) {
 			continue;
 		}
 
+		// A duplicated heading makes the single-shot replace below rewrite only the
+		// first one, which strands the real entries under [Unreleased] forever and
+		// writes an empty release-notes section. Fail loudly instead.
+		const unreleasedHeadings = content.match(/^## \[Unreleased\]$/gm) ?? [];
+		if (unreleasedHeadings.length !== 1) {
+			throw new Error(
+				`${changelog} has ${unreleasedHeadings.length} "## [Unreleased]" headings; exactly one is required before releasing.`,
+			);
+		}
+
 		const updated = content.replace(
 			"## [Unreleased]",
 			`## [${version}] - ${date}`
@@ -198,11 +208,20 @@ function addUnreleasedSection() {
 	for (const changelog of changelogs) {
 		const content = readFileSync(changelog, "utf-8");
 
-		// Insert after "# Changelog\n\n"
+		if (content.includes("## [Unreleased]")) {
+			console.log(`  ${changelog} already has an [Unreleased] section`);
+			continue;
+		}
+
+		// Insert after "# Changelog\n\n". A silent no-op here would leave the next
+		// release with nothing to write, so assert the anchor actually matched.
 		const updated = content.replace(
 			/^(# Changelog\n\n)/,
 			`$1${unreleasedSection}`
 		);
+		if (updated === content) {
+			throw new Error(`${changelog} does not start with a "# Changelog" heading; cannot add an [Unreleased] section.`);
+		}
 		writeFileSync(changelog, updated);
 		console.log(`  Added [Unreleased] to ${changelog}`);
 	}

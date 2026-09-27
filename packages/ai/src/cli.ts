@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import type { AuthPrompt, OAuthCredential, Provider } from "./index.ts";
 import { builtinProviders } from "./providers/all.ts";
@@ -15,17 +15,39 @@ function prompt(rl: ReturnType<typeof createInterface>, question: string): Promi
 	return new Promise((resolve) => rl.question(question, resolve));
 }
 
+/**
+ * Read the credential file. A file that exists but cannot be read is fatal:
+ * returning `{}` here would make the next `saveAuth` truncate it, logging the
+ * user out of every other provider. Repair or delete the file instead.
+ */
 function loadAuth(): Record<string, OAuthCredential> {
 	if (!existsSync(AUTH_FILE)) return {};
+	let raw: string;
 	try {
-		return JSON.parse(readFileSync(AUTH_FILE, "utf-8")) as Record<string, OAuthCredential>;
-	} catch {
-		return {};
+		raw = readFileSync(AUTH_FILE, "utf-8");
+	} catch (error) {
+		throw new Error(`Cannot read ${AUTH_FILE}: ${error instanceof Error ? error.message : String(error)}`);
 	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (error) {
+		throw new Error(
+			`${AUTH_FILE} is not valid JSON (${error instanceof Error ? error.message : String(error)}). ` +
+				`Repair or delete it, then log in again.`,
+		);
+	}
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error(`${AUTH_FILE} must contain a JSON object of provider credentials. Repair or delete it.`);
+	}
+	return parsed as Record<string, OAuthCredential>;
 }
 
 function saveAuth(auth: Record<string, OAuthCredential>): void {
-	writeFileSync(AUTH_FILE, JSON.stringify(auth, null, 2), "utf-8");
+	// Same contract as the coding agent's auth storage: OAuth access and refresh
+	// tokens are written owner-only, and an existing file is tightened too.
+	writeFileSync(AUTH_FILE, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 0o600 });
+	chmodSync(AUTH_FILE, 0o600);
 }
 
 async function answerPrompt(rl: ReturnType<typeof createInterface>, authPrompt: AuthPrompt): Promise<string> {

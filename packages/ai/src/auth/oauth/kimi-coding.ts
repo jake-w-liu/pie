@@ -96,7 +96,8 @@ async function startDeviceAuthorization(oauthHost: string, signal: AbortSignal):
 		!trustedHttpUrl(verificationUriComplete) ||
 		!trustedHttpUrl(verificationUri)
 	) {
-		throw new Error(`Invalid Kimi Code device authorization response: ${JSON.stringify(json)}`);
+		// Do not echo the response: even a malformed response may contain usable secrets.
+		throw new Error("Invalid Kimi Code device authorization response");
 	}
 
 	const interval = json?.interval;
@@ -130,7 +131,9 @@ function parseTokenResponse(json: Record<string, unknown> | null, operation: str
 		!Number.isFinite(expiresIn) ||
 		expiresIn <= 0
 	) {
-		throw new Error(`Kimi Code token ${operation} response missing fields: ${JSON.stringify(json)}`);
+		// Do not echo the response: a partially valid one still carries a live access
+		// token, and `ModelsError` splices cause text into the user-visible message.
+		throw new Error(`Kimi Code token ${operation} response is missing required fields`);
 	}
 	return {
 		access: accessToken,

@@ -3,6 +3,7 @@ import { defaultProviderAuthContext as defaultAuthContext } from "./auth/context
 import { InMemoryCredentialStore } from "./auth/credential-store.ts";
 import {
 	type AuthResolutionOverrides,
+	isCredentialFresh,
 	ModelsError,
 	OAUTH_FRESHNESS_POLICY,
 	resolveProviderAuth,
@@ -460,14 +461,15 @@ class ModelsImpl implements MutableModels {
 			const oauth = provider.auth.oauth;
 			if (!oauth) return undefined;
 			// Same freshness floor as the request path: never hand out a token
-			// that dies inside the refresh window.
-			if (Date.now() + OAUTH_FRESHNESS_POLICY.minimumValidityMs < stored.expires) return stored;
+			// that dies inside the refresh window. A non-finite expiry cannot be
+			// evaluated, so it fails closed into a refresh.
+			if (isCredentialFresh(stored, OAUTH_FRESHNESS_POLICY.minimumValidityMs)) return stored;
 			if (signal.aborted) return undefined;
 			const post = await this.credentials.modify(
 				provider.id,
 				async (current) => {
 					if (current?.type !== "oauth") return undefined;
-					if (Date.now() + OAUTH_FRESHNESS_POLICY.minimumValidityMs < current.expires) return undefined;
+					if (isCredentialFresh(current, OAUTH_FRESHNESS_POLICY.minimumValidityMs)) return undefined;
 					const refreshSignal = AbortSignal.any([
 						signal,
 						AbortSignal.timeout(OAUTH_FRESHNESS_POLICY.refreshTimeoutMs),

@@ -248,3 +248,59 @@ describe("workflowScript context isolation", () => {
 		).rejects.toThrow(/unawaited runs\.run launch\(es\): 'a'/);
 	});
 });
+
+/**
+ * A host call that throws SYNCHRONOUSLY must not hand the script a worker-realm
+ * Error. toContextPromise only converts async failures, because it hooks .then;
+ * `toContextPromise(host.runs.run(key, params))` evaluated that call first, so a
+ * sync throw escaped raw and `e.constructor.constructor` gave the script a live
+ * worker Function that reaches process.
+ *
+ * Each case below provokes a real synchronous host throw on a different entry
+ * point and asserts the caught value is a context-realm Error that cannot build a
+ * Function.
+ */
+const SYNC_THROW_PROBES: Array<{ name: string; script: string }> = [
+	{ name: "emit(undefined) -> host assertJsonValue", script: "try { emit(undefined); } catch (e) { REPORT(e); }" },
+	{ name: "state.set(bad key) -> host validateStateKey", script: 'try { await state.set("!!", 1); } catch (e) { REPORT(e); }' },
+	{ name: "runs.run(non-string key) -> host validateRunCall", script: 'try { await runs.run(42, { agent: "worker", task: "A" }); } catch (e) { REPORT(e); }' },
+	{ name: "runs.all(non-array) -> host check", script: 'try { await runs.all("nope"); } catch (e) { REPORT(e); }' },
+	{ name: "runs.steer(bad mode) -> host validate", script: 'try { await runs.steer("a", "hi", { mode: "bogus" }); } catch (e) { REPORT(e); }' },
+];
+
+function escapeProbe(body: string): string {
+	return [
+		"function REPORT(e) {",
+		"  let reach = 'no-error';",
+		"  try { reach = e.constructor.constructor('return typeof process')(); }",
+		"  catch (inner) { reach = 'blocked'; }",
+		"  emit({ isContextError: e instanceof Error, escape: reach });",
+		"}",
+		body,
+		"return 1;",
+	].join("\n");
+}
+
+describe("workflowScript synchronous host throws stay in the context realm", () => {
+	for (const { name, script } of SYNC_THROW_PROBES) {
+		it(`converts ${name} into a context-realm error`, async () => {
+			const result = await runWorkflowScript(
+				harness({ script: escapeProbe(script) }),
+			);
+			const reported = result.emits?.[0] as { isContextError?: boolean; escape?: string } | undefined;
+			expect(reported, "the probe should have caught a host throw").toBeDefined();
+			expect(reported?.isContextError, "a worker-realm Error reached the script").toBe(true);
+			// "object" would mean the host realm is reachable; anything else is blocked.
+			expect(reported?.escape, "the script reached the host realm's Function").not.toBe("object");
+		}, 20_000);
+	}
+
+	it("does not leak the host realm through a synchronous ref failure", async () => {
+		const result = await runWorkflowScript(
+			harness({ script: escapeProbe('try { runs.ref(undefined); } catch (e) { REPORT(e); }') }),
+		);
+		const reported = result.emits?.[0] as { isContextError?: boolean; escape?: string } | undefined;
+		expect(reported?.isContextError).toBe(true);
+		expect(reported?.escape).not.toBe("object");
+	}, 20_000);
+});

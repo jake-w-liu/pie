@@ -8,6 +8,8 @@
 
 ### Fixed
 
+- Fixed an aborted tool batch leaving the assistant message's remaining tool calls unanswered. The loop broke out on abort, so the persisted transcript carried orphaned `toolCall` blocks that providers reject on the next request; every call now settles with an "Operation aborted" result instead.
+- Fixed a throwing event listener skipping every listener after it, and on `message_start`/`message_end` swallowing `agent_end` entirely so consumers gating on the terminal event never settled. Delivery now completes to all listeners before the failure propagates, and the failure close-out always emits its full sequence.
 - Fixed `write` and `edit` destroying a file's contents when a write failed partway: both now replace the target atomically (temp file in the same directory, fsync, rename), so the original survives a failed or partial write. Symlinked targets, relative symlink chains, and the target's permission bits are preserved, a read-only target is still refused with `EACCES`, and an aborted write no longer lands the change.
 - Fixed `HarnessEventBus.emit` letting one throwing listener starve every listener after it and skip the watch pass; delivery now completes before the failure propagates.
 - Fixed rejected async event listeners becoming unhandled rejections, which can terminate the process.

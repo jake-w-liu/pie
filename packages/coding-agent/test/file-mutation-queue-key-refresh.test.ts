@@ -8,6 +8,19 @@ function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Wait until `predicate` holds instead of sleeping a fixed interval. A fixed sleep
+ * asserts a scheduling assumption and fails on a loaded runner; this fails only if
+ * the condition never becomes true.
+ */
+async function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() > deadline) throw new Error("waitFor timed out");
+		await delay(5);
+	}
+}
+
 function createDeferred(): { promise: Promise<void>; resolve: () => void } {
 	let resolve!: () => void;
 	const promise = new Promise<void>((promiseResolve) => {
@@ -43,7 +56,7 @@ describe("audit file-mutation-queue key refresh (E3)", () => {
 			await gate1.promise;
 			events.push("op1:end");
 		});
-		await delay(20);
+		await waitFor(() => events.includes("op1:start"));
 		expect(events).toEqual(["op1:start"]);
 
 		// op2 registers against key A and waits behind op1.
@@ -53,7 +66,7 @@ describe("audit file-mutation-queue key refresh (E3)", () => {
 			events.push("op2:run");
 		});
 		void op2.catch(() => {});
-		await delay(20);
+		await delay(50);
 
 		// Flip the symlink, then queue op3 against key B (runs immediately on B).
 		await rm(link);
@@ -63,13 +76,13 @@ describe("audit file-mutation-queue key refresh (E3)", () => {
 			await gate3.promise;
 			events.push("op3:end");
 		});
-		await delay(20);
+		await waitFor(() => events.includes("op3:start"));
 		expect(events).toContain("op3:start");
 
 		// Release op1. op2 must NOT run in parallel with op3 (it re-queues onto B).
 		gate1.resolve();
 		await op1;
-		await delay(50);
+		await delay(200);
 		expect(op2Started).toBe(false);
 
 		gate3.resolve();

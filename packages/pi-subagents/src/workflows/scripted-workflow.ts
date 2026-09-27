@@ -206,54 +206,6 @@ function trackRunObservation(observations, promise) {
   return trackObservationTracker(tracker, promise);
 }
 
-function trackPromiseCombinator(items, createPromise) {
-  const values = Array.from(items);
-  const dependencies = [...new Set(values.map(promiseObservationTracker).filter(Boolean))];
-  const promise = withSuppressedNativePromiseConsumption(() => createPromise(values.map(trackedPromiseTarget)));
-  if (dependencies.length === 0) return promise;
-  return trackObservationTracker({ observations: [], consumed: false, dependencies }, promise, true);
-}
-
-const workflowPromise = new Proxy(Promise, {
-  construct(target, [executor]) {
-    if (typeof executor !== "function") return new target(executor);
-    const tracker = { observations: [], consumed: false };
-    const promise = new target((resolve, reject) => {
-      let settled = false;
-      try {
-        executor((value) => {
-          if (settled) return;
-          settled = true;
-          addTrackerDependency(tracker, promiseObservationTracker(value));
-          resolve(trackedPromiseTarget(value));
-        }, (reason) => {
-          if (settled) return;
-          settled = true;
-          reject(reason);
-        });
-      } catch (error) {
-        settled = true;
-        throw error;
-      }
-    });
-    return trackObservationTracker(tracker, promise, true);
-  },
-  get(target, prop) {
-    if (prop === "all") return (items) => trackPromiseCombinator(items, (values) => target.all(values));
-    if (prop === "allSettled") return (items) => trackPromiseCombinator(items, (values) => target.allSettled(values));
-    if (prop === "race") return (items) => trackPromiseCombinator(items, (values) => target.race(values));
-    if (prop === "any") return (items) => trackPromiseCombinator(items, (values) => target.any(values));
-    if (prop === "resolve") return (value) => {
-      const dependency = promiseObservationTracker(value);
-      const promise = withSuppressedNativePromiseConsumption(() => target.resolve(trackedPromiseTarget(value)));
-      if (!dependency) return promise;
-      return trackObservationTracker({ observations: [], consumed: false, dependencies: [dependency] }, promise, true);
-    };
-    const value = target[prop];
-    return typeof value === "function" ? value.bind(target) : value;
-  },
-});
-
 function hostCall(method, args, observation) {
   const callId = ++nextCallId;
   const promise = new Promise((resolve, reject) => {
@@ -430,7 +382,11 @@ const state = Object.freeze({
   set(key, value) {
     const validKey = validateStateKey(key);
     assertJsonValue(value, "state.set('" + validKey + "') value");
-    return hostCall("state.set", { key: validKey, value });
+    // Unwrap the context-realm runs.all guard proxy, which structured clone cannot
+    // serialize, exactly as the emit path does.
+    const unwrapped = unwrapRunsAllResults(value);
+    assertJsonValue(unwrapped, "state.set('" + validKey + "') value");
+    return hostCall("state.set", { key: validKey, value: unwrapped });
   },
 });
 
@@ -566,6 +522,201 @@ function omitUndefinedWorkflowValues(value, seen = new Set()) {
   return normalized;
 }
 
+/**
+ * Installed INSIDE the vm context, so every function it defines belongs to the
+ * context realm and any host value it needs stays in an unreachable closure. The
+ * script therefore only ever sees context-realm objects: reading .constructor off
+ * them yields the context's own Function, which codeGeneration.strings:false
+ * refuses to build from a string, and whose realm has no process or require.
+ *
+ * Every host -> script value passes through adopt(), which deep-copies it into the
+ * context realm. Values travelling script -> host (emit, state.set) need no copy:
+ * they are already context-realm, and the host validates them with assertJsonValue,
+ * which accepts contextObjectPrototype.
+ */
+function installWorkflowApi(host) {
+  "use strict";
+
+  function adoptValue(value, seen) {
+    if (value === null) return null;
+    const kind = typeof value;
+    if (kind === "string" || kind === "number" || kind === "boolean" || kind === "undefined" || kind === "bigint") return value;
+    if (kind === "function" || kind === "symbol") {
+      // A function would carry the host realm on its .constructor. Host payloads are
+      // JSON-shaped by contract, so refuse loudly rather than hand over a live object.
+      throw new Error("workflow host call returned a " + kind + ", which cannot be exposed to the sandbox.");
+    }
+    if (seen.has(value)) return seen.get(value);
+    if (Array.isArray(value)) {
+      const copy = [];
+      seen.set(value, copy);
+      for (let index = 0; index < value.length; index++) copy[index] = adoptValue(value[index], seen);
+      return copy;
+    }
+    const copy = {};
+    seen.set(value, copy);
+    for (const key of Object.keys(value)) copy[key] = adoptValue(value[key], seen);
+    // Run results carry a non-enumerable toString for readable interpolation. Rebuild
+    // it here from the adopted copy rather than freezing the host's string, so it
+    // stays live if the script mutates the result.
+    if (typeof value.toString === "function" && Object.prototype.hasOwnProperty.call(value, "toString")) {
+      Object.defineProperty(copy, "toString", { value: resultToString, enumerable: false, configurable: true });
+    }
+    return copy;
+  }
+
+  function resultToString() {
+    const output = this && typeof this.output === "string" ? this.output.trim() : "";
+    if (output) return output;
+    if (!this || typeof this !== "object") return String(this);
+    const parts = ["run " + (this.key || "unknown")];
+    if (this.runId) parts.push("id=" + String(this.runId).slice(0, 8));
+    return "[" + parts.join("; ") + "]";
+  }
+
+  function adopt(value) {
+    return adoptValue(value, new Map());
+  }
+
+  function asContextError(error) {
+    if (error instanceof Error) return error;
+    const message = error && typeof error.message === "string" ? error.message : String(error);
+    // Deliberately not copying the host stack: it would disclose worker source
+    // offsets to a script the schema describes as isolated.
+    return new Error(message);
+  }
+
+  function toContextPromise(hostPromise, transform) {
+    let resolvePromise;
+    let rejectPromise;
+    const base = new Promise(function (resolve, reject) { resolvePromise = resolve; rejectPromise = reject; });
+    hostPromise.then(
+      function (value) {
+        try {
+          const adopted = adopt(value);
+          resolvePromise(transform ? transform(adopted) : adopted);
+        } catch (error) { rejectPromise(asContextError(error)); }
+      },
+      function (error) { rejectPromise(asContextError(error)); },
+    );
+    return reportConsumption(base, hostPromise);
+  }
+
+  // The host marks a launch "awaited" when the script attaches a handler to the
+  // promise runs.run returned, because that promise is a host tracking Proxy whose
+  // then/catch/finally call consumeTrackedObservations. The script now holds a
+  // context-realm promise, so it must relay that signal explicitly or every launch
+  // reads as unawaited. The relay is a context-realm Proxy: wrapping the host
+  // promise instead would hand the script a host prototype chain again.
+  function reportConsumption(base, hostPromise) {
+    return new Proxy(base, {
+      get: function (target, prop, receiver) {
+        if (prop === "then") {
+          return function (onFulfilled, onRejected) {
+            host.consume(hostPromise);
+            // Forward the value untouched: it is already a context-realm value, and
+            // adopting it again would copy plain arrays and strip the runs.all guard.
+            return Reflect.apply(target.then, target, [
+              typeof onFulfilled === "function" ? function (value) { return onFulfilled(value); } : onFulfilled,
+              typeof onRejected === "function" ? function (error) { return onRejected(asContextError(error)); } : onRejected,
+            ]);
+          };
+        }
+        if (prop === "catch") {
+          return function (onRejected) {
+            host.consume(hostPromise);
+            return Reflect.apply(target.catch, target, [
+              typeof onRejected === "function" ? function (error) { return onRejected(asContextError(error)); } : onRejected,
+            ]);
+          };
+        }
+        if (prop === "finally") {
+          return function (onFinally) {
+            host.consume(hostPromise);
+            return Reflect.apply(target.finally, target, [
+              typeof onFinally === "function" ? function (value) { return onFinally(value); } : onFinally,
+            ]);
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+  }
+
+  function runsAllKeyError(prop) {
+    return new Error(
+      "Cannot read runs.all result property '" + prop + "'. runs.all resolves to an ordered array, not a key map. " +
+      "Use results[0], array destructuring, or results.map((result) => result.output), not results." + prop + ".",
+    );
+  }
+
+  function isArrayIndexProperty(prop) {
+    if (!/^(0|[1-9]\\d*)$/.test(prop)) return false;
+    const index = Number(prop);
+    return Number.isSafeInteger(index) && index >= 0 && index < 4294967295;
+  }
+
+  // Rebuild the ordered-array guard in this realm so results.<key> still fails with
+  // the actionable message instead of silently returning undefined. The proxy is
+  // registered with the host so emit/state.set can unwrap it back to plain data.
+  function guardResultsArray(results) {
+    const guarded = new Proxy(results, {
+      get: function (target, prop, receiver) {
+        if (typeof prop !== "string") return Reflect.get(target, prop, receiver);
+        if (prop === "then" || prop === "toJSON") return undefined;
+        if (prop in target || isArrayIndexProperty(prop)) return Reflect.get(target, prop, receiver);
+        throw runsAllKeyError(prop);
+      },
+    });
+    if (host.registerResultsProxy) host.registerResultsProxy(guarded, results);
+    return guarded;
+  }
+
+  const runs = {
+    run: function (key, params) { return toContextPromise(host.runs.run(key, params)); },
+    all: function (items) { return toContextPromise(host.runs.all(items), guardResultsArray); },
+    steer: function (key, message, options) { return toContextPromise(host.runs.steer(key, message, options)); },
+    status: function (keyOrRunId) { return toContextPromise(host.runs.status(keyOrRunId)); },
+    ref: function (result) { return adopt(host.runs.ref(result)); },
+    refs: function (results) { return toContextPromise(host.runs.refs(results)); },
+  };
+
+  const consoleShim = {};
+  for (const level of ["log", "info", "warn", "error"]) {
+    consoleShim[level] = function () { host.console[level].apply(null, arguments); };
+  }
+
+  const stateShim = {
+    get: function (key) { return toContextPromise(host.state.get(key)); },
+    set: function (key, value) { return toContextPromise(host.state.set(key, value)); },
+  };
+
+  globalThis.runs = runs;
+  globalThis.console = consoleShim;
+  globalThis.emit = function (value) { return host.emit(value); };
+  if (host.state) globalThis.state = stateShim;
+
+  // Instrument Promise.prototype.then from THIS realm. The wrapper is a
+  // context-realm function closing over the host helpers, so reading its
+  // .constructor yields the context Function, which codeGeneration.strings:false
+  // refuses to build from a string. Defining this from the worker realm instead
+  // would restore the escape this rewrite exists to close.
+  if (host.nativeThen) {
+    Object.defineProperty(Promise.prototype, "then", {
+      ...host.nativeThenDescriptor,
+      value: function workflowPromiseThen(...args) {
+        // Capture the receiver lexically: the suppressed branch hands a plain
+        // function to a host caller, which would otherwise rebind the receiver.
+        const receiver = this;
+        if (host.isDirectHandlerCall() || host.suppressionDepth() > 0) {
+          return host.withSuppressedConsumption(function () { return Reflect.apply(host.nativeThen, receiver, args); });
+        }
+        return Reflect.apply(host.nativeThen, receiver, args);
+      },
+    });
+  }
+}
+
 parentPort.on("message", async (message) => {
   if (message.type === "response") {
     const entry = pending.get(message.callId);
@@ -581,14 +732,15 @@ parentPort.on("message", async (message) => {
   }
   if (message.type !== "start") return;
   try {
-    const sandbox = { runs, Promise: workflowPromise, emit(value) { const emittedValue = unwrapRunsAllResults(value); assertJsonValue(emittedValue); parentPort.postMessage({ type: "emit", value: emittedValue }); }, console: capturedConsole };
-    if (message.stateEnabled) sandbox.state = state;
-    // codeGeneration only governs code created *inside* this context. It does not
-    // restrict the objects handed in from the worker realm (runs, emit, console,
-    // state, workflowPromise): a script can read their constructors and walk back
-    // to the worker realm, so a script is trusted code, not a sandbox. Keep the
-    // tool schema's trust statement in sync with this.
-    const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
+    // The context is created EMPTY and the script-facing API is installed from
+    // inside it by WORKFLOW_CONTEXT_API_INSTALLER. Nothing from the worker realm is
+    // ever handed to vm.createContext, so a script cannot reach a worker-realm object
+    // and walk .constructor back to the worker realm's Function. Every value that
+    // crosses host -> script is deep-copied into this realm by the installer's
+    // adopt(), and host errors are re-thrown as errors created in this realm.
+    // codeGeneration then closes the remaining door: eval/Function are refused, and
+    // the realm those would construct in has no process, require, or filesystem.
+    const context = vm.createContext({}, { codeGeneration: { strings: false, wasm: false } });
     contextObjectPrototype = vm.runInContext("Object.prototype", context);
     let compiled;
     try {
@@ -605,13 +757,37 @@ parentPort.on("message", async (message) => {
     let stopWorkflowPromiseHook;
     let value;
     try {
-      Object.defineProperty(nativePromisePrototype, "then", {
-        ...nativeThenDescriptor,
-        value: function workflowPromiseThen(...args) {
-          if (isDirectWorkflowScriptPromiseHandlerCall() || suppressNativePromiseConsumption > 0) {
-            return withSuppressedNativePromiseConsumption(() => Reflect.apply(nativeThen, this, args));
-          }
-          return Reflect.apply(nativeThen, this, args);
+      // The Promise.prototype.then instrumentation is installed INSIDE the context by
+      // installWorkflowApi. Defining it from the worker realm would put a
+      // worker-realm function on the context's Promise.prototype, and reading its
+      // .constructor would hand the script the worker realm's Function - an escape,
+      // because codeGeneration.strings:false only guards the context's own Function.
+      vm.runInContext("(" + installWorkflowApi.toString() + ")", context)({
+        runs,
+        console: capturedConsole,
+        state: message.stateEnabled ? state : undefined,
+        nativeThen,
+        nativeThenDescriptor,
+        isDirectHandlerCall: () => isDirectWorkflowScriptPromiseHandlerCall(),
+        suppressionDepth: () => suppressNativePromiseConsumption,
+        withSuppressedConsumption: (callback) => withSuppressedNativePromiseConsumption(callback),
+        consume(hostPromise) {
+          const tracker = promiseObservationTracker(hostPromise);
+          // Mark consumed directly rather than through consumeTrackedObservations,
+          // which suppresses exactly this case: a synchronous attach from the script
+          // (Promise.all over a tracked promise) still means the launch was awaited.
+          // The recursion covers the combinator's per-launch dependencies.
+          if (tracker) markTrackedObservationsConsumed(tracker);
+        },
+        registerResultsProxy(proxy, target) {
+          // Teach the host's emit/state unwrapper about the context-realm guard proxy,
+          // otherwise a runs.all result array cannot cross back as plain data.
+          runsAllResultTargets.set(proxy, target);
+        },
+        emit(value) {
+          const emittedValue = unwrapRunsAllResults(value);
+          assertJsonValue(emittedValue);
+          parentPort.postMessage({ type: "emit", value: emittedValue });
         },
       });
       stopWorkflowPromiseHook = createWorkflowPromiseHook({

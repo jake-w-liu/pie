@@ -226,6 +226,17 @@ function runHostCall(key, params, collectFailure, batch) {
   return { key, callId, promise };
 }
 
+function registerRunBatch(batch) {
+  // The batch's call list gets its own message, posted before the calls it covers.
+  // Riding it on the first call does not work: a first call whose key was already
+  // launched takes the host's reuse path and returns before the batch is read, which
+  // left the host admitting one child instead of the whole batch. One message per
+  // batch keeps a fanout linear; repeating the list on all n calls was O(n*n).
+  // The callId is required by the host's message guard; nothing registers a pending
+  // entry for it and the host answers no response, so it is only a message marker.
+  parentPort.postMessage({ type: "call", callId: ++nextCallId, method: "run.batch", args: { id: batch.id, calls: batch.calls } });
+}
+
 const runsAllResultTargets = new WeakMap();
 
 // No worker-realm runs.all guard here on purpose. adopt() deep-copies whatever this
@@ -331,7 +342,8 @@ const runs = Object.freeze({
     }
     runFingerprints = fingerprints;
     const batch = { id: "batch-" + (++nextCallId), calls };
-    const launched = calls.map(({ key, params }) => runHostCall(key, params, true, batch));
+    registerRunBatch(batch);
+    const launched = calls.map(({ key, params }) => runHostCall(key, params, true, { id: batch.id }));
     return trackRunObservation(launched.map(({ key, callId }) => ({ key, operation: "run", callId })), Promise.all(launched.map(({ promise }) => promise)).then((results) => results.map(decorateWorkflowChildResult)));
   },
   steer(key, message, options = {}) {
@@ -1532,6 +1544,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	const stoppedLaunches = new Set<string>();
 	const childStopControllers = new Map<string, AbortController>();
 	const batchAdmissions = new Map<string, Promise<void>>();
+	const batchCalls = new Map<string, Array<{ key: string; params: Record<string, unknown> }>>();
 	const observedRunCalls = new Set<number>();
 	const observedSteerCalls = new Set<number>();
 	const childController = new AbortController();
@@ -1761,6 +1774,17 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					},
 				);
 			};
+			if (message.method === "run.batch") {
+				// One message per runs.all batch, always ahead of its calls, so the list is
+				// transferred once instead of on every call. It only records the list: the
+				// admission stays lazy, created by the first call that reaches the admission
+				// point, so a batch whose calls are all refused earlier (a one-use permit
+				// rejects runs.all outright) still never calls options.admit.
+				const id = message.args.id;
+				if (typeof id !== "string" || !Array.isArray(message.args.calls)) return;
+				batchCalls.set(id, (message.args.calls as unknown[]).filter((call): call is { key: string; params: Record<string, unknown> } => isRecord(call) && typeof call.key === "string" && isRecord(call.params)));
+				return;
+			}
 			if (message.method === "state.get" || message.method === "state.set") {
 				if (!options.state) return respond(Promise.reject(new Error("Workflow state is unavailable without a mission.")));
 				let key: string;
@@ -1920,13 +1944,13 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				return respond(Promise.reject(new Error(`runs.run('${key}') resume requires a non-empty task follow-up.`)));
 			}
 			const startedAt = Date.now();
-			const batch = isRecord(message.args.batch) && typeof message.args.batch.id === "string" && Array.isArray(message.args.batch.calls)
-				? { id: message.args.batch.id, calls: message.args.batch.calls.filter((call): call is { key: string; params: Record<string, unknown> } => isRecord(call) && typeof call.key === "string" && isRecord(call.params)) }
-				: undefined;
+			const batch = isRecord(message.args.batch) && typeof message.args.batch.id === "string" ? { id: message.args.batch.id } : undefined;
 			let admission = batch ? batchAdmissions.get(batch.id) : undefined;
 			if (!admission) {
 				const seenKeys = new Set<string>();
-				const calls = (batch?.calls ?? [{ key, params }]).filter((call) => {
+				// A registered batch contributes its whole call list; a standalone
+				// runs.run contributes only itself.
+				const calls = (batch ? batchCalls.get(batch.id) ?? [{ key, params }] : [{ key, params }]).filter((call) => {
 					if (seenKeys.has(call.key) || launches.has(call.key)) return false;
 					seenKeys.add(call.key);
 					return true;

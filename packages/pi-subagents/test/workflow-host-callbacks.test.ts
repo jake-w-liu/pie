@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { runWorkflowScript } from "../src/workflows/scripted-workflow.ts";
+import { claimWorkflowChildPermit, createWorkflowChildPermit, workflowChildPermitConsumed } from "../src/shared/workflow-child-permit.ts";
 import type { RunWorkflowScriptOptions, WorkflowScriptChildResult } from "../src/workflows/scripted-workflow.ts";
 
 const script = 'const s = await runs.status("a");\nreturn s.output;';
@@ -88,6 +89,64 @@ describe("workflowScript host callbacks stay contained", () => {
 		});
 		expect(result.emits).toEqual([{ caught: "Workflow could not copy the value returned by this call. getter ran" }]);
 		expect(result.value).toBe(1);
+	}, 20_000);
+});
+
+describe("workflowScript admits a whole runs.all batch from one message", () => {
+	// The batch's call list rides on the first call message only; the rest of the batch
+	// is O(n) instead of re-serializing n calls per message. The host contract that
+	// makes that safe is that admit still sees every call, exactly once.
+	const items = Array.from({ length: 8 }, (_, i) => ({ key: `k${i}`, agent: "w", task: "T" }));
+
+	it("calls admit once with every call in the batch", async () => {
+		const admitted: string[][] = [];
+		const result = await runWorkflowScript({
+			...harness(async () => okResult),
+			script: `const results = await runs.all(${JSON.stringify(items)});\nreturn results.length;`,
+			admit: (calls) => void admitted.push(calls.map((call) => call.key)),
+		});
+		expect(admitted).toEqual([items.map((item) => item.key)]);
+		expect(result.value).toBe(8);
+	}, 20_000);
+
+	it("omits keys that were already launched when the batch arrives", async () => {
+		const admitted: string[][] = [];
+		const result = await runWorkflowScript({
+			...harness(async () => okResult),
+			script: [
+				'const first = await runs.run("k0", { agent: "w", task: "T" });',
+				`const rest = await runs.all(${JSON.stringify(items)});`,
+				"return [first.output, rest.length];",
+			].join("\n"),
+			admit: (calls) => void admitted.push(calls.map((call) => call.key)),
+		});
+		// The standalone k0 is admitted on its own; the batch then admits everything it
+		// still owns, with the already-launched key filtered out. The batch's list comes
+		// from its own registration message, not from whichever call happens to be first.
+		expect(admitted).toEqual([["k0"], items.slice(1).map((item) => item.key)]);
+		expect(result.value).toEqual(["out:k0", 8]);
+	}, 20_000);
+	it("does not admit a batch the one-use permit refuses outright", async () => {
+		// The batch list is registered before its calls, but admission stays lazy: a
+		// permit rejects runs.all before the admission point, so the host must not
+		// reserve output paths or fanout budget for children that never launch.
+		const permit = createWorkflowChildPermit({
+			issuerPackage: "test",
+			workflowRunId: "wf",
+			childKey: "k0",
+			agent: "w",
+			launchContractDigest: "digest",
+			context: "fresh",
+		} as never);
+		const admitted: string[][] = [];
+		const result = await runWorkflowScript({
+			...harness(async () => okResult),
+			script: 'try { await runs.all(' + JSON.stringify(items.slice(0, 1)) + '); } catch (error) { emit({ refused: error.message }); }\nreturn 1;',
+			oneUsePermit: { claim: (key) => claimWorkflowChildPermit(permit, "wf", key) },
+			admit: (calls) => void admitted.push(calls.map((call) => call.key)),
+		});
+		expect(result.emits).toEqual([{ refused: "Workflow child permit does not support runs.all." }]);
+		expect(admitted).toEqual([]);
 	}, 20_000);
 });
 

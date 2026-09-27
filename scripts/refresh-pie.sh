@@ -17,7 +17,7 @@ Options:
   --test           Run ./test.sh after building
   --online-models  Refresh model catalogs during the build instead of reusing
                    the currently installed catalog data
-  --keep-build     Keep repository dist/ and generated model data after completion
+  --keep-build     Keep repository dist/ after completion
   --slim           After a successful install, also remove repository node_modules
                    so the checkout stays minimal (regenerated on the next build)
   -h, --help       Show this help
@@ -239,7 +239,6 @@ restore_original_activation() {
 cleanup() {
 	local status=$?
 	local cleanup_failed=false
-	local model_data
 	trap - EXIT HUP INT TERM
 	set +e
 
@@ -271,13 +270,11 @@ cleanup() {
 			cd "$repo_dir"
 			npm run clean
 		) || cleanup_failed=true
-		model_data="$repo_dir/packages/ai/src/providers/data"
-		if [[ -L "$model_data" ]]; then
-			printf 'error: refusing to remove symlinked model-data path: %s\n' "$model_data" >&2
-			cleanup_failed=true
-		else
-			rm -rf -- "$model_data" || cleanup_failed=true
-		fi
+		# The generated model catalogs under packages/ai/src/providers/data are left
+		# in place. They are gitignored, they total well under a megabyte, and deleting
+		# them made the next `npm run check` fail with dozens of type errors (each
+		# providers/*.models.ts imports its catalog JSON) until they were re-hydrated
+		# from the network. `--keep-build` still governs the dist/ removal above.
 	fi
 
 	# NOTE: nested node_modules under extension packages are intentionally kept.

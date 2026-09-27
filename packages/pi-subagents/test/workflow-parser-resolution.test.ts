@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -66,6 +66,42 @@ describe("workflow parser resolution", () => {
 		} finally {
 			if (previousTmpdir === undefined) delete process.env.TMPDIR;
 			else process.env.TMPDIR = previousTmpdir;
+			rmSync(emptyCwd, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses to write the tmp copy through a planted symlink", () => {
+		// The fallback path is fixed and predictable, so a symlink there must not turn
+		// it into an overwrite of whatever the link points at.
+		resolveWorkflowParserEntry();
+		const emptyCwd = mkdtempSync(join(tmpdir(), "pie-parser-test-"));
+		const parserDirectory = join(tmpdir(), "pie-workflow-parser");
+		const victim = join(emptyCwd, "victim.txt");
+		writeFileSync(victim, "ORIGINAL");
+		try {
+			rmSync(parserDirectory, { recursive: true, force: true });
+			mkdirSync(parserDirectory, { recursive: true });
+			symlinkSync(victim, join(parserDirectory, "acorn.js"));
+			expect(() => resolveWorkflowParserEntry(brokenRequire(), emptyCwd)).toThrow(/Cannot find module 'acorn'/);
+			expect(readFileSync(victim, "utf8")).toBe("ORIGINAL");
+		} finally {
+			rmSync(parserDirectory, { recursive: true, force: true });
+			rmSync(emptyCwd, { recursive: true, force: true });
+		}
+	});
+
+	it("materializes the tmp copy readable only by this user", () => {
+		resolveWorkflowParserEntry();
+		const emptyCwd = mkdtempSync(join(tmpdir(), "pie-parser-test-"));
+		const parserDirectory = join(tmpdir(), "pie-workflow-parser");
+		try {
+			rmSync(parserDirectory, { recursive: true, force: true });
+			const fallback = resolveWorkflowParserEntry(brokenRequire(), emptyCwd);
+			expect(statSync(fallback).mode & 0o777).toBe(0o600);
+			expect(statSync(dirname(fallback)).mode & 0o777).toBe(0o700);
+			loadParser(fallback);
+		} finally {
+			rmSync(parserDirectory, { recursive: true, force: true });
 			rmSync(emptyCwd, { recursive: true, force: true });
 		}
 	});

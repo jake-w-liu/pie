@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
@@ -427,7 +427,12 @@ function assertPortableWorkflowScript(source) {
   const wrapped = "(async () => {\n" + source + "\n})()";
   const ast = parse(wrapped, { ecmaVersion: "latest", sourceType: "script" });
   const wrapper = workflowWrapperFunction(ast);
-  walkWorkflowAst(wrapper.body, wrapper);
+  // Walk the whole program, not just the wrapper's own body. A script that closes
+  // the injected wrapper early ("} )(); (async () => { ... ") turns the rest of itself
+  // into a SECOND top-level statement, and walking only body[0] left that code
+  // unchecked: its nested async functions ran, and every static check below silently
+  // skipped it while reporting the script as valid.
+  walkWorkflowAst(ast.body, wrapper);
 }
 
 function workflowWrapperFunction(ast) {
@@ -500,13 +505,24 @@ function unwrapRunsAllResults(value, seen = new Map()) {
     return changed ? copy : target;
   }
   if (!isPlainWorkflowObject(target) || Object.getOwnPropertySymbols(target).length > 0) return target;
+  // Memoize the target itself before recursing. The object branch never recorded its
+  // target, so a self-referencing value (a script can build one with no host
+  // involvement) recursed until the stack blew and the script saw "Maximum call stack
+  // size exceeded" instead of the cycle error assertJsonValue reports one line later.
+  // Returning the ORIGINAL when nothing was unwrapped keeps the cycle intact, so the
+  // validator still sees it and reports it; substituting a placeholder here would
+  // silently truncate the value and let it through.
+  seen.set(target, target);
   let changed = false;
   const entries = Object.entries(target).map(([key, entry]) => {
     const unwrapped = unwrapRunsAllResults(entry, seen);
     changed ||= unwrapped !== entry;
     return [key, unwrapped];
   });
-  return changed ? Object.fromEntries(entries) : target;
+  if (!changed) return target;
+  const rebuilt = Object.fromEntries(entries);
+  seen.set(target, rebuilt);
+  return rebuilt;
 }
 
 function omitUndefinedWorkflowValues(value, seen = new Set()) {
@@ -555,7 +571,17 @@ function installWorkflowApi(host) {
     }
     const copy = {};
     seen.set(value, copy);
-    for (const key of Object.keys(value)) copy[key] = adoptValue(value[key], seen);
+    for (const key of Object.keys(value)) {
+      const entry = adoptValue(value[key], seen);
+      // A host key literally named "__proto__" is a data property (JSON.parse
+      // produces one, and mission state round-trips through JSON). Assigning it
+      // would hit the inherited __proto__ setter, replacing the copy's prototype and
+      // dropping the key, so the adopted value would no longer be JSON at all.
+      // Only that key needs defineProperty; measured on 50-key payloads it is free
+      // next to defineProperty on every key (0.0133ms vs 0.0276ms per adopt).
+      if (key === "__proto__") Object.defineProperty(copy, key, { value: entry, writable: true, enumerable: true, configurable: true });
+      else copy[key] = entry;
+    }
     // Run results carry a non-enumerable toString for readable interpolation. Rebuild
     // it here from the adopted copy rather than freezing the host's string, so it
     // stays live if the script mutates the result.
@@ -675,8 +701,14 @@ function installWorkflowApi(host) {
     );
   }
 
+  // This whole function is re-parsed inside the vm context through
+  // installWorkflowApi.toString(), so it must be written as it should read AFTER a
+  // re-parse. A "\\d" escape here would survive toString() and then match a literal
+  // backslash followed by "d", which silently reduced this to matching only "0" and
+  // made results[1] on a one-child runs.all throw a key-map error. [0-9] carries no
+  // escape, so no re-parse can change what it matches.
   function isArrayIndexProperty(prop) {
-    if (!/^(0|[1-9]\\d*)$/.test(prop)) return false;
+    if (!/^(0|[1-9][0-9]*)$/.test(prop)) return false;
     const index = Number(prop);
     return Number.isSafeInteger(index) && index >= 0 && index < 4294967295;
   }
@@ -765,7 +797,22 @@ parentPort.on("message", async (message) => {
     // adopt(), and host errors are re-thrown as errors created in this realm.
     // codeGeneration then closes the remaining door: eval/Function are refused, and
     // the realm those would construct in has no process, require, or filesystem.
-    const context = vm.createContext({}, { codeGeneration: { strings: false, wasm: false } });
+    //
+    // The sandbox MUST be a null-prototype object. Node's contextified global
+    // inherits from the sandbox object's prototype chain, so an ordinary {} sandbox
+    // left the worker realm's Object.prototype reachable from the script:
+    // globalThis.constructor.constructor("return typeof process")() built an
+    // unrestricted worker-realm Function - codeGeneration.strings:false only governs
+    // the context's own Function - and from there require, the filesystem and a shell
+    // were all reachable. The same leak applied to valueOf, toString, hasOwnProperty,
+    // isPrototypeOf, propertyIsEnumerable, toLocaleString and __proto__, so patching
+    // one name would not have closed it. A null prototype removes the chain, and the
+    // probe below turns any future reappearance into a loud failure instead of a
+    // silently isolated-looking but reachable realm.
+    const context = vm.createContext(Object.create(null), { codeGeneration: { strings: false, wasm: false } });
+    if (vm.runInContext("try { globalThis.constructor.constructor('return 0'); 'REACHABLE' } catch { 'BLOCKED' }", context) !== "BLOCKED") {
+      throw new Error("workflowScript sandbox context is not isolated; refusing to run the script.");
+    }
     contextObjectPrototype = vm.runInContext("Object.prototype", context);
     let compiled;
     try {
@@ -1097,7 +1144,7 @@ export function formatWorkflowJsonPreview(value: unknown, maxLength: number): st
 function workflowReturnRecoveryHint(children: WorkflowScriptChildResult[]): string {
 	if (children.length === 0) return " Return only plain JSON data. For a child result, select fields such as { runId: child.runId, ok: child.ok, outputReference: child.outputReference }.";
 	const references = children.slice(0, 10).map((child) => {
-		const fields = [child.runId ? `runId=${child.runId.slice(0, 500)}` : undefined, child.outputReference ? `outputReference=${child.outputReference.slice(0, 500)}` : undefined, child.artifactPaths[0] ? `artifact=${child.artifactPaths[0].slice(0, 500)}` : undefined].filter((field): field is string => field !== undefined);
+		const fields = [child.runId ? `runId=${child.runId.slice(0, 500)}` : undefined, child.outputReference ? `outputReference=${child.outputReference.slice(0, 500)}` : undefined, child.artifactPaths?.[0] ? `artifact=${child.artifactPaths[0].slice(0, 500)}` : undefined].filter((field): field is string => field !== undefined);
 		return `'${child.key}'${fields.length > 0 ? ` (${fields.join(", ")})` : ""}`;
 	});
 	return ` Child work completed before return serialization failed. Recover outputs from: ${references.join(", ")}${children.length > references.length ? `, and ${children.length - references.length} more` : ""}. Return a plain projection such as { runId: child.runId, ok: child.ok, outputReference: child.outputReference }.`;
@@ -1264,7 +1311,11 @@ export function validateWorkflowScript(script: string): WorkflowScriptValidation
 		? root.body[0].expression.callee
 		: undefined;
 	const workflowBody = wrapper && astNode(wrapper.body) ? wrapper.body : root;
-	walkAst(workflowBody, (node) => {
+	// The whole program, not just the wrapper's body: a script that closes the
+	// injected wrapper early puts the rest of itself in a second top-level statement,
+	// which the wrapper-only walk skipped entirely, so the nested-async rule and every
+	// other static check below reported such a script as valid.
+	walkAst(root.body, (node) => {
 		if (node !== wrapper && node.async === true && (node.type === "FunctionDeclaration" || node.type === "FunctionExpression" || node.type === "ArrowFunctionExpression")) {
 			errors.push({ message: "workflowScript does not support nested async functions. Use top-level await, plain helper functions that return runs.run(...), or explicit Promise chains.", ...nodeLocation(node) });
 		}
@@ -1298,7 +1349,7 @@ export function validateWorkflowScript(script: string): WorkflowScriptValidation
 			if (message) errors.push({ message: `workflowScript boundary value is invalid: ${message}.`, ...nodeLocation(boundaryValue) });
 		}
 	});
-	walkAst(workflowBody, (node) => {
+	walkAst(root.body, (node) => {
 		if (node.type !== "ReturnStatement" || !astNode(node.argument)) return;
 		const message = definitelyNonJson(node.argument, true);
 		if (message) errors.push({ message: `workflowScript boundary value is invalid: ${message}.`, ...nodeLocation(node.argument) });
@@ -1393,9 +1444,24 @@ function materializeCachedAcornEntry(): string | undefined {
 	if (!cachedAcornEntry) return undefined;
 	try {
 		const directory = join(tmpdir(), "pie-workflow-parser");
-		mkdirSync(directory, { recursive: true });
+		// This path is fixed and predictable, so it is only safe to write when the
+		// directory is ours alone and the entry is a regular file rather than a
+		// symlink someone else planted: writeFileSync follows symlinks, which turned
+		// the fallback into an overwrite of whatever the link pointed at.
+		mkdirSync(directory, { recursive: true, mode: 0o700 });
+		chmodSync(directory, 0o700);
 		const entry = join(directory, "acorn.js");
-		if (readAcornEntrySource(entry) !== cachedAcornEntry.source) writeFileSync(entry, cachedAcornEntry.source);
+		const existing = lstatSync(entry, { throwIfNoEntry: false });
+		if (existing) {
+			if (!existing.isFile()) return undefined;
+			if (readAcornEntrySource(entry) === cachedAcornEntry.source) return entry;
+			writeFileSync(entry, cachedAcornEntry.source, { mode: 0o600 });
+			return entry;
+		}
+		// Exclusive create: if anything appeared at the path in the meantime (a symlink
+		// included) this fails instead of writing through it, and the caller reports the
+		// parser as unavailable rather than loading whatever is there.
+		writeFileSync(entry, cachedAcornEntry.source, { mode: 0o600, flag: "wx" });
 		return entry;
 	} catch {
 		return undefined;
@@ -1491,7 +1557,11 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	let settled = false;
 	let finishing = false;
 
-	const partial = (): Omit<WorkflowScriptResult, "value"> => ({ emits, console: consoleEntries, trace, children: childOrder.flatMap((key) => {
+	// Snapshot every list, not just children: on the success path the drain does not
+	// wait for in-flight children, so a launch that settles after the workflow returned
+	// kept pushing into the live arrays, growing the trace the caller already received
+	// and firing onTrace for a finished workflow. children was already snapshotted.
+	const partial = (): Omit<WorkflowScriptResult, "value"> => ({ emits: [...emits], console: [...consoleEntries], trace: [...trace], children: childOrder.flatMap((key) => {
 		const child = children.get(key);
 		return child ? [child] : [];
 	}) });
@@ -1501,6 +1571,10 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	// failed and abort its siblings through Promise.all. Telemetry must not decide
 	// workflow outcomes, so a failing callback is reported and the run continues.
 	const traceChanged = () => {
+		// Nothing is owed to the host after the result was handed over: a child that
+		// settles past the drain (or past a successful return, which does not drain
+		// launches at all) used to re-persist a workflow that had already finished.
+		if (settled) return;
 		try {
 			options.onTrace?.([...trace]);
 		} catch (error) {
@@ -1526,7 +1600,15 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 		traceChanged();
 		return true;
 	};
-	options.registerStopChild?.(stopChild);
+	try {
+		options.registerStopChild?.(stopChild);
+	} catch (error) {
+		// The worker is already running by now, and nothing below can settle the
+		// returned promise once this throws, so a host that cannot register its stop
+		// hook would leave the worker thread - and this process - alive forever.
+		await worker.terminate();
+		throw error;
+	}
 
 	return await new Promise<WorkflowScriptResult>((resolve, reject) => {
 		const finish = (outcome: { value: unknown } | { error: Error & { workflowErrorKind?: unknown } }) => {
@@ -1550,7 +1632,15 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				}
 				if (settled) return;
 				settled = true;
-				options.registerStopChild?.(undefined);
+				try {
+					options.registerStopChild?.(undefined);
+				} catch (error) {
+					// Teardown bookkeeping must not decide the workflow outcome: this runs
+					// after settled = true, so a throw here skipped clearTimeout, the abort
+					// listener removal and worker.terminate(), and left the caller waiting
+					// forever. The stop hook is the host's convenience, not the result.
+					console.error("Workflow registerStopChild cleanup failed:", error);
+				}
 				if (timer) clearTimeout(timer);
 				options.signal?.removeEventListener("abort", onAbort);
 				void worker.terminate();
@@ -1639,7 +1729,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			}
 			if (message.type === "error") {
 				const rawError = typeof message.error === "string" ? message.error : "Workflow script failed.";
-				const text = message.errorPhase === "return-serialization" ? `${rawError}${workflowReturnRecoveryHint(partial().children)}` : rawError;
+				const text = message.errorPhase === "return-serialization" ? `${rawError}\n${workflowReturnRecoveryHint(partial().children).trimStart()}` : rawError;
 				const workflowError = new Error(text) as Error & { workflowErrorKind?: "detached-child" };
 				if (message.errorKind === "detached-child") workflowError.workflowErrorKind = "detached-child";
 				return finish({ error: workflowError });
@@ -1663,7 +1753,17 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				void promise.then(
 					(value) => {
 						if (settled) return;
-						const normalized = responsePath ? omitNonJsonWorkflowResultMetadata(value) : omitUndefinedWorkflowValues(value);
+						// Normalizing a host value walks it (Object.entries invokes getters),
+						// and a value that throws there used to reject this floating promise,
+						// which is an unhandled rejection and takes the agent process down.
+						// The script gets the failure as a rejected call instead.
+						let normalized: unknown;
+						try {
+							normalized = responsePath ? omitNonJsonWorkflowResultMetadata(value) : omitUndefinedWorkflowValues(value);
+						} catch (error) {
+							worker.postMessage({ type: "response", callId: message.callId, ok: false, error: `Workflow could not copy the value returned by this call. ${error instanceof Error ? error.message : String(error)}` });
+							return;
+						}
 						if (!responsePath) {
 							worker.postMessage({ type: "response", callId: message.callId, ok: true, value: normalized });
 							return;
@@ -1703,15 +1803,29 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				if (typeof keyOrRunId !== "string" || !keyOrRunId.trim()) return respond(Promise.reject(new Error("runs.status(keyOrRunId) requires a non-empty string.")));
 				const known = children.get(keyOrRunId);
 				const target = known?.runId ?? keyOrRunId;
+				// Check for a settled workflow before journalling the call: pushing
+				// "started" first left a trace entry with no terminal state and left the
+				// script waiting on a call nobody would ever answer.
+				if (settled || finishing) return;
 				trace.push({ operation: "status", key: keyOrRunId, state: "started", ...(known?.runId ? { runId: known.runId } : {}) });
 				traceChanged();
-				if (settled || finishing) return;
-				respond(options.status(target, childController.signal).then((result) => {
+				// Every other host callback in this handler is invoked inside a promise
+				// chain so a synchronous throw becomes a rejection the script can see.
+				// status was called directly, so a host that threw before returning its
+				// promise escaped the worker "message" listener as an uncaughtException
+				// and took the whole agent process down instead of failing the workflow.
+				respond(Promise.resolve().then(() => options.status(target, childController.signal)).then((result) => {
 					if (settled || finishing) return result;
 					trace.push({ operation: "status", key: keyOrRunId, state: result.ok ? "completed" : "failed", ...(result.runId ? { runId: result.runId } : {}), ...(!result.ok ? { error: result.output } : {}) });
 					traceChanged();
 					if (!result.ok) throw new Error(`Status '${keyOrRunId}' failed: ${result.output}`);
 					return result;
+				}, (error: unknown) => {
+					// Every journalled "started" needs a terminal entry, including when the
+					// host status itself failed and the script swallowed the rejection.
+					trace.push({ operation: "status", key: keyOrRunId, state: "failed", error: error instanceof Error ? error.message : String(error) });
+					traceChanged();
+					throw error;
 				}));
 				return;
 			}
@@ -1777,10 +1891,23 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				traceChanged();
 				return respond(deliver(existing.promise), `runs.run('${key}') result`);
 			}
-			const permitError = options.oneUsePermit?.claim(key);
-			if (permitError) return respond(Promise.reject(new Error(permitError)));
+			// Host-capability gates come before the claim. claimWorkflowChildPermit is
+			// deliberately irreversible and runs ahead of model-authored shape checks
+			// (see its own contract), but a runs.all or retained-resume call can never
+			// be served under a one-use permit at all, so letting those consume the
+			// single attempt left the workflow permanently unable to launch.
 			if (options.oneUsePermit && message.args.batch !== undefined) return respond(Promise.reject(new Error("Workflow child permit does not support runs.all.")));
 			if (options.oneUsePermit && params.resume !== undefined) return respond(Promise.reject(new Error("Workflow child permit does not support retained resume.")));
+			// The claim is a host call made from inside the worker's "message" listener, so
+			// like status it has to be guarded: a throw that escapes the listener is an
+			// uncaughtException that kills the process and leaves the script waiting.
+			let permitError: string | undefined;
+			try {
+				permitError = options.oneUsePermit?.claim(key);
+			} catch (error) {
+				return respond(Promise.reject(error instanceof Error ? error : new Error(String(error))));
+			}
+			if (permitError) return respond(Promise.reject(new Error(permitError)));
 			if (params.action !== undefined) return respond(Promise.reject(new Error(`runs.run('${key}') accepts execution params only; management action is not allowed.`)));
 			if (params.workflowScript !== undefined) return respond(Promise.reject(new Error(`runs.run('${key}') cannot start a nested workflow script.`)));
 			if (params.tasks !== undefined || params.chain !== undefined || params.parallel !== undefined || params.concurrency !== undefined || params.chainDir !== undefined) {

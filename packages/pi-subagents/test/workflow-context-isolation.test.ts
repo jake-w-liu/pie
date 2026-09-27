@@ -57,6 +57,41 @@ describe("workflowScript context isolation", () => {
 		}
 	});
 
+	it("cannot reach the host realm through any name the global inherits", async () => {
+		// Node's contextified global inherits from the sandbox object's prototype
+		// chain. With an ordinary {} sandbox that chain was the worker realm's
+		// Object.prototype, so each inherited name below yielded the worker realm's
+		// UNRESTRICTED Function - codeGeneration.strings:false only governs the
+		// context's own Function - and from there require, the filesystem and a
+		// shell were reachable. Every route has to be covered: blocking only
+		// "constructor" left the other seven open.
+		for (const expression of [
+			"globalThis.constructor.constructor('return typeof process')()",
+			"globalThis.valueOf.constructor('return typeof process')()",
+			"globalThis.toString.constructor('return typeof process')()",
+			"globalThis.hasOwnProperty.constructor('return typeof process')()",
+			"globalThis.isPrototypeOf.constructor('return typeof process')()",
+			"globalThis.propertyIsEnumerable.constructor('return typeof process')()",
+			"globalThis.toLocaleString.constructor('return typeof process')()",
+			"globalThis.globalThis.constructor.constructor('return typeof process')()",
+			"this.constructor.constructor('return typeof process')()",
+			"globalThis.__proto__.constructor.constructor('return typeof process')()",
+			"Object.getPrototypeOf(globalThis).constructor.constructor('return typeof process')()",
+			"Object.getPrototypeOf(Object.getPrototypeOf(globalThis)).constructor.constructor('return typeof process')()",
+			"globalThis.constructor.constructor(\"return require('node:fs').readFileSync('/etc/hosts', 'utf8').length > 0\")()",
+			"globalThis.constructor.constructor(\"return require('node:child_process').execSync('echo ESCAPED').toString().trim()\")()",
+		]) {
+			// Every route throws in the script: either the context's own Function
+			// refuses to build from a string, or the name is gone entirely.
+			await expect(probe(`return ${expression};`), expression).rejects.toThrow();
+		}
+	}, 30_000);
+
+	it("keeps code generation from strings disabled in the context's own Function", async () => {
+		// Isolation must come from the sandbox shape, not from switching the guard off.
+		await expect(probe("return typeof Function('return 1')();")).rejects.toThrow(/Code generation from strings disallowed/);
+	});
+
 	it("exposes no host-realm prototype to walk", async () => {
 		// A context-realm object has the context's Object.prototype, whose
 		// constructor chain stops inside the context.
@@ -87,6 +122,40 @@ describe("workflowScript context isolation", () => {
 		expect(result).toEqual({ output: "out:a", proto: true });
 	});
 
+	it("keeps a host payload's own __proto__ key as data, not as a prototype", async () => {
+		// JSON.parse produces an own "__proto__" data key, and mission state reaches the
+		// worker as exactly that. Adopting it with copy[key] = ... hit the inherited
+		// __proto__ setter, so the copy lost the key and inherited the payload instead.
+		const store = new Map<string, unknown>([["evil", JSON.parse('{"__proto__":{"polluted":"yes"},"ok":1}')]]);
+		const result = await runWorkflowScript(
+			harness({
+				script: [
+					'const v = await state.get("evil");',
+					"return {",
+					"  own: Object.getOwnPropertyNames(v),",
+					"  protoIsObject: Object.getPrototypeOf(v) === Object.prototype,",
+					"  inherited: v.polluted,",
+					"};",
+				].join("\n"),
+				state: { get: async (key) => store.get(key), set: async (key, value) => void store.set(key, value) },
+			}),
+		);
+		expect(result.value).toEqual({ own: ["__proto__", "ok"], protoIsObject: true, inherited: undefined });
+	});
+
+	it("returns a host payload that carries its own __proto__ key", async () => {
+		// The prototype swap also made the adopted value non-JSON, so returning it
+		// failed the return serializer with "must contain only plain JSON objects".
+		const store = new Map<string, unknown>([["evil", JSON.parse('{"__proto__":{"polluted":"yes"},"ok":1}')]]);
+		const result = await runWorkflowScript(
+			harness({
+				script: ['const v = await state.get("evil");', "return v;"].join("\n"),
+				state: { get: async (key) => store.get(key), set: async (key, value) => void store.set(key, value) },
+			}),
+		);
+		expect(JSON.stringify(result.value)).toBe('{"__proto__":{"polluted":"yes"},"ok":1}');
+	});
+
 	it("keeps runs.all an ordered array and rejects key access", async () => {
 		const ordered = await probe(
 			[
@@ -96,6 +165,31 @@ describe("workflowScript context isolation", () => {
 		);
 		expect(ordered).toEqual([true, 2, "out:a", "out:b"]);
 
+		await expect(
+			probe(
+				[
+					'const results = await runs.all([{ key: "a", agent: "worker", task: "A" }]);',
+					"return results.a;",
+				].join("\n"),
+			),
+		).rejects.toThrow(/resolves to an ordered array, not a key map/);
+	});
+
+	it("reads an out-of-range index on a runs.all result as undefined", async () => {
+		// The guard is rebuilt inside the vm context from installWorkflowApi.toString(),
+		// so its index test has to read the same after a re-parse. A double-escaped
+		// digit class matched only "0", and every other index fell through to the
+		// key-map error instead of the undefined a real array read returns.
+		const outOfRange = await probe(
+			[
+				'const results = await runs.all([{ key: "a", agent: "worker", task: "A" }]);',
+				"return [results[1], results[99]];",
+			].join("\n"),
+		);
+		expect(outOfRange).toEqual([null, null]);
+		const emptyIndex = await probe(["const results = await runs.all([]);", "return results[0];"].join("\n"));
+		expect(emptyIndex).toBeNull();
+		// A key-shaped read is still the actionable error it documents.
 		await expect(
 			probe(
 				[
@@ -129,6 +223,19 @@ describe("workflowScript context isolation", () => {
 		expect(result.emits).toEqual([{ note: "hi" }]);
 		expect(result.console).toEqual([{ level: "log", text: "from script" }]);
 	});
+
+	it("reports a self-referencing emit as a cycle instead of overflowing the stack", async () => {
+		// Unwrapping the runs.all guard before the JSON check never recorded plain
+		// objects it was visiting, so a script-built cycle recursed until the stack gave
+		// out and the failure named stack exhaustion instead of the cycle.
+		for (const [name, script] of [
+			["direct", "const o = { a: 1 }; o.self = o; emit(o); return 1;"],
+			["mutual", "const a = {}; const b = { a }; a.b = b; emit(a); return 1;"],
+			["through a runs.all result", 'const r = await runs.all([{ key: "a", agent: "w", task: "A" }]); const o = { r }; o.self = o; emit(o); return 1;'],
+		] as const) {
+			await expect(runWorkflowScript(harness({ script })), name).rejects.toThrow(/must not contain cycles/);
+		}
+	}, 30_000);
 
 	it("round-trips workflow state through the host", async () => {
 		const store = new Map<string, unknown>();

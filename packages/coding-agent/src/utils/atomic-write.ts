@@ -31,7 +31,8 @@ export function atomicWriteFileSync(
 		} else {
 			writeFileSync(tempPath, data, { mode: options?.mode });
 		}
-		const fd = openSync(tempPath, "r");
+		// fsync requires a write-capable handle on Windows ("r" fails with EPERM).
+		const fd = openSync(tempPath, "r+");
 		try {
 			fsyncSync(fd);
 		} finally {
@@ -61,7 +62,8 @@ export function atomicWriteFileExclusiveSync(
 		} else {
 			writeFileSync(tempPath, data, { mode: options?.mode });
 		}
-		const fd = openSync(tempPath, "r");
+		// fsync requires a write-capable handle on Windows ("r" fails with EPERM).
+		const fd = openSync(tempPath, "r+");
 		try {
 			fsyncSync(fd);
 		} finally {

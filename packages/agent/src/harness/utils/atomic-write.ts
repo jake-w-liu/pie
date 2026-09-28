@@ -119,7 +119,8 @@ export async function atomicWriteFile(
 		});
 		// Apply the mode after creation: open(2) intersects it with the umask, chmod does not.
 		if (mode !== undefined) await chmod(tempPath, mode);
-		const handle = await open(tempPath, "r");
+		// fsync requires a write-capable handle on Windows ("r" fails with EPERM).
+		const handle = await open(tempPath, "r+");
 		try {
 			await handle.sync();
 		} finally {

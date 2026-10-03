@@ -246,3 +246,74 @@ describe("Main-screen click routing", () => {
 		}
 	});
 });
+
+describe("Main-screen editor selection routing", () => {
+	// One sequence per sendInput: the input handler parses a single SGR report
+	// per call, so batching them would only deliver the press.
+	function drag(terminal: RecordingTerminal, x1: number, y1: number, x2: number, y2: number): void {
+		terminal.sendInput(click(x1, y1));
+		terminal.sendInput(`\x1b[<32;${x2};${y2}M`);
+		terminal.sendInput(`\x1b[<0;${x2};${y2}m`);
+	}
+
+	it("routes a drag over the editor into an editor selection", async () => {
+		const terminal = new RecordingTerminal(80, 24);
+		const tui = new TuiMainScreen(terminal);
+		const editor = new Editor(tui, defaultEditorTheme);
+		editor.setText("hello brave world");
+		tui.addChild(new Text("line1", 0, 0));
+		tui.addChild(editor);
+		tui.addChild(new Text("foot", 0, 0));
+		tui.setFocus(editor);
+		tui.start();
+		await terminal.waitForRender();
+
+		// Editor text row is absolute row 21 (1-based terminal row 22); the text
+		// starts at column 1.
+		drag(terminal, 1, 22, 6, 22);
+		assert.strictEqual(editor.getSelectedText(), "hello");
+
+		tui.stop();
+	});
+
+	it("deletes an editor selection on backspace", async () => {
+		const terminal = new RecordingTerminal(80, 24);
+		const tui = new TuiMainScreen(terminal);
+		const editor = new Editor(tui, defaultEditorTheme);
+		editor.setText("hello brave world");
+		tui.addChild(new Text("line1", 0, 0));
+		tui.addChild(editor);
+		tui.addChild(new Text("foot", 0, 0));
+		tui.setFocus(editor);
+		tui.start();
+		await terminal.waitForRender();
+
+		// 1-based columns 1..12 are buffer columns 0..11, i.e. "hello brave".
+		drag(terminal, 1, 22, 12, 22);
+		assert.strictEqual(editor.getSelectedText(), "hello brave");
+		editor.handleInput("\x7f");
+		assert.strictEqual(editor.getText(), " world");
+
+		tui.stop();
+	});
+
+	it("leaves the transcript selection path untouched for editor rows", async () => {
+		const terminal = new RecordingTerminal(80, 24);
+		const tui = new TuiMainScreen(terminal);
+		const editor = new Editor(tui, defaultEditorTheme);
+		editor.setText("hello");
+		tui.addChild(new Text("line1\nline2", 0, 0));
+		tui.addChild(editor);
+		tui.addChild(new Text("foot", 0, 0));
+		tui.setFocus(editor);
+		tui.start();
+		await terminal.waitForRender();
+
+		// A transcript drag must not create an editor selection.
+		drag(terminal, 1, 2, 8, 2);
+		assert.strictEqual(editor.hasSelection(), false);
+		assert.strictEqual(editor.getText(), "hello");
+
+		tui.stop();
+	});
+});

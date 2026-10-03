@@ -180,6 +180,12 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	private selectionRepaintEndRow: number | undefined;
 	// In-progress drag from the latest press; coordinates share the selection form.
 	private pendingDrag: PendingDrag | undefined;
+	/**
+	 * Set when a press landed inside a component that can own a selection drag.
+	 * The rows are captured at press time so drag and release map through the
+	 * same geometry the press used.
+	 */
+	private componentMouseGesture: { component: Component; after: number; targetHeight: number } | undefined;
 	private lastClick: { timestamp: number; count: number; row: number; wordStart: number; wordEnd: number } | undefined;
 	// Coalesce clipboard requests produced by one burst without waiting on older
 	// callbacks, which may be slow or never settle.
@@ -342,7 +348,15 @@ export class TuiMainScreen extends TuiBase implements TUI {
 						typeof focused.handleMousePress === "function" &&
 						focused.handleMousePress(x, targetHeight - 1 - localFromBottom)
 					) {
+						// Hand the rest of this gesture to the component so drag and
+						// release extend its own selection instead of the transcript's.
+						this.componentMouseGesture =
+							typeof focused.handleMouseDrag === "function"
+								? { component: focused, after, targetHeight }
+								: undefined;
 						this.requestRender();
+					} else {
+						this.componentMouseGesture = undefined;
 					}
 					this.logMouse("press-editor");
 					return;
@@ -363,6 +377,18 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		}
 		if (this.hasOverlay() || this.hasStalePointerFrame()) {
 			this.cancelSelectionGestureForRerender();
+			this.requestRender();
+			return true;
+		}
+		const gesture = this.componentMouseGesture;
+		if (gesture) {
+			this.componentMouseGesture = undefined;
+			if (!isPrimaryMouseRelease({ button, x, y, press: false })) return true;
+			if (this.hasOverlay() || this.hasStalePointerFrame()) {
+				this.requestRender();
+				return true;
+			}
+			gesture.component.handleMouseRelease?.();
 			this.requestRender();
 			return true;
 		}
@@ -391,6 +417,26 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	override routeMouseDrag(x: number, y: number): boolean {
+		// A component that claimed the press owns the rest of the gesture.
+		const gesture = this.componentMouseGesture;
+		if (gesture) {
+			if (this.hasOverlay() || this.hasStalePointerFrame()) {
+				this.componentMouseGesture = undefined;
+				this.requestRender();
+				return true;
+			}
+			const total = this.previousLines.length;
+			if (total === 0) {
+				this.componentMouseGesture = undefined;
+				return true;
+			}
+			const absoluteRow = this.previousViewportTop + y;
+			const localFromBottom = total - 1 - absoluteRow - gesture.after;
+			if (localFromBottom < 0 || localFromBottom >= gesture.targetHeight) return true;
+			gesture.component.handleMouseDrag?.(x, gesture.targetHeight - 1 - localFromBottom);
+			this.requestRender();
+			return true;
+		}
 		const pending = this.pendingDrag;
 		if (!pending) return false;
 		if (this.hasOverlay() || this.hasStalePointerFrame()) {

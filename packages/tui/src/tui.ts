@@ -41,6 +41,18 @@ export interface Component {
 	handleMousePress?(x: number, y: number): boolean;
 
 	/**
+	 * Optional drag continuation of `handleMousePress`. Coordinates match
+	 * `handleMousePress`. Return true when the component consumed the drag, so
+	 * the host does not also start a transcript selection.
+	 */
+	handleMouseDrag?(x: number, y: number): boolean;
+
+	/**
+	 * Optional end of a drag that `handleMouseDrag` consumed.
+	 */
+	handleMouseRelease?(): void;
+
+	/**
 	 * If true, component receives key release events (Kitty protocol).
 	 * Default is false - release events are filtered out.
 	 */

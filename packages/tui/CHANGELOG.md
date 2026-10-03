@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added prompt editor text selection: click-and-drag selects a range, double-click selects a word (paths and kebab-case tokens stay whole, matching transcript selection), and the highlight follows the pointer. Typing, pasting, Backspace and Delete remove the selection instead of editing at the cursor, which sits at the drag anchor and collapses to the selection start on removal. Selection is drawn through a single coalesced escape pair per run rather than one per character, and stays correct across word-wrapped lines. Transcript selection is unchanged.
 - Added masked single-line input rendering for secret authentication prompts.
 - Added environment and programmatic overrides for OSC 8 hyperlinks, inline image protocols, and truecolor terminal capabilities ([#8665](https://github.com/earendil-works/pi/issues/8665)).
 - Added a `TuiAltScreen` `copyOnSelect` option plus helpers to detect and copy the active fullscreen text selection programmatically ([#7720](https://github.com/earendil-works/pi/issues/7720)).

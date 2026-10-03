@@ -250,6 +250,40 @@ interface LayoutLine {
 	startIndex: number;
 }
 
+const EDITOR_DOUBLE_CLICK_INTERVAL_MS = 500;
+const editorWordSegmenter = getWordSegmenter();
+// Terminals treat these as word-internal so paths and kebab-case tokens select whole.
+const EDITOR_WORD_JOINERS = new Set(["/", "-"]);
+
+/** Order two buffer positions. */
+function comparePositions(a: { line: number; col: number }, b: { line: number; col: number }): number {
+	if (a.line !== b.line) return a.line - b.line;
+	return a.col - b.col;
+}
+
+/**
+ * Word ranges in a line as [start, end) UTF-16 offsets, using the shared
+ * segmenter so editor selection matches the transcript selection the two TUI
+ * modes already agree on.
+ */
+export function wordBoundaries(line: string): Array<[number, number]> {
+	const ranges: Array<[number, number]> = [];
+	let offset = 0;
+	for (const segment of editorWordSegmenter.segment(line)) {
+		const start = offset;
+		const end = start + segment.segment.length;
+		offset = end;
+		if (segment.isWordLike !== true && !EDITOR_WORD_JOINERS.has(segment.segment)) continue;
+		const previous = ranges[ranges.length - 1];
+		if (previous && previous[1] === start) {
+			previous[1] = end;
+			continue;
+		}
+		ranges.push([start, end]);
+	}
+	return ranges;
+}
+
 export interface EditorTheme {
 	borderColor: (str: string) => string;
 	selectList: SelectListTheme;
@@ -316,6 +350,14 @@ export class Editor implements Component, Focusable {
 	private lastClickLayout:
 		| { paddingX: number; rows: Array<{ bufferLine: number; startIndex: number; text: string }> }
 		| undefined;
+
+	// Text selection in logical buffer coordinates. Both endpoints are set while
+	// a selection exists; equal endpoints mean "no selection". Kept separate from
+	// the cursor so a selection survives the cursor moving away from it.
+	private selectionAnchor: { line: number; col: number } | null = null;
+	private selectionFocus: { line: number; col: number } | null = null;
+	// Click bookkeeping for double-click word selection inside the editor.
+	private lastEditorClick: { timestamp: number; line: number; col: number } | null = null;
 
 	// Border color (can be changed dynamically)
 	public borderColor: (str: string) => string;
@@ -596,47 +638,104 @@ export class Editor implements Component, Focusable {
 		const emitCursorMarker = this.focused;
 
 		for (const layoutLine of visibleLines) {
-			let displayText = layoutLine.text;
-			let lineVisibleWidth = visibleWidth(displayText);
+			let plainText = layoutLine.text;
+			let lineVisibleWidth = visibleWidth(plainText);
 			let cursorPos = layoutLine.cursorPos;
 			if (lineVisibleWidth > layoutWidth) {
 				// wordWrapLine isolates indivisible over-wide graphemes. Keep its
-				// source offsets and use the shared wrapper's visual fallback only.
-				displayText = wrapTextWithAnsi(displayText, layoutWidth)[0]!;
-				lineVisibleWidth = visibleWidth(displayText);
-				if (cursorPos !== undefined && cursorPos > 0) cursorPos = displayText.length;
+				// source offsets and use the shared wrappers visual fallback only.
+				plainText = wrapTextWithAnsi(plainText, layoutWidth)[0]!;
+				lineVisibleWidth = visibleWidth(plainText);
+				if (cursorPos !== undefined && cursorPos > 0) cursorPos = plainText.length;
 			}
-			let cursorInPadding = false;
 
-			// Add cursor if this line has it
-			if (layoutLine.hasCursor && cursorPos !== undefined) {
-				const before = displayText.slice(0, cursorPos);
-				const after = displayText.slice(cursorPos);
-
-				// Hardware cursor marker (zero-width, emitted before fake cursor for IME positioning)
-				const marker = emitCursorMarker ? CURSOR_MARKER : "";
-
-				if (after.length > 0) {
-					// Cursor is on a character (grapheme) - replace it with highlighted version
-					// Get the first grapheme from 'after'
-					const afterGraphemes = [...this.segment(after, "grapheme")];
-					const firstGrapheme = afterGraphemes[0]?.segment || "";
-					const restAfter = after.slice(firstGrapheme.length);
-					const cursor = `\x1b[7m${firstGrapheme}\x1b[0m`;
-					displayText = before + marker + cursor + restAfter;
-					// lineVisibleWidth stays the same - we're replacing, not adding
-				} else {
-					// Cursor is at the end - add highlighted space
-					const cursor = "\x1b[7m \x1b[0m";
-					displayText = before + marker + cursor;
-					lineVisibleWidth = lineVisibleWidth + 1;
-					// If cursor overflows content width into the padding, flag it
-					if (lineVisibleWidth > contentWidth && paddingX > 0) {
-						cursorInPadding = true;
+			// Selection offsets within this visual line, derived from the buffer range
+			// and this chunks slice of the buffer line.
+			const selection = this.selectionRange();
+			let selectedFrom: number | undefined;
+			let selectedTo: number | undefined;
+			if (selection) {
+				const { start, end } = selection;
+				if (layoutLine.bufferLine >= start.line && layoutLine.bufferLine <= end.line) {
+					const lineLength = (this.state.lines[layoutLine.bufferLine] ?? "").length;
+					const lineStart = layoutLine.bufferLine === start.line ? start.col : 0;
+					const lineEnd = layoutLine.bufferLine === end.line ? end.col : lineLength;
+					const chunkEnd = layoutLine.startIndex + plainText.length;
+					const from = Math.max(lineStart, layoutLine.startIndex);
+					const to = Math.min(lineEnd, chunkEnd);
+					if (to > from) {
+						selectedFrom = from - layoutLine.startIndex;
+						selectedTo = to - layoutLine.startIndex;
 					}
 				}
 			}
 
+			// Hardware cursor marker (zero-width, emitted before the fake cursor for IME positioning).
+			const marker = emitCursorMarker && !this.hasSelection() ? CURSOR_MARKER : "";
+			let displayText: string;
+			let cursorInPadding = false;
+
+			if (selectedFrom !== undefined && selectedTo !== undefined) {
+				// Style selection and cursor in a single pass so neither pass shifts the
+				// offsets the other one is measured against.
+				let out = "";
+				let offset = 0;
+				let cursorPlaced = false;
+				// Coalesce adjacent graphemes sharing a style so a long selection costs
+				// one escape pair instead of one per character.
+				let runStyle: "none" | "selected" = "none";
+				let run = "";
+				const flushRun = () => {
+					if (run.length === 0) return;
+					out += runStyle === "selected" ? `\x1b[7m${run}\x1b[0m` : run;
+					run = "";
+				};
+				for (const segment of this.segment(plainText, "grapheme")) {
+					const start = offset;
+					const end = offset + segment.segment.length;
+					offset = end;
+					const inSelection = end > selectedFrom! && start < selectedTo!;
+					const isCursor = !cursorPlaced && cursorPos !== undefined && start === cursorPos;
+					if (isCursor) {
+						cursorPlaced = true;
+						flushRun();
+						out += `${marker}\x1b[7m${segment.segment}\x1b[0m`;
+						continue;
+					}
+					const style = inSelection ? "selected" : "none";
+					if (style !== runStyle) {
+						flushRun();
+						runStyle = style;
+					}
+					run += segment.segment;
+				}
+				flushRun();
+				if (!cursorPlaced && cursorPos !== undefined && cursorPos >= plainText.length) {
+					out += `${marker}\x1b[7m \x1b[0m`;
+					lineVisibleWidth = lineVisibleWidth + 1;
+					if (lineVisibleWidth > contentWidth && paddingX > 0) cursorInPadding = true;
+				}
+				displayText = out;
+			} else {
+				// No selection: the original cursor-only rendering, unchanged.
+				displayText = plainText;
+				if (layoutLine.hasCursor && cursorPos !== undefined) {
+					const before = displayText.slice(0, cursorPos);
+					const after = displayText.slice(cursorPos);
+					if (after.length > 0) {
+						const afterGraphemes = [...this.segment(after, "grapheme")];
+						const firstGrapheme = afterGraphemes[0]?.segment || "";
+						const restAfter = after.slice(firstGrapheme.length);
+						displayText = `${before}${marker}\x1b[7m${firstGrapheme}\x1b[0m${restAfter}`;
+						// lineVisibleWidth stays the same - were replacing, not adding
+					} else {
+						displayText = `${before}${marker}\x1b[7m \x1b[0m`;
+						lineVisibleWidth = lineVisibleWidth + 1;
+						// If cursor overflows content width into the padding, flag it
+						if (lineVisibleWidth > contentWidth && paddingX > 0) cursorInPadding = true;
+					}
+				}
+			}
 			// Calculate padding based on actual visible width
 			const padding = " ".repeat(Math.max(0, contentWidth - lineVisibleWidth));
 			const lineRightPadding = cursorInPadding ? rightPadding.slice(1) : rightPadding;
@@ -1160,23 +1259,65 @@ export class Editor implements Component, Focusable {
 	 * or the autocomplete popup are ignored. Returns true when the cursor moved.
 	 */
 	handleMousePress(x: number, y: number): boolean {
-		const layout = this.lastClickLayout;
-		if (!layout) return false;
-		// Row 0 is the top border; text rows follow; anything below is the
-		// bottom border or the autocomplete popup.
-		if (y < 1 || y > layout.rows.length) return false;
-		const row = layout.rows[y - 1];
-		if (!row) return false;
-		const bufferLine = this.state.lines[row.bufferLine] ?? "";
-		const charIndex = this.columnToCharIndex(row.text, x - layout.paddingX);
-		// Word-wrap can trim trailing whitespace, so clamp into the buffer line.
-		const bufferCol = Math.min(row.startIndex + charIndex, bufferLine.length);
+		const position = this.positionAtClick(x, y);
+		if (!position) return false;
 		this.cancelAutocomplete();
 		this.jumpMode = null;
 		this.lastAction = null;
-		this.state.cursorLine = row.bufferLine;
-		this.setCursorCol(bufferCol);
+		this.state.cursorLine = position.line;
+		this.setCursorCol(position.col);
+
+		// A press starts a fresh selection. A second press on the same word within
+		// the double-click window selects that whole word instead, which is what
+		// makes "double-click a word, then type" replace it.
+		const now = Date.now();
+		const previous = this.lastEditorClick;
+		const isRepeat =
+			previous !== null &&
+			now - previous.timestamp <= EDITOR_DOUBLE_CLICK_INTERVAL_MS &&
+			previous.line === position.line &&
+			previous.col === position.col;
+		this.lastEditorClick = { timestamp: now, line: position.line, col: position.col };
+		if (isRepeat) {
+			this.selectWordAt(position.line, position.col);
+		} else {
+			this.setSelection(position, position);
+		}
 		return true;
+	}
+
+	/**
+	 * Extend the selection started by {@link handleMousePress} to a new position.
+	 * Returns false when the press did not land inside the editor.
+	 */
+	handleMouseDrag(x: number, y: number): boolean {
+		const position = this.positionAtClick(x, y);
+		if (!position) return false;
+		return this.extendSelectionTo(position.line, position.col);
+	}
+
+	/**
+	 * Finish a mouse selection. The highlight is kept so the user can see what
+	 * the next keystroke or delete will remove.
+	 */
+	handleMouseRelease(): void {
+		// A press with no drag leaves the endpoints equal, so hasSelection() is
+		// false and the next keystroke inserts at the cursor as usual.
+	}
+
+	/** Resolve a component-relative click to a buffer position. */
+	private positionAtClick(x: number, y: number): { line: number; col: number } | undefined {
+		const layout = this.lastClickLayout;
+		if (!layout) return undefined;
+		// Row 0 is the top border; text rows follow; anything below is the
+		// bottom border or the autocomplete popup.
+		if (y < 1 || y > layout.rows.length) return undefined;
+		const row = layout.rows[y - 1];
+		if (!row) return undefined;
+		const bufferLine = this.state.lines[row.bufferLine] ?? "";
+		const charIndex = this.columnToCharIndex(row.text, x - layout.paddingX);
+		// Word-wrap can trim trailing whitespace, so clamp into the buffer line.
+		return { line: row.bufferLine, col: Math.min(row.startIndex + charIndex, bufferLine.length) };
 	}
 
 	/**
@@ -1229,7 +1370,118 @@ export class Editor implements Component, Focusable {
 		this.pushUndoSnapshot();
 		this.lastAction = null;
 		this.exitHistoryBrowsing();
+		// Typing over a selection replaces it rather than appending at the cursor.
+		if (this.hasSelection()) this.deleteSelection();
 		this.insertTextAtCursorInternal(text);
+	}
+
+	/** Whether a non-empty selection currently exists. */
+	hasSelection(): boolean {
+		return this.selectionRange() !== null;
+	}
+
+	/**
+	 * The active selection as an ordered, non-empty range in buffer coordinates,
+	 * or null when there is no selection. Endpoints are always inside the buffer.
+	 */
+	private selectionRange(): { start: { line: number; col: number }; end: { line: number; col: number } } | null {
+		const anchor = this.selectionAnchor;
+		const focus = this.selectionFocus;
+		if (!anchor || !focus) return null;
+		const start = comparePositions(anchor, focus) <= 0 ? anchor : focus;
+		const end = comparePositions(anchor, focus) <= 0 ? focus : anchor;
+		if (start.line === end.line && start.col === end.col) return null;
+		return { start, end };
+	}
+
+	/** The selected text, or null when nothing is selected. */
+	getSelectedText(): string | null {
+		const range = this.selectionRange();
+		if (!range) return null;
+		const { start, end } = range;
+		if (start.line === end.line) {
+			return (this.state.lines[start.line] ?? "").slice(start.col, end.col);
+		}
+		const parts: string[] = [];
+		for (let line = start.line; line <= end.line; line++) {
+			const text = this.state.lines[line] ?? "";
+			const from = line === start.line ? start.col : 0;
+			const to = line === end.line ? end.col : text.length;
+			parts.push(text.slice(from, to));
+		}
+		return parts.join("\n");
+	}
+
+	/** Drop any selection without touching the buffer or the cursor. */
+	clearSelection(): void {
+		this.selectionAnchor = null;
+		this.selectionFocus = null;
+		this.lastEditorClick = null;
+	}
+
+	/**
+	 * Remove the selected text and collapse the cursor to the selection start.
+	 * Returns false when there was nothing selected, so callers can fall through
+	 * to their normal single-character behaviour.
+	 */
+	deleteSelection(): boolean {
+		const range = this.selectionRange();
+		if (!range) return false;
+		const { start, end } = range;
+		if (start.line === end.line) {
+			const line = this.state.lines[start.line] ?? "";
+			this.state.lines[start.line] = line.slice(0, start.col) + line.slice(end.col);
+		} else {
+			const first = this.state.lines[start.line] ?? "";
+			const last = this.state.lines[end.line] ?? "";
+			this.state.lines = [
+				...this.state.lines.slice(0, start.line),
+				first.slice(0, start.col) + last.slice(end.col),
+				...this.state.lines.slice(end.line + 1),
+			];
+		}
+		this.state.cursorLine = start.line;
+		this.setCursorCol(start.col);
+		this.clearSelection();
+		return true;
+	}
+
+	/**
+	 * Select the word around a buffer position, using the same word boundaries
+	 * the terminal uses (plus "/" and "-" as joiners, so paths and kebab-case
+	 * tokens stay whole). Returns false when the position is out of bounds.
+	 */
+	selectWordAt(line: number, col: number): boolean {
+		const text = this.state.lines[line];
+		if (text === undefined) return false;
+		const boundaries = wordBoundaries(text);
+		if (boundaries.length === 0) return false;
+		const index = boundaries.findIndex(([from, to]) => col >= from && col < to);
+		if (index < 0) {
+			// Clicking past the last word selects the final one, matching terminals.
+			const last = boundaries[boundaries.length - 1];
+			this.setSelection({ line, col: last[0] }, { line, col: last[1] });
+			return true;
+		}
+		const [from, to] = boundaries[index];
+		this.setSelection({ line, col: from }, { line, col: to });
+		return true;
+	}
+
+	/** Set the selection endpoints directly. */
+	setSelection(anchor: { line: number; col: number }, focus: { line: number; col: number }): void {
+		this.selectionAnchor = { ...anchor };
+		this.selectionFocus = { ...focus };
+	}
+
+	/**
+	 * Extend the in-progress selection from the anchor to a buffer position.
+	 * Returns false when there is no anchor, so the caller can ignore the drag.
+	 */
+	extendSelectionTo(line: number, col: number): boolean {
+		if (!this.selectionAnchor) return false;
+		this.selectionFocus = { line, col };
+		return true;
 	}
 
 	/**
@@ -1475,6 +1727,13 @@ export class Editor implements Component, Focusable {
 	private handleBackspace(): void {
 		this.exitHistoryBrowsing();
 		this.lastAction = null;
+
+		// A live selection is the deletion target; the cursor position is ignored.
+		if (this.hasSelection()) {
+			this.pushUndoSnapshot();
+			this.deleteSelection();
+			return;
+		}
 
 		if (this.state.cursorCol > 0) {
 			this.pushUndoSnapshot();
@@ -1874,6 +2133,13 @@ export class Editor implements Component, Focusable {
 	private handleForwardDelete(): void {
 		this.exitHistoryBrowsing();
 		this.lastAction = null;
+
+		// A live selection is the deletion target; the cursor position is ignored.
+		if (this.hasSelection()) {
+			this.pushUndoSnapshot();
+			this.deleteSelection();
+			return;
+		}
 
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
 

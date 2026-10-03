@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { advanceLatestRelease, compareReleaseVersions } from "./publish-release-announcement.mjs";
+import { advanceLatestRelease, compareReleaseVersions, putImmutableObject } from "./publish-release-announcement.mjs";
 
 test("compares stable release versions numerically", () => {
 	assert.ok(compareReleaseVersions("0.85.0", "0.84.9") > 0);
@@ -59,4 +59,56 @@ test("creates a missing marker with an if-none-match condition", async () => {
 
 	assert.deepEqual(result, { advanced: true, version: "0.84.0" });
 	assert.deepEqual(condition, { missing: true });
+});
+
+test("an idempotent immutable write proceeds when the existing object matches", async () => {
+	const body = Buffer.from('{"version":"0.85.0"}\n');
+	const result = await putImmutableObject({
+		write: async () => false,
+		readRemote: async () => body,
+		key: "releases/v1/releases/0.85.0.json",
+		body,
+	});
+
+	assert.equal(result, false);
+});
+
+test("an idempotent immutable write fails before pointers move when the existing object differs", async () => {
+	await assert.rejects(
+		putImmutableObject({
+			write: async () => false,
+			readRemote: async () => Buffer.from('{"version":"0.85.0","sourceCommit":"other"}\n'),
+			key: "releases/v1/releases/0.85.0.json",
+			body: Buffer.from('{"version":"0.85.0"}\n'),
+		}),
+		/already exists with different content/,
+	);
+});
+
+test("an idempotent immutable write fails when the object is neither written nor readable", async () => {
+	await assert.rejects(
+		putImmutableObject({
+			write: async () => false,
+			readRemote: async () => undefined,
+			key: "installer/v1/releases/0.85.0/package.json",
+			body: Buffer.from("{}\n"),
+		}),
+		/could not be written and is absent/,
+	);
+});
+
+test("a first-time immutable write does not read the remote object", async () => {
+	let reads = 0;
+	const result = await putImmutableObject({
+		write: async () => true,
+		readRemote: async () => {
+			reads++;
+			return undefined;
+		},
+		key: "releases/v1/releases/0.85.0.json",
+		body: Buffer.from("{}\n"),
+	});
+
+	assert.equal(result, true);
+	assert.equal(reads, 0);
 });

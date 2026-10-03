@@ -6,7 +6,7 @@ import { isGeminiWebAvailable, queryWithCookies } from "./gemini-web.ts";
 import { isGeminiApiAvailableWithVideo, queryGeminiApiWithVideo } from "./gemini-api.ts";
 import { isPerplexityAvailable, searchWithPerplexity } from "./perplexity.ts";
 import { extractHeadingTitle, type ExtractedContent, type FrameResult, type VideoFrame } from "./extract.ts";
-import { formatSeconds, readExecError, isTimeoutError, trimErrorText, mapFfmpegError, getWebSearchConfigPath } from "./utils.ts";
+import { formatSeconds, readExecError, isTimeoutError, trimErrorText, mapFfmpegError, getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
 
 const CONFIG_PATH = getWebSearchConfigPath();
 
@@ -64,8 +64,7 @@ function loadYouTubeConfig(): YouTubeConfig {
 	try {
 		raw = JSON.parse(rawText) as { youtube?: { enabled?: boolean; preferredModel?: string } };
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 
 	const yt = raw.youtube ?? {};

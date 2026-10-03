@@ -8,6 +8,12 @@
 - NVIDIA and OpenRouter now refresh their model catalogs live from their own `/models` endpoints at runtime instead of relying only on the shipped static catalog, so new models appear in the `/model` picker without waiting for a release. NVIDIA keeps its curated static baseline and adds newly-available chat models (filtering out embeddings, safety guards, and code/vision-only endpoints); OpenRouter replaces baseline entries with current metadata (context window, pricing, reasoning, tool support).
 
 ### Fixed
+- A throwing `onResponse` callback no longer resubmits an already accepted Codex response; the callback runs after the retry loop, and a failed callback cancels the response body.
+- `timeoutMs` now covers the Codex SSE response body, not only the response headers, so a stalled body can no longer wait indefinitely.
+- The Bedrock adapter honors `maxRetries` and `timeoutMs` and destroys its per-request client, so retries can be disabled, requests are bounded, and connections are released on every path.
+- Re-registering the built-in API providers no longer marks a custom override as the built-in implementation and routes built-in models around it.
+- Image model catalogs no longer emit negative per-million prices from OpenRouter's `-1` unknown-price sentinel.
+- CLI auth credentials are written atomically, so an interruption cannot leave a truncated or unparseable credential file.
 
 - Fixed Kimi Coding and Anthropic OAuth error messages echoing the raw token-endpoint response. A partially valid response still carries a usable access token, and `ModelsError` splices cause text into the user-visible message, so the token reached logs and transcripts; the message now names the failure without the body.
 - Fixed `npx @earendil-works/pi-ai login` writing `auth.json` with default (world-readable) permissions, and silently truncating it when the existing file failed to parse so one login logged the user out of every other provider.

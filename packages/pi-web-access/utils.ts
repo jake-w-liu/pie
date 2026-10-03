@@ -181,6 +181,25 @@ export function isTimeoutError(err: unknown): boolean {
 	return name === "AbortError" || code === "ETIMEDOUT" || message.toLowerCase().includes("timed out");
 }
 
+/**
+ * Diagnostic for a `JSON.parse` failure of a file that is itself the credential
+ * store (`web-search.json`, the Gemini ADC file, the Bright Data config).
+ *
+ * V8 quotes a slice of the source text around the offending token back inside the
+ * parser message — for a short file, effectively the whole file. `{"apiKey":
+ * sk-live-abc123}` (quotes forgotten around a pasted token) yields `Unexpected
+ * token 's', "{"apiKey": sk-live-abc123}" is not valid JSON`, and there is no
+ * credential to redact against, because the credential is what the file was being
+ * read for. So the parser text is dropped entirely and only the position is kept;
+ * the position is also the only part that cannot smuggle a status-shaped phrase
+ * into `providerErrorStatus`.
+ */
+export function jsonParseDiagnostic(err: unknown): string {
+	const message = err instanceof Error ? err.message : String(err);
+	const position = message.match(/at position \d+(?: \(line \d+ column \d+\))?/i);
+	return position ? `not valid JSON, ${position[0]}` : "not valid JSON";
+}
+
 export function trimErrorText(text: string): string {
 	return text.replace(/\s+/g, " ").trim().slice(0, 200);
 }

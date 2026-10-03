@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { createSign } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
 import { redactCredential, CredentialResolutionError } from "./credential-source.ts";
 
 const CONFIG_PATH = getWebSearchConfigPath();
@@ -36,8 +36,7 @@ function loadConfig(): GeminiAdcConfig {
 		}
 		cachedConfig = parsed as GeminiAdcConfig;
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 	return cachedConfig;
 }
@@ -106,26 +105,35 @@ function requiredString(record: Record<string, unknown>, name: string, context: 
 }
 
 function parseAdcFile(raw: string): AdcFile {
-	const parsed = objectRecord(JSON.parse(raw));
-	if (!parsed) throw new Error("credential root must be an object");
-	const type = stringField(parsed, "type") ?? "authorized_user";
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (err) {
+		// The ADC file is the credential: V8's parser message quotes the source text
+		// around the offending token, so only its position is safe to repeat. The
+		// caller wraps whatever this throws in the path-bearing message below.
+		throw new Error(jsonParseDiagnostic(err));
+	}
+	const record = objectRecord(parsed);
+	if (!record) throw new Error("credential root must be an object");
+	const type = stringField(record, "type") ?? "authorized_user";
 	if (type === "authorized_user") {
 		return {
 			type,
-			client_id: requiredString(parsed, "client_id", "Gemini ADC authorized_user file"),
-			client_secret: requiredString(parsed, "client_secret", "Gemini ADC authorized_user file"),
-			refresh_token: requiredString(parsed, "refresh_token", "Gemini ADC authorized_user file"),
-			universe_domain: stringField(parsed, "universe_domain"),
+			client_id: requiredString(record, "client_id", "Gemini ADC authorized_user file"),
+			client_secret: requiredString(record, "client_secret", "Gemini ADC authorized_user file"),
+			refresh_token: requiredString(record, "refresh_token", "Gemini ADC authorized_user file"),
+			universe_domain: stringField(record, "universe_domain"),
 		};
 	}
 	if (type === "service_account") {
 		return {
 			type,
-			client_email: requiredString(parsed, "client_email", "Gemini ADC service_account file"),
-			private_key: requiredString(parsed, "private_key", "Gemini ADC service_account file"),
-			private_key_id: stringField(parsed, "private_key_id"),
-			token_uri: stringField(parsed, "token_uri"),
-			universe_domain: stringField(parsed, "universe_domain"),
+			client_email: requiredString(record, "client_email", "Gemini ADC service_account file"),
+			private_key: requiredString(record, "private_key", "Gemini ADC service_account file"),
+			private_key_id: stringField(record, "private_key_id"),
+			token_uri: stringField(record, "token_uri"),
+			universe_domain: stringField(record, "universe_domain"),
 		};
 	}
 	return { type };

@@ -27,7 +27,9 @@ export async function readPipedStdin(source: Readable = process.stdin): Promise<
 		const onEnd = () => {
 			cleanup();
 			source.pause();
-			resolve(data.trim() || undefined);
+			// Only whitespace-only input counts as empty. Trimming a real prompt stripped
+			// leading indentation and trailing newlines from piped code blocks.
+			resolve(data.trim().length === 0 ? undefined : data);
 		};
 		const onError = () => {
 			cleanup();

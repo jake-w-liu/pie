@@ -376,6 +376,24 @@ export function resolveGoogleFunctionCallingMode(
 /**
  * Map Gemini FinishReason to our StopReason.
  */
+/**
+ * Map string finish reason to our StopReason (for raw API responses).
+ *
+ * Kept on purpose: `packages/ai/package.json` publishes `./api/*`, so this is part of
+ * the package's public surface even though the Google adapters use the enum-based
+ * `mapStopReason`. Removing it would be a breaking API change, not stale-code cleanup.
+ */
+export function mapStopReasonString(reason: string): StopReason {
+	switch (reason) {
+		case "STOP":
+			return "stop";
+		case "MAX_TOKENS":
+			return "length";
+		default:
+			return "error";
+	}
+}
+
 export function mapStopReason(reason: FinishReason): StopReason {
 	switch (reason) {
 		case FinishReason.STOP:
@@ -402,20 +420,6 @@ export function mapStopReason(reason: FinishReason): StopReason {
 			const _exhaustive: never = reason;
 			throw new Error(`Unhandled stop reason: ${_exhaustive}`);
 		}
-	}
-}
-
-/**
- * Map string finish reason to our StopReason (for raw API responses).
- */
-export function mapStopReasonString(reason: string): StopReason {
-	switch (reason) {
-		case "STOP":
-			return "stop";
-		case "MAX_TOKENS":
-			return "length";
-		default:
-			return "error";
 	}
 }
 

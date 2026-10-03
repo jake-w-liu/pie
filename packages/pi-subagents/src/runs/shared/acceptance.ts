@@ -937,7 +937,13 @@ function reportEvidenceStatus(report: AcceptanceReport, kind: AcceptanceEvidence
 		case "tests-added":
 			if (!isStringArray(report.testsAddedOrUpdated)) return "failed";
 			return report.testsAddedOrUpdated.length === 0 ? "not-applicable" : "passed";
-		case "commands-run": return Array.isArray(report.commandsRun) && report.commandsRun.length > 0 ? "passed" : "failed";
+		case "commands-run": {
+			if (!Array.isArray(report.commandsRun) || report.commandsRun.length === 0) return "failed";
+			// A reported command that failed is not verification: reporting
+			// `{command:"npm test", result:"failed"}` used to satisfy checked
+			// acceptance purely by being present in the array.
+			return report.commandsRun.some((item) => item.result !== "passed") ? "failed" : "passed";
+		}
 		case "validation-output": return isStringArray(report.validationOutput) && report.validationOutput.length > 0 ? "passed" : "failed";
 		case "residual-risks": return isStringArray(report.residualRisks) ? "passed" : "failed";
 		case "no-staged-files": return report.noStagedFiles === true ? "passed" : "failed";
@@ -1137,6 +1143,10 @@ interface VerifyWorkspaceState {
 	diffHash: string;
 }
 
+// Content-hashing the untracked tree is bounded: a workspace with more untracked
+// bytes than this is not fingerprinted at all, and the verify command runs instead.
+const UNTRACKED_FINGERPRINT_MAX_BYTES = 64 * 1024 * 1024;
+
 function readVerifyWorkspaceState(cwd: string): VerifyWorkspaceState | undefined {
 	const repo = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf-8", windowsHide: true });
 	if (repo.status !== 0 || !repo.stdout.trim()) return undefined;
@@ -1157,17 +1167,62 @@ function readVerifyWorkspaceState(cwd: string): VerifyWorkspaceState | undefined
  * `git diff HEAD` only reports tracked paths, so a child that leaves new untracked
  * files (a new test file, a new fixture) leaves head and diffHash byte-identical and
  * a stale `passed` memo silently satisfies the `verified` gate. Fingerprint the
- * untracked and ignored path state as well. `--untracked-files=all` lists every
+ * untracked and ignored content as well. `--untracked-files=all` lists every
  * untracked file individually instead of collapsing directories, and
  * `--ignored=matching` reports an ignored directory as one entry instead of walking
  * it, so a dependency or build directory cannot turn this into a full tree scan.
- * Returns undefined when the state cannot be read: a verify that cannot prove its
- * workspace unchanged must run instead of trusting a memo.
+ *
+ * Path names alone are not enough: `git status` output stays byte-identical when the
+ * bytes of an existing untracked file change, so editing a test the verify command
+ * runs reused a memoized `passed` for a tree nobody verified. Untracked file contents
+ * are hashed too, and the fingerprint is abandoned (undefined) once the untracked
+ * tree exceeds `UNTRACKED_FINGERPRINT_MAX_BYTES` or a file cannot be read: a verify
+ * that cannot prove its workspace unchanged must run instead of trusting a memo.
  */
 function readUntrackedWorkspaceHash(repoRoot: string): string | undefined {
 	const status = spawnSync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"], { cwd: repoRoot, encoding: "utf-8", maxBuffer: 50 * 1024 * 1024, windowsHide: true });
 	if (status.status !== 0 || status.error) return undefined;
-	return hash(status.stdout);
+	const records = status.stdout.split("\0");
+	const fingerprints: string[] = [];
+	let budget = UNTRACKED_FINGERPRINT_MAX_BYTES;
+	for (let index = 0; index < records.length; index++) {
+		const record = records[index]!;
+		if (!record) continue;
+		const code = record.slice(0, 2);
+		const relative = record.slice(3);
+		// Renames and copies emit a second NUL-terminated original-path record.
+		if (code.startsWith("R") || code.startsWith("C")) index++;
+		if (code !== "??" && code !== "!!") continue;
+		if (!relative) continue;
+		const absolute = path.resolve(repoRoot, relative);
+		if (!absolute.startsWith(`${repoRoot}${path.sep}`)) return undefined;
+		let stats: fs.Stats;
+		try {
+			stats = fs.lstatSync(absolute);
+		} catch {
+			return undefined;
+		}
+		if (stats.isSymbolicLink()) {
+			// Never follow a link out of the workspace; its target is not the
+			// workspace's state. Size and mtime still change when the link is retargeted.
+			fingerprints.push(`${code} ${relative} link ${stats.size} ${stats.mtimeMs}`);
+			continue;
+		}
+		if (!stats.isFile()) {
+			fingerprints.push(`${code} ${relative} dir`);
+			continue;
+		}
+		if (stats.size > budget) return undefined;
+		let contents: Buffer;
+		try {
+			contents = fs.readFileSync(absolute);
+		} catch {
+			return undefined;
+		}
+		budget -= contents.byteLength;
+		fingerprints.push(`${code} ${relative} ${contents.byteLength} ${createHash("sha256").update(contents).digest("hex")}`);
+	}
+	return hash(`${status.stdout}\n${fingerprints.join("\n")}`);
 }
 
 function isCachedVerifyResult(value: unknown): value is AcceptanceVerifyResult {
@@ -1451,7 +1506,11 @@ export async function evaluateAcceptance(input: {
 		ledger.childReportParseError = parsed.error;
 	}
 
-	if (parsed.report && LEVEL_RANK[acceptance.level] >= LEVEL_RANK.checked) {
+	// An attested contract still requires the reviewer to report its criteria and
+	// evidence. Those structural checks used to run only from `checked` upward, so a
+	// report containing nothing but `changedFiles` was accepted as `attested` with an
+	// empty check list. Host-side verification stays reserved for higher levels.
+	if (parsed.report && acceptance.criteria.length + acceptance.evidence.length > 0) {
 		ledger.runtimeChecks = [
 			...ledger.runtimeChecks,
 			...checkCriteriaSatisfied(acceptance.criteria, parsed.report),

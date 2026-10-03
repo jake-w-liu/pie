@@ -20,8 +20,12 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult
 
 const readSchema = Type.Object({
 	path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
-	offset: Type.Optional(Type.Number({ minimum: 1, description: "Line number to start reading from (1-indexed)" })),
-	limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
+	// Integer with a positive minimum, not a bare Number: `limit: 0`, a negative limit
+	// and fractional limits all passed schema validation, and the negative/fractional
+	// cases then produced wrong content plus continuation notices with impossible
+	// counts and offsets ("2.5 more lines ... offset=2.5").
+	offset: Type.Optional(Type.Integer({ minimum: 1, description: "Line number to start reading from (1-indexed)" })),
+	limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum number of lines to read" })),
 });
 
 export const readToolSystemPromptContribution = {
@@ -229,6 +233,16 @@ export function createReadToolDefinition(
 		) {
 			return new Promise<{ content: (TextContent | ImageContent)[]; details: ReadToolDetails | undefined }>(
 				(resolve, reject) => {
+					// The schema rejects these, but `execute` is also reachable directly
+					// through the SDK without schema validation.
+					if (offset !== undefined && (!Number.isInteger(offset) || offset < 1)) {
+						reject(new Error("offset must be an integer >= 1"));
+						return;
+					}
+					if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
+						reject(new Error("limit must be an integer >= 1"));
+						return;
+					}
 					if (signal?.aborted) {
 						reject(new Error("Operation aborted"));
 						return;

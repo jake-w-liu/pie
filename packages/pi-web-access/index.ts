@@ -12,7 +12,7 @@ import { clearCloneCache } from "./github-extract.ts";
 import { ALL_SEARCH_PROVIDERS, getConfiguredSearchRouting, normalizeSearchProviderSelection, RESOLVED_SEARCH_PROVIDERS, SEARCH_PROVIDERS, search, type AttributedSearchResponse, type ProviderAvailability, type SearchProvider, type SearchProviderSelection, type ResolvedSearchProvider } from "./gemini-search.ts";
 export type { ProviderAvailability } from "./gemini-search.ts";
 import type { SearchResult } from "./perplexity.ts";
-import { formatSeconds, getWebSearchConfigDir, getWebSearchConfigPath, installGlobalProxyFetch, resolveCuratorNetworkConfig, runWithProxy } from "./utils.ts";
+import { formatSeconds, getWebSearchConfigDir, getWebSearchConfigPath, installGlobalProxyFetch, jsonParseDiagnostic, resolveCuratorNetworkConfig, runWithProxy } from "./utils.ts";
 import {
 	clearResults,
 	deleteResult,
@@ -184,8 +184,7 @@ function parseConfigRoot(raw: string): Record<string, unknown> {
 	try {
 		parsed = JSON.parse(raw);
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${WEB_SEARCH_CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${WEB_SEARCH_CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 		throw new Error(`Invalid config in ${WEB_SEARCH_CONFIG_PATH}: expected a JSON object`);
@@ -1759,7 +1758,9 @@ export default function (pi: ExtensionAPI) {
 			numResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Results per query (default: 5, max: 20)" })),
 			includeContent: Type.Optional(Type.Boolean({ description: "Fetch full page content (async)" })),
 			recencyFilter: Type.Optional(
-				StringEnum(["day", "week", "month", "year"], { description: "Filter by recency" }),
+				StringEnum(["day", "week", "month", "year"], {
+					description: "Filter by recency. Applied by providers that support it; providers without a recency parameter return unfiltered results, so prefer a domainFilter or put the date in the query when it matters.",
+				}),
 			),
 			domainFilter: Type.Optional(Type.Array(Type.String(), { description: "Limit to domains (prefix with - to exclude)" })),
 			provider: Type.Optional(searchProviderSchema("Search provider or non-empty list of providers to search simultaneously; use all to search every eligible provider except Parallel MCP, DuckDuckGo, Kimi, AnySearch, XCrawl, Valyu, xAI, Bright Data, SerpBase, and Serper, omit this field to use the configured provider, or use auto when none is configured")),

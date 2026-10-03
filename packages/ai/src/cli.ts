@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import type { AuthPrompt, OAuthCredential, Provider } from "./index.ts";
 import { builtinProviders } from "./providers/all.ts";
@@ -45,8 +47,24 @@ function loadAuth(): Record<string, OAuthCredential> {
 
 function saveAuth(auth: Record<string, OAuthCredential>): void {
 	// Same contract as the coding agent's auth storage: OAuth access and refresh
-	// tokens are written owner-only, and an existing file is tightened too.
-	writeFileSync(AUTH_FILE, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 0o600 });
+	// tokens are written owner-only, and an existing file is tightened too. The write
+	// goes to an owner-only temporary sibling and is renamed over the target: a direct
+	// `writeFileSync` truncated every stored credential before the replacement was
+	// durable, so an interruption left an unparseable auth file.
+	const directory = dirname(AUTH_FILE);
+	mkdirSync(directory, { recursive: true });
+	const temporary = join(directory, `.${basename(AUTH_FILE)}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`);
+	try {
+		writeFileSync(temporary, JSON.stringify(auth, null, 2), { encoding: "utf-8", mode: 0o600 });
+		renameSync(temporary, AUTH_FILE);
+	} catch (error) {
+		try {
+			rmSync(temporary, { force: true });
+		} catch {
+			// Preserve the write/rename failure; cleanup is best effort.
+		}
+		throw error;
+	}
 	chmodSync(AUTH_FILE, 0o600);
 }
 

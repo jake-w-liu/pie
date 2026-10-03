@@ -50,10 +50,6 @@ export function normalizeNativeShiftEnterInput(
 	return data;
 }
 
-export function normalizeAppleTerminalInput(data: string, isAppleTerminal: boolean, isShiftPressed: boolean): string {
-	return normalizeNativeShiftEnterInput(data, isAppleTerminal, isShiftPressed);
-}
-
 /**
  * Minimal terminal interface for TUI
  */

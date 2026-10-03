@@ -162,6 +162,11 @@ function validateProvider(value: unknown): ExternalJobProvider {
 	for (const op of ["start", "status", "result", "reattach"] as const) {
 		if (typeof provider[op] !== "function") throw new Error(`External-job provider '${name}' must expose ${op}().`);
 	}
+	// Optional operations still have to be callable when present: a non-function
+	// `followUp` was accepted here and then failed at call time with a TypeError.
+	if (provider.followUp !== undefined && typeof provider.followUp !== "function") {
+		throw new Error(`External-job provider '${name}' followUp must be a function when provided.`);
+	}
 	return value as ExternalJobProvider;
 }
 

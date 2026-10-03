@@ -251,6 +251,46 @@ export function createExtensionRuntime(): ExtensionRuntime {
  * Registration methods write to the extension object.
  * Action methods delegate to the shared runtime.
  */
+/** Runtime event names accepted by `pi.on`, mirroring the `ExtensionAPI.on` overloads. */
+const SUPPORTED_EXTENSION_EVENTS = new Set<string>([
+	"after_provider_response",
+	"agent_end",
+	"agent_settled",
+	"agent_start",
+	"before_agent_start",
+	"before_provider_headers",
+	"before_provider_request",
+	"context",
+	"input",
+	"message_end",
+	"message_start",
+	"message_update",
+	"model_select",
+	"project_trust",
+	"resources_discover",
+	"session_before_compact",
+	"session_before_fork",
+	"session_before_switch",
+	"session_before_tree",
+	"session_compact",
+	"session_compact_failed",
+	"session_info_changed",
+	"session_shutdown",
+	"session_start",
+	"session_tree",
+	"thinking_level_select",
+	"tool_call",
+	"tool_execution_end",
+	"tool_execution_start",
+	"tool_execution_update",
+	"tool_result",
+	"turn_end",
+	"turn_start",
+	"ui_prompt_end",
+	"ui_prompt_start",
+	"user_bash",
+]);
+
 function createExtensionAPI(
 	extension: Extension,
 	runtime: ExtensionRuntime,
@@ -281,6 +321,13 @@ function createExtensionAPI(
 		// Registration methods - write to extension
 		on(event: string, handler: HandlerFn): void {
 			assertActive();
+			// `.js` extensions skip TypeScript, so a typo like `sesion_start` used to
+			// register a handler nothing ever called. Reject unknown names at load time.
+			if (!SUPPORTED_EXTENSION_EVENTS.has(event)) {
+				throw new Error(
+					`Unsupported extension event '${event}'. Supported events: ${[...SUPPORTED_EXTENSION_EVENTS].join(", ")}`,
+				);
+			}
 			const list = extension.handlers.get(event) ?? [];
 			list.push(handler);
 			extension.handlers.set(event, list);

@@ -3,7 +3,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { activityMonitor } from "./activity.ts";
 import type { SearchOptions, SearchResponse, SearchResult } from "./perplexity.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
 
 // xAI's Agent Tools API: a hosted `web_search` tool on an OpenAI-compatible
 // Responses endpoint. The search runs inside xAI's own inference, so — unlike
@@ -58,8 +58,7 @@ function loadConfig(): WebSearchConfig {
 		cachedConfig = JSON.parse(raw) as WebSearchConfig;
 		return cachedConfig;
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 }
 

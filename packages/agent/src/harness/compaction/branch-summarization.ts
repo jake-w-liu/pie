@@ -202,6 +202,9 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
+/** Upper bound on the summary output reservation. */
+const BRANCH_SUMMARY_MAX_OUTPUT_TOKENS = 2048;
+
 /** Generate a summary for abandoned branch entries. */
 export async function generateBranchSummary(
 	entries: Entry[],
@@ -218,6 +221,14 @@ export async function generateBranchSummary(
 		callbacks,
 	} = options;
 	const contextWindow = model.contextWindow || 128000;
+	// The output reservation must fit the model: sending `maxTokens` above
+	// `model.maxTokens` either exceeds the model's cap or makes
+	// `completeSimpleWithRetries` reject an otherwise valid small-context request,
+	// because it validates input + the requested maxTokens against the context window.
+	const maxOutputTokens = Math.max(
+		1,
+		Math.min(BRANCH_SUMMARY_MAX_OUTPUT_TOKENS, model.maxTokens || BRANCH_SUMMARY_MAX_OUTPUT_TOKENS),
+	);
 	const tokenBudget = contextWindow - reserveTokens;
 	if (!Number.isFinite(tokenBudget) || tokenBudget <= 0 || !Number.isFinite(reserveTokens) || reserveTokens < 0) {
 		return err(
@@ -263,7 +274,7 @@ export async function generateBranchSummary(
 		models,
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		{ signal, maxTokens: 2048 },
+		{ signal, maxTokens: maxOutputTokens },
 		retry,
 		callbacks,
 	);

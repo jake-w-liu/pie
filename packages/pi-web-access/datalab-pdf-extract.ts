@@ -4,7 +4,7 @@ import {
 	resolveCredential,
 	redactCredential,
 } from "./credential-source.ts";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
 
 const DEFAULT_API_HOST = "https://www.datalab.to";
 const API_PREFIX = "/api/v1";
@@ -49,8 +49,7 @@ function loadConfig(): DatalabConfig {
 		cachedConfig = JSON.parse(rawText) as DatalabConfig;
 		return cachedConfig;
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 }
 

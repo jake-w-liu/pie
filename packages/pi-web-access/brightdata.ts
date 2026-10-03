@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
 
 const BRIGHTDATA_API_URL = "https://api.brightdata.com/request";
 const CONFIG_PATH = getWebSearchConfigPath();
@@ -50,25 +50,6 @@ interface BrightDataSearchOptions extends SearchOptions {
 
 let cachedConfig: WebSearchConfig | null = null;
 
-// `web-search.json` is a credential store: its own text is the secret. V8 quotes a
-// window of the source it choked on back inside the `JSON.parse` message — with a
-// short file, the whole file — so `{"brightdataApiKey": bd-real-token}` (quotes
-// forgotten around a pasted token) produces
-// `Unexpected token 'b', "{"brightdataApiKey": bd-real-token}" is not valid JSON`.
-// There is no credential to redact against at this point, because the credential is
-// what the file was being read for, so the parser's text is dropped entirely and only
-// its position is kept. That position is also the only part that cannot carry a
-// status-shaped phrase into `providerErrorStatus`.
-//
-// This is a deliberate divergence from `serpdive.ts:59-62`, `brave.ts:33-36`,
-// `anysearch.ts:48-51` and `firecrawl.ts:50-53`, which all quote the parser message
-// verbatim. They have the same leak; fixing it for every provider is a separate
-// change, and this module is not going to copy the bug forward to justify symmetry.
-function configParseDetail(err: unknown): string {
-	const position = errorMessage(err).match(/at position \d+(?: \(line \d+ column \d+\))?/i);
-	return position ? `not valid JSON, ${position[0]}` : "not valid JSON";
-}
-
 function loadConfig(): WebSearchConfig {
 	if (cachedConfig) return cachedConfig;
 	if (!existsSync(CONFIG_PATH)) {
@@ -81,7 +62,7 @@ function loadConfig(): WebSearchConfig {
 	try {
 		parsed = JSON.parse(raw);
 	} catch (err) {
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${configParseDetail(err)}`);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 		throw new Error(`Invalid config in ${CONFIG_PATH}: expected a JSON object`);

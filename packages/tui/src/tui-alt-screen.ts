@@ -343,33 +343,45 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 	protected override afterTerminalStop(options: TuiStopOptions): void {
 		if (!this.altScreenActive) return;
-		this.altScreenActive = false;
 		if (options.preserveScreen) {
 			this.terminal.write(`${BEGIN_SYNCHRONIZED_OUTPUT}${EXIT_ALT_SCREEN}\x1b[?25h${END_SYNCHRONIZED_OUTPUT}`);
+			this.altScreenActive = false;
 		} else {
 			const width = Math.max(1, this.terminal.columns);
-			const documentLines = this.render(width).map((line) => line.replace(OSC133_ZONE_PREFIX, ""));
-			const finalDocument = this.applyLineResets(
-				documentLines.map((line) => line.replaceAll(CURSOR_MARKER, "")),
-			).map((line) =>
-				isImageLine(line) || visibleWidth(line) <= width ? line : sliceByColumn(line, 0, width, true),
-			);
-			const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
-			output.append(`${BEGIN_SYNCHRONIZED_OUTPUT}${EXIT_ALT_SCREEN}${DISABLE_AUTOWRAP}`);
-			for (let row = 0; row < finalDocument.length; row++) {
-				if (row > 0) output.append("\r\n");
-				const line = finalDocument[row] ?? "";
-				output.append("\r");
-				if (isImageLine(line)) {
-					output.append("\x1b[2K");
-					output.append(line);
-				} else {
-					output.append(line);
-					if (visibleWidth(line) < width) output.append("\x1b[K");
+			// A component that throws while rendering the final transcript must not leave
+			// the terminal in the alternate screen with autowrap disabled. The normal exit
+			// sequence stays byte-for-byte what it was; the failure path gets a minimal
+			// unconditional restoration in `finally`, and `altScreenActive` is cleared only
+			// after it, so the caller can retry restoration.
+			let restored = false;
+			try {
+				const documentLines = this.render(width).map((line) => line.replace(OSC133_ZONE_PREFIX, ""));
+				const finalDocument = this.applyLineResets(
+					documentLines.map((line) => line.replaceAll(CURSOR_MARKER, "")),
+				).map((line) =>
+					isImageLine(line) || visibleWidth(line) <= width ? line : sliceByColumn(line, 0, width, true),
+				);
+				const output = new BoundedTerminalWriter((data) => this.terminal.write(data));
+				output.append(`${BEGIN_SYNCHRONIZED_OUTPUT}${EXIT_ALT_SCREEN}${DISABLE_AUTOWRAP}`);
+				for (let row = 0; row < finalDocument.length; row++) {
+					if (row > 0) output.append("\r\n");
+					const line = finalDocument[row] ?? "";
+					output.append("\r");
+					if (isImageLine(line)) {
+						output.append("\x1b[2K");
+						output.append(line);
+					} else {
+						output.append(line);
+						if (visibleWidth(line) < width) output.append("\x1b[K");
+					}
 				}
+				output.append(`\x1b[0m${ENABLE_AUTOWRAP}\r\n\x1b[?25h${END_SYNCHRONIZED_OUTPUT}`);
+				output.flush();
+				restored = true;
+			} finally {
+				if (!restored) this.terminal.write(`${EXIT_ALT_SCREEN}\x1b[0m${ENABLE_AUTOWRAP}\x1b[?25h`);
+				this.altScreenActive = false;
 			}
-			output.append(`\x1b[0m${ENABLE_AUTOWRAP}\r\n\x1b[?25h${END_SYNCHRONIZED_OUTPUT}`);
-			output.flush();
 		}
 		if (this.savedCapabilities) {
 			setCapabilities(this.savedCapabilities);

@@ -85,6 +85,54 @@ describe("JSONL v4 codec", () => {
 			}
 		});
 
+		it("rejects a usage record without a valid nested payload", () => {
+			// A `usage` record missing `usage` used to decode fine and then threw a raw
+			// TypeError in SessionState when it read `record.usage.cacheRead`.
+			for (const usage of [
+				undefined,
+				"nope",
+				{ input: 1, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 3 },
+			]) {
+				const result = parseMutation(
+					JSON.stringify({
+						kind: "record",
+						type: "usage",
+						id: "u",
+						lane: "main",
+						seq: 1,
+						timestamp: 1,
+						...(usage !== undefined ? { usage } : {}),
+					}),
+				);
+				expect(result.ok).toBe(false);
+				if (result.ok) throw new Error("Expected a schema decode error");
+				expect(result.error).toBeInstanceOf(JsonlDecodeError);
+				expect(result.error).toMatchObject({ kind: "schema" });
+			}
+		});
+
+		it("accepts a usage record with a complete payload", () => {
+			const result = parseMutation(
+				JSON.stringify({
+					kind: "record",
+					type: "usage",
+					id: "u",
+					lane: "main",
+					seq: 1,
+					timestamp: 1,
+					usage: {
+						input: 1,
+						output: 2,
+						cacheRead: 3,
+						cacheWrite: 4,
+						totalTokens: 6,
+						cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 },
+					},
+				}),
+			);
+			expect(result.ok).toBe(true);
+		});
+
 		it("round trips a lane-bound entry line", () => {
 			expectMutationRoundTrip({
 				kind: "entry",

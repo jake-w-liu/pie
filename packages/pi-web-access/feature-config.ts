@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
 
 const CONFIG_PATH = getWebSearchConfigPath();
 
@@ -11,8 +11,7 @@ function loadFeatureConfig(): FeatureConfig {
 		const raw: unknown = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
 		return raw && typeof raw === "object" ? raw as FeatureConfig : {};
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 }
 

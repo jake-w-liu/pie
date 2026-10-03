@@ -53,16 +53,6 @@ export interface ResearchArtifact {
 	errors?: Array<{ query: string; error: string }>;
 }
 
-export interface ResearchSearchRequest {
-	query: string;
-	numResults: number;
-	recencyFilter?: RecencyFilter;
-	domainFilter?: string[];
-}
-export interface ResearchSearchResult { url: string; title: string; snippet: string; rank: number }
-export interface ResearchSearchResponse { provider: string; results: ResearchSearchResult[]; summary?: string }
-export interface ResearchProvider { name: string; search(req: ResearchSearchRequest): Promise<ResearchSearchResponse> }
-
 const OFFICIAL_DOCS_HOSTS = /^(developers\.|docs\.|learn\.|reference\.)|\.github\.io$/i;
 const OFFICIAL_DOCS_PATHS = /\/(docs?|reference)(\/|\b)/i;
 const VENDOR_DOCS_PATHS = /\/(documentation|docs?)\//i;
@@ -132,15 +122,10 @@ export function buildPassages(sources: ResearchSource[], fetched: ExtractedConte
 	const passages: ResearchPassage[] = [];
 	const fetchedByUrl = new Map(fetched.map((item) => [item.url, item]));
 	for (const source of sources) {
-		if (source.snippet) {
-			passages.push({
-				passage_id: passageId(source.rank, 0),
-				source_url: source.url,
-				source_rank: source.rank,
-				text: source.snippet,
-				content_hash: hashContent(source.snippet),
-			});
-		}
+		// Only fetched page content becomes a citable passage. A search snippet is
+		// provider-written text about the page, not text extracted from it, so it stays
+		// on `source.snippet` (already recorded) instead of being cited as an exact
+		// passage with no `extraction_span` to verify against.
 		const page = fetchedByUrl.get(source.url);
 		if (page && !page.error && page.content) {
 			const passageHint = source.snippet?.trim() || hint;
@@ -181,30 +166,70 @@ function hasPolarityMarker(value: string, markers: string[], allowNegated = fals
 	return markers.some((marker) => containsPhrase(value, marker) && (allowNegated || !markerIsNegated(value, marker)));
 }
 
+const CLAUSE_SPLIT_PATTERN = /[^.!?\n]+(?:[.!?]+(?=\s|$)|$)/g;
+const NEGATION_WINDOW_CHARS = 48;
+const NEGATION_CUES = [
+	"not", "isn't", "aren't", "wasn't", "weren't", "cannot", "can't", "no longer", "never",
+	"nothing", "neither", "nor", "rather than", "instead of", "contrary to", "not true",
+	"incorrect", "false", "wrong", "debunked", "retracted", "misleading", "denied", "falsely",
+];
+
+/**
+ * True when a negation or contrast cue sits close to `term` inside `clause`.
+ *
+ * Polarity words are not entailment. "It is true that the moon is made of rock, not
+ * cheese." contains the support marker "true" and every term of the claim "The moon is
+ * made of cheese.", so the previous marker-only heuristic cited it as *supporting*.
+ * A cue in the term's own neighbourhood is what actually decides polarity.
+ */
+function negatesTerm(clause: string, term: string): boolean {
+	const escaped = term.trim().toLowerCase().split(/\s+/).map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\\s+");
+	const pattern = new RegExp(`(?:^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, "gi");
+	let match: RegExpExecArray | null;
+	while ((match = pattern.exec(clause)) !== null) {
+		const start = Math.max(0, match.index - NEGATION_WINDOW_CHARS);
+		const end = Math.min(clause.length, match.index + match[0].length + NEGATION_WINDOW_CHARS);
+		const window = clause.slice(start, end).toLowerCase();
+		if (NEGATION_CUES.some((cue) => containsPhrase(window, cue))) return true;
+		if (pattern.lastIndex === match.index) pattern.lastIndex++;
+	}
+	return false;
+}
+
 export function assessClaim(claim: string, passages: ResearchPassage[]): ClaimAssessment {
 	const terms = tokenize(claim);
 	if (terms.length === 0 || passages.length === 0) {
 		return { claim, status: "missing-evidence", supporting_passages: [], contradicting_passages: [], rationale: "No passages available that discuss the claim's terms.", confidence: 0.2 };
 	}
-	const supporting: string[] = [];
-	const contradicting: string[] = [];
+	// Polarity is decided per clause, not per passage, so a negation next to one clause
+	// cannot be outweighed by a support marker in another.
+	const supporting = new Set<string>();
+	const contradicting = new Set<string>();
+	const minimumOverlap = Math.max(2, Math.ceil(terms.length / 4));
 	for (const passage of passages) {
-		const lower = passage.text.toLowerCase();
-		const overlap = terms.filter((term) => containsPhrase(lower, term)).length;
-		if (overlap < Math.max(2, Math.ceil(terms.length / 4))) continue;
-		const contra = hasPolarityMarker(lower, CONTRADICTION_MARKERS);
-		const support = hasPolarityMarker(lower, SUPPORT_MARKERS);
-		if (contra && !support) contradicting.push(passage.passage_id);
-		else if (support && !contra) supporting.push(passage.passage_id);
+		for (const clause of passage.text.match(CLAUSE_SPLIT_PATTERN) ?? []) {
+			const lower = clause.toLowerCase();
+			if (terms.filter((term) => containsPhrase(lower, term)).length < minimumOverlap) continue;
+			if (terms.some((term) => negatesTerm(clause, term))) {
+				contradicting.add(passage.passage_id);
+				continue;
+			}
+			const contra = hasPolarityMarker(lower, CONTRADICTION_MARKERS);
+			const support = hasPolarityMarker(lower, SUPPORT_MARKERS);
+			if (contra && !support) contradicting.add(passage.passage_id);
+			else if (support && !contra) supporting.add(passage.passage_id);
+		}
 	}
-	if (contradicting.length > 0 && supporting.length === 0) {
-		return { claim, status: "contradicted", supporting_passages: [], contradicting_passages: contradicting, rationale: `${contradicting.length} passage(s) contradict the claim; none support it.`, confidence: Math.min(0.85, 0.5 + contradicting.length * 0.1) };
+	const supportingIds = [...supporting];
+	const contradictingIds = [...contradicting];
+	if (contradictingIds.length > 0 && supportingIds.length === 0) {
+		return { claim, status: "contradicted", supporting_passages: [], contradicting_passages: contradictingIds, rationale: `${contradictingIds.length} passage(s) contradict the claim; none support it.`, confidence: Math.min(0.85, 0.5 + contradictingIds.length * 0.1) };
 	}
-	if (supporting.length > 0 && contradicting.length === 0) {
-		return { claim, status: "supported", supporting_passages: supporting, contradicting_passages: [], rationale: `${supporting.length} passage(s) support the claim; none contradict it.`, confidence: Math.min(0.85, 0.5 + supporting.length * 0.1) };
+	if (supportingIds.length > 0 && contradictingIds.length === 0) {
+		return { claim, status: "supported", supporting_passages: supportingIds, contradicting_passages: [], rationale: `${supportingIds.length} passage(s) support the claim; none contradict it.`, confidence: Math.min(0.85, 0.5 + supportingIds.length * 0.1) };
 	}
-	if (supporting.length > 0 || contradicting.length > 0) {
-		return { claim, status: "unclear", supporting_passages: supporting, contradicting_passages: contradicting, rationale: `${supporting.length} supporting and ${contradicting.length} contradicting passage(s); evidence is mixed.`, confidence: 0.4 };
+	if (supportingIds.length > 0 || contradictingIds.length > 0) {
+		return { claim, status: "unclear", supporting_passages: supportingIds, contradicting_passages: contradictingIds, rationale: `${supportingIds.length} supporting and ${contradictingIds.length} contradicting passage(s); evidence is mixed.`, confidence: 0.4 };
 	}
 	return { claim, status: "unclear", supporting_passages: [], contradicting_passages: [], rationale: "Passages mention the claim's terms but contain no clear support or contradiction markers.", confidence: 0.3 };
 }

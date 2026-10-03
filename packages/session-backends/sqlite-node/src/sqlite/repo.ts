@@ -675,6 +675,7 @@ export class SqliteSessionRepository
 	private database: SqliteDatabase | undefined;
 	private databasePromise: Promise<SqliteDatabase> | undefined;
 	private closePromise: Promise<void> | undefined;
+	private closing = false;
 	private readonly operations = new SerialOperationQueue();
 	private readonly activeStorages = new Set<SqliteSessionStorage>();
 	private readonly options: SqliteSessionRepositoryOptions;
@@ -719,6 +720,7 @@ export class SqliteSessionRepository
 	}
 
 	async create(options: SqliteSessionCreateOptions): Promise<Session<SqliteSessionMetadata>> {
+		this.assertOpen();
 		return this.operations.enqueue(async () => {
 			const db = await this.getDatabase();
 			const path = await this.getDatabasePath();
@@ -913,6 +915,11 @@ export class SqliteSessionRepository
 	}
 
 	async close(): Promise<void> {
+		// Set synchronously: without it a later `getDatabase()` sees an empty
+		// `databasePromise`, opens a fresh handle, and the recorded (already resolved)
+		// close promise never closes it, so every post-close operation leaked a
+		// database handle.
+		this.closing = true;
 		// Idempotent and safe under concurrency: concurrent callers share one
 		// close sequence so storages are released and the handle closed once.
 		this.closePromise ??= (async () => {
@@ -937,7 +944,12 @@ export class SqliteSessionRepository
 		return this.databasePath;
 	}
 
+	private assertOpen(): void {
+		if (this.closing) throw new Error("Session repository is closed.");
+	}
+
 	private async getDatabase(): Promise<SqliteDatabase> {
+		this.assertOpen();
 		if (!this.databasePromise) this.databasePromise = this.openDatabase();
 		this.database = await this.databasePromise;
 		return this.database;

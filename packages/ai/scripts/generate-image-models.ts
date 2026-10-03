@@ -75,10 +75,10 @@ export function parseOpenRouterImageModels(
 			input,
 			output,
 			cost: {
-				input: parseFloat(model.pricing?.prompt || "0") * 1_000_000,
-				output: parseFloat(model.pricing?.completion || "0") * 1_000_000,
-				cacheRead: parseFloat(model.pricing?.input_cache_read || "0") * 1_000_000,
-				cacheWrite: parseFloat(model.pricing?.input_cache_write || "0") * 1_000_000,
+				input: pricePerMillion(model.pricing?.prompt),
+				output: pricePerMillion(model.pricing?.completion),
+				cacheRead: pricePerMillion(model.pricing?.input_cache_read),
+				cacheWrite: pricePerMillion(model.pricing?.input_cache_write),
 			},
 		});
 	}
@@ -87,6 +87,16 @@ export function parseOpenRouterImageModels(
 		throw new Error("OpenRouter API returned no usable image models");
 	}
 	return models;
+}
+
+/**
+ * OpenRouter uses `"-1"` (and other sentinels) for "unknown price". Multiplying
+ * those through produced negative per-million rates that `openrouter-images.ts`
+ * then reported as negative costs. Unknown price is zero here.
+ */
+function pricePerMillion(raw: string | undefined): number {
+	const parsed = parseFloat(raw ?? "0");
+	return Number.isFinite(parsed) && parsed > 0 ? parsed * 1_000_000 : 0;
 }
 
 async function fetchOpenRouterImageModels(strict: boolean): Promise<ImagesModel<"openrouter-images">[]> {

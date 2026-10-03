@@ -1,8 +1,9 @@
+import { matchesDomainFilters, normalizeDomain, normalizeDomainFilters, type NormalizedDomainFilters } from "./domain-filter.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import { fetchRemoteUrl, loadSsrfConfig } from "./ssrf-protection.ts";
 import type { SearchOptions, SearchResult, SearchResponse } from "./perplexity.ts";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
 
 const CONFIG_PATH = getWebSearchConfigPath();
 const SEARCH_TIMEOUT_MS = 30_000;
@@ -10,11 +11,6 @@ const SEARCH_TIMEOUT_MS = 30_000;
 interface WebSearchConfig {
 	searxngBaseUrl?: unknown;
 	searxngHeaders?: unknown;
-}
-
-interface NormalizedDomainFilters {
-	allowed: string[];
-	blocked: string[];
 }
 
 interface SearXNGResult {
@@ -42,8 +38,7 @@ function loadConfig(): WebSearchConfig {
 		cachedConfig = JSON.parse(raw) as WebSearchConfig;
 		return cachedConfig;
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 }
 
@@ -126,31 +121,7 @@ function normalizeCount(value: number | undefined): number {
 	return Math.max(1, Math.min(Math.floor(value), 20));
 }
 
-function normalizeDomain(value: string): string | null {
-	let input = value.trim().toLowerCase();
-	if (!input) return null;
-	if (input.startsWith("-")) input = input.slice(1).trim();
-	if (!input) return null;
-	try {
-		const parsed = input.includes("://") ? new URL(input) : new URL(`https://${input}`);
-		input = parsed.hostname;
-	} catch {
-		input = input.split("/")[0]?.split(":")[0] ?? "";
-	}
-	input = input.replace(/^\.+|\.+$/g, "");
-	return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(input) ? input : null;
-}
 
-function normalizeDomainFilters(domainFilter: string[] | undefined): NormalizedDomainFilters {
-	const filters: NormalizedDomainFilters = { allowed: [], blocked: [] };
-	for (const raw of domainFilter ?? []) {
-		const domain = normalizeDomain(raw);
-		if (!domain) continue;
-		const target = raw.trim().startsWith("-") ? filters.blocked : filters.allowed;
-		if (!target.includes(domain)) target.push(domain);
-	}
-	return filters;
-}
 
 function buildSearXNGQuery(query: string, filters: NormalizedDomainFilters): string {
 	const parts = [query];
@@ -163,21 +134,7 @@ function buildSearXNGQuery(query: string, filters: NormalizedDomainFilters): str
 	return parts.join(" ");
 }
 
-function hostMatchesDomain(hostname: string, domain: string): boolean {
-	return hostname === domain || hostname.endsWith(`.${domain}`);
-}
 
-function matchesDomainFilters(url: string, filters: NormalizedDomainFilters): boolean {
-	if (filters.allowed.length === 0 && filters.blocked.length === 0) return true;
-	let hostname: string;
-	try {
-		hostname = new URL(url).hostname.toLowerCase();
-	} catch {
-		return false;
-	}
-	if (filters.allowed.length > 0 && !filters.allowed.some(domain => hostMatchesDomain(hostname, domain))) return false;
-	return !filters.blocked.some(domain => hostMatchesDomain(hostname, domain));
-}
 
 function mapTimeRange(recencyFilter: SearchOptions["recencyFilter"]): string | null {
 	return recencyFilter === "day" || recencyFilter === "week" || recencyFilter === "month" || recencyFilter === "year"

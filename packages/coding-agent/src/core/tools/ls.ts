@@ -128,8 +128,18 @@ export function createLsToolDefinition(
 					return;
 				}
 
-				const onAbort = () => reject(new Error("Operation aborted"));
+				// Rejecting the promise is not enough: the async body kept running, so after
+				// cancellation it still performed `stat`, `readdir` and a `stat` per entry.
+				// `aborted` makes every await boundary check for cancellation.
+				let aborted = false;
+				const onAbort = () => {
+					aborted = true;
+					reject(new Error("Operation aborted"));
+				};
 				signal?.addEventListener("abort", onAbort, { once: true });
+				const throwIfAborted = (): void => {
+					if (aborted) throw new Error("Operation aborted");
+				};
 
 				(async () => {
 					try {
@@ -141,9 +151,11 @@ export function createLsToolDefinition(
 							reject(new Error(`Path not found: ${dirPath}`));
 							return;
 						}
+						throwIfAborted();
 
 						// Check if path is a directory.
 						const stat = await ops.stat(dirPath);
+						throwIfAborted();
 						if (!stat.isDirectory()) {
 							reject(new Error(`Not a directory: ${dirPath}`));
 							return;
@@ -165,6 +177,7 @@ export function createLsToolDefinition(
 						const results: string[] = [];
 						let entryLimitReached = false;
 						for (const entry of entries) {
+							throwIfAborted();
 							if (results.length >= effectiveLimit) {
 								entryLimitReached = true;
 								break;

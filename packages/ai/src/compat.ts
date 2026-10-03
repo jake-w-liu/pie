@@ -198,9 +198,15 @@ const builtinApiProviderInstances = new Map<Api, ReturnType<typeof getApiProvide
  */
 export function registerBuiltInApiProviders(): void {
 	for (const [api, streams] of BUILTIN_APIS) {
-		if (!getApiProvider(api)) {
-			registerApiProvider({ api, stream: streams.stream, streamSimple: streams.streamSimple });
+		const existing = getApiProvider(api);
+		if (existing) {
+			// A custom override stays in charge. Recording it as the builtin instance made
+			// `getBuiltinProviderForModel` treat the override as the builtin implementation
+			// and route built-in catalog models around it, so a re-registration silently
+			// disabled the override this function exists to preserve.
+			continue;
 		}
+		registerApiProvider({ api, stream: streams.stream, streamSimple: streams.streamSimple });
 		builtinApiProviderInstances.set(api, getApiProvider(api));
 	}
 }

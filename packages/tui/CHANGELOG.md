@@ -22,6 +22,13 @@
 - Extended slash-command autocomplete to a whitespace-bounded `/` token anywhere on the first line, so `please run /` opens the same command menu as a line-start `/`; slashes inside words and paths with a second separator still complete as files.
 
 ### Fixed
+- Input is decoded as a byte stream: a multi-byte character split across reads is decoded once complete, and the legacy single high-byte Meta conversion still applies to bytes that never complete a UTF-8 sequence.
+- Astral characters (emoji) are emitted as one sequence instead of a lone high surrogate followed by a lone low surrogate.
+- Keys queued before a bracketed paste (a lone Escape, a split mouse report) are emitted before the paste instead of replayed after it.
+- An over-long paste is truncated without splitting a surrogate pair.
+- F1-F12 stay recognizable once Kitty keyboard flag 2 adds event types: F1-F4 `CSI ... P-S` sequences parse, F5-F12 tilde numbers are mapped, and modified function keys match.
+- The alternate screen is exited even when a component throws while rendering the final transcript, and a failed terminal start rolls back the modes it already acquired.
+- Only the first hardware-cursor marker was stripped, so a second focusable component on screen (a dialog input alongside the editor) wrote its marker to the terminal as text.
 
 - Fixed bracketed-paste expansion re-scanning substituted content, so a paste payload containing another paste marker was expanded a second time.
 - Fixed `StdinBuffer` discarding an incomplete key sequence that arrived immediately before a paste, dropping a partial escape or mouse report.

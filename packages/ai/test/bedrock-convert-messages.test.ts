@@ -10,6 +10,9 @@ vi.mock("@aws-sdk/client-bedrock-runtime", () => {
 	class BedrockRuntimeServiceException extends Error {}
 
 	class BedrockRuntimeClient {
+		// The real Smithy client exposes destroy(); the adapter releases it after the stream.
+		destroy(): void {}
+
 		constructor(config: Record<string, unknown>) {
 			bedrockMock.constructorCalls.push(config);
 		}

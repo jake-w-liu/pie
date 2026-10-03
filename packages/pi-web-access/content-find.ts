@@ -40,9 +40,41 @@ function editDistanceWithin(left: string, right: string, maximum: number): boole
 	return (previous[right.length] ?? maximum + 1) <= maximum;
 }
 
+/**
+ * Case-fold `text` for a case-insensitive search while keeping a map from every folded
+ * UTF-16 index back to the original one.
+ *
+ * Folding the whole string at once (`text.toLocaleLowerCase()`) changes its length:
+ * `"İ".toLocaleLowerCase()` is two code units, so a folded offset no longer points at
+ * the same place in the original text and slicing the original with it returned
+ * unrelated snippets. Folding per code point keeps `map` exact.
+ */
+function foldWithOffsets(text: string): { folded: string; map: number[] } {
+	let folded = "";
+	const map: number[] = [];
+	let originalIndex = 0;
+	for (const char of text) {
+		const lowered = char.toLocaleLowerCase();
+		for (const loweredChar of lowered) map.push(originalIndex);
+		folded += lowered;
+		originalIndex += char.length;
+	}
+	map.push(text.length);
+	return { folded, map };
+}
+
 function literalMatches(text: string, query: string, caseInsensitive: boolean): Match[] {
-	const haystack = caseInsensitive ? text.toLocaleLowerCase() : text;
-	const needle = caseInsensitive ? query.toLocaleLowerCase() : query;
+	if (caseInsensitive) {
+		const { folded, map } = foldWithOffsets(text);
+		const needle = query.toLocaleLowerCase();
+		const matches: Match[] = [];
+		for (let start = folded.indexOf(needle); start >= 0; start = folded.indexOf(needle, start + Math.max(needle.length, 1))) {
+			matches.push({ query, start: map[start] ?? text.length, end: map[start + needle.length] ?? text.length });
+		}
+		return matches;
+	}
+	const haystack = text;
+	const needle = query;
 	const matches: Match[] = [];
 	for (let start = haystack.indexOf(needle); start >= 0; start = haystack.indexOf(needle, start + Math.max(needle.length, 1))) {
 		matches.push({ query, start, end: start + query.length });

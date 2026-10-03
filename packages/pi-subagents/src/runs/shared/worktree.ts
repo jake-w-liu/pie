@@ -516,7 +516,11 @@ function captureWorktreeDiff(
 	removeSyntheticPathsBeforeDiff(worktree);
 	runGitChecked(worktree.path, ["add", "-A"]);
 	const diffStat = runGitChecked(worktree.path, ["diff", "--cached", "--stat", setup.baseCommit]).trim();
-	const patch = runGitChecked(worktree.path, ["diff", "--cached", setup.baseCommit]);
+	// `--binary --full-index` is required, not cosmetic: without it git emits only
+	// "Binary files a/x and b/x differ" for binary content, the handoff patch cannot
+	// be applied, and cleanup still accepts the nonempty patch and deletes the
+	// worktree, so those changes are unrecoverable.
+	const patch = runGitChecked(worktree.path, ["diff", "--cached", "--binary", "--full-index", setup.baseCommit]);
 	const numstat = runGitChecked(worktree.path, ["diff", "--cached", "--numstat", setup.baseCommit]);
 	fs.writeFileSync(patchPath, patch, "utf-8");
 

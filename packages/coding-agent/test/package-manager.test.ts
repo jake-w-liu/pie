@@ -295,6 +295,35 @@ Content`,
 			// Should NOT find helper.ts (not declared in manifest)
 			expect(result.extensions.some((r) => pathEndsWith(r.path, "helper.ts"))).toBe(false);
 		});
+
+		it("does not load manifest entries that resolve outside the package root", async () => {
+			// A manifest declares what the package ships. Entries that escape the root
+			// (`../outside.ts`, an absolute path, a `..` glob) must not become loadable
+			// resources.
+			const pkgDir = join(tempDir, "traversal-pkg");
+			mkdirSync(join(pkgDir, "extensions"), { recursive: true });
+			mkdirSync(join(tempDir, "sibling"), { recursive: true });
+			writeFileSync(join(tempDir, "sibling", "outside.ts"), "export default function() {}");
+			writeFileSync(
+				join(pkgDir, "package.json"),
+				JSON.stringify({
+					name: "traversal-pkg",
+					pi: {
+						extensions: ["../sibling/outside.ts", "../sibling/*.ts", "./extensions/inside.ts"],
+					},
+				}),
+			);
+			writeFileSync(join(pkgDir, "extensions", "inside.ts"), "export default function() {}");
+
+			settingsManager.setExtensionPaths([pkgDir]);
+			const result = await packageManager.resolve();
+
+			expect(result.extensions.some((r) => r.path === join(pkgDir, "extensions", "inside.ts") && r.enabled)).toBe(
+				true,
+			);
+			const outside = result.extensions.filter((r) => pathEndsWith(r.path, "outside.ts"));
+			expect(outside.length).toBe(0);
+		});
 	});
 
 	describe("auto-discovered skill metadata", () => {

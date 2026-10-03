@@ -236,7 +236,11 @@ export class LlamaClient {
 		while (true) {
 			const chunk = await reader.read();
 			if (chunk.done) break;
-			buffer += decoder.decode(chunk.value, { stream: true }).replaceAll("\r\n", "\n");
+			// Normalize CRLF on the accumulated buffer, not on each chunk: a chunk ending
+			// with "...\r\n\r" plus a chunk starting with "\n" became "...\n\r\n", whose
+			// delimiter no longer matches "\n\n" and the frame was never delivered.
+			buffer += decoder.decode(chunk.value, { stream: true });
+			buffer = buffer.replaceAll("\r\n", "\n");
 			// A frame boundary must arrive eventually; a server streaming an
 			// endless line without one is malfunctioning, not slow.
 			if (buffer.length > MAX_SSE_BUFFER_CHARS) {

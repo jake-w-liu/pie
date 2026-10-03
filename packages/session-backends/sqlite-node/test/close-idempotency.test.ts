@@ -43,4 +43,25 @@ describe("SQLite repository close idempotency (D2)", () => {
 		await repo.close();
 		expect(counts.closes).toBe(1);
 	});
+
+	it("rejects operations after close without reopening a handle", async () => {
+		const root = createTempDir();
+		const databasePath = join(root, "sessions.sqlite");
+		const env = new NodeExecutionEnv({ cwd: root });
+		const { counts, sqlite } = createCloseCountingSqliteFactory();
+		const repo = new SqliteSessionRepository({ env, sqlite, databasePath });
+		await repo.create({ cwd: root, id: "session-1" });
+		const opensAfterCreate = counts.opens;
+
+		await repo.close();
+
+		// A post-close operation used to reopen a handle that the already-resolved
+		// close promise never closed, leaking a connection per call.
+		await expect(repo.create({ cwd: root, id: "session-2" })).rejects.toThrow(/closed/);
+		await expect(repo.list()).rejects.toThrow(/closed/);
+		await repo.close();
+
+		expect(counts.opens).toBe(opensAfterCreate);
+		expect(counts.closes).toBe(counts.opens);
+	});
 });

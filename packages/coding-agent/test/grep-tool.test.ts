@@ -148,3 +148,29 @@ describe("grep flag handling", () => {
 		await expect(grep({ pattern: "needle", path: join(root, "no-such-dir") })).rejects.toThrow(/Path not found/);
 	});
 });
+
+describe("grep output ceiling", () => {
+	it("bounds files_with_matches output and reports the truncation", async () => {
+		const manyRoot = mkdtempSync(join(tmpdir(), "pie-grep-many-"));
+		try {
+			mkdirSync(join(manyRoot, "many"));
+			for (let index = 0; index < 2_000; index++) {
+				writeFileSync(join(manyRoot, "many", `matching-file-${index}-abcdefghijklmnopqrstuvwxyz.txt`), "needle\n");
+			}
+			const manyTool = createGrepTool(manyRoot);
+			const result = await manyTool.execute("test", {
+				pattern: "needle",
+				path: manyRoot,
+				outputMode: "files_with_matches",
+			} as never);
+			const text = result.content.map((part) => ("text" in part ? part.text : "")).join("");
+			// The documented 50KB ceiling applies to every output mode; thousands of
+			// matching paths used to be returned whole.
+			expect(Buffer.byteLength(text, "utf-8")).toBeLessThanOrEqual(60_000);
+			expect(text).toContain("limit reached");
+			expect(result.details).toMatchObject({ truncation: { truncated: true } });
+		} finally {
+			rmSync(manyRoot, { recursive: true, force: true });
+		}
+	}, 60_000);
+});

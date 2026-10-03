@@ -3,7 +3,7 @@ import { activityMonitor } from "./activity.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import type { ExtractedContent, ExtractOptions } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
 
 const SEARCH1API_SEARCH_URL = "https://api.search1api.com/search";
 const SEARCH1API_CRAWL_URL = "https://api.search1api.com/crawl";
@@ -57,8 +57,7 @@ function loadConfig(): WebSearchConfig {
 	try {
 		parsed = JSON.parse(raw);
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 		throw new Error(`Invalid config in ${CONFIG_PATH}: expected a JSON object`);
@@ -237,10 +236,13 @@ export async function searchWithSearch1API(
 			SEARCH_TIMEOUT_MS,
 			options.signal,
 		);
-		const results = mapSearchResults(data.results);
+		// The provider can return more entries than requested; cap the canonical result
+		// set (and everything derived from it) at the normalized `numResults`.
+		const limit = normalizeNumResults(options.numResults);
+		const results = mapSearchResults(data.results).slice(0, limit);
 		const response: SearchResponse = { answer: buildAnswer(results), results };
 		if (options.includeContent) {
-			const inlineContent = mapInlineContent(data.results);
+			const inlineContent = mapInlineContent(data.results).slice(0, limit);
 			if (inlineContent.length > 0) response.inlineContent = inlineContent;
 		}
 		activityMonitor.logComplete(activityId, 200);

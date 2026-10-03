@@ -239,6 +239,32 @@ function validateInstallerArtifacts(packageJsonPath, packageLockPath, version) {
 	}
 }
 
+/**
+ * Idempotently publish one immutable release object.
+ *
+ * These keys are written with `If-None-Match: *` and served with a one-year
+ * immutable cache, so a retry that finds the key already present must prove the
+ * existing bytes are the bytes this run intended to publish. Logging a collision
+ * and moving on would let a retried run advertise a `latest` pointer whose
+ * immutable artifacts came from a different build of the same version.
+ *
+ * @param readRemote returns the remote bytes, or undefined when the key is absent
+ */
+export async function putImmutableObject({ write, readRemote, key, body }) {
+	const local = Buffer.isBuffer(body) ? body : Buffer.from(body);
+	if (await write()) return true;
+	const remote = await readRemote();
+	if (remote === undefined) {
+		throw new Error(`Release object ${key} could not be written and is absent; retry the publication.`);
+	}
+	if (!Buffer.isBuffer(remote) || !remote.equals(local)) {
+		throw new Error(
+			`Release object ${key} already exists with different content; refusing to advertise this release.`,
+		);
+	}
+	return false;
+}
+
 export function compareReleaseVersions(left, right) {
 	const leftMatch = STABLE_SEMVER_RE.exec(left);
 	const rightMatch = STABLE_SEMVER_RE.exec(right);
@@ -287,47 +313,40 @@ async function main() {
 	try {
 		const releasePath = join(temporaryDirectory, "release.json");
 		const latestPath = join(temporaryDirectory, "latest.json");
-		writeFileSync(releasePath, `${JSON.stringify(release, null, "\t")}\n`);
-		if (
-			!putJson(
-				options.bucket,
-				options.endpoint,
-				releasePath,
-				`${RELEASES_PREFIX}/releases/${options.version}.json`,
-				"public, max-age=31536000, immutable",
-				{ missing: true },
-			)
-		) {
-			console.log(`Release record ${options.version} already exists.`);
-		}
+		const releaseBody = `${JSON.stringify(release, null, "\t")}\n`;
+		writeFileSync(releasePath, releaseBody);
+		const readRemoteObject = async (key) => {
+			const remotePath = join(temporaryDirectory, `remote-${key.replace(/[^a-zA-Z0-9.-]/g, "_")}`);
+			const downloaded = runAws(
+				["s3api", "get-object", "--bucket", options.bucket, "--key", key, "--endpoint-url", options.endpoint, remotePath],
+				{ allowNotFound: true },
+			);
+			return downloaded === undefined ? undefined : readFileSync(remotePath);
+		};
+		await putImmutableObject({
+			write: () => Promise.resolve(putJson(options.bucket, options.endpoint, releasePath, `${RELEASES_PREFIX}/releases/${options.version}.json`, "public, max-age=31536000, immutable", { missing: true })),
+			readRemote: () => readRemoteObject(`${RELEASES_PREFIX}/releases/${options.version}.json`),
+			key: `${RELEASES_PREFIX}/releases/${options.version}.json`,
+			body: releaseBody,
+		});
 
-		writeFileSync(latestPath, `${JSON.stringify(release, null, "\t")}\n`);
+		writeFileSync(latestPath, releaseBody);
 		validateInstallerArtifacts(options.installerPackageJson, options.installerPackageLock, options.version);
 		const installerReleasePrefix = `${INSTALLER_PREFIX}/releases/${options.version}`;
-		putObject(
-			options.bucket,
-			options.endpoint,
-			options.installerPackageJson,
-			`${installerReleasePrefix}/package.json`,
-			"public, max-age=31536000, immutable",
-			{ missing: true },
-		);
-		putObject(
-			options.bucket,
-			options.endpoint,
-			options.installerPackageLock,
-			`${installerReleasePrefix}/package-lock.json`,
-			"public, max-age=31536000, immutable",
-			{ missing: true },
-		);
-		putJson(
-			options.bucket,
-			options.endpoint,
-			releasePath,
-			`${installerReleasePrefix}/metadata.json`,
-			"public, max-age=31536000, immutable",
-			{ missing: true },
-		);
+		// Every immutable installer artifact is verified before any `latest` pointer
+		// moves, so a mismatched retry cannot publish an inconsistent release.
+		for (const [key, path] of [
+			[`${installerReleasePrefix}/package.json`, options.installerPackageJson],
+			[`${installerReleasePrefix}/package-lock.json`, options.installerPackageLock],
+			[`${installerReleasePrefix}/metadata.json`, releasePath],
+		]) {
+			await putImmutableObject({
+				write: () => Promise.resolve(putObject(options.bucket, options.endpoint, path, key, "public, max-age=31536000, immutable", { missing: true })),
+				readRemote: () => readRemoteObject(key),
+				key,
+				body: readFileSync(path),
+			});
+		}
 		const installerLatest = await advanceLatestRelease(
 			options.version,
 			() =>

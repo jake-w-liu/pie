@@ -3,7 +3,7 @@ import { activityMonitor } from "./activity.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import type { ExtractedContent, ExtractOptions } from "./extract.ts";
 import { validateRemoteUrl, type Lookup } from "./ssrf-protection.ts";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
 
 const CONFIG_PATH = getWebSearchConfigPath();
 const BRIGHTDATA_REQUEST_URL = "https://api.brightdata.com/request";
@@ -28,20 +28,6 @@ interface BrightDataConfig {
 
 let cachedConfig: BrightDataConfig | null = null;
 
-// V8's JSON.parse message quotes a slice of the source text around the offending
-// token — `JSON.parse('{"brightdataApiKey": bd-live-abc123}')` reports
-// `Unexpected token 'b', ..."aApiKey": bd-live-ab"... is not valid JSON`. This
-// file is where the API key lives, so echoing that message verbatim (which
-// firecrawl.ts:50 and ssrf-protection.ts:39 both do) puts a fragment of the
-// credential into an error string that extract.ts surfaces to the user. Only the
-// position is safe to repeat; the snippet never is. The `Failed to parse ` prefix
-// is preserved because extract.ts's isConfigParseError matches on it.
-function parseFailureDetail(err: unknown): string {
-	const message = err instanceof Error ? err.message : String(err);
-	const position = message.match(/at position \d+(?: \(line \d+ column \d+\))?/);
-	return position ? `invalid JSON ${position[0]}` : "invalid JSON";
-}
-
 function loadConfig(): BrightDataConfig {
 	if (cachedConfig) return cachedConfig;
 	if (!existsSync(CONFIG_PATH)) {
@@ -53,7 +39,7 @@ function loadConfig(): BrightDataConfig {
 	try {
 		parsed = JSON.parse(raw);
 	} catch (err) {
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${parseFailureDetail(err)}`);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 		throw new Error(`Invalid config in ${CONFIG_PATH}: expected a JSON object`);

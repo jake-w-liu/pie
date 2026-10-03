@@ -143,7 +143,10 @@ export class RpcClient {
 		// Wait a moment for process to initialize
 		await new Promise((resolve) => setTimeout(resolve, 100));
 
-		if (this.process.exitCode !== null) {
+		// A child killed during startup leaves `exitCode === null` and a non-null
+		// `signalCode`; checking only `exitCode !== null` let `start()` resolve for a
+		// process that was already dead, so the first real request failed instead.
+		if (this.process.exitCode !== null || this.process.signalCode !== null) {
 			const error = this.exitError ?? this.createProcessExitError(this.process.exitCode, this.process.signalCode);
 			this.exitError = error;
 			throw error;
@@ -556,8 +559,10 @@ export class RpcClient {
 				const pending = this.pendingRequests.get(id)!;
 				this.pendingRequests.delete(id);
 				pending.resolve(data as RpcResponse);
-				return;
 			}
+			// A response frame is never an agent event. Delivering an expired or unknown
+			// response id through the typed event API handed consumers a malformed event.
+			return;
 		}
 
 		// Otherwise it's an event. Dispatch to every listener even if one throws, and

@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
 
 const CONFIG_PATH = getWebSearchConfigPath();
 
@@ -65,8 +65,7 @@ function loadConfig(): GeminiWebConfig {
 	try {
 		raw = JSON.parse(rawText) as { chromeProfile?: unknown; browserCookies?: unknown; allowBrowserCookies?: unknown };
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 
 	if (raw.chromeProfile !== undefined) {
@@ -94,8 +93,7 @@ export function isBrowserCookieAccessAllowed(): boolean {
 	try {
 		raw = JSON.parse(rawText) as { allowBrowserCookies?: unknown };
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 	return raw.allowBrowserCookies === true;
 }

@@ -106,23 +106,45 @@ function deriveExportColors(baseColor: string): { pageBg: string; cardBg: string
 }
 
 /**
+ * Theme colors come from user data (a custom theme JSON) and are interpolated into a
+ * `<style>` raw-text element, where HTML escaping does not apply. A value such as
+ * `#fff;} </style><script>…` would close the style block and execute when the exported
+ * document is opened, so every interpolated value must be a CSS color literal first.
+ * Hex, the legacy rgb()/rgba()/hsl()/hsla() forms, a bare CSS color keyword, and a
+ * `var(--name)` reference cover everything theme resolution produces; `;`, `{`, `}`,
+ * quotes, angle brackets and backslashes cannot appear in any of them.
+ */
+const CSS_COLOR_VALUE_RE =
+	/^(?:#[0-9a-fA-F]{3,8}|(?:rgb|rgba|hsl|hsla)\([^()<>;"'\\]{1,96}\)|[a-zA-Z]{3,20}|var\(\s*--[A-Za-z0-9_-]{1,64}\s*\))$/;
+
+function cssColor(value: string, label: string): string {
+	const trimmed = value.trim();
+	if (!CSS_COLOR_VALUE_RE.test(trimmed)) {
+		throw new Error(
+			`Theme color '${label}' is not a valid CSS color and cannot be exported: ${JSON.stringify(value.slice(0, 40))}`,
+		);
+	}
+	return trimmed;
+}
+
+/**
  * Generate CSS custom property declarations from theme colors.
  */
 function generateThemeVars(themeName?: string): string {
 	const colors = getResolvedThemeColors(themeName);
 	const lines: string[] = [];
 	for (const [key, value] of Object.entries(colors)) {
-		lines.push(`--${key}: ${value};`);
+		lines.push(`--${key}: ${cssColor(value, key)};`);
 	}
 
 	// Use explicit theme export colors if available, otherwise derive from userMessageBg
 	const themeExport = getThemeExportColors(themeName);
 	const userMessageBg = colors.userMessageBg || "#343541";
-	const derivedColors = deriveExportColors(userMessageBg);
+	const derivedColors = deriveExportColors(cssColor(userMessageBg, "userMessageBg"));
 
-	lines.push(`--exportPageBg: ${themeExport.pageBg ?? derivedColors.pageBg};`);
-	lines.push(`--exportCardBg: ${themeExport.cardBg ?? derivedColors.cardBg};`);
-	lines.push(`--exportInfoBg: ${themeExport.infoBg ?? derivedColors.infoBg};`);
+	lines.push(`--exportPageBg: ${cssColor(themeExport.pageBg ?? derivedColors.pageBg, "export.pageBg")};`);
+	lines.push(`--exportCardBg: ${cssColor(themeExport.cardBg ?? derivedColors.cardBg, "export.cardBg")};`);
+	lines.push(`--exportInfoBg: ${cssColor(themeExport.infoBg ?? derivedColors.infoBg, "export.infoBg")};`);
 
 	return lines.join("\n      ");
 }
@@ -152,9 +174,9 @@ function generateHtml(sessionData: SessionData, themeName?: string): string {
 	const colors = getResolvedThemeColors(themeName);
 	const themeExport = getThemeExportColors(themeName);
 	const derivedExportColors = deriveExportColors(colors.userMessageBg || "#343541");
-	const bodyBg = themeExport.pageBg ?? derivedExportColors.pageBg;
-	const containerBg = themeExport.cardBg ?? derivedExportColors.cardBg;
-	const infoBg = themeExport.infoBg ?? derivedExportColors.infoBg;
+	const bodyBg = cssColor(themeExport.pageBg ?? derivedExportColors.pageBg, "export.pageBg");
+	const containerBg = cssColor(themeExport.cardBg ?? derivedExportColors.cardBg, "export.cardBg");
+	const infoBg = cssColor(themeExport.infoBg ?? derivedExportColors.infoBg, "export.infoBg");
 
 	// Base64 encode session data to avoid escaping issues
 	const sessionDataBase64 = Buffer.from(JSON.stringify(sessionData)).toString("base64");

@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { getWebSearchConfigPath, jsonParseDiagnostic } from "./utils.ts";
 
 const WEB_SEARCH_CONFIG_PATH = getWebSearchConfigPath();
 const AUTH_PROFILE_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
@@ -62,14 +62,16 @@ function loadAuthFetchProfiles(): AuthFetchProfile[] {
 	if (!existsSync(WEB_SEARCH_CONFIG_PATH)) return [];
 	const raw = readFileSync(WEB_SEARCH_CONFIG_PATH, "utf-8");
 	let parsed: AuthFetchConfigRoot;
+	let value: unknown;
 	try {
-		const value: unknown = JSON.parse(raw);
-		if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("expected a JSON object");
-		parsed = value as AuthFetchConfigRoot;
+		value = JSON.parse(raw);
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${WEB_SEARCH_CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${WEB_SEARCH_CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error(`Failed to parse ${WEB_SEARCH_CONFIG_PATH}: expected a JSON object`);
+	}
+	parsed = value as AuthFetchConfigRoot;
 	if (parsed.authFetch === undefined || parsed.authFetch === null) return [];
 	if (typeof parsed.authFetch !== "object" || Array.isArray(parsed.authFetch)) {
 		throw new Error(`authFetch in ${WEB_SEARCH_CONFIG_PATH} must be an object`);

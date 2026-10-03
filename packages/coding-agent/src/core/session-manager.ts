@@ -13,7 +13,7 @@ import {
 	statSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
-import { join, resolve } from "path";
+import { basename, dirname, extname, join, resolve } from "path";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
@@ -28,6 +28,7 @@ import {
 } from "./messages.ts";
 import { getSummaryUsage } from "./usage-totals.ts";
 
+const MAX_SESSION_FILE_COLLISION_ATTEMPTS = 100;
 export const CURRENT_SESSION_VERSION = 3;
 
 export interface SessionHeader {
@@ -1145,18 +1146,22 @@ export class SessionManager {
 				);
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException)?.code === "EEXIST") {
-					// Another process (or a migration) created the file first. The
-					// entries still exist in memory; append them instead of dropping
-					// the current entry with an EEXIST error. Readers require a valid
-					// leading session header, so write ours unless the existing file
-					// already has one (a headerless file would otherwise load as empty).
-					const header = this.fileEntries.find((e): e is SessionHeader => e.type === "session");
-					if (header && !this.existingFileHasSessionHeader(this.sessionFile)) {
-						appendSessionLine(this.sessionFile, header);
-					}
-					for (const e of this.fileEntries) {
-						if (e.type === "session") continue;
-						appendSessionLine(this.sessionFile, e);
+					// Another process (or a migration) created the file first. A file that
+					// already carries a session header belongs to a *different* session, so
+					// appending merged two conversations under one header. Pick a fresh
+					// filename instead. A headerless file is not a session (it would load as
+					// empty), so that case still writes our header into it.
+					if (this.existingFileHasSessionHeader(this.sessionFile)) {
+						this.writeToFreeSessionFile();
+					} else {
+						const header = this.fileEntries.find((e): e is SessionHeader => e.type === "session");
+						if (header) {
+							appendSessionLine(this.sessionFile, header);
+						}
+						for (const e of this.fileEntries) {
+							if (e.type === "session") continue;
+							appendSessionLine(this.sessionFile, e);
+						}
 					}
 				} else {
 					throw error;
@@ -1166,6 +1171,32 @@ export class SessionManager {
 		} else {
 			appendSessionLine(this.sessionFile, entry);
 		}
+	}
+
+	/**
+	 * Write the pending entries to a free filename after an exclusive-create collision.
+	 * Sessions created with the same explicit id in the same millisecond otherwise
+	 * resolved to the same path and the second one merged into the first.
+	 */
+	private writeToFreeSessionFile(): string {
+		const base = this.sessionFile ?? join(this.getSessionDir(), "session.jsonl");
+		const directory = dirname(base);
+		const extension = extname(base);
+		const stem = basename(base, extension);
+		const content = this.fileEntries.map((e) => `${JSON.stringify(e)}\n`).join("");
+		for (let attempt = 0; attempt <= MAX_SESSION_FILE_COLLISION_ATTEMPTS; attempt++) {
+			const candidate = attempt === 0 ? base : join(directory, `${stem}-${attempt}${extension}`);
+			try {
+				// The exclusive write is also the claim, so no separate existence check
+				// can race with it.
+				atomicWriteFileExclusiveSync(candidate, content);
+				this.sessionFile = candidate;
+				return candidate;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
+			}
+		}
+		throw new Error(`Could not find a free session filename next to '${base}'.`);
 	}
 
 	private existingFileHasSessionHeader(sessionFile: string): boolean {

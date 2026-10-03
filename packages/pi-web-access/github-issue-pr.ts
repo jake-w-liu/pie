@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import type { ExtractedContent, ExtractOptions } from "./extract.ts";
 import { checkGhAvailable, showGhHint } from "./github-api.ts";
 import { fetchRemoteUrl, loadFetchContentDomainPolicy, loadSsrfConfig } from "./ssrf-protection.ts";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
 
 const CONFIG_PATH = getWebSearchConfigPath();
 const GH_TIMEOUT_MS = 10_000;
@@ -85,8 +85,7 @@ function loadConfig(): GitHubPrIssueConfig {
 	try {
 		parsed = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 	const root = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
 	const value = root.githubPrIssue;

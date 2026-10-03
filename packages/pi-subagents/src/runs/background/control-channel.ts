@@ -522,8 +522,12 @@ export function consumeInterruptRequest(
 	if (!fsImpl.existsSync(requestPath)) return false;
 	try {
 		fsImpl.rmSync(requestPath, { force: true, recursive: true });
-	} catch {
-		// Already removed by a concurrent check — still counts as consumed.
+	} catch (error) {
+		// Only a concurrent removal means someone else consumed it. Any other failure
+		// (EACCES, EBUSY, a read-only filesystem) leaves the marker in place, so
+		// reporting success would re-fire the same interrupt on every poll and let a
+		// later runner consume the stale marker again.
+		if (!isNotFoundError(error)) return false;
 	}
 	return true;
 }
@@ -536,10 +540,16 @@ export function consumeTimeoutRequest(
 	if (!fsImpl.existsSync(requestPath)) return false;
 	try {
 		fsImpl.rmSync(requestPath, { force: true, recursive: true });
-	} catch {
-		// Already removed by a concurrent check — still counts as consumed.
+	} catch (error) {
+		// See consumeInterruptRequest: only a concurrent removal is a consumed race.
+		if (!isNotFoundError(error)) return false;
 	}
 	return true;
+}
+
+function isNotFoundError(error: unknown): boolean {
+	const code = (error as { code?: string } | undefined)?.code;
+	return code === "ENOENT" || code === "ENOTDIR";
 }
 
 function parseStopRequest(raw: unknown): StopRequest | undefined {

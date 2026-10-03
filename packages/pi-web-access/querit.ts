@@ -3,7 +3,7 @@ import { activityMonitor } from "./activity.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import type { ExtractedContent, ExtractOptions } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
 
 const QUERIT_SEARCH_URL = "https://api.querit.ai/v1/search";
 const QUERIT_CONTENTS_URL = "https://api.querit.ai/v1/contents";
@@ -78,8 +78,7 @@ function loadConfig(): WebSearchConfig {
 	try {
 		parsed = JSON.parse(raw);
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 		throw new Error(`Invalid config in ${CONFIG_PATH}: expected a JSON object`);
@@ -364,7 +363,9 @@ export async function searchWithQuerit(
 			options.signal,
 		);
 		assertApiSuccess("Search", data);
-		const results = mapSearchResults(data);
+		// Cap before the answer, inline content and follow-up requests are built from it,
+		// so an over-returning provider cannot pull extra pages.
+		const results = mapSearchResults(data).slice(0, normalizeNumResults(options.numResults));
 		const response: SearchResponse = { answer: buildAnswer(results), results };
 		if (options.includeContent && results.length > 0) {
 			const inlineContent = await fetchInlineContent(results.map((result) => result.url), apiKey, options.signal);

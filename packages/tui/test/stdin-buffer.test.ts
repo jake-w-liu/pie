@@ -507,29 +507,37 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedSequences, []);
 		});
 
-		it("reassembles a sequence split across a paste instead of dropping it", () => {
-			// A mouse press whose report is split by the PTY right before the
-			// paste payload starts.
+		it("emits bytes queued before a paste opener before the paste, in stream order", () => {
+			// A mouse press whose report is split by the PTY right before the paste
+			// payload starts. The paste opener is itself a sequence boundary, so the
+			// incomplete prefix can never complete in order and is delivered now.
 			processInput("\x1b[<35");
 			assert.deepStrictEqual(emittedSequences, []);
 
 			processInput("\x1b[200~pasted\x1b[201~");
+			assert.deepStrictEqual(emittedSequences, ["\x1b[<35"]);
 			assert.deepStrictEqual(emittedPaste, ["pasted"]);
 
-			// The tail of the mouse report completes the queued prefix.
+			// The remainder of the interrupted report is still delivered, not dropped.
+			// It cannot re-form the mouse report (the opener already ended it), so it
+			// arrives as ordinary characters in stream order.
 			processInput(";20;5m");
-			assert.deepStrictEqual(emittedSequences, ["\x1b[<35;20;5m"]);
+			assert.deepStrictEqual(emittedSequences, ["\x1b[<35", ";", "2", "0", ";", "5", "m"]);
 		});
 
-		it("keeps a lone Escape pressed immediately before a paste", async () => {
+		it("emits a lone Escape pressed immediately before a paste before the paste", async () => {
 			const escapeBuffer = new StdinBuffer({ timeout: 10, escapeTimeout: 10 });
 			const sequences: string[] = [];
+			const order: string[] = [];
 			escapeBuffer.on("data", (sequence) => sequences.push(sequence));
+			escapeBuffer.on("paste", () => order.push("paste"));
 
 			escapeBuffer.process("\x1b");
 			escapeBuffer.process("\x1b[200~pasted\x1b[201~");
 
-			assert.deepStrictEqual(sequences, []);
+			// The Escape keypress precedes the paste rather than being replayed after it.
+			assert.deepStrictEqual(sequences, ["\x1b"]);
+			assert.deepStrictEqual(order, ["paste"]);
 			await wait(25);
 			assert.deepStrictEqual(sequences, ["\x1b"]);
 			escapeBuffer.destroy();
@@ -555,5 +563,56 @@ describe("StdinBuffer", () => {
 			// Should not have emitted anything
 			assert.deepStrictEqual(emittedSequences, []);
 		});
+	});
+});
+
+describe("unicode input handling", () => {
+	it("decodes a multi-byte character split across Buffer chunks", () => {
+		const events: string[] = [];
+		const buffer = new StdinBuffer({ timeout: 20, escapeTimeout: 20 });
+		buffer.on("data", (sequence) => events.push(sequence));
+
+		// "€" is E2 82 AC; feeding the chunks separately used to produce ESC+b plus
+		// two replacement characters.
+		buffer.process(Buffer.from([0xe2]));
+		buffer.process(Buffer.from([0x82]));
+		buffer.process(Buffer.from([0xac]));
+		assert.deepStrictEqual(events, ["€"]);
+		buffer.destroy();
+	});
+
+	it("emits an astral character as one sequence", () => {
+		const events: string[] = [];
+		const buffer = new StdinBuffer({ timeout: 20, escapeTimeout: 20 });
+		buffer.on("data", (sequence) => events.push(sequence));
+
+		buffer.process("a😀b");
+		assert.deepStrictEqual(events, ["a", "😀", "b"]);
+		buffer.destroy();
+	});
+
+	it("still converts a lone high byte to the legacy Meta escape", async () => {
+		const events: string[] = [];
+		const buffer = new StdinBuffer({ timeout: 20, escapeTimeout: 20 });
+		buffer.on("data", (sequence) => events.push(sequence));
+
+		buffer.process(Buffer.from([0xe9]));
+		await new Promise((resolve) => setTimeout(resolve, 40));
+		assert.deepStrictEqual(events, ["\x1bi"]);
+		buffer.destroy();
+	});
+
+	it("truncates an over-long paste without splitting a surrogate pair", () => {
+		const buffer = new StdinBuffer();
+		let pasted = "";
+		buffer.on("paste", (content) => {
+			pasted = content;
+		});
+		buffer.process(`\x1b[200~a${"😀".repeat(500_000)}\x1b[201~`);
+		const last = pasted.charCodeAt(pasted.length - 1);
+		assert.ok(pasted.length > 0);
+		// A lone high surrogate at the end means the cap cut an emoji in half.
+		assert.equal(last >= 0xd800 && last <= 0xdbff, false);
+		buffer.destroy();
 	});
 });

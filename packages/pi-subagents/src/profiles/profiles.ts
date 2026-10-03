@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { writeAtomicJson } from "../shared/atomic-json.ts";
 import { BUILTIN_AGENT_NAMES } from "../agents/agents.ts";
 import { getPiSpawnCommand } from "../runs/shared/pi-spawn.ts";
 import { findModelInfo, getSupportedThinkingLevels, splitKnownThinkingSuffix, toModelInfo } from "../shared/model-info.ts";
@@ -96,9 +97,15 @@ function readJsonObjectFile(filePath: string): Record<string, unknown> {
 	return parsed as Record<string, unknown>;
 }
 
-function writeJsonFile(filePath: string, value: unknown): void {
-	fs.mkdirSync(path.dirname(filePath), { recursive: true });
-	fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf-8");
+/**
+ * Settings, generated profiles and provider catalogs are durable configuration.
+ * `writeFileSync` truncates the destination before the replacement bytes are
+ * durable, so an interruption left a half-written file that the next run could not
+ * parse. Route them through the package's canonical atomic writer like every other
+ * persisted artifact.
+ */
+function writeJsonFile(filePath: string, value: object): void {
+	writeAtomicJson(filePath, value);
 }
 
 const SAFE_PATH_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -499,10 +506,35 @@ export function applySubagentProfile(name: string): { filePath: string; settings
 	return { filePath, settingsPath };
 }
 
+/**
+ * Validate a persisted catalog before it is trusted.
+ *
+ * The reader used to accept any JSON object and cast it, so a malformed or older
+ * catalog reached `countHeuristicFallbackModels()` as `catalog.models.filter(...)`
+ * and threw an incidental TypeError instead of being treated as unusable. An
+ * unusable catalog is reported as stale so the caller regenerates it.
+ */
+function isProviderModelCatalogFile(value: unknown): value is ProviderModelCatalogFile {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const catalog = value as Record<string, unknown>;
+	if (typeof catalog.provider !== "string" || typeof catalog.refreshedAt !== "string") return false;
+	if (!Array.isArray(catalog.sources) || !catalog.sources.every((source) => typeof source === "string")) return false;
+	if (!Array.isArray(catalog.models)) return false;
+	return catalog.models.every((model) => {
+		if (!model || typeof model !== "object" || Array.isArray(model)) return false;
+		const record = model as Record<string, unknown>;
+		if (typeof record.id !== "string" || typeof record.fullId !== "string") return false;
+		const observed = record.observed;
+		if (!observed || typeof observed !== "object" || Array.isArray(observed)) return false;
+		return typeof (observed as Record<string, unknown>).availableInRegistry === "boolean";
+	});
+}
+
 export function readProviderModelCatalog(provider: string): ProviderModelCatalogFile | null {
 	const filePath = getProviderModelsPath(provider);
 	if (!fs.existsSync(filePath)) return null;
-	return readJsonObjectFile(filePath) as unknown as ProviderModelCatalogFile;
+	const parsed = readJsonObjectFile(filePath);
+	return isProviderModelCatalogFile(parsed) ? parsed : null;
 }
 
 export function isProviderModelCatalogStale(catalog: ProviderModelCatalogFile, maxAgeDays = DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS): boolean {

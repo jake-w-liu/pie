@@ -2428,20 +2428,20 @@ function resolveAsyncStepTranscriptPath(input: {
 
 type SingleStepResult = Awaited<ReturnType<typeof runSingleStep>>;
 
+/**
+ * Combine several signals into one.
+ *
+ * `AbortSignal.any` holds its sources weakly and adds no listener that outlives the
+ * composite. The previous hand-rolled version added a `once` listener to every input
+ * signal and removed none of them on normal completion, so each finished child left
+ * its controller registered on the run-level signals (more than ten children trips
+ * Node's excessive-listener warning and retains every controller).
+ */
 function combinedAbortSignal(signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
 	const activeSignals = signals.filter((signal): signal is AbortSignal => Boolean(signal));
 	if (activeSignals.length === 0) return undefined;
 	if (activeSignals.length === 1) return activeSignals[0];
-	const controller = new AbortController();
-	const abort = (): void => controller.abort();
-	for (const signal of activeSignals) {
-		if (signal.aborted) {
-			abort();
-			break;
-		}
-		signal.addEventListener("abort", abort, { once: true });
-	}
-	return controller.signal;
+	return AbortSignal.any(activeSignals);
 }
 
 /**
@@ -2538,7 +2538,11 @@ async function runSubagent(
 	let previousCumulativeTokens: TokenUsage = { input: 0, output: 0, total: 0 };
 	let latestSessionFile: string | undefined;
 
-	const flatSteps = flattenSteps(steps);
+	// Re-flattened whenever a dynamic group materializes, so `flatSteps[flatIndex]` keeps
+	// pointing at the step that actually owns the slot. The array used to be frozen
+	// before materialization, which made every later event read another step's
+	// `mutationTools`/`toolBudget` (or `undefined` for a newly created slot).
+	let flatSteps = flattenSteps(steps);
 	const initialFlatStepCount = flatSteps.length;
 	const parallelGroups: Array<{ start: number; count: number; stepIndex: number }> = [];
 	const initialStatusSteps: RunnerStatusStep[] = [];
@@ -4135,6 +4139,26 @@ async function runSubagent(
 			}
 			mutatingFailureStates.splice(groupStartFlatIndex, 1, ...dynamicStatusSteps.map(() => createMutatingFailureState()));
 			pendingToolResults.splice(groupStartFlatIndex, 1, ...dynamicStatusSteps.map(() => undefined));
+			// These are indexed by flat step like `statusPayload.steps`. Leaving them at
+			// the pre-materialization length made `recordActiveToolCall` a silent no-op for
+			// every newly introduced slot (optional chaining found no map), so those steps
+			// never reported `currentTool` and never released their supervisor block.
+			// The dynamic placeholder occupied exactly one slot; the materialized items
+			// take its place so `flatSteps[flatIndex]` still resolves to the step that
+			// owns the slot.
+			flatSteps = [
+				...flatSteps.slice(0, groupStartFlatIndex),
+				...dynamicSteps,
+				...flatSteps.slice(groupStartFlatIndex + 1),
+			];
+			const newSlots = dynamicStatusSteps.map(() => ({
+				calls: new Map<string, ActiveToolCall>(),
+				keysByName: new Map<string, string[]>(),
+				sequence: 0,
+			}));
+			activeToolCalls.splice(groupStartFlatIndex, 1, ...newSlots.map((slot) => slot.calls));
+			activeToolKeysByName.splice(groupStartFlatIndex, 1, ...newSlots.map((slot) => slot.keysByName));
+			activeToolSequences.splice(groupStartFlatIndex, 1, ...newSlots.map((slot) => slot.sequence));
 			const materializedDelta = dynamicStatusSteps.length - 1;
 			for (const group of statusPayload.parallelGroups) {
 				if (group.stepIndex === stepIndex) {
@@ -4148,7 +4172,9 @@ async function runSubagent(
 				const shiftFlatIndexes = (nodes: NonNullable<typeof statusPayload.workflowGraph>["nodes"]): void => {
 					for (const node of nodes) {
 						if (node.stepIndex !== undefined && node.stepIndex > stepIndex && node.flatIndex !== undefined && node.flatIndex >= groupStartFlatIndex) {
-							node.flatIndex += dynamicStatusSteps.length;
+							// The placeholder at `groupStartFlatIndex` became `length`
+							// entries, so every downstream slot moves by `length - 1`.
+							node.flatIndex += materializedDelta;
 						}
 						if (node.children) shiftFlatIndexes(node.children);
 					}

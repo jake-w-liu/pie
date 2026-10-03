@@ -321,7 +321,61 @@ const FUNCTIONAL_CODEPOINTS = {
 	pageDown: -13,
 	home: -14,
 	end: -15,
+	// F1-F12 are assigned distinct negative codepoints so a Kitty/xterm function-key
+	// sequence can report a stable codepoint that `matchesKey` can compare against,
+	// the same way the other non-printable keys already work.
+	f1: -16,
+	f2: -17,
+	f3: -18,
+	f4: -19,
+	f5: -20,
+	f6: -21,
+	f7: -22,
+	f8: -23,
+	f9: -24,
+	f10: -25,
+	f11: -26,
+	f12: -27,
 } as const;
+
+/** CSI <number>~ forms for F1-F12 (xterm), including the `[[X`-style Linux variants. */
+const FUNCTION_KEY_CSI_NUMBERS: Record<number, number> = {
+	11: FUNCTIONAL_CODEPOINTS.f1,
+	12: FUNCTIONAL_CODEPOINTS.f2,
+	13: FUNCTIONAL_CODEPOINTS.f3,
+	14: FUNCTIONAL_CODEPOINTS.f4,
+	15: FUNCTIONAL_CODEPOINTS.f5,
+	17: FUNCTIONAL_CODEPOINTS.f6,
+	18: FUNCTIONAL_CODEPOINTS.f7,
+	19: FUNCTIONAL_CODEPOINTS.f8,
+	20: FUNCTIONAL_CODEPOINTS.f9,
+	21: FUNCTIONAL_CODEPOINTS.f10,
+	23: FUNCTIONAL_CODEPOINTS.f11,
+	24: FUNCTIONAL_CODEPOINTS.f12,
+};
+
+const FUNCTIONAL_KEY_ID_BY_CODEPOINT: Record<number, KeyId> = {
+	[FUNCTIONAL_CODEPOINTS.f1]: "f1",
+	[FUNCTIONAL_CODEPOINTS.f2]: "f2",
+	[FUNCTIONAL_CODEPOINTS.f3]: "f3",
+	[FUNCTIONAL_CODEPOINTS.f4]: "f4",
+	[FUNCTIONAL_CODEPOINTS.f5]: "f5",
+	[FUNCTIONAL_CODEPOINTS.f6]: "f6",
+	[FUNCTIONAL_CODEPOINTS.f7]: "f7",
+	[FUNCTIONAL_CODEPOINTS.f8]: "f8",
+	[FUNCTIONAL_CODEPOINTS.f9]: "f9",
+	[FUNCTIONAL_CODEPOINTS.f10]: "f10",
+	[FUNCTIONAL_CODEPOINTS.f11]: "f11",
+	[FUNCTIONAL_CODEPOINTS.f12]: "f12",
+};
+
+/** CSI 1;<mod>:<event> P/Q/R/S is the Kitty/xterm form of F1-F4. */
+const FUNCTION_KEY_CSI_FINAL: Record<string, number> = {
+	P: FUNCTIONAL_CODEPOINTS.f1,
+	Q: FUNCTIONAL_CODEPOINTS.f2,
+	R: FUNCTIONAL_CODEPOINTS.f3,
+	S: FUNCTIONAL_CODEPOINTS.f4,
+};
 
 const KITTY_FUNCTIONAL_KEY_EQUIVALENTS = new Map<number, number>([
 	[57399, 48], // KP_0 -> 0
@@ -517,9 +571,6 @@ interface ParsedModifyOtherKeysSequence {
 	modifier: number;
 }
 
-// Store the last parsed event type for isKeyRelease() to query
-let _lastEventType: KeyEventType = "press";
-
 /**
  * Check if the last parsed key event was a key release.
  * Only meaningful when Kitty keyboard protocol with flag 2 is active.
@@ -543,7 +594,12 @@ export function isKeyRelease(data: string): boolean {
 		data.includes(":3C") ||
 		data.includes(":3D") ||
 		data.includes(":3H") ||
-		data.includes(":3F")
+		data.includes(":3F") ||
+		// F1-F4 release events end in P/Q/R/S under flag 2.
+		data.includes(":3P") ||
+		data.includes(":3Q") ||
+		data.includes(":3R") ||
+		data.includes(":3S")
 	) {
 		return true;
 	}
@@ -602,7 +658,6 @@ function parseKittySequence(data: string): ParsedKittySequence | null {
 		const baseLayoutKey = csiUMatch[3] ? parseInt(csiUMatch[3], 10) : undefined;
 		const modValue = csiUMatch[4] ? parseInt(csiUMatch[4], 10) : 1;
 		const eventType = parseEventType(csiUMatch[5]);
-		_lastEventType = eventType;
 		return { codepoint, shiftedKey, baseLayoutKey, modifier: modValue - 1, eventType };
 	}
 
@@ -612,7 +667,6 @@ function parseKittySequence(data: string): ParsedKittySequence | null {
 		const modValue = parseInt(arrowMatch[1]!, 10);
 		const eventType = parseEventType(arrowMatch[2]);
 		const arrowCodes: Record<string, number> = { A: -1, B: -2, C: -3, D: -4 };
-		_lastEventType = eventType;
 		return { codepoint: arrowCodes[arrowMatch[3]!]!, modifier: modValue - 1, eventType };
 	}
 
@@ -629,11 +683,21 @@ function parseKittySequence(data: string): ParsedKittySequence | null {
 			6: FUNCTIONAL_CODEPOINTS.pageDown,
 			7: FUNCTIONAL_CODEPOINTS.home,
 			8: FUNCTIONAL_CODEPOINTS.end,
+			...FUNCTION_KEY_CSI_NUMBERS,
 		};
 		const codepoint = funcCodes[keyNum];
 		if (codepoint !== undefined) {
-			_lastEventType = eventType;
 			return { codepoint, modifier: modValue - 1, eventType };
+		}
+	}
+
+	// Function keys F1-F4: CSI 1;<mod>:<event> P/Q/R/S, or the unmodified CSI P/Q/R/S.
+	const functionKeyMatch = data.match(/^\x1b(?:\[1|O)?(?:;(\d+))?(?::(\d+))?([PQRS])$/);
+	if (functionKeyMatch) {
+		const codepoint = FUNCTION_KEY_CSI_FINAL[functionKeyMatch[3]!];
+		if (codepoint !== undefined) {
+			const modValue = functionKeyMatch[1] ? parseInt(functionKeyMatch[1], 10) : 1;
+			return { codepoint, modifier: modValue - 1, eventType: parseEventType(functionKeyMatch[2]) };
 		}
 	}
 
@@ -643,7 +707,6 @@ function parseKittySequence(data: string): ParsedKittySequence | null {
 		const modValue = parseInt(homeEndMatch[1]!, 10);
 		const eventType = parseEventType(homeEndMatch[2]);
 		const codepoint = homeEndMatch[3] === "H" ? FUNCTIONAL_CODEPOINTS.home : FUNCTIONAL_CODEPOINTS.end;
-		_lastEventType = eventType;
 		return { codepoint, modifier: modValue - 1, eventType };
 	}
 
@@ -1137,6 +1200,10 @@ export function matchesKey(data: string, keyId: KeyId): boolean {
 		case "f10":
 		case "f11":
 		case "f12": {
+			const functionKeyId = key as keyof typeof FUNCTIONAL_CODEPOINTS & keyof typeof FUNCTIONAL_KEY_ID_BY_CODEPOINT;
+			// Kitty/xterm function-key forms carry the modifier, so the legacy-sequence
+			// only path rejected Shift+F1 and every F5-F12 once flag 2 was negotiated.
+			if (matchesKittySequence(data, FUNCTIONAL_CODEPOINTS[functionKeyId], modifier)) return true;
 			if (modifier !== 0) {
 				return false;
 			}
@@ -1235,6 +1302,8 @@ function formatParsedKey(codepoint: number, modifier: number, baseLayoutKey?: nu
 	else if (effectiveCodepoint === FUNCTIONAL_CODEPOINTS.home) keyName = "home";
 	else if (effectiveCodepoint === FUNCTIONAL_CODEPOINTS.end) keyName = "end";
 	else if (effectiveCodepoint === FUNCTIONAL_CODEPOINTS.pageUp) keyName = "pageUp";
+	else if (FUNCTIONAL_KEY_ID_BY_CODEPOINT[effectiveCodepoint])
+		keyName = FUNCTIONAL_KEY_ID_BY_CODEPOINT[effectiveCodepoint];
 	else if (effectiveCodepoint === FUNCTIONAL_CODEPOINTS.pageDown) keyName = "pageDown";
 	else if (effectiveCodepoint === ARROW_CODEPOINTS.up) keyName = "up";
 	else if (effectiveCodepoint === ARROW_CODEPOINTS.down) keyName = "down";

@@ -413,12 +413,26 @@ async function failToolCallsFromTruncatedMessage(
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
 	const messages: ToolResultMessage[] = [];
+	// A throwing event listener is recorded, not propagated immediately: every call in
+	// this assistant message still needs a toolResult event (that is what puts it in
+	// the transcript) before the run fails. Same rule as `Agent.processEvents` and the
+	// parallel executor -- deliver everything, then surface the first failure.
+	let firstError: unknown;
+	const emitSafely = async (emitEvents: () => Promise<void>): Promise<void> => {
+		try {
+			await emitEvents();
+		} catch (error) {
+			firstError ??= error;
+		}
+	};
 	for (const toolCall of toolCalls) {
-		await emit({
-			type: "tool_execution_start",
-			toolCallId: toolCall.id,
-			toolName: toolCall.name,
-			args: toolCall.arguments,
+		await emitSafely(async () => {
+			await emit({
+				type: "tool_execution_start",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				args: toolCall.arguments,
+			});
 		});
 		const finalized: FinalizedToolCallOutcome = {
 			toolCall,
@@ -427,11 +441,13 @@ async function failToolCallsFromTruncatedMessage(
 			),
 			isError: true,
 		};
-		await emitToolExecutionEnd(finalized, emit);
+		await emitSafely(() => emitToolExecutionEnd(finalized, emit));
 		const toolResultMessage = createToolResultMessage(finalized);
-		await emitToolResultMessage(toolResultMessage, emit);
+		await emitSafely(() => emitToolResultMessage(toolResultMessage, emit));
 		messages.push(toolResultMessage);
 	}
+
+	if (firstError !== undefined) throw firstError;
 	return { messages, terminate: false };
 }
 
@@ -470,13 +486,31 @@ async function executeToolCallsSequential(
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallOutcome[] = [];
 	const messages: ToolResultMessage[] = [];
+	// Every toolCall in the assistant message needs a toolResult, or the persisted
+	// transcript carries an unanswered tool call and providers reject the next
+	// request. A listener throwing on tool_execution_start/tool_execution_end/
+	// message_start/message_end therefore must not abandon the remaining calls, so
+	// emission failures are recorded and the loop continues; the first failure is
+	// rethrown once every result has been published. The tool-result `message_end`
+	// events are what put the messages in the transcript, so they must run even when
+	// an earlier listener failed. Same rule as the parallel executor below.
+	let firstError: unknown;
+	const emitSafely = async (emitEvents: () => Promise<void>): Promise<void> => {
+		try {
+			await emitEvents();
+		} catch (error) {
+			firstError ??= error;
+		}
+	};
 
 	for (const toolCall of toolCalls) {
-		await emit({
-			type: "tool_execution_start",
-			toolCallId: toolCall.id,
-			toolName: toolCall.name,
-			args: toolCall.arguments,
+		await emitSafely(async () => {
+			await emit({
+				type: "tool_execution_start",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				args: toolCall.arguments,
+			});
 		});
 
 		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
@@ -499,9 +533,9 @@ async function executeToolCallsSequential(
 			);
 		}
 
-		await emitToolExecutionEnd(finalized, emit);
+		await emitSafely(() => emitToolExecutionEnd(finalized, emit));
 		const toolResultMessage = createToolResultMessage(finalized);
-		await emitToolResultMessage(toolResultMessage, emit);
+		await emitSafely(() => emitToolResultMessage(toolResultMessage, emit));
 		finalizedCalls.push(finalized);
 		messages.push(toolResultMessage);
 
@@ -511,6 +545,10 @@ async function executeToolCallsSequential(
 		// "not-executed" error result immediately once the signal is aborted, so
 		// the remaining calls settle without dispatching.
 	}
+
+	// Surface the first listener failure after every result is published, so the run
+	// still fails loudly instead of masquerading as a clean tool batch.
+	if (firstError !== undefined) throw firstError;
 
 	return {
 		messages,

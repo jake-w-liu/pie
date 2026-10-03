@@ -3,7 +3,13 @@ import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
-import { fetchWithCredentialRedirects, getWebSearchConfigPath, resolveApiBaseUrl } from "./utils.ts";
+import { fetchWithCredentialRedirects, getWebSearchConfigPath, resolveApiBaseUrl , jsonParseDiagnostic } from "./utils.ts";
+
+/** Same 1..20 result contract the other adapters and the tool schema use. */
+function normalizeNumResults(value: number | undefined): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return 5;
+	return Math.max(1, Math.min(Math.floor(value), 20));
+}
 
 const EXA_API_BASE_URL = "https://api.exa.ai";
 const EXA_MCP_URL = "https://mcp.exa.ai/mcp";
@@ -66,8 +72,7 @@ function loadConfig(): WebSearchConfig {
 		cachedConfig = JSON.parse(raw) as WebSearchConfig;
 		return cachedConfig;
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 }
 
@@ -135,7 +140,7 @@ function exaSearchArgs(query: string, options: ExaSearchOptions): Record<string,
 	return {
 		query,
 		type: "auto",
-		numResults: options.numResults ?? 5,
+		numResults: normalizeNumResults(options.numResults),
 		...mapDomainFilter(options.domainFilter),
 		...(startDate ? { startPublishedDate: startDate } : {}),
 	};
@@ -419,7 +424,7 @@ async function searchWithFilteredExaMcp(
 
 async function searchWithExaMcp(query: string, options: ExaSearchOptions = {}): Promise<SearchResponse | null> {
 	const activityId = activityMonitor.logStart({ type: "api", query });
-	const basicArgs = { query: buildMcpQuery(query, options), numResults: options.numResults ?? 5 };
+	const basicArgs = { query: buildMcpQuery(query, options), numResults: normalizeNumResults(options.numResults) };
 	const filtered = !!options.includeContent || !!options.recencyFilter || !!options.domainFilter?.length;
 
 	try {
@@ -509,8 +514,10 @@ export async function searchWithExa(query: string, options: ExaSearchOptions = {
 
 		return toSearchResponse(
 			buildAnswerFromSearchResults(data.results),
-			mapResults(data.results),
-			options.includeContent ? mapInlineContent(data.results) : null,
+			mapResults(data.results).slice(0, normalizeNumResults(options.numResults)),
+			options.includeContent
+				? mapInlineContent(data.results).slice(0, normalizeNumResults(options.numResults))
+				: null,
 		);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);

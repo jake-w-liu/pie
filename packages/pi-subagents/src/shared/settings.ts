@@ -5,7 +5,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { discoverAgents, formatUnknownAgentError, unknownAgentDiagnosticContext, type AgentConfig, type AgentScope, type UnknownAgentDiagnosticContext } from "../agents/agents.ts";
+import type { AgentConfig } from "../agents/agents.ts";
 import { normalizeSkillInput } from "../agents/skills.ts";
 import { CHAIN_RUNS_DIR, type AcceptanceInput, type AgentContract, type ChainGateLayer, type JsonSchemaObject, type OutputMode, type ToolBudgetConfig } from "./types.ts";
 const CHAIN_DIR_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -356,87 +356,6 @@ export function buildChainInstructions(
 		: "";
 
 	return { prefix, suffix };
-}
-
-// =============================================================================
-// Parallel Step Support
-// =============================================================================
-
-/**
- * Resolve behaviors for all tasks in a parallel step.
- * Creates namespaced output paths to avoid collisions.
- */
-/** Exact discovery context, or explicit input for defensive fallback discovery. */
-export type ParallelBehaviorDiagnostics = UnknownAgentDiagnosticContext | { cwd: string; scope?: AgentScope };
-
-export function resolveParallelBehaviors(
-	tasks: ParallelTaskItem[],
-	agentConfigs: AgentConfig[],
-	stepIndex: number,
-	chainSkills?: string[],
-	diagnostics?: ParallelBehaviorDiagnostics,
-): ResolvedStepBehavior[] {
-	return tasks.map((task, taskIndex) => {
-		const config = agentConfigs.find((a) => a.name === task.agent);
-		if (!config) {
-			if (!diagnostics) throw new Error("resolveParallelBehaviors requires unknown-agent diagnostic context or fallback discovery input.");
-			const context = "directories" in diagnostics
-				? diagnostics
-				: unknownAgentDiagnosticContext(discoverAgents(path.resolve(diagnostics.cwd), diagnostics.scope ?? "both"));
-			throw new Error(formatUnknownAgentError(task.agent, context));
-		}
-
-		// Build subdirectory path for this parallel task
-		const subdir = path.join(`parallel-${stepIndex}`, `${taskIndex}-${task.agent}`);
-
-		// Output: task override > agent default (namespaced) > false
-		// Absolute paths pass through unchanged; relative paths get namespaced under subdir
-		let output: string | false = false;
-		const taskOutput = normalizeOutputOverride(task.output);
-		const configOutput = normalizeOutputOverride(config.output);
-		if (taskOutput !== undefined) {
-			if (taskOutput === false) {
-				output = false;
-			} else if (path.isAbsolute(taskOutput)) {
-				output = taskOutput; // Absolute path: use as-is
-			} else {
-				output = path.join(subdir, taskOutput); // Relative: namespace under subdir
-			}
-		} else if (configOutput) {
-			// Agent defaults are always relative, so namespace them
-			output = path.join(subdir, configOutput);
-		}
-
-		// Reads: task override > agent default > false
-		const reads =
-			task.reads !== undefined ? task.reads : config.defaultReads ?? false;
-
-		// Progress: task override > agent default > false
-		const progress =
-			task.progress !== undefined
-				? task.progress
-				: config.defaultProgress ?? false;
-
-		const taskSkillInput = normalizeSkillInput(task.skill);
-		let skills: string[] | false;
-		if (taskSkillInput === false) {
-			skills = false;
-		} else if (taskSkillInput !== undefined) {
-			skills = [...taskSkillInput];
-			if (chainSkills && chainSkills.length > 0) {
-				skills = [...new Set([...skills, ...chainSkills])];
-			}
-		} else {
-			skills = config.skills ? [...config.skills] : [];
-			if (chainSkills && chainSkills.length > 0) {
-				skills = [...new Set([...skills, ...chainSkills])];
-			}
-		}
-
-		const outputMode = task.outputMode ?? config.outputMode ?? "inline";
-		const model = task.model ?? config.model;
-		return { output, outputMode, reads, progress, skills, model };
-	});
 }
 
 export type { ParallelTaskResult } from "../runs/shared/parallel-utils.ts";

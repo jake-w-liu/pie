@@ -206,10 +206,17 @@ export default function promptUrlWidgetExtension(pi: ExtensionAPI) {
 		}
 	};
 
+	// Each lookup runs detached, so a slow request for an older prompt could land after
+	// a newer one and overwrite the widget and session name with stale metadata. The
+	// generation counter makes every completion that is no longer current a no-op.
+	let promptGeneration = 0;
+
 	const updatePromptContext = (ctx: ExtensionContext, match: PromptMatch) => {
+		const generation = ++promptGeneration;
 		setWidget(ctx, match);
 		applySessionName(match);
 		void fetchGhMetadata(pi, match.kind, match.target, ctx.cwd).then((meta) => {
+			if (generation !== promptGeneration) return;
 			setWidget(ctx, match, meta);
 			applySessionName(match, meta);
 		});

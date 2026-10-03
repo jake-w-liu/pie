@@ -263,8 +263,11 @@ export function createMlxProvider(): { provider: Provider<"openai-completions"> 
 							message: "API key (optional)",
 						})
 					).trim();
-					// Verify connectivity before storing the credential.
+					// Verify connectivity before storing the credential. An API-key-protected
+					// MLX server rejects an unauthenticated probe, so the key collected here
+					// has to travel with the request.
 					const checkResponse = await fetch(`${serverUrl}/models`, {
+						...(apiKey ? { headers: { Authorization: `Bearer ${apiKey}` } } : {}),
 						signal: AbortSignal.any([interaction.signal, AbortSignal.timeout(15_000)]),
 					});
 					if (!checkResponse.ok) {
@@ -343,6 +346,11 @@ export function createMlxProvider(): { provider: Provider<"openai-completions"> 
 			if (context.allowNetwork) {
 				try {
 					const response = await fetch(`${serverUrl}/models`, {
+						// The stored credential is what authorizes this request on a protected
+						// server; without the header the catalog could never be refreshed.
+						...(context.credential?.key
+							? { headers: { Authorization: `Bearer ${context.credential.key}` } }
+							: {}),
 						signal: AbortSignal.any([context.signal, AbortSignal.timeout(15_000)]),
 					});
 					if (!response.ok) {

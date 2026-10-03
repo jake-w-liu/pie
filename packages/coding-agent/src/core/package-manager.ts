@@ -51,6 +51,16 @@ const NETWORK_TIMEOUT_MS = 10000;
 const UPDATE_CHECK_CONCURRENCY = 4;
 const GIT_UPDATE_CONCURRENCY = 4;
 
+// Git sources may embed credentials (`https://user:token@host/org/repo.git`). Progress
+// events are printed by `package-manager-cli.ts` and command errors are shown to the
+// user, so URL userinfo is replaced before either is built. Only the argv handed to
+// `spawnProcess` keeps the real URL. The whole userinfo is dropped rather than just a
+// password because a bare `https://<token>@host/...` form carries the secret in the
+// username position.
+function redactUrlCredentials(text: string): string {
+	return text.replace(/([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/\s@]*@/g, "$1***@");
+}
+
 function isExactNpmVersion(version: string | undefined): boolean {
 	return valid(version ?? "") !== null;
 }
@@ -286,7 +296,7 @@ function expandPackageGlob(pattern: string, root: string): string[] {
 		.filter((path) =>
 			relative(root, path)
 				.split(sep)
-				.every((segment) => segment === ".." || !segment.startsWith(".")),
+				.every((segment) => !segment.startsWith(".")),
 		)
 		.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
@@ -549,6 +559,21 @@ function collectAutoThemeEntries(dir: string): string[] {
 	return entries;
 }
 
+/**
+ * True when `candidate` resolves inside `root` (or is `root` itself).
+ *
+ * A package manifest declares what that package ships, so manifest entries resolve
+ * against the package root and anything landing outside it is dropped: a plain
+ * `../outside.ts`, an absolute path, or a glob whose matches escape via `..`. Without
+ * this a manifest could pull arbitrary readable files off the machine into the
+ * resource set and get them loaded as extensions.
+ */
+function isWithinRoot(root: string, candidate: string): boolean {
+	const resolvedRoot = resolve(root);
+	const resolved = resolve(candidate);
+	return resolved === resolvedRoot || resolved.startsWith(`${resolvedRoot}${sep}`);
+}
+
 function resolveExtensionEntries(dir: string): string[] | null {
 	const packageJsonPath = join(dir, "package.json");
 	if (existsSync(packageJsonPath)) {
@@ -557,7 +582,7 @@ function resolveExtensionEntries(dir: string): string[] | null {
 			const entries: string[] = [];
 			for (const extPath of manifest.extensions) {
 				const resolvedExtPath = resolve(dir, extPath);
-				if (existsSync(resolvedExtPath)) {
+				if (isWithinRoot(dir, resolvedExtPath) && existsSync(resolvedExtPath)) {
 					entries.push(resolvedExtPath);
 				}
 			}
@@ -893,13 +918,14 @@ export class DefaultPackageManager implements PackageManager {
 		message: string,
 		operation: () => Promise<void>,
 	): Promise<void> {
-		this.emitProgress({ type: "start", action, source, message });
+		const safeSource = redactUrlCredentials(source);
+		this.emitProgress({ type: "start", action, source: safeSource, message: redactUrlCredentials(message) });
 		try {
 			await operation();
-			this.emitProgress({ type: "complete", action, source });
+			this.emitProgress({ type: "complete", action, source: safeSource });
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : String(error);
-			this.emitProgress({ type: "error", action, source, message: errorMessage });
+			this.emitProgress({ type: "error", action, source: safeSource, message: redactUrlCredentials(errorMessage) });
 			throw error;
 		}
 	}
@@ -2313,10 +2339,11 @@ export class DefaultPackageManager implements PackageManager {
 		const sourceEntries = entries.filter((entry) => !isOverridePattern(entry));
 		const resolved = sourceEntries.flatMap((entry) => {
 			if (!hasGlobPattern(entry)) {
-				return [resolve(root, entry)];
+				const candidate = resolve(root, entry);
+				return isWithinRoot(root, candidate) ? [candidate] : [];
 			}
 
-			return expandPackageGlob(entry, root);
+			return expandPackageGlob(entry, root).filter((candidate) => isWithinRoot(root, candidate));
 		});
 		return this.collectFilesFromPaths(resolved, resourceType);
 	}
@@ -2650,7 +2677,11 @@ export class DefaultPackageManager implements PackageManager {
 			child.once("close", (code, signal) => {
 				if (timeout) clearTimeout(timeout);
 				if (timedOut) {
-					reject(new Error(`${command} ${args.join(" ")} timed out after ${options?.timeoutMs}ms`));
+					reject(
+						new Error(
+							`${redactUrlCredentials(`${command} ${args.join(" ")}`)} timed out after ${options?.timeoutMs}ms`,
+						),
+					);
 					return;
 				}
 				if (code === 0) {
@@ -2658,7 +2689,11 @@ export class DefaultPackageManager implements PackageManager {
 					return;
 				}
 				const exitStatus = code === null ? `signal ${signal ?? "unknown"}` : `code ${code}`;
-				reject(new Error(`${command} ${args.join(" ")} failed with ${exitStatus}: ${stderr || stdout}`));
+				reject(
+					new Error(
+						`${redactUrlCredentials(`${command} ${args.join(" ")}`)} failed with ${exitStatus}: ${stderr || stdout}`,
+					),
+				);
 			});
 		});
 	}
@@ -2671,7 +2706,7 @@ export class DefaultPackageManager implements PackageManager {
 				if (code === 0) {
 					resolvePromise();
 				} else {
-					reject(new Error(`${command} ${args.join(" ")} failed with code ${code}`));
+					reject(new Error(`${redactUrlCredentials(`${command} ${args.join(" ")}`)} failed with code ${code}`));
 				}
 			});
 		});
@@ -2686,7 +2721,7 @@ export class DefaultPackageManager implements PackageManager {
 		});
 		if (result.error || result.status !== 0) {
 			throw new Error(
-				`Failed to run ${command} ${args.join(" ")}: ${result.error?.message || result.stderr || result.stdout}`,
+				`Failed to run ${command} ${redactUrlCredentials(args.join(" "))}: ${result.error?.message || result.stderr || result.stdout}`,
 			);
 		}
 		return (result.stdout || result.stderr || "").trim();

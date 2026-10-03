@@ -162,11 +162,40 @@ function parseRecordMutation(
 		}
 	}
 	if (type === "operation_finished") requireString(value.runId, "runId");
+	if (type === "usage") validateUsageRecord(value.usage);
 	const { kind: _kind, ...recordFields } = value;
 	return {
 		kind: "record",
 		record: { ...recordFields, id, lane, type, seq, timestamp } as unknown as LaneRecord,
 	};
+}
+
+/**
+ * A `usage` record without its nested payload decoded fine and then threw a raw
+ * TypeError inside `SessionState.applyMutation` (`usage.cacheRead`), which surfaced
+ * as a crash instead of the documented `invalid_entry` rejection.
+ */
+function validateUsageRecord(value: unknown): void {
+	if (!isObject(value)) throw new JsonlDecodeError("schema", "has invalid usage");
+	const usage = value as {
+		input?: unknown;
+		output?: unknown;
+		cacheRead?: unknown;
+		cacheWrite?: unknown;
+		totalTokens?: unknown;
+		cost?: unknown;
+	};
+	if (typeof usage.input !== "number" || typeof usage.output !== "number" || typeof usage.totalTokens !== "number") {
+		throw new JsonlDecodeError("schema", "has invalid usage token counts");
+	}
+	if (typeof usage.cacheRead !== "number" || typeof usage.cacheWrite !== "number") {
+		throw new JsonlDecodeError("schema", "has invalid usage cache counts");
+	}
+	if (!isObject(usage.cost)) throw new JsonlDecodeError("schema", "has invalid usage cost");
+	const cost = usage.cost as Record<string, unknown>;
+	for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"]) {
+		if (typeof cost[key] !== "number") throw new JsonlDecodeError("schema", `has invalid usage cost ${key}`);
+	}
 }
 
 function parseLaneMutation(value: Record<string, unknown>, seq: number): Extract<SessionMutation, { kind: "lane" }> {

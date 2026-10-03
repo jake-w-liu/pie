@@ -148,6 +148,10 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 		const requestSignal = options.signal
 			? AbortSignal.any([options.signal, requestAbort.signal])
 			: requestAbort.signal;
+		// Declared outside the try so `finally` can release the client on every path:
+		// each stream builds its own, and the SDK's request handler owns a connection
+		// pool / HTTP agents that outlive the request otherwise.
+		let bedrockClient: BedrockRuntimeClient | undefined;
 		try {
 			// A profile explicitly configured through pi's auth flow (the `profile`
 			// option or scoped `AWS_PROFILE` on the stored credential's env) must win
@@ -236,7 +240,15 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			}
 
 			const supportsStrictMode = model.compat?.supportsStrictMode ?? false;
-			const client = new BedrockRuntimeClient(config);
+			// Honor the shared retry/timeout options: the SDK otherwise applies its own
+			// default attempts, so `maxRetries: 0` could not disable retries and
+			// `timeoutMs` could not bound the request. `maxAttempts` counts the first try.
+			const clientConfig =
+				typeof options.maxRetries === "number"
+					? { ...config, maxAttempts: Math.max(1, Math.floor(options.maxRetries) + 1) }
+					: config;
+			const client = new BedrockRuntimeClient(clientConfig);
+			bedrockClient = client;
 			let observedRawResponse = false;
 			if (options.onResponse) {
 				addResponseHeadersMiddleware(client, options.onResponse, model, () => {
@@ -267,7 +279,10 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			}
 			const command = new ConverseStreamCommand(commandInput);
 
-			const response = await client.send(command, { abortSignal: requestSignal });
+			const response = await client.send(command, {
+				abortSignal: requestSignal,
+				...(typeof options.timeoutMs === "number" ? { requestTimeout: options.timeoutMs } : {}),
+			});
 			responseRequestId = normalizeDiagnosticValue(response.$metadata.requestId);
 			if (!observedRawResponse && response.$metadata.httpStatusCode !== undefined) {
 				const responseHeaders: Record<string, string> = {};
@@ -338,6 +353,8 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			}
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
+		} finally {
+			bedrockClient?.destroy();
 		}
 	})();
 

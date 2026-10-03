@@ -8,6 +8,7 @@ export interface DrainableSource {
 export interface JsonlWriteStream {
 	write(chunk: string): boolean;
 	once(event: "drain", listener: () => void): JsonlWriteStream;
+	once(event: "error", listener: (error: unknown) => void): JsonlWriteStream;
 	end(callback?: () => void): void;
 }
 
@@ -36,10 +37,14 @@ export function createJsonlWriter(
 	}
 
 	const createWriteStream = deps.createWriteStream ?? ((targetPath: string) => fs.createWriteStream(targetPath, { flags: "a" }));
-	let stream: JsonlWriteStream | undefined;
-	try {
-		stream = createWriteStream(filePath);
-	} catch {
+	const stream = ((): JsonlWriteStream | undefined => {
+		try {
+			return createWriteStream(filePath);
+		} catch {
+			return undefined;
+		}
+	})();
+	if (!stream) {
 		return {
 			writeLine() {},
 			async close() {},
@@ -48,12 +53,31 @@ export function createJsonlWriter(
 
 	let backpressured = false;
 	let closed = false;
+	let failed = false;
 	let bytesWritten = 0;
+	let settleClose: (() => void) | undefined;
 	const maxBytes = deps.maxBytes ?? DEFAULT_MAX_JSONL_BYTES;
+
+	// `fs.createWriteStream` reports a failed open (missing parent directory, EACCES)
+	// asynchronously through `"error"`. Without a listener the event is unhandled and
+	// takes the host process down, so an optional artifact could kill the session.
+	// Once it fires the artifact is abandoned: writes are dropped, a source paused by
+	// backpressure is resumed so the producer cannot stall, and `close()` settles.
+	stream.once("error", (error: unknown) => {
+		if (failed) return;
+		failed = true;
+		closed = true;
+		if (backpressured) {
+			backpressured = false;
+			source.resume();
+		}
+		settleClose?.();
+		console.error(`JSONL artifact writer for '${filePath}' failed:`, error);
+	});
 
 	return {
 		writeLine(line: string) {
-			if (!stream || closed || !line.trim()) return;
+			if (closed || !line.trim()) return;
 			const chunk = `${line}\n`;
 			const chunkBytes = Buffer.byteLength(chunk, "utf-8");
 			if (bytesWritten + chunkBytes > maxBytes) return;
@@ -71,11 +95,18 @@ export function createJsonlWriter(
 			} catch {}
 		},
 		async close() {
-			if (!stream || closed) return;
+			if (closed) return;
 			closed = true;
-			const current = stream;
-			stream = undefined;
-			await new Promise<void>((resolve) => current.end(() => resolve()));
+			await new Promise<void>((resolve) => {
+				let settled = false;
+				const done = () => {
+					if (settled) return;
+					settled = true;
+					resolve();
+				};
+				settleClose = done;
+				stream.end(done);
+			});
 		},
 	};
 }

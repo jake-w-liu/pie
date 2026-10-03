@@ -495,18 +495,37 @@ function mergeSummary(existing: NestedRunSummary | undefined, event: NestedEvent
 	};
 }
 
+/**
+ * Merge one child into the list it belongs to.
+ *
+ * An event that declares `parentStepIndex` belongs beneath that step, exactly as
+ * `attachRootChildrenToSteps` already does for root-level children. Attaching it to
+ * the parent's run-level `children` instead rendered grandchildren at run level.
+ */
+function mergeChildInto(existing: NestedRunSummary[] | undefined, event: NestedEventRecord): NestedRunSummary[] {
+	const children = existing ?? [];
+	const childIndex = children.findIndex((child) => child.id === event.child.id);
+	const nextChild = mergeSummary(childIndex >= 0 ? children[childIndex] : undefined, event);
+	return childIndex >= 0
+		? children.map((child, index) => index === childIndex ? nextChild : child)
+		: [...children, nextChild];
+}
+
 function attachChild(children: NestedRunSummary[], event: NestedEventRecord): NestedRunSummary[] {
 	let updated = false;
 	const walk = (items: NestedRunSummary[]): NestedRunSummary[] => items.map((item) => {
 		if (item.id === event.parentRunId) {
-			const existingChildren = item.children ?? [];
-			const childIndex = existingChildren.findIndex((child) => child.id === event.child.id);
-			const nextChild = mergeSummary(childIndex >= 0 ? existingChildren[childIndex] : undefined, event);
-			const nextChildren = childIndex >= 0
-				? existingChildren.map((child, index) => index === childIndex ? nextChild : child)
-				: [...existingChildren, nextChild];
+			// `steps` is positional: its array index is the step index.
+			const stepIndex = event.child.parentStepIndex;
+			if (stepIndex !== undefined && stepIndex >= 0 && stepIndex < (item.steps?.length ?? 0)) {
+				const nextChildren = mergeChildInto(item.steps![stepIndex]!.children, event).slice(0, MAX_CHILDREN);
+				updated = true;
+				const nextSteps = item.steps!.map((step, index) => index === stepIndex ? { ...step, children: nextChildren } : step);
+				return { ...item, steps: nextSteps, lastUpdate: Math.max(item.lastUpdate ?? 0, event.ts) };
+			}
+			const nextChildren = mergeChildInto(item.children, event).slice(0, MAX_CHILDREN);
 			updated = true;
-			return { ...item, children: nextChildren.slice(0, MAX_CHILDREN), lastUpdate: Math.max(item.lastUpdate ?? 0, event.ts) };
+			return { ...item, children: nextChildren, lastUpdate: Math.max(item.lastUpdate ?? 0, event.ts) };
 		}
 		if (!item.children?.length) return item;
 		const nextChildren = walk(item.children);

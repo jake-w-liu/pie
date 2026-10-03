@@ -544,6 +544,8 @@ export class InteractiveMode {
 
 	// Track current bash execution component
 	private bashComponent: BashExecutionComponent | undefined = undefined;
+	/** Guards against two concurrent bash submissions sharing one component. */
+	private bashSubmissionInFlight = false;
 
 	// Track pending bash components (shown in pending area, moved to chat on submit)
 	private pendingBashComponents: BashExecutionComponent[] = [];
@@ -6681,6 +6683,19 @@ export class InteractiveMode {
 	}
 
 	private async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
+		// Claim the slot before awaiting the extension hook. The caller's
+		// `isBashRunning` check happens before this function, so two submissions could
+		// both pass while the first hook was pending and then share `this.bashComponent`.
+		if (this.bashSubmissionInFlight) return;
+		this.bashSubmissionInFlight = true;
+		try {
+			await this.runBashCommand(command, excludeFromContext);
+		} finally {
+			this.bashSubmissionInFlight = false;
+		}
+	}
+
+	private async runBashCommand(command: string, excludeFromContext = false): Promise<void> {
 		const extensionRunner = this.session.extensionRunner;
 
 		// Emit user_bash event to let extensions intercept
@@ -6724,7 +6739,8 @@ export class InteractiveMode {
 
 		// Normal execution path (possibly with custom operations)
 		const isDeferred = this.session.isStreaming;
-		this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext);
+		const component = new BashExecutionComponent(command, this.ui, excludeFromContext);
+		this.bashComponent = component;
 
 		if (isDeferred) {
 			// Show in pending area when agent is streaming
@@ -6740,31 +6756,27 @@ export class InteractiveMode {
 			const result = await this.session.executeBash(
 				command,
 				(chunk) => {
-					if (this.bashComponent) {
-						this.bashComponent.appendOutput(chunk);
-						this.ui.requestRender();
-					}
+					// The captured component, never `this.bashComponent`: a later command
+					// must not receive this one's output and completion.
+					component.appendOutput(chunk);
+					this.ui.requestRender();
 				},
 				{ excludeFromContext, operations: eventResult?.operations },
 			);
 
-			if (this.bashComponent) {
-				this.bashComponent.setComplete(
-					result.exitCode,
-					result.cancelled,
-					result.truncated ? ({ truncated: true, content: result.output } as TruncationResult) : undefined,
-					result.fullOutputPath,
-				);
-			}
+			component.setComplete(
+				result.exitCode,
+				result.cancelled,
+				result.truncated ? ({ truncated: true, content: result.output } as TruncationResult) : undefined,
+				result.fullOutputPath,
+			);
 		} catch (error) {
-			if (this.bashComponent) {
-				this.bashComponent.setComplete(undefined, false);
-			}
+			component.setComplete(undefined, false);
 			this.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
+		} finally {
+			if (this.bashComponent === component) this.bashComponent = undefined;
+			this.ui.requestRender();
 		}
-
-		this.bashComponent = undefined;
-		this.ui.requestRender();
 	}
 
 	private async handleCompactCommand(customInstructions?: string): Promise<void> {

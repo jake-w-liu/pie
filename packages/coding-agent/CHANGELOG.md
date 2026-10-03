@@ -43,6 +43,21 @@
 - Raised the MLX provider local-model context ceiling from 32k to 128k so models with large native windows and a capable local server (e.g. 27B hybrid-attention 4-bit) are reported with up to 131072 tokens; models without a readable local config still default to 32k.
 
 ### Fixed
+- Authenticated Git URLs no longer leak credentials into progress output or command errors.
+- A package manifest can no longer load extensions from outside its own package root through `../` or absolute entries.
+- An HTML export refuses theme colors that could terminate the document's `<style>` element.
+- The `grep` tool bounds `files_with_matches` output at the documented 50KB and reports truncation; the `read` tool rejects non-integer or non-positive `offset`/`limit`.
+- `grep` and `ls` stop promptly when aborted during setup instead of continuing to traverse or launch a process.
+- Loading an extension with an unknown `pi.on` event name now fails with the supported event list instead of registering an unreachable handler.
+- Two sessions created with the same explicit id in the same millisecond resolve to separate files instead of merging into one transcript.
+- Concurrent bash submissions are rejected while one is in flight, and each command's output stays on its own component.
+- `findInitialModel` no longer carries CLI-argument and scoped-model branches that the sole caller can never take.
+- The examples project typechecks again (`tsgo -p tsconfig.examples.json`).
+- Piped stdin preserves leading indentation and trailing newlines instead of being trimmed.
+- Auth commands reject unrelated global options instead of silently ignoring them.
+- The llama.cpp SSE parser recognizes CRLF frames split across reads, and the MLX provider sends its API key with catalog requests.
+- A slow `fetch` for prompt-URL metadata no longer overwrites newer widget state and the session name.
+- `RpcClient.start()` rejects when the child dies by signal during startup, and an unknown response id is no longer delivered as an agent event.
 
 - Closed a remaining `workflowScript` sandbox escape. A host call that threw synchronously bypassed the context-realm error conversion entirely, because the host function was evaluated as the argument to `toContextPromise` before that helper was entered. The script could catch a worker-realm `Error`, take `e.constructor.constructor` to obtain a live worker `Function`, and from there reach `process`, the environment, and the filesystem. Every host entry point is now invoked inside a guard that converts synchronous throws the same way asynchronous ones already were.
 - Fixed `workflowScript`'s `runs.refs([...])` always throwing `TypeError: hostPromise.then is not a function`. The context-realm API wrapped the host's synchronous formatted string as if it were a promise, so every workflow using it failed; it now returns the string like `runs.ref`.

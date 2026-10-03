@@ -939,11 +939,26 @@ export abstract class TuiBase extends Container implements TUI {
 
 	start(): void {
 		this.stopped = false;
+		// `beforeTerminalStart()` can already acquire terminal state (the fullscreen TUI
+		// enters the alternate screen there), and `terminal.start()` can then throw from
+		// raw-mode setup, stdout writes or resize signalling. Without a rollback the
+		// process dies holding the alternate screen with no way back, so the acquisition
+		// is unwound before the original error propagates.
 		this.beforeTerminalStart();
-		this.terminal.start(
-			(data) => this.handleTerminalInput(data),
-			() => this.routeTerminalResize(),
-		);
+		try {
+			this.terminal.start(
+				(data) => this.handleTerminalInput(data),
+				() => this.routeTerminalResize(),
+			);
+		} catch (error) {
+			this.stopped = true;
+			try {
+				this.stop({ preserveScreen: true });
+			} catch {
+				// Restoration is best effort; the startup failure is what matters.
+			}
+			throw error;
+		}
 		this.afterTerminalStart();
 		this.terminal.hideCursor();
 		this.mouseReportingActive = this.isMouseReportingEnabled();
@@ -1543,21 +1558,31 @@ export abstract class TuiBase extends Container implements TUI {
 	protected extractCursorPosition(lines: string[], height: number): { row: number; col: number } | null {
 		// Only scan the bottom `height` lines (visible viewport)
 		const viewportTop = Math.max(0, lines.length - height);
+		let position: { row: number; col: number } | null = null;
 		for (let row = lines.length - 1; row >= viewportTop; row--) {
-			const line = lines[row];
-			const markerIndex = line.indexOf(CURSOR_MARKER);
-			if (markerIndex !== -1) {
+			let line = lines[row];
+			let markerIndex = line.indexOf(CURSOR_MARKER);
+			if (markerIndex === -1) continue;
+			if (!position) {
 				// Calculate visual column (width of text before marker)
-				const beforeMarker = line.slice(0, markerIndex);
-				const col = visibleWidth(beforeMarker);
-
-				// Strip marker from the line
-				lines[row] = line.slice(0, markerIndex) + line.slice(markerIndex + CURSOR_MARKER.length);
-
-				return { row, col };
+				position = { row, col: visibleWidth(line.slice(0, markerIndex)) };
 			}
+			// Strip every marker, not just the one that placed the cursor: two focusable
+			// components can render on the same screen (the prompt editor plus a dialog
+			// input), and an unstripped marker was written to the terminal verbatim.
+			while (markerIndex !== -1) {
+				line = line.slice(0, markerIndex) + line.slice(markerIndex + CURSOR_MARKER.length);
+				markerIndex = line.indexOf(CURSOR_MARKER);
+			}
+			lines[row] = line;
 		}
-		return null;
+		// Strip markers that sit above the scanned viewport too. They can only reach
+		// here when the rendered screen is taller than the terminal (a long document in
+		// fullscreen mode), and an unstripped marker reaches the terminal as text.
+		for (let row = viewportTop - 1; row >= 0; row--) {
+			if (lines[row].includes(CURSOR_MARKER)) lines[row] = lines[row].replaceAll(CURSOR_MARKER, "");
+		}
+		return position;
 	}
 
 	/**

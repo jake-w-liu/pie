@@ -2,7 +2,7 @@ import { lookup as dnsLookup } from "node:dns/promises";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import net from "node:net";
 import { Agent, ProxyAgent } from "undici/index.js";
-import { fetchWithDispatcher, getProxyForUrl, getWebSearchConfigPath, type ProxiedRequestInit } from "./utils.ts";
+import { fetchWithDispatcher, getProxyForUrl, getWebSearchConfigPath, type ProxiedRequestInit , jsonParseDiagnostic } from "./utils.ts";
 
 const DEFAULT_MAX_REDIRECTS = 5;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
@@ -41,8 +41,7 @@ function loadConfigRoot(): Record<string, unknown> | null {
 	try {
 		parsed = JSON.parse(raw);
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${WEB_SEARCH_CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${WEB_SEARCH_CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 
 	const value = parsed && typeof parsed === "object" && !Array.isArray(parsed)
@@ -344,6 +343,13 @@ function extractEmbeddedIPv4(groups: number[]): string | null {
 	if (groups.slice(0, 5).every(group => group === 0) && groups[5] === 0xffff) {
 		return embedded(groups[6], groups[7]);
 	}
+	// ::ffff:0:0:0/96 - IPv4-translatable address (RFC 6052 2.2 / RFC 6145): the same
+	// trailing 32 bits as ::ffff:0:0/96 but with a zero group after the marker. Without
+	// this, `::ffff:0:a9fe:a9fe` reached 169.254.169.254 (link-local cloud metadata)
+	// as an "ordinary" IPv6 destination.
+	if (groups.slice(0, 4).every(group => group === 0) && groups[4] === 0xffff && groups[5] === 0) {
+		return embedded(groups[6], groups[7]);
+	}
 	// ::/96 - deprecated IPv4-compatible address (RFC 4291 2.5.5.1). `::` and
 	// `::1` are rejected by the caller, so only a real embedded host reaches here.
 	if (groups.slice(0, 6).every(group => group === 0)) {
@@ -379,6 +385,14 @@ function isBlockedIPv6(address: string): boolean {
 	if (groups.slice(0, 7).every(group => group === 0) && groups[7] === 1) return true;
 	if ((first & 0xfe00) === 0xfc00) return true;
 	if ((first & 0xffc0) === 0xfe80) return true;
+	// ff00::/8 multicast: network-local scope, never a legitimate fetch target.
+	if ((first & 0xff00) === 0xff00) return true;
+	// fec0::/10 site-local, deprecated by RFC 3879 and not globally routable.
+	if ((first & 0xffc0) === 0xfec0) return true;
+	// 100::/64 discard-only (RFC 6666).
+	if (first === 0x0100 && groups.slice(1, 4).every(group => group === 0)) return true;
+	// 2001:db8::/32 documentation (RFC 3849): reserved, never routable.
+	if (first === 0x2001 && groups[1] === 0x0db8) return true;
 
 	const embeddedIPv4 = extractEmbeddedIPv4(groups);
 	if (embeddedIPv4 !== null) return isBlockedIPv4(embeddedIPv4);

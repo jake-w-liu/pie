@@ -261,9 +261,13 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 				return { sequences, remainder: remaining };
 			}
 		} else {
-			// Not an escape sequence - take a single character
-			sequences.push(remaining[0]!);
-			pos++;
+			// Not an escape sequence - take one whole character. Taking a single UTF-16
+			// code unit split every astral character (emoji) into a lone high surrogate
+			// followed by a lone low surrogate.
+			const first = remaining.codePointAt(0)!;
+			const width = first > 0xffff ? 2 : 1;
+			sequences.push(remaining.slice(0, width));
+			pos += width;
 		}
 	}
 
@@ -292,6 +296,68 @@ export type StdinBufferEventMap = {
  * Buffers stdin input and emits complete sequences via the 'data' event.
  * Handles partial escape sequences that arrive across multiple chunks.
  */
+/**
+ * Decode a byte buffer as UTF-8, falling back to the legacy Meta convention
+ * (`ESC` + byte - 128) for bytes that cannot start a valid sequence.
+ *
+ * A lead byte whose continuation bytes have not arrived yet is left pending so a
+ * character split across reads is decoded once complete. A lead byte followed by a
+ * byte that is *not* a continuation is legacy 8-bit input, not a broken character, so
+ * it is converted immediately instead of swallowing the following character.
+ */
+function decodeUtf8WithLegacyFallback(buffer: Buffer): { text: string; rest: Buffer } {
+	const legacyEscape = (byte: number): string => `\x1b${String.fromCharCode((byte - 128) & 0xff)}`;
+	let index = 0;
+	let text = "";
+	while (index < buffer.length) {
+		const byte = buffer[index]!;
+		if (byte < 0x80) {
+			text += String.fromCharCode(byte);
+			index++;
+			continue;
+		}
+		const needed =
+			byte >= 0xc2 && byte <= 0xdf ? 2 : byte >= 0xe0 && byte <= 0xef ? 3 : byte >= 0xf0 && byte <= 0xf4 ? 4 : 0;
+		if (needed === 0) {
+			text += legacyEscape(byte);
+			index++;
+			continue;
+		}
+		let incomplete = false;
+		let valid = true;
+		for (let offset = 1; offset < needed; offset++) {
+			const next = buffer[index + offset];
+			if (next === undefined) {
+				incomplete = true;
+				valid = false;
+				break;
+			}
+			if (next < 0x80 || next > 0xbf) {
+				valid = false;
+				break;
+			}
+		}
+		if (incomplete) break;
+		if (!valid) {
+			text += legacyEscape(byte);
+			index++;
+			continue;
+		}
+		text += buffer.subarray(index, index + needed).toString("utf8");
+		index += needed;
+	}
+	return { text, rest: buffer.subarray(index) };
+}
+
+/** Slice to `limit` code units without cutting a surrogate pair in half. */
+function sliceWithoutSplittingSurrogatePair(value: string, limit: number): string {
+	if (limit <= 0 || value.length <= limit) return value.slice(0, Math.max(0, limit));
+	const lastCodeUnit = value.charCodeAt(limit - 1);
+	// A high surrogate at the boundary means the pair's low half was cut off.
+	const boundary = lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff ? limit - 1 : limit;
+	return value.slice(0, boundary);
+}
+
 export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private buffer: string = "";
 	private timeout: ReturnType<typeof setTimeout> | null = null;
@@ -301,14 +367,8 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private pasteBuffer: string = "";
 	private pasteTruncated: boolean = false;
 	private pasteOverflowTail: string = "";
-	/**
-	 * Bytes that arrived before a bracketed-paste start but did not form a
-	 * complete sequence. They are not garbage: a split mouse report or a bare
-	 * Escape is still in flight, and the remaining bytes show up in a later
-	 * chunk, so they are re-queued ahead of the bytes that follow the paste
-	 * terminator instead of being dropped.
-	 */
-	private pastePrefix: string = "";
+	/** Incomplete trailing UTF-8 sequence from a Buffer chunk boundary. */
+	private pendingBytes: Buffer = Buffer.alloc(0);
 	private pendingKittyPrintableCodepoint: number | undefined;
 
 	constructor(options: StdinBufferOptions = {}) {
@@ -324,21 +384,24 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.timeout = null;
 		}
 
-		// Handle high-byte conversion (for compatibility with parseKeypress)
-		// If buffer has single byte > 127, convert to ESC + (byte - 128)
+		// Buffer input is a byte stream, not a character stream: a multi-byte character
+		// can straddle two chunks, and decoding each chunk on its own turned "€"
+		// (E2 82 AC) into ESC+b plus two replacement characters. Bytes are accumulated
+		// until a whole UTF-8 sequence is available. Bytes below 0xC2 can never start a
+		// UTF-8 sequence, so they keep the legacy Meta conversion (ESC + byte - 128); a
+		// genuine lone high byte is held until the idle timeout, where flush() applies
+		// the same conversion.
 		let str: string;
 		if (Buffer.isBuffer(data)) {
-			if (data.length === 1 && data[0]! > 127) {
-				const byte = data[0]! - 128;
-				str = `\x1b${String.fromCharCode(byte)}`;
-			} else {
-				str = data.toString();
-			}
+			const pending = Buffer.concat([this.pendingBytes, data]);
+			const decoded = decodeUtf8WithLegacyFallback(pending);
+			this.pendingBytes = Buffer.from(decoded.rest);
+			str = decoded.text;
 		} else {
 			str = data;
 		}
 
-		if (str.length === 0 && this.buffer.length === 0) {
+		if (str.length === 0 && this.buffer.length === 0 && this.pendingBytes.length === 0) {
 			this.emitDataSequence("");
 			return;
 		}
@@ -375,7 +438,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			if (endIndex !== -1) {
 				let pastedContent = this.pasteBuffer.slice(0, endIndex);
 				if (pastedContent.length > MAX_BRACKETED_PASTE_CHARS) {
-					pastedContent = pastedContent.slice(0, MAX_BRACKETED_PASTE_CHARS);
+					pastedContent = sliceWithoutSplittingSurrogatePair(pastedContent, MAX_BRACKETED_PASTE_CHARS);
 				}
 				const remaining = this.pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
 
@@ -392,7 +455,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				// middle, retain a small tail so a terminator split across the
 				// truncation point is still detected.
 				this.pasteOverflowTail = this.pasteBuffer.slice(-(BRACKETED_PASTE_END.length - 1));
-				this.pasteBuffer = this.pasteBuffer.slice(0, MAX_BRACKETED_PASTE_CHARS);
+				this.pasteBuffer = sliceWithoutSplittingSurrogatePair(this.pasteBuffer, MAX_BRACKETED_PASTE_CHARS);
 				this.pasteTruncated = true;
 			}
 			return;
@@ -406,11 +469,12 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				for (const sequence of result.sequences) {
 					this.emitDataSequence(sequence);
 				}
-				// A trailing incomplete sequence (a lone Escape, a mouse report
-				// split across PTY reads) is a real keypress whose remaining bytes
-				// have not arrived. Queue it instead of dropping it, so the next
-				// chunk can complete it.
-				this.pastePrefix = result.remainder;
+				// A trailing incomplete sequence (a lone Escape, a mouse report split
+				// across PTY reads) can no longer complete once the paste opener has
+				// arrived: the opener is itself a sequence boundary. Those bytes are a
+				// real keypress, so emit them now, before the paste. Queueing them and
+				// replaying after the paste delivered input out of byte-stream order.
+				if (result.remainder.length > 0) this.emitDataSequence(result.remainder);
 			}
 
 			this.pendingKittyPrintableCodepoint = undefined;
@@ -425,7 +489,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			if (endIndex !== -1) {
 				let pastedContent = this.pasteBuffer.slice(0, endIndex);
 				if (pastedContent.length > MAX_BRACKETED_PASTE_CHARS) {
-					pastedContent = pastedContent.slice(0, MAX_BRACKETED_PASTE_CHARS);
+					pastedContent = sliceWithoutSplittingSurrogatePair(pastedContent, MAX_BRACKETED_PASTE_CHARS);
 				}
 				const remaining = this.pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
 
@@ -439,7 +503,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				this.resumeAfterPaste(remaining);
 			} else if (this.pasteBuffer.length > MAX_BRACKETED_PASTE_CHARS + BRACKETED_PASTE_END.length) {
 				this.pasteOverflowTail = this.pasteBuffer.slice(-(BRACKETED_PASTE_END.length - 1));
-				this.pasteBuffer = this.pasteBuffer.slice(0, MAX_BRACKETED_PASTE_CHARS);
+				this.pasteBuffer = sliceWithoutSplittingSurrogatePair(this.pasteBuffer, MAX_BRACKETED_PASTE_CHARS);
 				this.pasteTruncated = true;
 			}
 			return;
@@ -452,8 +516,8 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.emitDataSequence(sequence);
 		}
 
-		if (this.buffer.length > 0) {
-			const timeoutMs = this.buffer === ESC ? this.escapeTimeoutMs : this.timeoutMs;
+		if (this.buffer.length > 0 || this.pendingBytes.length > 0) {
+			const timeoutMs = this.buffer === ESC || this.buffer.length === 0 ? this.escapeTimeoutMs : this.timeoutMs;
 			this.timeout = setTimeout(() => {
 				const flushed = this.flush();
 
@@ -470,11 +534,8 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	 * the paste boundary is re-assembled instead of being dropped.
 	 */
 	private resumeAfterPaste(remaining: string): void {
-		const prefix = this.pastePrefix;
-		this.pastePrefix = "";
-		const tail = prefix + remaining;
-		if (tail.length > 0) {
-			this.process(tail);
+		if (remaining.length > 0) {
+			this.process(remaining);
 		}
 	}
 
@@ -495,11 +556,22 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.timeout = null;
 		}
 
+		const sequences: string[] = [];
+		if (this.pendingBytes.length > 0) {
+			// The held bytes never completed a UTF-8 sequence, so treat them as legacy
+			// 8-bit Meta input exactly as a single-byte chunk used to be treated.
+			sequences.push(
+				this.pendingBytes
+					.toString("latin1")
+					.replace(/[\u0080-\u00ff]/g, (char) => `\x1b${String.fromCharCode((char.charCodeAt(0) - 128) & 0xff)}`),
+			);
+			this.pendingBytes = Buffer.alloc(0);
+		}
 		if (this.buffer.length === 0) {
-			return [];
+			return sequences;
 		}
 
-		const sequences = [this.buffer];
+		sequences.push(this.buffer);
 		this.buffer = "";
 		this.pendingKittyPrintableCodepoint = undefined;
 		return sequences;
@@ -515,7 +587,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.pasteBuffer = "";
 		this.pasteTruncated = false;
 		this.pasteOverflowTail = "";
-		this.pastePrefix = "";
+		this.pendingBytes = Buffer.alloc(0);
 		this.pendingKittyPrintableCodepoint = undefined;
 	}
 

@@ -58,4 +58,44 @@ describe("acceptance verify memoization key", () => {
 			fs.rmSync(artifacts, { recursive: true, force: true });
 		}
 	}, 60_000);
+
+	it("re-runs a memoized verify command after an untracked file changes only its bytes", async () => {
+		const repo = fs.mkdtempSync(path.join(os.tmpdir(), "verify-memo-untracked-bytes-"));
+		const artifacts = fs.mkdtempSync(path.join(os.tmpdir(), "verify-memo-artifacts-"));
+		try {
+			git(repo, ["init", "-q"]);
+			fs.writeFileSync(path.join(repo, "tracked.txt"), "committed\n", "utf-8");
+			git(repo, ["add", "tracked.txt"]);
+			git(repo, ["-c", "user.email=verify@example.com", "-c", "user.name=verify", "commit", "-q", "-m", "base"]);
+			// An untracked verifier input: the command reads its bytes and the path never
+			// changes across the mutation below.
+			const input = path.join(repo, "gate-input.txt");
+			fs.writeFileSync(input, "ok\n", "utf-8");
+			const verifier = path.join(repo, "verify.mjs");
+			fs.writeFileSync(
+				verifier,
+				"import { readFileSync } from \"node:fs\";\nprocess.exit(readFileSync(new URL(\"gate-input.txt\", import.meta.url).pathname, \"utf-8\").trim() === \"ok\" ? 0 : 1);\n",
+				"utf-8",
+			);
+			const acceptance = verifiedAcceptance([{ id: "gate", command: `${process.execPath} ${JSON.stringify(verifier)}` }]);
+
+			const clean = await evaluateAcceptance({ acceptance, output: "", cwd: repo, reportOptional: true, artifactsDir: artifacts, runId: "run-1" });
+			expect(clean.verifyRuns[0]?.status).toBe("passed");
+			expect(clean.verifyRuns[0]?.memoized).toBe(false);
+			const memoized = await evaluateAcceptance({ acceptance, output: "", cwd: repo, reportOptional: true, artifactsDir: artifacts, runId: "run-1" });
+			expect(memoized.verifyRuns[0]?.memoized).toBe(true);
+
+			// Only the contents change: HEAD, the tracked diff and the `git status` path
+			// list stay byte-identical, so a path-only fingerprint would reuse the stale
+			// `passed` for a tree nobody verified.
+			fs.writeFileSync(input, "fail\n", "utf-8");
+			const afterEdit = await evaluateAcceptance({ acceptance, output: "", cwd: repo, reportOptional: true, artifactsDir: artifacts, runId: "run-1" });
+			expect(afterEdit.verifyRuns[0]?.memoized).toBe(false);
+			expect(afterEdit.verifyRuns[0]?.status).toBe("failed");
+			expect(afterEdit.status).toBe("rejected");
+		} finally {
+			fs.rmSync(repo, { recursive: true, force: true });
+			fs.rmSync(artifacts, { recursive: true, force: true });
+		}
+	}, 60_000);
 });

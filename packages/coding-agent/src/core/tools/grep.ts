@@ -188,8 +188,23 @@ export function createGrepToolDefinition(
 
 				(async () => {
 					try {
+						// Cancellation is registered before any awaited setup: the abort
+						// handler is installed after `isDirectory` resolves, so aborting
+						// during that await was missed and ripgrep still ran to completion.
+						let abortedEarly = false;
+						const onEarlyAbort = (): void => {
+							abortedEarly = true;
+							settle(() => reject(new Error("Operation aborted")));
+						};
+						if (signal?.aborted) {
+							onEarlyAbort();
+							return;
+						}
+						signal?.addEventListener("abort", onEarlyAbort, { once: true });
+
 						const rgPath = await ensureTool("rg");
 						if (!rgPath) {
+							signal?.removeEventListener("abort", onEarlyAbort);
 							settle(() => reject(new Error("ripgrep (rg) is not available and could not be downloaded")));
 							return;
 						}
@@ -200,9 +215,14 @@ export function createGrepToolDefinition(
 						try {
 							isDirectory = await ops.isDirectory(searchPath);
 						} catch {
+							signal?.removeEventListener("abort", onEarlyAbort);
 							settle(() => reject(new Error(`Path not found: ${searchPath}`)));
 							return;
 						}
+						// The child installs its own listener that kills the process; drop the
+						// setup-phase one so an abort is not reported twice.
+						signal?.removeEventListener("abort", onEarlyAbort);
+						if (abortedEarly) return;
 
 						const contextValue = context && context > 0 ? context : 0;
 						// Only 'content' mode stops at the match limit; 'files_with_matches' and
@@ -453,9 +473,19 @@ export function createGrepToolDefinition(
 							}
 
 							if (outputMode === "files_with_matches") {
-								const files = matchedFiles.map((filePath) => formatPath(filePath));
+								// The advertised 50KB ceiling applies to every output mode. Thousands
+								// of matching paths otherwise produced an unbounded result the model
+								// had to re-read and the caller had to hold in memory.
+								const rawOutput = matchedFiles.map((filePath) => formatPath(filePath)).join("\n");
+								const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
+								const text = truncation.truncated
+									? `${truncation.content}\n\n[${formatSize(DEFAULT_MAX_BYTES)} limit reached. Narrow the path or pattern to see more files.]`
+									: rawOutput;
 								settle(() =>
-									resolve({ content: [{ type: "text", text: files.join("\n") }], details: undefined }),
+									resolve({
+										content: [{ type: "text", text }],
+										details: truncation.truncated ? { truncation } : undefined,
+									}),
 								);
 								return;
 							}

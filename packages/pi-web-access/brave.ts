@@ -1,8 +1,9 @@
+import { matchesDomainFilters, normalizeDomain, normalizeDomainFilters, type NormalizedDomainFilters } from "./domain-filter.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import type { SearchOptions, SearchResult, SearchResponse } from "./perplexity.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
-import { fetchWithCredentialRedirects, getWebSearchConfigPath, resolveApiBaseUrl } from "./utils.ts";
+import { fetchWithCredentialRedirects, getWebSearchConfigPath, resolveApiBaseUrl , jsonParseDiagnostic } from "./utils.ts";
 
 const BRAVE_API_BASE_URL = "https://api.search.brave.com/res/v1";
 const CONFIG_PATH = getWebSearchConfigPath();
@@ -11,11 +12,6 @@ const SEARCH_TIMEOUT_MS = 30_000;
 interface WebSearchConfig {
 	braveApiKey?: unknown;
 	braveBaseUrl?: unknown;
-}
-
-interface NormalizedDomainFilters {
-	allowed: string[];
-	blocked: string[];
 }
 
 let cachedConfig: WebSearchConfig | null = null;
@@ -32,8 +28,7 @@ function loadConfig(): WebSearchConfig {
 		cachedConfig = JSON.parse(raw) as WebSearchConfig;
 		return cachedConfig;
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 }
 
@@ -61,34 +56,7 @@ function normalizeCount(value: number | undefined): number {
 	return Math.max(1, Math.min(Math.floor(value), 20));
 }
 
-function normalizeDomain(value: string): string | null {
-	let input = value.trim().toLowerCase();
-	if (!input) return null;
-	if (input.startsWith("-")) input = input.slice(1).trim();
-	if (!input) return null;
-	try {
-		const parsed = input.includes("://") ? new URL(input) : new URL(`https://${input}`);
-		input = parsed.hostname;
-	} catch {
-		input = input.split("/")[0]?.split(":")[0] ?? "";
-	}
-	input = input.replace(/^\.+|\.+$/g, "");
-	return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(input) ? input : null;
-}
 
-function normalizeDomainFilters(domainFilter: string[] | undefined): NormalizedDomainFilters {
-	const filters: NormalizedDomainFilters = { allowed: [], blocked: [] };
-	if (!domainFilter?.length) return filters;
-
-	for (const raw of domainFilter) {
-		const domain = normalizeDomain(raw);
-		if (!domain) continue;
-		const target = raw.trim().startsWith("-") ? filters.blocked : filters.allowed;
-		if (!target.includes(domain)) target.push(domain);
-	}
-
-	return filters;
-}
 
 function buildBraveQuery(query: string, domainFilter: string[] | undefined): string {
 	const filters = normalizeDomainFilters(domainFilter);
@@ -107,26 +75,7 @@ function buildBraveQuery(query: string, domainFilter: string[] | undefined): str
 	return parts.join(" ");
 }
 
-function hostMatchesDomain(hostname: string, domain: string): boolean {
-	return hostname === domain || hostname.endsWith(`.${domain}`);
-}
 
-function matchesDomainFilters(url: string, filters: NormalizedDomainFilters): boolean {
-	if (filters.allowed.length === 0 && filters.blocked.length === 0) return true;
-
-	let hostname = "";
-	try {
-		hostname = new URL(url).hostname.toLowerCase();
-	} catch {
-		return false;
-	}
-
-	if (filters.allowed.length > 0 && !filters.allowed.some(domain => hostMatchesDomain(hostname, domain))) {
-		return false;
-	}
-
-	return !filters.blocked.some(domain => hostMatchesDomain(hostname, domain));
-}
 
 export function isBraveAvailable(): boolean {
 	return hasCredentialSource({

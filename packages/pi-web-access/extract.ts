@@ -24,7 +24,7 @@ import { extractWithBrightDataUnlocker, isBrightDataUnlockerAvailable } from "./
 import { isVideoFile, extractVideo, extractVideoFrame, getLocalVideoDuration } from "./video-extract.ts";
 import { appendDeclaredWebLinks, discoverDeclaredWebLinks, type DeclaredWebLink } from "./declared-web-links.ts";
 import { fetchRemoteUrl, loadFetchContentDomainPolicy, loadSsrfConfig, validateRemoteUrl, type DomainPolicy, type Lookup, type SsrfConfig } from "./ssrf-protection.ts";
-import { formatSeconds, getWebSearchConfigPath, type ProxiedRequestInit } from "./utils.ts";
+import { formatSeconds, getWebSearchConfigPath, jsonParseDiagnostic, type ProxiedRequestInit } from "./utils.ts";
 import { isImageEnabled } from "./feature-config.ts";
 import { assertAuthFetchUrl, authFetchRedirectGuard, type AuthFetchProfile } from "./auth-fetch.ts";
 import { getBrowserCookiesForHosts, getLastBrowserCookieDiagnostic } from "./chrome-cookies.ts";
@@ -81,10 +81,6 @@ async function extractWithDefuddle(text: string, url: string): Promise<{ title: 
 }
 
 export { loadSsrfConfig } from "./ssrf-protection.ts";
-
-export function loadSsrfAllowRanges(): string[] {
-	return loadSsrfConfig().allowRanges;
-}
 
 function errorMessage(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
@@ -157,16 +153,16 @@ function loadFetchRouting(): FetchRouting {
 	}
 
 	let raw: Record<string, unknown>;
+	let parsed: unknown;
 	try {
-		const parsed: unknown = JSON.parse(readFileSync(WEB_SEARCH_CONFIG_PATH, "utf-8"));
-		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-			throw new Error("expected a JSON object");
-		}
-		raw = parsed as Record<string, unknown>;
+		parsed = JSON.parse(readFileSync(WEB_SEARCH_CONFIG_PATH, "utf-8"));
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${WEB_SEARCH_CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${WEB_SEARCH_CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error(`Failed to parse ${WEB_SEARCH_CONFIG_PATH}: expected a JSON object`);
+	}
+	raw = parsed as Record<string, unknown>;
 
 	if (!Object.hasOwn(raw, "fetchRouting")) {
 		return { providers: DEFAULT_FETCH_PROVIDER_ORDER, allowRemoteHostedProviders: false };

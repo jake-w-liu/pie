@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Operations after `close()` are rejected instead of reopening a database handle that the already-resolved close promise never closed.
+
 ## [0.84.3] - 2026-08-24
 
 ## [0.84.2] - 2026-08-14

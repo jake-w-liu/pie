@@ -1,6 +1,5 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { readMissionBinding } from "../../missions/lifecycle.ts";
 import { listMissions, missionRecordPath, resolveMissionStoreLocation } from "../../missions/store.ts";
@@ -11,6 +10,7 @@ import { DIRS, type Details, type SubagentState } from "../../shared/types.ts";
 import { readStatus } from "../../shared/utils.ts";
 import { resolveSubagentRunId } from "../../runs/background/run-id-resolver.ts";
 import { resolveNodeExecutable } from "../../shared/node-executable.ts";
+import { getPackageRoot } from "../../shared/package-root.ts";
 import { createHerdrClient, detectHerdr, type HerdrClient, type HerdrErrorCode, type HerdrResult } from "./client.ts";
 import { encodeSessionRoots } from "./session-roots-codec.ts";
 import { formatShellCommand } from "./shell-command.ts";
@@ -86,6 +86,14 @@ function extractPaneId(value: unknown): string | undefined {
 	const pane = record.pane && typeof record.pane === "object" && !Array.isArray(record.pane) ? record.pane as Record<string, unknown> : record;
 	for (const key of ["pane_id", "paneId", "id"]) if (typeof pane[key] === "string") return pane[key];
 	return undefined;
+}
+
+function defaultInspectorRunnerPath(): string {
+	// The package ships TypeScript sources and Node runs them through type stripping
+	// (engines: node >= 22.19), the same entry style the async runner uses. There is
+	// no `inspector-runner.mjs` at the package root, so pointing there left Herdr to
+	// launch a nonexistent file and report an inspector that was already dead.
+	return path.join(getPackageRoot(), "src", "inspectors", "herdr", "inspector-runner.ts");
 }
 
 function inspectorCommand(input: { runnerPath: string; asyncDir: string; runId: string; index?: number; missionPath?: string; allowSteer: boolean; allowStop: boolean; sessionRoots: string[] }): string {
@@ -192,6 +200,12 @@ export async function handleHerdrInspectorAction(action: HerdrInspectorAction, p
 	if (existing) {
 		const live = await paneExists(client, existing.paneId, deps.signal);
 		if (live.ok) return result(`Herdr inspector pane ${existing.paneId} is already open for async run ${target.runId}.${params.focus ? " Herdr cannot refocus an arbitrary raw pane id; select it in the Herdr UI." : ""}`);
+		// Only an explicit "gone" verdict may orphan the existing pane by replacing it.
+		// A TIMEOUT or transport failure proves nothing about the pane, and splitting
+		// anyway left a still-live inspector behind with its binding overwritten.
+		if (!live.ok && live.error.code !== "NOT_FOUND" && live.error.code !== "PANE_GONE" && live.error.code !== "HERDR_UNSUPPORTED_VERSION") {
+			return result(`Herdr inspector error: ${formatHerdrError(live.error)}\nBinding kept for ${existing.paneId}: ${bindingPath(target.asyncDir, params.index)}`, true);
+		}
 	}
 	const splitArgs = ["pane", "split", "--current", "--direction", "right", "--cwd", status.cwd ?? deps.cwd];
 	splitArgs.push(params.focus === true ? "--focus" : "--no-focus");
@@ -200,7 +214,10 @@ export async function handleHerdrInspectorAction(action: HerdrInspectorAction, p
 	const paneId = extractPaneId(split.data);
 	if (!paneId) return result("Herdr inspector error (PANE_GONE): pane split returned no pane id.", true);
 	const mission = missionForRun(target.asyncDir, deps.cwd, deps.missions, target.runId);
-	const runnerPath = deps.runnerPath ?? fileURLToPath(new URL("../../../inspector-runner.mjs", import.meta.url));
+	const runnerPath = deps.runnerPath ?? defaultInspectorRunnerPath();
+	if (!fs.existsSync(runnerPath)) {
+		return result(`Herdr inspector error (RUNNER_MISSING): inspector runner '${runnerPath}' does not exist; the active Pie installation may have changed (e.g. refresh:pie). Restart pie and retry.`, true);
+	}
 	const command = inspectorCommand({
 		runnerPath,
 		asyncDir: target.asyncDir,

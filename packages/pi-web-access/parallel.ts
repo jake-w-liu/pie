@@ -3,7 +3,7 @@ import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent, ExtractOptions } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
 
 const PARALLEL_SEARCH_URL = "https://api.parallel.ai/v1/search";
 const PARALLEL_EXTRACT_URL = "https://api.parallel.ai/v1/extract";
@@ -64,8 +64,7 @@ function loadConfig(): WebSearchConfig {
 		cachedConfig = JSON.parse(raw) as WebSearchConfig;
 		return cachedConfig;
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 }
 
@@ -313,15 +312,23 @@ async function fetchAndMapExtractResult(
 	return { mapped: mapExtractResult(result), result };
 }
 
+/** Same 1..20 result contract the other adapters and the tool schema use. */
+function normalizeParallelNumResults(value: number | undefined): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return 5;
+	return Math.max(1, Math.min(Math.floor(value), 20));
+}
+
 export async function searchWithParallel(query: string, options: ParallelSearchOptions = {}): Promise<SearchResponse> {
 	const data = await parallelFetch(PARALLEL_SEARCH_URL, buildSearchRequestBody(query, options), options.signal);
-	const results = data.results as V1WebSearchResult[] | undefined;
+	const limit = normalizeParallelNumResults(options.numResults);
+	// Cap at the normalized request count before anything is derived from the results.
+	const results = (data.results as V1WebSearchResult[] | undefined)?.slice(0, limit);
 	const response: SearchResponse = {
 		answer: buildAnswerFromExcerpts(results),
-		results: mapSearchResults(results),
+		results: mapSearchResults(results).slice(0, limit),
 	};
 	if (options.includeContent) {
-		const inlineContent = mapInlineContent(results);
+		const inlineContent = mapInlineContent(results).slice(0, limit);
 		if (inlineContent.length > 0) response.inlineContent = inlineContent;
 	}
 	return response;

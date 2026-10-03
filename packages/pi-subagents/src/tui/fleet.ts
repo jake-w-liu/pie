@@ -1050,6 +1050,9 @@ export class SubagentFleetComponent implements Component {
 	}
 
 	private setActionNotice(result: FleetActionResult): void {
+		// An action can settle after the component was disposed; mutating state or
+		// requesting a render on the destroyed TUI is a use-after-free.
+		if (this.disposed) return;
 		this.actionNotice = result;
 		this.resetActionInput();
 		this.detailAutoFollow = false;
@@ -1068,7 +1071,8 @@ export class SubagentFleetComponent implements Component {
 			.catch((error) => this.setActionNotice({ text: error instanceof Error ? error.message : String(error), isError: true }))
 			.finally(() => {
 				this.actionBusy = false;
-				if (!this.disposed) this.tui.requestRender();
+				if (this.disposed) return;
+				this.tui.requestRender();
 			});
 	}
 

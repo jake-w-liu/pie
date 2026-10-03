@@ -7,7 +7,7 @@ import { canAttachImages } from "./feature-config.ts";
 import { isGeminiWebAvailable, queryWithCookies } from "./gemini-web.ts";
 import { queryGeminiApiWithVideo, getApiKey, fetchGeminiApi, getVersionedApiBase, getUploadBase, redactGeminiApiResponse } from "./gemini-api.ts";
 import { extractHeadingTitle, type ExtractedContent, type ExtractOptions, type FrameResult } from "./extract.ts";
-import { readExecError, trimErrorText, mapFfmpegError, getWebSearchConfigPath } from "./utils.ts";
+import { readExecError, trimErrorText, mapFfmpegError, getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
 
 const CONFIG_PATH = getWebSearchConfigPath();
 
@@ -49,6 +49,8 @@ interface VideoConfig {
 	enabled: boolean;
 	preferredModel: string;
 	maxSizeMB: number;
+	/** Bound on upload + polling + analysis for one video, in milliseconds. */
+	flowTimeoutMs: number;
 }
 
 function normalizePreferredModel(value: unknown, fallback: string): string {
@@ -61,6 +63,16 @@ function normalizeEnabled(value: unknown, fallback: boolean): boolean {
 	return typeof value === "boolean" ? value : fallback;
 }
 
+// Upload + poll + analysis for one video. Exposed through `video.flowTimeoutMs` so a
+// caller (and a test) can bound it without waiting out the default.
+const DEFAULT_VIDEO_FLOW_TIMEOUT_MS = 120000;
+
+function normalizeFlowTimeoutMs(value: unknown, fallback: number): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+	// Below one second a slow upload would abort before it can make progress.
+	return value >= 1_000 ? Math.floor(value) : fallback;
+}
+
 function normalizeMaxSizeMB(value: unknown, fallback: number): number {
 	if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
 	return value > 0 ? value : fallback;
@@ -70,6 +82,7 @@ const VIDEO_CONFIG_DEFAULTS: VideoConfig = {
 	enabled: true,
 	preferredModel: "gemini-3.6-flash",
 	maxSizeMB: 50,
+	flowTimeoutMs: DEFAULT_VIDEO_FLOW_TIMEOUT_MS,
 };
 
 let cachedVideoConfig: VideoConfig | null = null;
@@ -82,12 +95,11 @@ function loadVideoConfig(): VideoConfig {
 	}
 
 	const rawText = readFileSync(CONFIG_PATH, "utf-8");
-	let raw: { video?: { enabled?: boolean; preferredModel?: string; maxSizeMB?: number } };
+	let raw: { video?: { enabled?: boolean; preferredModel?: string; maxSizeMB?: number; flowTimeoutMs?: number } };
 	try {
-		raw = JSON.parse(rawText) as { video?: { enabled?: boolean; preferredModel?: string; maxSizeMB?: number } };
+		raw = JSON.parse(rawText) as { video?: { enabled?: boolean; preferredModel?: string; maxSizeMB?: number; flowTimeoutMs?: number } };
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 
 	const v = raw.video ?? {};
@@ -95,6 +107,7 @@ function loadVideoConfig(): VideoConfig {
 		enabled: normalizeEnabled(v.enabled, VIDEO_CONFIG_DEFAULTS.enabled),
 		preferredModel: normalizePreferredModel(v.preferredModel, VIDEO_CONFIG_DEFAULTS.preferredModel),
 		maxSizeMB: normalizeMaxSizeMB(v.maxSizeMB, VIDEO_CONFIG_DEFAULTS.maxSizeMB),
+		flowTimeoutMs: normalizeFlowTimeoutMs(v.flowTimeoutMs, VIDEO_CONFIG_DEFAULTS.flowTimeoutMs),
 	};
 	return cachedVideoConfig;
 }
@@ -267,6 +280,13 @@ async function tryVideoGeminiWeb(
 	}
 }
 
+function remainingMs(deadline: number): number {
+	const remaining = deadline - Date.now();
+	// A non-positive `AbortSignal.timeout` fires immediately, which is the intent: the
+	// deadline has passed and the caller must see a timeout rather than start new work.
+	return Math.max(1, remaining);
+}
+
 async function tryVideoGeminiApi(
 	info: VideoFileInfo,
 	prompt: string,
@@ -278,18 +298,25 @@ async function tryVideoGeminiApi(
 	if (signal?.aborted) return null;
 
 	let fileName: string | null = null;
+	// One deadline covers upload, polling and the analysis request. The caller signal
+	// alone is not a bound: `fetch` only returns when the peer responds, so a hung
+	// upload or a hung poll request would outlive `timeoutMs` before the poll loop ever
+	// rechecked its deadline.
+	const flowTimeoutMs = loadVideoConfig().flowTimeoutMs;
+	const deadline = Date.now() + flowTimeoutMs;
+	const deadlineSignal = (): AbortSignal => AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(remainingMs(deadline))]);
 	try {
-		const uploaded = await uploadToFilesApi(info, apiKey, signal);
+		const uploaded = await uploadToFilesApi(info, apiKey, deadlineSignal());
 		fileName = uploaded.name;
 
-		await pollFileState(fileName, apiKey, signal, 120000);
+		await pollFileState(fileName, apiKey, deadlineSignal(), flowTimeoutMs);
 
 		const text = await queryGeminiApiWithVideo(prompt, uploaded.uri, {
 			apiKey,
 			model,
 			mimeType: info.mimeType,
-			signal,
-			timeoutMs: 120000,
+			signal: deadlineSignal(),
+			timeoutMs: flowTimeoutMs,
 		});
 
 		return {
@@ -373,7 +400,7 @@ async function pollFileState(
 		if (data.state === "ACTIVE") return;
 		if (data.state === "FAILED") throw new Error("File processing failed");
 
-		await new Promise(r => setTimeout(r, 5000));
+		await new Promise((resolve) => setTimeout(resolve, Math.min(5000, Math.max(1, deadline - Date.now()))));
 	}
 
 	throw new Error("File processing timed out");

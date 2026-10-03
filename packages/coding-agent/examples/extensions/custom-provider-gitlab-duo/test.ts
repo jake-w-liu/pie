@@ -9,8 +9,8 @@
  */
 
 import { type Api, type Context, type Model, registerApiProvider, streamSimple } from "@earendil-works/pi-ai/compat";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { readFileSync } from "fs";
-import { getAgentDir } from "packages/coding-agent/src/config.js";
 import { join } from "path";
 import { MODELS, streamGitLabDuo } from "./index.ts";
 

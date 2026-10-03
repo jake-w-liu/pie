@@ -545,3 +545,93 @@ describe("parallel sibling settlement on entry failure", () => {
 		expect(events.at(-1)?.type).toBe("agent_end");
 	});
 });
+
+describe("sequential sibling settlement on entry failure", () => {
+	it("sequential pairs every tool call before surfacing a listener failure", async () => {
+		const failure = new Error("sequential listener failure");
+		const executed: string[] = [];
+		const agent = new Agent({
+			initialState: {
+				model,
+				tools: [
+					tool(async (_args, signal) => {
+						executed.push("run");
+						await signal;
+						return result;
+					}),
+				],
+			},
+			toolExecution: "sequential",
+			streamFn: streamCalls(["first", "second"]),
+			shouldStopAfterTurn: () => true,
+		});
+		agent.subscribe(async (event) => {
+			if (event.type === "tool_execution_end" && event.toolCallId === "first") {
+				throw failure;
+			}
+		});
+		await agent.prompt(prompt);
+		await agent.waitForIdle();
+
+		const asked = agent.state.messages
+			.filter((message) => message.role === "assistant")
+			.flatMap((message) =>
+				(message as AssistantMessage).content.filter((block) => block.type === "toolCall").map((block) => block.id),
+			);
+		const answered = agent.state.messages
+			.filter((message) => message.role === "toolResult")
+			.map((message) => (message as { toolCallId: string }).toolCallId);
+		expect(asked.length).toBeGreaterThan(0);
+		expect(answered).toEqual(asked);
+		// The call after the failing one still executed instead of being abandoned.
+		expect(executed.length).toBe(asked.length);
+		// The failure still fails the run loudly instead of a partial success.
+		expect(agent.state.errorMessage).toContain("sequential listener failure");
+	});
+
+	it("pairs every tool call of a truncated assistant message before surfacing a listener failure", async () => {
+		const failure = new Error("truncated listener failure");
+		const streamFn: StreamFn = () => {
+			const stream = createAssistantMessageEventStream();
+			const message: AssistantMessage = {
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "cut-1", name: "test", arguments: {} },
+					{ type: "toolCall", id: "cut-2", name: "test", arguments: {} },
+				],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "length",
+				timestamp: 1,
+			};
+			stream.push({ type: "done", reason: "length", message });
+			return stream;
+		};
+		const agent = new Agent({
+			initialState: { model, tools: [tool(async () => result)] },
+			toolExecution: "sequential",
+			streamFn,
+			shouldStopAfterTurn: () => true,
+		});
+		agent.subscribe(async (event) => {
+			if (event.type === "tool_execution_end") throw failure;
+		});
+		await agent.prompt(prompt);
+		await agent.waitForIdle();
+
+		const answered = agent.state.messages
+			.filter((message) => message.role === "toolResult")
+			.map((message) => (message as { toolCallId: string }).toolCallId);
+		expect(answered).toEqual(["cut-1", "cut-2"]);
+		expect(agent.state.errorMessage).toContain("truncated listener failure");
+	});
+});

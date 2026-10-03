@@ -179,12 +179,10 @@ export function createWaitSubscriptionManager(
 
 	const settle = (record: WaitSubscriptionRecord, outcome: string, detail: string, completion?: WaitCompletion) => {
 		if (disposed || state.currentSessionId !== record.sessionId) return;
-		try {
-			remove(record);
-		} catch (error) {
-			console.error(`Failed to clear wait subscription '${record.token}'; it remains armed:`, error);
-			return;
-		}
+		// Deliver before clearing: the record is the durable retry state for this
+		// wake, so removing it first and only then sending would lose the wake for
+		// good if `sendMessage` threw. A failed delivery leaves the subscription
+		// armed and reconciliation retries it.
 		try {
 			pi.sendMessage({
 				customType: "subagent-wait-subscription",
@@ -198,7 +196,13 @@ export function createWaitSubscriptionManager(
 				},
 			}, { triggerTurn: true });
 		} catch (error) {
-			console.error(`Failed to deliver wait subscription '${record.token}' after clearing it:`, error);
+			console.error(`Failed to deliver wait subscription '${record.token}'; it remains armed:`, error);
+			return;
+		}
+		try {
+			remove(record);
+		} catch (error) {
+			console.error(`Failed to clear wait subscription '${record.token}' after delivering it; it may fire again:`, error);
 		}
 	};
 

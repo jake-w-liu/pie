@@ -439,8 +439,15 @@ function getProjectSettingsPath(cwd: string): string | undefined {
 	}
 }
 
+/**
+ * Project settings file for writes.
+ *
+ * Reads walk up to the nearest project root, but writes always targeted
+ * `<cwd>/.pi/settings.json`. Configuring from a nested directory therefore created a
+ * second project root that then shadowed the original one for every later read.
+ */
 export function getWatchdogProjectSettingsPath(cwd: string): string {
-	return path.join(getProjectConfigDir(cwd), "settings.json");
+	return getProjectSettingsPath(cwd) ?? path.join(getProjectConfigDir(cwd), "settings.json");
 }
 
 function deepMerge<T extends Record<string, unknown>>(base: T, patch: Record<string, unknown>): T {

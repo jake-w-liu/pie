@@ -7,6 +7,9 @@
 - Changed `prepareNextTurn` and `prepareNextTurnWithContext` to run only after `shouldStopAfterTurn` and queued-message checks determine that the agent loop will start another assistant turn. They no longer run after final or terminating turns; move end-of-run work to `agent_end` handling ([#6879](https://github.com/earendil-works/pi/issues/6879)).
 
 ### Fixed
+- Tool results are no longer lost when an event listener throws: sequential and truncated tool batches now publish every tool result before rethrowing, so a listener failure can no longer leave an assistant tool call unanswered in the transcript ([deep-debug audit](https://github.com/jake-w-liu/pie)).
+- Malformed `usage` records in a session JSONL are rejected as schema errors instead of crashing session state with a `TypeError`.
+- Branch summarization no longer requests a fixed 2048 output tokens when the model caps less than that.
 
 - Fixed an aborted tool batch leaving the assistant message's remaining tool calls unanswered. The loop broke out on abort, so the persisted transcript carried orphaned `toolCall` blocks that providers reject on the next request; every call now settles with an "Operation aborted" result instead.
 - Fixed a throwing event listener skipping every listener after it, and on `message_start`/`message_end` swallowing `agent_end` entirely so consumers gating on the terminal event never settled. Delivery now completes to all listeners before the failure propagates, and the failure close-out always emits its full sequence.

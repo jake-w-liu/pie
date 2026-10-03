@@ -1873,6 +1873,15 @@ function loadAgentsFromDefinitionFiles(files: AgentDefinitionFile[], source: Age
 		const { frontmatter, body } = parseFrontmatter(content);
 
 		if (!frontmatter.name || !frontmatter.description) {
+			// Skipping silently made an invalid file indistinguishable from an absent
+			// one, so a typo in `name`/`description` produced no clue at all.
+			const missing = [!frontmatter.name && "name", !frontmatter.description && "description"]
+				.filter((field): field is string => Boolean(field));
+			diagnostics.push({
+				source,
+				filePath,
+				error: `Agent file is missing required frontmatter: ${missing.join(", ")}.`,
+			});
 			continue;
 		}
 
@@ -2218,8 +2227,46 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 		...userLoaded.flatMap((loaded) => loaded.diagnostics),
 		...projectLoaded.flatMap((loaded) => loaded.diagnostics),
 		...packageLoaded.flatMap((loaded) => loaded.diagnostics),
+		...collectDuplicateAgentDiagnostics([
+			{ source: "user", agents: userLoaded.flatMap((loaded) => loaded.agents) },
+			{ source: "project", agents: projectLoaded.flatMap((loaded) => loaded.agents) },
+			{ source: "package", agents: packageLoaded.flatMap((loaded) => loaded.agents) },
+		]),
 	];
 	return { agents, agentDiagnostics, projectAgentsDir, cwd: effectiveCwd, scope, directories, ...(modelScope !== undefined ? { modelScope } : {}), ...(maxThinking !== undefined ? { maxThinking } : {}) };
+}
+
+/**
+ * Diagnose agents that share a runtime name inside one source scope.
+ *
+ * Cross-source overrides are a documented priority (project beats user beats package
+ * beats builtin), but two files in the *same* scope resolving to one name resolved
+ * purely by directory iteration order, with no clue about which definition won.
+ */
+function collectDuplicateAgentDiagnostics(groups: Array<{ source: AgentSource; agents: AgentConfig[] }>): AgentDiscoveryDiagnostic[] {
+	const diagnostics: AgentDiscoveryDiagnostic[] = [];
+	for (const { source, agents } of groups) {
+		const byName = new Map<string, AgentConfig[]>();
+		for (const agent of agents) {
+			const existing = byName.get(agent.name);
+			if (existing) existing.push(agent);
+			else byName.set(agent.name, [agent]);
+		}
+		for (const [name, colliding] of byName) {
+			if (colliding.length < 2) continue;
+			const paths = colliding.map((agent) => agent.filePath);
+			// Report against every colliding definition so none of them is silently hidden.
+			for (const agent of colliding) {
+				diagnostics.push({
+					source,
+					filePath: agent.filePath,
+					name,
+					error: `Duplicate agent name '${name}' in the ${source} scope: ${paths.join(", ")}. Only one definition is active.`,
+				});
+			}
+		}
+	}
+	return diagnostics;
 }
 
 export function discoverAgentsAll(cwd: string): {
@@ -2304,6 +2351,12 @@ export function discoverAgentsAll(cwd: string): {
 		projectSettingsPath,
 	);
 
+	const duplicateAgentDiagnostics = collectDuplicateAgentDiagnostics([
+		{ source: "user", agents: userLoaded.flatMap((loaded) => loaded.agents) },
+		{ source: "package", agents: Array.from(packageMap.values()) },
+		{ source: "project", agents: Array.from(projectMap.values()) },
+	]);
+
 	const chainMap = new Map<string, ChainConfig>();
 	const packageChainDiagnostics: ChainDiscoveryDiagnostic[] = [];
 	const packageChainMap = new Map<string, ChainConfig>();
@@ -2338,6 +2391,7 @@ export function discoverAgentsAll(cwd: string): {
 		...userLoaded.flatMap((loaded) => loaded.diagnostics),
 		...packageAgentDiagnostics,
 		...projectAgentDiagnostics,
+		...duplicateAgentDiagnostics,
 	];
 
 	const userDir = (process.env.PIE_CODING_AGENT_DIR ?? process.env.PI_CODING_AGENT_DIR)

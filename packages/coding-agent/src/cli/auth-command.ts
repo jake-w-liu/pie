@@ -95,6 +95,35 @@ export function parseAuthCommand(args: string[]): AuthCommand | undefined {
 		: { kind, args: commandArgs, json, credentials, noRefresh, minExpiryMs };
 }
 
+/** Parsed `Args` fields an auth command must not carry, in help-text order. */
+const AUTH_UNSUPPORTED_ARG_FIELDS = [
+	"systemPrompt",
+	"appendSystemPrompt",
+	"thinking",
+	"continue",
+	"resume",
+	"mode",
+	"name",
+	"noSession",
+	"session",
+	"sessionId",
+	"fork",
+	"sessionDir",
+	"models",
+	"tools",
+	"excludeTools",
+	"noTools",
+	"noBuiltinTools",
+	"extensions",
+	"noExtensions",
+	"print",
+	"export",
+	"noSkills",
+	"skills",
+	"promptTemplates",
+	"noPromptTemplates",
+] as const satisfies ReadonlyArray<keyof Args>;
+
 export function validateAuthCommandArgs(args: Args, kind: AuthCommandKind): { provider?: string; model?: string } {
 	const provider = args.provider?.trim() || undefined;
 	const model = args.model?.trim() || undefined;
@@ -104,6 +133,17 @@ export function validateAuthCommandArgs(args: Args, kind: AuthCommandKind): { pr
 	}
 	if (args.apiKey !== undefined || args.messages.length > 0 || args.fileArgs.length > 0) {
 		throw new AuthCommandError("Auth commands only accept --provider and --model");
+	}
+	// Every other populated option belongs to the interactive/print session commands.
+	// They used to be accepted and silently ignored, so `pi auth login --thinking high`
+	// looked like it configured something and did nothing.
+	const disallowed = AUTH_UNSUPPORTED_ARG_FIELDS.filter(
+		(field) => args[field] !== undefined && (!Array.isArray(args[field]) || args[field].length > 0),
+	);
+	if (disallowed.length > 0) {
+		throw new AuthCommandError(
+			`Option --${disallowed[0]!.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)} is not supported for "${getAuthCommandName(kind)}"; auth commands only accept --provider and --model.`,
+		);
 	}
 	if (kind === "check") {
 		if (!provider && !model) {

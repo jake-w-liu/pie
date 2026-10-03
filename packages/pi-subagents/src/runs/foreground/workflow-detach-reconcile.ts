@@ -45,7 +45,7 @@ function findWorkflowStep(status: AsyncStatus, childRunId: string, workflowKey?:
 		?? (workflowKey ? status.steps?.find((candidate) => candidate.workflowKey === workflowKey) : undefined) as WorkflowStatusStep | undefined;
 }
 
-export function applyDetachedChildToPausedWorkflow(
+function applyDetachedChildToPausedWorkflow(
 	status: AsyncStatus,
 	input: { childRunId: string; result: Pick<SingleResult, "exitCode" | "error" | "interrupted" | "sessionFile" | "stopped">; workflowKey?: string },
 ): AsyncStatus | undefined {

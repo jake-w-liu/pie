@@ -49,24 +49,6 @@ export interface MissionLaunchInput {
 	labels?: string[];
 }
 
-export interface MissionUpdateToolInput {
-	title?: string;
-	objective?: string;
-	goal?: boolean | { paused: boolean };
-	budget?: MissionTokenBudget;
-	status?: MissionStatus;
-	summary?: string;
-	labels?: string[];
-	artifacts?: MissionArtifact[];
-	receipts?: Array<Omit<MissionReceipt, "createdAt">>;
-	decisions?: Array<{
-		title: string;
-		prompt?: string;
-		options?: string[];
-		recommendation?: string;
-	}>;
-}
-
 export interface MissionActionParams {
 	missionId?: string;
 	mission?: unknown;

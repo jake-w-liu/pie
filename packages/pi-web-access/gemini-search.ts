@@ -37,7 +37,8 @@ import { isSerpBaseAvailable, searchWithSerpBase } from "./serpbase.ts";
 import { isSerperAvailable, searchWithSerper } from "./serper.ts";
 import { isValyuAvailable, searchWithValyu } from "./valyu.ts";
 import { isKimiSearchAvailable, searchWithKimi } from "./kimi-search.ts";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { matchesDomainFilters, normalizeDomainFilters } from "./domain-filter.ts";
+import { getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
 
 export const RESOLVED_SEARCH_PROVIDERS = ["openai", "brave", "parallel", "parallel-mcp", "tinyfish", "search1api", "searchinfinity", "querit", "tavily", "firecrawl", "jina", "searxng", "duckduckgo", "perplexity", "gemini", "kimi", "exa", "serpdive", "kagi", "ollama", "anysearch", "xai", "brightdata", "serpbase", "serper", "valyu", "bocha", "xcrawl"] as const;
 export const SEARCH_PROVIDERS = ["auto", "all", ...RESOLVED_SEARCH_PROVIDERS] as const;
@@ -104,6 +105,11 @@ export interface AttributedSearchResponse extends SearchResponse {
 
 const CONFIG_PATH = getWebSearchConfigPath();
 const DEFAULT_SEARCH_MODEL = "gemini-3.6-flash";
+/** Same 1..20 result contract the other adapters and the tool schema use. */
+function normalizeSearchCount(value: number | undefined): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return 5;
+	return Math.max(1, Math.min(Math.floor(value), 20));
+}
 // Explicit-only providers (Parallel MCP, DuckDuckGo, Kimi, AnySearch, XCrawl, xAI, Bright Data, SerpBase, Serper, Valyu) are deliberately absent:
 // `all` must never fan out to an opt-in or paid provider without the user asking for it.
 export const ALL_SEARCH_PROVIDERS: ResolvedSearchProvider[] = ["searxng", "openai", "exa", "brave", "parallel", "tinyfish", "search1api", "searchinfinity", "querit", "tavily", "firecrawl", "jina", "serpdive", "kagi", "ollama", "perplexity", "gemini", "bocha"];
@@ -134,8 +140,7 @@ function getSearchConfig(): SearchConfig {
 		}
 		raw = parsed as Record<string, unknown>;
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 
 	const searchModel = normalizeSearchModel(raw.searchModel);
@@ -223,8 +228,22 @@ function errorMessage(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
 }
 
+// A caller-initiated cancellation surfaces as `AbortError`. Our own per-request
+// deadline (`AbortSignal.timeout`, which every provider here uses) surfaces as
+// `TimeoutError: "The operation was aborted due to timeout"` — the word "aborted"
+// is in that message, so matching on message text treated every provider timeout as
+// a caller abort and rethrew it out of the whole fallback chain before the next
+// provider was tried. Classification is structural: only `AbortError` stops routing.
 function isAbortError(err: unknown): boolean {
-	return errorMessage(err).toLowerCase().includes("abort");
+	return err instanceof Error && err.name === "AbortError";
+}
+
+/** The caller's signal fired after `Promise.allSettled` swallowed the rejections. */
+function abortError(reason: unknown): Error {
+	const message = typeof reason === "string" ? reason : errorMessage(reason);
+	const err = new Error(message || "Aborted");
+	err.name = "AbortError";
+	return err;
 }
 
 function shouldTryOpenAIInAuto(options: SearchOptions): boolean {
@@ -258,7 +277,10 @@ async function searchWithGemini(
 	options: SearchOptions,
 	strictErrors: boolean,
 ): Promise<SearchResponse | null> {
+	// `errors` are real transport failures; `diagnostics` are "this transport is not
+	// configured", which must not fail an auto-routing search.
 	const errors: string[] = [];
+	const diagnostics: string[] = [];
 
 	try {
 		const apiResult = await searchWithGeminiApi(query, options);
@@ -272,14 +294,18 @@ async function searchWithGemini(
 		const webResult = await searchWithGeminiWeb(query, options);
 		if (webResult) return webResult;
 		const diagnostic = getGeminiWebAvailabilityDiagnostic();
-		if (diagnostic) errors.push(`Gemini Web: ${diagnostic}`);
+		if (diagnostic) diagnostics.push(`Gemini Web: ${diagnostic}`);
 	} catch (err) {
 		if (isAbortError(err)) throw err;
 		errors.push(`Gemini Web: ${errorMessage(err)}`);
 	}
 
-	if (strictErrors && errors.length > 0) {
-		throw new Error(`Gemini search failed:\n  - ${errors.join("\n  - ")}`);
+	// A configured transport that failed must be reported even when `strictErrors` is
+	// off: the auto caller only records thrown errors, so returning null here dropped
+	// the Gemini HTTP failure from its final "all providers failed" diagnostic.
+	const allErrors = [...errors, ...(strictErrors ? diagnostics : [])];
+	if (allErrors.length > 0) {
+		throw new Error(`Gemini search failed:\n  - ${allErrors.join("\n  - ")}`);
 	}
 
 	return null;
@@ -302,6 +328,9 @@ function classifyProviderError(provider: ResolvedSearchProvider, err: unknown): 
 		kind = "credential";
 	} else if (isAbortError(err)) {
 		kind = "aborted";
+	} else if (err instanceof Error && err.name === "TimeoutError") {
+		// Our own per-request deadline: retryable on the next provider.
+		kind = "transient";
 	} else if (provider === "xai" && status === 403 && /spending[- ]limit|(?:no|out of) credits?|insufficient quota|quota (?:exceeded|exhausted)|credits? (?:exhausted|depleted|used up)/.test(lower)) {
 		kind = "quota";
 	} else if (status === 401 || status === 403) {
@@ -483,7 +512,7 @@ async function searchWithProviders(
 			? searchWithResolvedProvider(provider, query, options)
 			: searchWithAllProvider(provider, query, options)),
 	);
-	if (options.signal?.aborted) throw new Error("Aborted");
+	if (options.signal?.aborted) throw abortError(options.signal.reason);
 
 	const successes: AttributedSearchResponse[] = [];
 	const failures: Array<{ provider: ResolvedSearchProvider; error: string }> = [];
@@ -561,7 +590,41 @@ async function searchWithConfiguredRouting(
 	throw new Error(`Configured search routing exhausted:\n  - ${diagnostics.join("\n  - ")}`);
 }
 
+/**
+ * Enforce the caller's domain and result-count constraints on the way out.
+ *
+ * Only a handful of adapters filtered by domain themselves, so a `domainFilter`
+ * reaching Gemini, Kagi, AnySearch, Ollama or any other provider without a local check
+ * was silently ignored and excluded/off-domain results were returned anyway. Applying
+ * it here makes the filter hold for every provider and every routing path.
+ */
+function applyCallerConstraints(
+	response: AttributedSearchResponse,
+	options: FullSearchOptions,
+): AttributedSearchResponse {
+	const filters = normalizeDomainFilters(options.domainFilter);
+	const limit = normalizeSearchCount(options.numResults);
+	const keep = (url: string): boolean => matchesDomainFilters(url, filters);
+	const results = response.results.filter((result) => keep(result.url)).slice(0, limit);
+	const inlineContent = response.inlineContent?.filter((item) => keep(item.url)).slice(0, limit);
+	const providerResponses = response.providerResponses?.map((entry) => ({
+		...entry,
+		results: entry.results.filter((result) => keep(result.url)).slice(0, limit),
+		...(entry.inlineContent ? { inlineContent: entry.inlineContent.filter((item) => keep(item.url)).slice(0, limit) } : {}),
+	}));
+	return {
+		...response,
+		results,
+		...(inlineContent ? { inlineContent } : {}),
+		...(providerResponses ? { providerResponses } : {}),
+	};
+}
+
 export async function search(query: string, options: FullSearchOptions = {}): Promise<AttributedSearchResponse> {
+	return applyCallerConstraints(await searchUnconstrained(query, options), options);
+}
+
+async function searchUnconstrained(query: string, options: FullSearchOptions = {}): Promise<AttributedSearchResponse> {
 	const config = getSearchConfig();
 	const provider = options.provider === undefined || options.provider === "auto"
 		? config.searchProvider
@@ -887,6 +950,26 @@ function extractSourceUrls(markdown: string): SearchResult[] {
 	return results;
 }
 
+const GROUNDING_REDIRECT_HOST = "vertexaisearch.cloud.google.com";
+const GROUNDING_REDIRECT_PATH = "/grounding-api-redirect";
+
+/**
+ * True only for a real grounding redirect: HTTPS, the exact Google host, and the
+ * expected path. A substring check accepted `https://attacker.example/path?q=...` and
+ * the resolver then issued a HEAD request to that attacker URL.
+ */
+function isGroundingRedirectUrl(candidate: string): boolean {
+	let parsed: URL;
+	try {
+		parsed = new URL(candidate);
+	} catch {
+		return false;
+	}
+	return parsed.protocol === "https:"
+		&& parsed.hostname === GROUNDING_REDIRECT_HOST
+		&& parsed.pathname === GROUNDING_REDIRECT_PATH;
+}
+
 async function resolveGroundingChunks(
 	chunks: GroundingChunk[] | undefined,
 	signal?: AbortSignal,
@@ -899,7 +982,7 @@ async function resolveGroundingChunks(
 		const title = chunk.web.title || "";
 		let url = chunk.web.uri || "";
 
-		if (url.includes("vertexaisearch.cloud.google.com/grounding-api-redirect")) {
+		if (isGroundingRedirectUrl(url)) {
 			const resolved = await resolveRedirect(url, signal);
 			if (resolved) url = resolved;
 		}
@@ -911,6 +994,9 @@ async function resolveGroundingChunks(
 
 async function resolveRedirect(proxyUrl: string, signal?: AbortSignal): Promise<string | null> {
 	try {
+		// Defence in depth: the caller only passes URLs that `isGroundingRedirectUrl`
+		// accepted, and this re-checks before anything leaves the process.
+		if (!isGroundingRedirectUrl(proxyUrl)) return null;
 		const res = await fetch(proxyUrl, {
 			method: "HEAD",
 			redirect: "manual",

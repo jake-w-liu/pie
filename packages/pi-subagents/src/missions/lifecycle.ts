@@ -112,7 +112,13 @@ function missionStatusForRun(record: MissionRecord, runId: string, runStatus: st
 }
 
 function usageForResult(result: AgentToolResult<Details>): { tokens: number } | undefined {
-	const tokens = result.details.results.reduce((total, child) => total + child.usage.input + child.usage.output, 0);
+	// Cache reads and writes are billed tokens and are counted by the usage budget
+	// (`sumResultsCost`), so a goal mission that summed only input+output would stay
+	// active while cache usage alone blew its budget.
+	const tokens = result.details.results.reduce(
+		(total, child) => total + child.usage.input + child.usage.output + child.usage.cacheRead + child.usage.cacheWrite,
+		0,
+	);
 	return tokens > 0 ? { tokens } : undefined;
 }
 

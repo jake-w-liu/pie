@@ -7,6 +7,7 @@ import { describe, it } from "node:test";
 import {
 	decodeKittyPrintable,
 	decodePrintableKey,
+	isKeyRelease,
 	Key,
 	matchesKey,
 	parseKey,
@@ -629,5 +630,52 @@ describe("parseKey", () => {
 		it("should parse double bracket pageUp", () => {
 			assert.strictEqual(parseKey("\x1b[[5~"), "pageUp");
 		});
+	});
+});
+
+describe("kitty function keys", () => {
+	it("parses and matches F1-F4 kitty sequences with modifiers and release events", () => {
+		setKittyProtocolActive(true);
+		try {
+			assert.equal(parseKey("\x1b[1;1:1P"), "f1");
+			assert.equal(parseKey("\x1b[1;2:1P"), "shift+f1");
+			assert.equal(parseKey("\x1b[1;1:1Q"), "f2");
+			assert.equal(parseKey("\x1b[1;1:1R"), "f3");
+			assert.equal(parseKey("\x1b[1;1:1S"), "f4");
+			assert.equal(matchesKey("\x1b[1;1:1P", "f1"), true);
+			assert.equal(matchesKey("\x1b[1;2:1P", "shift+f1"), true);
+			assert.equal(matchesKey("\x1b[1;1:1P", "f2"), false);
+			assert.equal(isKeyRelease("\x1b[1;1:3P"), true);
+			assert.equal(isKeyRelease("\x1b[1;1:3S"), true);
+			assert.equal(isKeyRelease("\x1b[1;1:1P"), false);
+		} finally {
+			setKittyProtocolActive(false);
+		}
+	});
+
+	it("parses and matches F5-F12 kitty sequences", () => {
+		setKittyProtocolActive(true);
+		try {
+			for (const [csi, key] of [
+				[15, "f5"],
+				[17, "f6"],
+				[21, "f10"],
+				[24, "f12"],
+			] as const) {
+				const sequence = `\x1b[${csi};1:1~`;
+				assert.equal(parseKey(sequence), key);
+				assert.equal(matchesKey(sequence, key), true);
+				assert.equal(isKeyRelease(`\x1b[${csi};1:3~`), true);
+			}
+			assert.equal(matchesKey("\x1b[15;5:1~", "ctrl+f5"), true);
+		} finally {
+			setKittyProtocolActive(false);
+		}
+	});
+
+	it("still matches legacy function-key sequences when kitty is inactive", () => {
+		assert.equal(matchesKey("\x1bOP", "f1"), true);
+		assert.equal(matchesKey("\x1b[15~", "f5"), true);
+		assert.equal(parseKey("\x1bOP"), "f1");
 	});
 });

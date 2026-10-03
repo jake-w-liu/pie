@@ -377,16 +377,22 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			let response: Response | undefined;
 			let lastError: Error | undefined;
 			const maxRetries = options?.maxRetries ?? DEFAULT_MAX_RETRIES;
+			// Held for the accepted response only; released once its body is consumed.
+			let activeStreamSignal: ReturnType<typeof combineAbortSignals> | undefined;
 
 			for (let attempt = 0; attempt <= maxRetries; attempt++) {
 				if (options?.signal?.aborted) {
 					throw new Error("Request was aborted");
 				}
 
+				// The timeout has to stay armed while the body streams, not just until
+				// headers arrive: a body that stalls after a 200 waited forever because the
+				// combined signal was cleaned up before `processStream` started reading.
+				const headerTimeoutSignal =
+					httpTimeoutMs !== undefined && httpTimeoutMs > 0 ? AbortSignal.timeout(httpTimeoutMs) : undefined;
+				const combinedSignal = combineAbortSignals([options?.signal, headerTimeoutSignal]);
+				activeStreamSignal = combinedSignal;
 				try {
-					const headerTimeoutSignal =
-						httpTimeoutMs !== undefined && httpTimeoutMs > 0 ? AbortSignal.timeout(httpTimeoutMs) : undefined;
-					const combinedSignal = combineAbortSignals([options?.signal, headerTimeoutSignal]);
 					try {
 						response = await (options?.fetch ?? globalThis.fetch)(resolveCodexUrl(model.baseUrl), {
 							method: "POST",
@@ -399,18 +405,14 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 							throw new Error(`Codex SSE response headers timed out after ${httpTimeoutMs}ms`);
 						}
 						throw error;
-					} finally {
-						combinedSignal.cleanup();
 					}
-					await options?.onResponse?.(
-						{ status: response.status, headers: headersToRecord(response.headers) },
-						model,
-					);
 
 					if (response.ok) {
 						break;
 					}
 
+					combinedSignal.cleanup();
+					activeStreamSignal = undefined;
 					const errorText = await response.text();
 					if (attempt < maxRetries && isRetryableError(response.status, errorText)) {
 						const retryAfterDelayMs = getRetryAfterDelayMs(response.headers);
@@ -431,6 +433,8 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					const info = await parseErrorResponse(fakeResponse);
 					throw new Error(info.friendlyMessage || info.message);
 				} catch (error) {
+					combinedSignal.cleanup();
+					activeStreamSignal = undefined;
 					await cancelResponseBody(response);
 					response = undefined;
 					if (error instanceof Error) {
@@ -461,11 +465,28 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				throw new Error("No response body");
 			}
 
+			// `onResponse` observes the accepted response, so it runs after the retry
+			// loop like every other provider. A throwing observer must not resubmit a
+			// request the provider already accepted; the body is cancelled so the
+			// connection is not leaked on that path.
+			try {
+				await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			} catch (error) {
+				await cancelResponseBody(response);
+				response = undefined;
+				throw error;
+			}
+
 			if (!startEmitted) {
 				startEmitted = true;
 				stream.push({ type: "start", partial: output });
 			}
-			await processStream(response, output, stream, model, grammarToolInputProperties, options);
+			await processStream(response, output, stream, model, grammarToolInputProperties, {
+				...(options ?? {}),
+				// Keep `timeoutMs` effective for the body as well as the headers.
+				signal: activeStreamSignal?.signal ?? options?.signal,
+			});
+			activeStreamSignal?.cleanup();
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");

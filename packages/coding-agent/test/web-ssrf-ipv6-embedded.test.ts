@@ -34,6 +34,14 @@ describe("SSRF guard IPv4-embedded IPv6 literals", () => {
 		["6to4 2002::/16 link-local", "http://[2002:a9fe:a9fe::]/"],
 		["Teredo 2001::/32 server loopback", "http://[2001:0:7f00:1::]/"],
 		["Teredo 2001::/32 server link-local", "http://[2001:0:a9fe:a9fe::]/"],
+		["IPv4-translatable ::ffff:0:0:0/96 loopback (RFC 6145)", "http://[::ffff:0:7f00:1]/"],
+		["IPv4-translatable ::ffff:0:0:0/96 link-local", "http://[::ffff:0:a9fe:a9fe]/"],
+		["IPv4-translatable ::ffff:0:0:0/96 private", "http://[::ffff:0:c0a8:101]/"],
+		["multicast ff02::1", "http://[ff02::1]/"],
+		["multicast ff0e::1", "http://[ff0e::1]/"],
+		["deprecated site-local fec0::1", "http://[fec0::1]/"],
+		["discard-only 100::1", "http://[100::1]/"],
+		["documentation 2001:db8::1", "http://[2001:db8::1]/"],
 	])("blocks %s", async (_form, url) => {
 		await expect(validate(url)).rejects.toThrow("Blocked internal address");
 	});
@@ -45,6 +53,8 @@ describe("SSRF guard IPv4-embedded IPv6 literals", () => {
 		["6to4 public", "http://[2002:808:808::]/"],
 		["Teredo public server", "http://[2001:0:808:808::]/"],
 		["unrelated IPv6", "http://[2001:4860:4860::8888]/"],
+		["IPv4-translatable public", "http://[::ffff:0:808:808]/"],
+		["ordinary global unicast", "http://[2a00:1450:4001:81f::200e]/"],
 	])("allows %s", async (_form, url) => {
 		await expect(validate(url)).resolves.toBeInstanceOf(URL);
 	});

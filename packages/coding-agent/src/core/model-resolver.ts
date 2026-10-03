@@ -612,66 +612,28 @@ export interface InitialModelResult {
 
 /**
  * Find the initial model to use based on priority:
- * 1. CLI args (provider + model)
- * 2. First model from scoped models (if not continuing/resuming)
- * 3. Restored from session (if continuing/resuming)
- * 4. Saved default from settings
- * 5. First available model with valid API key
+ * 1. Saved default from settings
+ * 2. First available model with valid API key
+ *
+ * Session restore is not part of this chain: callers that continue a session
+ * restore through `restoreModelFromSession` before reaching this function. The
+ * former CLI-argument and scoped-model branches were removed because the only
+ * caller (`sdk.ts`) resolves the CLI model and `--models` scope before calling and
+ * never passed either, so they could only be taken by a caller that does not exist.
  */
 export async function findInitialModel(options: {
-	cliProvider?: string;
-	cliModel?: string;
-	scopedModels: ScopedModel[];
-	isContinuing: boolean;
 	defaultProvider?: string;
 	defaultModelId?: string;
 	defaultThinkingLevel?: ThinkingLevel;
 	modelThinkingLevels?: Record<string, ThinkingLevel>;
 	modelRuntime: ModelRuntime;
 }): Promise<InitialModelResult> {
-	const {
-		cliProvider,
-		cliModel,
-		scopedModels,
-		isContinuing,
-		defaultProvider,
-		defaultModelId,
-		defaultThinkingLevel,
-		modelThinkingLevels,
-		modelRuntime,
-	} = options;
+	const { defaultProvider, defaultModelId, defaultThinkingLevel, modelThinkingLevels, modelRuntime } = options;
 
 	let model: Model<Api> | undefined;
 	let thinkingLevel: ThinkingLevel = DEFAULT_THINKING_LEVEL;
 
-	// 1. CLI args take priority
-	if (cliProvider && cliModel) {
-		const resolved = resolveCliModel({
-			cliProvider,
-			cliModel,
-			modelRuntime,
-		});
-		if (resolved.error) {
-			console.error(chalk.red(resolved.error));
-			process.exit(1);
-		}
-		if (resolved.model) {
-			return { model: resolved.model, thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
-		}
-	}
-
-	// 2. Use first model from scoped models (skip if continuing/resuming)
-	if (scopedModels.length > 0 && !isContinuing) {
-		const scopedModel = scopedModels[0];
-		const perModel = modelThinkingLevels?.[`${scopedModel.model.provider}/${scopedModel.model.id}`];
-		return {
-			model: scopedModel.model,
-			thinkingLevel: scopedModel.thinkingLevel ?? perModel ?? defaultThinkingLevel ?? DEFAULT_THINKING_LEVEL,
-			fallbackMessage: undefined,
-		};
-	}
-
-	// 3. Try saved default from settings if auth is configured.
+	// 1. Try saved default from settings if auth is configured.
 	if (defaultProvider && defaultModelId) {
 		const found = modelRuntime.getModel(defaultProvider, defaultModelId);
 		if (found && modelRuntime.hasConfiguredAuth(found.provider)) {
@@ -686,7 +648,7 @@ export async function findInitialModel(options: {
 		}
 	}
 
-	// 4. Try first available model with valid API key
+	// 2. Try first available model with valid API key
 	const availableModels = [...modelRuntime.getAvailableSnapshot()];
 
 	if (availableModels.length > 0) {
@@ -703,7 +665,7 @@ export async function findInitialModel(options: {
 		return { model: availableModels[0], thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
 	}
 
-	// 5. No model found
+	// 3. No model found
 	return { model: undefined, thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
 }
 

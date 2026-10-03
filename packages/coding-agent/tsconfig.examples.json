@@ -2,15 +2,28 @@
 	"extends": "../../tsconfig.base.json",
 	"compilerOptions": {
 		"noEmit": true,
+		// Workspace sources are pulled in directly through `paths`, and the generated
+		// `*.models.ts` shards use import attributes, which `Node16` rejects.
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
 		"paths": {
 			"@earendil-works/pi-coding-agent": ["./src/index.ts"],
 			"@earendil-works/pi-coding-agent/hooks": ["./src/core/hooks/index.ts"],
+			"@earendil-works/pi-agent-core": ["../agent/src/index.ts"],
+			"@earendil-works/pi-telemetry": ["../telemetry/src/index.ts"],
+			"@earendil-works/pi-agent-core/*": ["../agent/src/*.ts"],
 			"@earendil-works/pi-tui": ["../tui/src/index.ts"],
+			"@earendil-works/pi-tui/*": ["../tui/src/*.ts"],
 			"@earendil-works/pi-ai": ["../ai/src/index.ts"],
+			"@earendil-works/pi-ai/*": ["../ai/src/*.ts", "../ai/src/providers/*.ts", "../ai/src/api/*.ts"],
+			"@earendil-works/pi-client": ["../client/src/index.ts"],
+			"@earendil-works/pi-protocol": ["../protocol/src/index.ts"],
+			"@earendil-works/pi-ext-subagents": ["./src/extensions/vendored/vendored.d.ts"],
+			"@earendil-works/pi-ext-web-access": ["./src/extensions/vendored/vendored.d.ts"],
 			"typebox": ["../../node_modules/typebox"]
 		},
 		"skipLibCheck": true
 	},
-	"include": ["examples/**/*.ts"],
+	"include": ["examples/**/*.ts", "src/**/*.d.ts"],
 	"exclude": ["node_modules", "dist"]
 }

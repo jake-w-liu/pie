@@ -22,7 +22,7 @@ import {
 } from "./datalab-pdf-extract.ts";
 import { isGeminiApiAvailable } from "./gemini-api.ts";
 import { extractPDFViaGemini } from "./gemini-pdf-extract.ts";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
 
 export interface PDFExtractResult {
 	title: string;
@@ -82,8 +82,7 @@ export function loadPDFConfig(): PDFConfig {
 	try {
 		raw = JSON.parse(rawText) as unknown;
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
+		throw new Error(`Failed to parse ${CONFIG_PATH}: ${jsonParseDiagnostic(err)}`);
 	}
 
 	const root =
@@ -231,40 +230,65 @@ export async function extractPDFToMarkdown(
 		}
 	}
 
+	// The local unpdf path never read `signal`: after cancellation it still loaded the
+	// document, fetched metadata and rendered every page. `PDFExtractOptions.signal`
+	// promises to cancel every extraction provider, so check it before the expensive
+	// load and between pages, and destroy the document so its worker is released.
+	const throwIfAborted = () => {
+		if (signal?.aborted) throw new Error("Operation aborted");
+	};
+	throwIfAborted();
+
 	const { getDocumentProxy, VerbosityLevel } = await getUnpdf();
 	const pdf = await getDocumentProxy(new Uint8Array(buffer), {
 		verbosity: VerbosityLevel.ERRORS,
 	});
-	const metadata = await pdf.getMetadata();
-	const metadataInfo =
-		metadata.info && typeof metadata.info === "object"
-			? (metadata.info as Record<string, unknown>)
-			: null;
+	let title = urlTitle;
+	let metaAuthor: string | undefined;
+	let totalPages = 0;
+	let pagesToExtract = 0;
+	let truncated = false;
+	let pages: { pageNum: number; text: string }[] = [];
+	try {
+		const metadata = await pdf.getMetadata();
+		const metadataInfo =
+			metadata.info && typeof metadata.info === "object"
+				? (metadata.info as Record<string, unknown>)
+				: null;
 
-	const metaTitle =
-		typeof metadataInfo?.Title === "string" ? metadataInfo.Title : undefined;
-	const metaAuthor =
-		typeof metadataInfo?.Author === "string" ? metadataInfo.Author : undefined;
-	const title = metaTitle?.trim() || urlTitle;
-	const pagesToExtract = Math.min(pdf.numPages, safeMaxPages);
-	const truncated = pdf.numPages > safeMaxPages;
-	const pages: { pageNum: number; text: string }[] = [];
+		const metaTitle =
+			typeof metadataInfo?.Title === "string" ? metadataInfo.Title : undefined;
+		metaAuthor =
+			typeof metadataInfo?.Author === "string" ? metadataInfo.Author : undefined;
+		title = metaTitle?.trim() || urlTitle;
+		totalPages = pdf.numPages;
+		pagesToExtract = Math.min(totalPages, safeMaxPages);
+		truncated = totalPages > safeMaxPages;
+		const extractedPages: { pageNum: number; text: string }[] = [];
 
-	for (let i = 1; i <= pagesToExtract; i++) {
-		const page = await pdf.getPage(i);
-		const textContent = await page.getTextContent();
-		const pageText = textContent.items
-			.map((item: unknown) => {
-				const textItem = item as { str?: string };
-				return textItem.str || "";
-			})
-			.join(" ")
-			.replace(/\s+/g, " ")
-			.trim();
+		for (let i = 1; i <= pagesToExtract; i++) {
+			throwIfAborted();
+			const page = await pdf.getPage(i);
+			const textContent = await page.getTextContent();
+			const pageText = textContent.items
+				.map((item: unknown) => {
+					const textItem = item as { str?: string };
+					return textItem.str || "";
+				})
+				.join(" ")
+				.replace(/\s+/g, " ")
+				.trim();
 
-		if (pageText) {
-			pages.push({ pageNum: i, text: pageText });
+			if (pageText) {
+				extractedPages.push({ pageNum: i, text: pageText });
+			}
 		}
+		pages = extractedPages;
+	} finally {
+		// Releases the pdf.js worker and its WASM heap (the same teardown unpdf itself
+		// uses); without it a cancelled extraction leaks the document for the life of
+		// the process.
+		await pdf.loadingTask.destroy().catch(() => {});
 	}
 
 	const bodyLines: string[] = [];
@@ -280,7 +304,7 @@ export async function extractPDFToMarkdown(
 	return writeMarkdownResult({
 		markdownBody: bodyLines.join("\n"),
 		title,
-		pages: pdf.numPages,
+		pages: totalPages,
 		outputDir,
 		filename,
 		url,

@@ -408,7 +408,6 @@ package_dirs=(
 	"packages/protocol"
 	"packages/client"
 	"packages/coding-agent"
-	"packages/pi-fff"
 	"packages/pi-web-access"
 	"packages/pi-subagents"
 )
@@ -420,7 +419,6 @@ package_names=(
 	"@earendil-works/pi-protocol"
 	"@earendil-works/pi-client"
 	"@earendil-works/pi-coding-agent"
-	"@earendil-works/pi-ext-fff"
 	"@earendil-works/pi-ext-web-access"
 	"@earendil-works/pi-ext-subagents"
 )

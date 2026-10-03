@@ -5,7 +5,6 @@
 
 Pie ships the verified package set as pinned first-run defaults:
 
-- `@earendil-works/pi-ext-fff` (vendored)
 - `@earendil-works/pi-ext-web-access` (vendored)
 - `@earendil-works/pi-ext-subagents` (vendored)
 
@@ -14,7 +13,6 @@ On a fresh configuration, Pie writes these sources to `~/.pi/agent/settings.json
 Manual recovery commands, if needed:
 
 ```bash
-# pi-fff is vendored as @earendil-works/pi-ext-fff
 # pi-web-access is vendored as @earendil-works/pi-ext-web-access
 # pi-subagents is vendored as @earendil-works/pi-ext-subagents
 ```
@@ -23,7 +21,6 @@ Installed versions at verification time (run `pie list` to see yours):
 
 | Package | Version verified | Purpose |
 |---|---|---|
-| `pi-fff` | 0.1.12 | Fuzzy file finding, FFF-backed `grep`, `@...` autocomplete |
 | `pi-web-access` | 0.26.0 | Web search, URL fetch, GitHub clone, PDF/YouTube/video extraction |
 | `pi-subagents` | 0.58.0 | Child agents: scout, researcher, worker, reviewer, oracle, delegate |
 
@@ -43,7 +40,7 @@ Probe that tools actually registered (fresh process loads the packages):
 
 ```bash
 pie -p "List every available tool matching: web_search, fetch_content, get_search_content,
-source_check, find_files, fff_multi_grep, subagent. Say MISSING for any absent one."
+source_check, subagent. Say MISSING for any absent one."
 ```
 
 VERIFIED output on this machine:
@@ -53,40 +50,23 @@ web_search: web_search
 fetch_content: fetch_content
 get_search_content: get_search_content
 source_check: source_check
-find_files: find_files
-fff_multi_grep: fff_multi_grep
 subagent: subagent, subagent_wait, subagent_supervisor
 ```
 
-## 3. Use pi-fff — and don't use `grep` for code search
+## 3. Code search — built in, no extension
 
-pi-fff gives the agent FFF-backed search tools. Rule for new Pie sessions:
+File search and content search are core Pie tools, not an extension. They need no install
+step and no native dependency: `grep` and `find` shell out to `rg` and `fd`, which Pie
+downloads on first use into its own tools directory for darwin, linux and windows on both
+x64 and arm64.
 
-- **Code search → the `grep` tool** (it is the built-in `grep` upgraded with FFF indexing —
-  description reads "Uses fff for content search and can resolve approximate file or folder scopes").
-  VERIFIED: it found `hello` in `sample.js` line 2 in a test project, via the FFF index.
-- **Find files by fuzzy name → `find_files`** (VERIFIED: query `readme` → `readme.md`).
-- **Multiple literal patterns at once → `fff_multi_grep`**.
-- Prefer these over `bash` + `grep`/`find` shell spelunking. `read` also resolves approximate
-  paths, so `read src/index` works instead of exact paths.
-- `resolve_file` / `related_files` / `fff_grep` do **NOT** exist as tools in pi-fff 0.1.12 —
-  the README over-promises those three; the grep upgrade is named `grep`, and the two agent
-  tools are `find_files` and `fff_multi_grep` (VERIFIED in `src/register-tools.ts`).
-
-### Feature flags (all ON by default — VERIFIED in `src/index.ts`)
-
-- `autocomplete` — `@...` fuzzy file completion in the editor
-- `builtInReadEnhancement` — `read` resolves approximate paths
-- `builtInGrepEnhancement` — `grep` is FFF-indexed
-- `agentTools` — registers `find_files` / `fff_multi_grep`
-- `statusUI` — startup notices
-
-Commands: `/fff-features` (toggle flags; toggling read/grep enhancement needs `/reload`),
-`/fff-status` (runtime state, indexed file count), `/reindex-fff` (manual rescan fallback).
-State file: `~/.pi/agent/extensions/pi-fff.json`.
-
-Indexing is automatic: runtime indexes the project on session start, keeps a watcher running.
-No manual reindex in normal use.
+- **Content search → `grep`**. Supports `pattern`, `path`, `glob`, `ignoreCase`, `literal`,
+  `context`, `outputMode` (`content` / `files_with_matches` / `count`), and `limit`.
+- **File search by glob → `find`**. Supports `pattern`, `path`, and `limit`, and respects
+  `.gitignore`.
+- Prefer these over `bash` + `grep`/`find` shell spelunking.
+- `read` and `grep` take exact relative or absolute paths. There is no fuzzy path
+  resolution; pass the real path.
 
 ## 4. pi-web-access — zero config, optional keys
 
@@ -136,7 +116,6 @@ Background runs keep working after control returns; FleetView shows them under t
 
 ```bash
 pie update                  # unpinned packages; pinned refs are reconciled
-# vendored; update from packages/pi-fff       # one package (pinned versions are skipped)
 ```
 
 Pie itself is source-managed and is updated by rebuilding and reinstalling from this repository.
@@ -146,6 +125,4 @@ Pie itself is source-managed and is updated by rebuilding and reinstalling from 
 1. **Restart (or `/reload`) after install** — tools don't appear in the running session.
 2. `pie -p "..."` print mode is the cheapest way to smoke-test that tools registered and work
    (used for every VERIFIED claim above).
-3. pi-fff indexes whatever project Pie starts in; huge dirs (like `$HOME`) take longer to warm.
-4. If the FFF index looks stale after big branch switches/renames: `/reindex-fff`.
-5. pi-web-access cache is session-scoped; clones are wiped on session change.
+3. pi-web-access cache is session-scoped; clones are wiped on session change.

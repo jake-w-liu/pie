@@ -1,5 +1,4 @@
-import { readFile as fsReadFile, stat as fsStat } from "node:fs/promises";
-import { createInterface } from "node:readline";
+import { stat as fsStat } from "node:fs/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Text } from "@earendil-works/pi-tui";
 import { spawn } from "child_process";
@@ -64,18 +63,18 @@ export interface GrepToolDetails {
 
 /**
  * Pluggable operations for the grep tool.
- * Override these to delegate search to remote systems (for example SSH).
+ *
+ * Only the directory probe is pluggable. `readFile` was removed together with
+ * the re-read path: context lines now come from ripgrep's own context events,
+ * so the tool no longer opens every matched file a second time.
  */
 export interface GrepOperations {
 	/** Check if path is a directory. Throws if path does not exist. */
 	isDirectory: (absolutePath: string) => Promise<boolean> | boolean;
-	/** Read file contents for context lines */
-	readFile: (absolutePath: string) => Promise<string> | string;
 }
 
 const defaultGrepOperations: GrepOperations = {
 	isDirectory: async (p) => (await fsStat(p)).isDirectory(),
-	readFile: (p) => fsReadFile(p, "utf-8"),
 };
 
 export interface GrepToolOptions {
@@ -220,29 +219,34 @@ export function createGrepToolDefinition(
 							return path.basename(filePath);
 						};
 
-						const fileCache = new Map<string, string[]>();
-						const getFileLines = async (filePath: string): Promise<string[]> => {
-							let lines = fileCache.get(filePath);
-							if (!lines) {
-								try {
-									const content = await ops.readFile(filePath);
-									lines = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
-								} catch {
-									lines = [];
-								}
-								fileCache.set(filePath, lines);
-							}
-							return lines;
-						};
-
-						const args: string[] = ["--json", "--line-number", "--color=never", "--hidden"];
+						// rg's own engine work (traversal + SIMD search) dominates; the output
+						// format is nearly free by comparison. So pick the narrowest format
+						// each mode can use and stop paying for what it does not need:
+						//   -l  files_with_matches  rg stops at the first hit per file
+						//   -c  count               one number per file instead of a match event
+						//   --json  content        the only format that carries a path and a
+						//       line number unambiguously on Windows, where "C:\x" and
+						//       "dir:name" both contain the field separator
+						// Context is taken from rg's context events rather than re-reading
+						// each matched file, which also removes the unbounded per-file line
+						// cache the old path kept for the whole run.
+						// --no-config keeps a user RIPGREP_CONFIG_PATH from injecting flags
+						// that break these assumptions.
+						const args: string[] = ["--no-config", "--color=never", "--hidden"];
 						if (ignoreCase) args.push("--ignore-case");
 						if (literal) args.push("--fixed-strings");
 						if (glob) args.push("--glob", glob);
+						if (outputMode === "files_with_matches") {
+							args.push("-l");
+						} else if (outputMode === "count") {
+							args.push("-c");
+						} else {
+							if (contextValue > 0) args.push("-C", String(contextValue));
+							args.push("--json");
+						}
 						args.push("--", pattern, searchPath);
 
 						const child = spawn(rgPath, args, { stdio: ["ignore", "pipe", "pipe"] });
-						const rl = createInterface({ input: child.stdout });
 						let stderr = "";
 						let matchCount = 0;
 						let matchLimitReached = false;
@@ -251,10 +255,16 @@ export function createGrepToolDefinition(
 						let killedDueToLimit = false;
 						const outputLines: string[] = [];
 
-						const cleanup = () => {
-							rl.close();
-							signal?.removeEventListener("abort", onAbort);
-						};
+						// Paths seen in "-l" mode, in first-seen order.
+						const matchedFiles: string[] = [];
+						const seenFiles = new Set<string>();
+						// Current begin..end block in "--json -C" mode.
+						let blockFile: string | undefined;
+						let blockLines: string[] | undefined;
+						// Last file whose matches were written, for the "=== path ===" grouping used
+						// when no context was requested.
+						let lastFile: string | undefined;
+
 						const stopChild = (dueToLimit = false) => {
 							if (!child.killed) {
 								killedDueToLimit = dueToLimit;
@@ -265,67 +275,157 @@ export function createGrepToolDefinition(
 							aborted = true;
 							stopChild();
 						};
+						const cleanup = () => {
+							child.stdout?.removeAllListeners();
+							signal?.removeEventListener("abort", onAbort);
+						};
 						signal?.addEventListener("abort", onAbort, { once: true });
 						child.stderr?.on("data", (chunk) => {
 							stderr += chunk.toString();
 						});
 
-						const formatBlock = async (filePath: string, lineNumber: number): Promise<string[]> => {
-							const relativePath = formatPath(filePath);
-							const lines = await getFileLines(filePath);
-							if (!lines.length) return [`${relativePath}:${lineNumber}: (unable to read file)`];
-							const block: string[] = [];
-							const start = contextValue > 0 ? Math.max(1, lineNumber - contextValue) : lineNumber;
-							const end = contextValue > 0 ? Math.min(lines.length, lineNumber + contextValue) : lineNumber;
-							for (let current = start; current <= end; current++) {
-								const lineText = lines[current - 1] ?? "";
-								const sanitized = lineText.replace(/\r/g, "");
-								const isMatchLine = current === lineNumber;
-								// Truncate long lines so grep output stays compact.
-								const { text: truncatedText, wasTruncated } = truncateLine(sanitized);
-								if (wasTruncated) linesTruncated = true;
-								if (isMatchLine) block.push(`${relativePath}:${current}: ${truncatedText}`);
-								else block.push(`${relativePath}-${current}- ${truncatedText}`);
+						// Emit a finished context block. rg already merges nearby hits into a single
+						// block and orders the lines, so nothing here re-reads the file.
+						const flushBlock = (): void => {
+							if (blockFile === undefined || !blockLines || blockLines.length === 0) {
+								blockFile = undefined;
+								blockLines = undefined;
+								return;
 							}
-							return block;
+							if (outputLines.length > 0) outputLines.push("");
+							outputLines.push(`=== ${blockFile} ===`, ...blockLines);
+							blockFile = undefined;
+							blockLines = undefined;
 						};
 
-						// Collect matches during streaming, then format them after rg exits.
-						const matches: Array<{ filePath: string; lineNumber: number; lineText?: string }> = [];
-						const matchedFiles = new Set<string>();
-						rl.on("line", (line) => {
-							if (!line.trim() || matchCount >= effectiveLimit) return;
+						const pushContentLine = (
+							relativePath: string,
+							lineNumber: number,
+							rawText: string,
+							isMatch: boolean,
+						): void => {
+							const sanitized = rawText.replace(/\r\n/g, "\n").replace(/\r/g, "").replace(/\n$/, "");
+							const { text: truncatedText, wasTruncated } = truncateLine(sanitized);
+							if (wasTruncated) linesTruncated = true;
+							blockLines?.push(
+								isMatch
+									? `${relativePath}:${lineNumber}: ${truncatedText}`
+									: `${relativePath}-${lineNumber}- ${truncatedText}`,
+							);
+						};
+
+						// "-c" prints "<path>:<count>", except when ripgrep is handed a single file,
+						// where it prints the bare count. A Windows path already contains a colon for
+						// the drive letter, so the count is whatever follows the last one.
+						const addCountLine = (line: string): void => {
+							const colon = line.lastIndexOf(":");
+							const count = Number.parseInt(colon < 0 ? line : line.slice(colon + 1), 10);
+							if (Number.isFinite(count)) matchCount += count;
+						};
+
+						const handleLine = (rawLine: string): void => {
+							const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+							if (line.length === 0) return;
+
+							if (outputMode === "files_with_matches") {
+								if (!seenFiles.has(line)) {
+									seenFiles.add(line);
+									matchedFiles.push(line);
+									// "-l" reports one line per matching file and no match events, so
+									// count the file here to keep the "no matches" check below honest.
+									matchCount++;
+								}
+								return;
+							}
+							if (outputMode === "count") {
+								addCountLine(line);
+								return;
+							}
+
+							// Content mode. "--json" is the only format that carries the path verbatim,
+							// which is what makes the path/line split unambiguous on Windows.
+							if (matchCount >= effectiveLimit) return;
 							let event: any;
 							try {
 								event = JSON.parse(line);
 							} catch {
 								return;
 							}
-							if (event.type === "match") {
-								matchCount++;
-								const filePath = event.data?.path?.text;
-								const lineNumber = event.data?.line_number;
-								if (filePath && typeof lineNumber === "number") {
-									matchedFiles.add(filePath);
-									// Retain full records only when formatting needs them
-									// (content mode). Other modes keep just the file set so
-									// giant result sets cannot OOM the agent.
-									if (stopAtLimit) {
-										matches.push({ filePath, lineNumber, lineText: event.data?.lines?.text });
-									}
-								}
-								if (matchCount >= effectiveLimit) {
-									matchLimitReached = true;
-									if (stopAtLimit) stopChild(true);
-								}
+							const filePath = event.data?.path?.text;
+							if (typeof filePath !== "string") return;
+							const relativePath = formatPath(filePath);
+
+							if (event.type === "begin") {
+								flushBlock();
+								blockFile = relativePath;
+								blockLines = [];
+								return;
 							}
+							if (event.type === "end") {
+								flushBlock();
+								return;
+							}
+							if (event.type === "context") {
+								const contextLine = event.data?.line_number;
+								if (typeof contextLine === "number" && blockLines) {
+									pushContentLine(relativePath, contextLine, event.data?.lines?.text ?? "", false);
+								}
+								return;
+							}
+							if (event.type !== "match") return;
+
+							matchCount++;
+							const lineNumber = event.data?.line_number;
+							if (typeof lineNumber !== "number") return;
+
+							if (contextValue > 0) {
+								// Inside a begin..end block; rg already ordered the lines.
+								pushContentLine(relativePath, lineNumber, event.data?.lines?.text ?? "", true);
+							} else {
+								if (lastFile !== relativePath) {
+									if (outputLines.length > 0) outputLines.push("");
+									outputLines.push(`=== ${relativePath} ===`);
+									lastFile = relativePath;
+								}
+								blockLines = [];
+								pushContentLine(relativePath, lineNumber, event.data?.lines?.text ?? "", true);
+								outputLines.push(...blockLines);
+								blockLines = undefined;
+							}
+
+							if (matchCount >= effectiveLimit) {
+								matchLimitReached = true;
+								if (stopAtLimit) stopChild(true);
+							}
+						};
+
+						// Split stdout on newlines directly. readline allocates a reader and event
+						// plumbing per line, which is measurable at the 100k+ lines a context search
+						// over a monorepo produces.
+						let pending = "";
+						child.stdout?.on("data", (chunk: Buffer) => {
+							pending += chunk.toString();
+							let newlineIndex = pending.indexOf("\n");
+							while (newlineIndex >= 0) {
+								const line = pending.slice(0, newlineIndex);
+								pending = pending.slice(newlineIndex + 1);
+								handleLine(line);
+								newlineIndex = pending.indexOf("\n");
+							}
+						});
+						child.stdout?.on("end", () => {
+							if (pending.length > 0) {
+								handleLine(pending);
+								pending = "";
+							}
+							flushBlock();
 						});
 
 						child.on("error", (error) => {
 							cleanup();
 							settle(() => reject(new Error(`Failed to run ripgrep: ${error.message}`)));
 						});
-						child.on("close", async (code) => {
+						child.on("close", (code) => {
 							cleanup();
 							if (aborted) {
 								settle(() => reject(new Error("Operation aborted")));
@@ -343,7 +443,7 @@ export function createGrepToolDefinition(
 							}
 
 							if (outputMode === "files_with_matches") {
-								const files = [...matchedFiles].map((filePath) => formatPath(filePath));
+								const files = matchedFiles.map((filePath) => formatPath(filePath));
 								settle(() =>
 									resolve({ content: [{ type: "text", text: files.join("\n") }], details: undefined }),
 								);
@@ -355,31 +455,6 @@ export function createGrepToolDefinition(
 									resolve({ content: [{ type: "text", text: String(matchCount) }], details: undefined }),
 								);
 								return;
-							}
-
-							// Format matches after streaming finishes so custom readFile() backends can be async.
-							// Matches are grouped by file so results stay organized and one noisy file cannot
-							// bury matches from the other files.
-							let lastFile: string | undefined;
-							for (const match of matches) {
-								const relativePath = formatPath(match.filePath);
-								if (lastFile !== relativePath) {
-									if (outputLines.length > 0) outputLines.push("");
-									outputLines.push(`=== ${relativePath} ===`);
-									lastFile = relativePath;
-								}
-								if (contextValue === 0 && match.lineText !== undefined) {
-									const sanitized = match.lineText
-										.replace(/\r\n/g, "\n")
-										.replace(/\r/g, "")
-										.replace(/\n$/, "");
-									const { text: truncatedText, wasTruncated } = truncateLine(sanitized);
-									if (wasTruncated) linesTruncated = true;
-									outputLines.push(`${relativePath}:${match.lineNumber}: ${truncatedText}`);
-								} else {
-									const block = await formatBlock(match.filePath, match.lineNumber);
-									outputLines.push(...block);
-								}
 							}
 
 							const rawOutput = outputLines.join("\n");

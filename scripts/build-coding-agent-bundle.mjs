@@ -16,10 +16,8 @@ const banner = {
 	js: 'import { createRequire as __piCreateRequire } from "node:module"; const require = __piCreateRequire(import.meta.url);',
 };
 const allowedExternalPackages = new Set([
-	"@ff-labs/fff-node",
 	"@silvia-odwyer/photon-node",
 	"canvas",
-	"ffi-rs",
 	"jiti",
 	// Optional native accelerators. Their callers fall back to JavaScript when absent.
 	"bufferutil",
@@ -82,7 +80,7 @@ function commonBuildOptions() {
 		banner,
 		bundle: true,
 		define: { PI_BUNDLED_NODE: "true" },
-		external: ["@ff-labs/fff-node", "@silvia-odwyer/photon-node", "canvas", "ffi-rs"],
+		external: ["@silvia-odwyer/photon-node", "canvas"],
 		format: "esm",
 		legalComments: "none",
 		logLevel: "warning",

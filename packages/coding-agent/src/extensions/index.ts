@@ -7,11 +7,11 @@ import redrawsExtension from "./redraws/index.ts";
 import tpsExtension from "./tps/index.ts";
 
 /**
- * The fff/subagents/web-access packages import runtime values from
+ * The subagents/web-access packages import runtime values from
  * `@earendil-works/pi-coding-agent`, whose entry re-exports `./main.ts`, which
  * loads these built-ins. Literal dynamic imports defer evaluation until the
  * factory runs, when the host is fully loaded, avoiding TDZ failures such as
- * `class FffEditor extends CustomEditor` evaluating before `CustomEditor`
+ * `class SubagentEditor extends CustomEditor` evaluating before `CustomEditor`
  * initializes (the order would otherwise depend on import order). Async
  * factories are awaited by the extension loader. The bundler follows these
  * imports and emits the packages as transpiled chunks, so shipped installs
@@ -28,7 +28,6 @@ function lazyBuiltIn(loader: () => Promise<{ default: ExtensionFactory }>): Exte
 }
 
 export const builtInExtensions: InlineExtension[] = [
-	{ name: "fff", factory: lazyBuiltIn(() => import("@earendil-works/pi-ext-fff")) },
 	{ name: "subagents", factory: lazyBuiltIn(() => import("@earendil-works/pi-ext-subagents")) },
 	{ name: "web-access", factory: lazyBuiltIn(() => import("@earendil-works/pi-ext-web-access")) },
 	{ name: "import-repro", factory: importReproExtension, hidden: true },

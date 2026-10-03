@@ -9,7 +9,7 @@ The package keeps the upstream npm identity `@earendil-works/pi-coding-agent` fo
 
 ## Pie features
 
-- Default packages: `pi-fff@0.1.12`, `pi-web-access@0.26.0`, and `pi-subagents@0.58.0`.
+- Default packages: `pi-web-access@0.26.0` and `pi-subagents@0.58.0`.
 - Default-on Headroom compression with exact `headroom_retrieve` recovery.
 - Automatic model selection after logging in to a different provider.
 - Complete Nippon-color themes for UI, messages, tools, Markdown, diffs, syntax, search, and exports.

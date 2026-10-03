@@ -45,10 +45,10 @@ test("patch-file: refuses ambiguous matches", () => {
 
 test("patch-file: all replaces every occurrence", () => {
 	const file = join(tmpdir(), `patch-${Date.now()}.txt`);
-	writeFileSync(file, "pi-fff\nx\npi-fff\n");
-	const res = runPatch({ file, old: "pi-fff", new: "pi-ext-fff", all: true });
+	writeFileSync(file, "old-name\nx\nold-name\n");
+	const res = runPatch({ file, old: "old-name", new: "new-name", all: true });
 	assert.strictEqual(res.status, 0, res.stderr);
-	assert.strictEqual(readFileSync(file, "utf8"), "pi-ext-fff\nx\npi-ext-fff\n");
+	assert.strictEqual(readFileSync(file, "utf8"), "new-name\nx\nnew-name\n");
 	rmSync(file, { force: true });
 });
 

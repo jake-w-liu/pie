@@ -10,12 +10,6 @@
  * with each package's default export; `test/builtin-extensions.test.ts`
  * loads every entry and asserts the registrations.
  */
-declare module "@earendil-works/pi-ext-fff" {
-	import type { ExtensionFactory } from "../core/extensions/types.ts";
-	const factory: ExtensionFactory;
-	export default factory;
-}
-
 declare module "@earendil-works/pi-ext-subagents" {
 	import type { ExtensionFactory } from "../core/extensions/types.ts";
 	const factory: ExtensionFactory;

@@ -8,7 +8,7 @@ import {
 } from "../src/core/distribution-defaults.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 
-const shippedPackages = ["npm:pi-fff@0.1.12", "npm:pi-web-access@0.26.0", "npm:pi-subagents@0.58.0"] as const;
+const shippedPackages = ["npm:pi-web-access@0.26.0", "npm:pi-subagents@0.58.0"] as const;
 
 describe("distribution package defaults", () => {
 	let tempDir: string | undefined;

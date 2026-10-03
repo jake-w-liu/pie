@@ -23,7 +23,7 @@ describe("package distribution entrypoints", () => {
 		expect(packageJson.bin).toEqual({ pie: "dist/bundle/pie-cli.js" });
 		expect(packageJson.piConfig).toEqual({
 			configDir: ".pi",
-			// The pi-fff / pi-web-access / pi-subagents extensions are now vendored into
+			// The pi-web-access / pi-subagents extensions are now vendored into
 			// the release (as @earendil-works/pi-ext-*) and auto-discovered from the
 			// coding-agent's node_modules, so defaultPackages no longer pulls them from
 			// the npm registry.

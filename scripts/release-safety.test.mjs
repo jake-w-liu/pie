@@ -16,7 +16,6 @@ const publicPackages = [
 	["session-backends/sqlite-node", "pi-session-backend-sqlite-node"],
 	["server", "pi-server"],
 	["coding-agent", "pi-coding-agent"],
-	["pi-fff", "pi-ext-fff"],
 	["pi-web-access", "pi-ext-web-access"],
 	["pi-subagents", "pi-ext-subagents"],
 ];

@@ -5,14 +5,20 @@
 ### Breaking Changes
 
 - Changed the default interrupt shortcut from Escape to Ctrl+Alt+C. Escape now clears all editor input without aborting; when a completion menu is open, it closes the menu first. With empty editor input, Escape acts as interrupt again (aborts streaming turns, bash execution, compaction, and retry). Both shortcuts remain configurable.
+- Removed the `pi-fff` extension (`@earendil-works/pi-ext-fff`) and its `@ff-labs/fff-node` / `@ff-labs/fff-bin-*` native dependencies. fff located its Rust library through `node_modules` resolution that cannot work inside a single-file binary: Bun flattens bundled modules to `/$bunfs/root/<outfile>`, so every released binary failed with `fff native library not found` on all platforms. The `find_files` and `fff_multi_grep` tools and the `/fff-*` commands are gone. File search and content search remain available as the built-in `find` and `grep` tools, which use `fd` and `ripgrep` and are downloaded on first use.
+- Removed `GrepOperations.readFile` from the grep tool options. Context lines now come from ripgrep's own context events, so the tool no longer opens every matched file a second time. `GrepOperations.isDirectory` is unchanged.
+
+### Changed
+
+- Made the built-in `grep` tool take context lines from ripgrep's own context events instead of re-reading and caching every matched file. An unbounded context search over a 35MB, 4500-file corpus dropped from a 1839ms median to 806ms, with peak RSS down from 215MB to 188MB. `files_with_matches` and `count` now select ripgrep's `-l` and `-c` output instead of parsing a match event per hit, so they no longer build a full result set in memory. Output format is unchanged, and ripgrep is now invoked with `--no-config` so a user `RIPGREP_CONFIG_PATH` cannot inject flags that break the parsing.
 
 ### Added
 
-- Built fff, subagents, and web-access into Pie as always-on core capabilities: they now load as built-in extensions from the shipped dependencies instead of opt-in vendored extension discovery, so every install gets file search, subagent orchestration, and web search/fetch without extra setup. Removed the `discoverBundledExtensions` scan; user and project extensions continue to load unchanged.
+- Built subagents and web-access into Pie as always-on core capabilities: they now load as built-in extensions from the shipped dependencies instead of opt-in vendored extension discovery, so every install gets subagent orchestration and web search/fetch without extra setup. Removed the `discoverBundledExtensions` scan; user and project extensions continue to load unchanged.
 - Built the former `.pi/extensions` helpers into Pie: token-speed (TPS) agent summaries, the `/tui` redraw counter, the PR/issue/advisory prompt widget with session renaming, and the `/ir` CI session importer. The `.pi/extensions` copies were removed.
 
 - Added a built-in MLX provider extension that serves models from a local `mlx_lm.server` / `mlx_vlm.server` via the `MLX_BASE_URL` config or credential, discovering models from the server's `/v1/models` endpoint.
-- Added Pie distribution branding, pinned first-run defaults for pi-fff, pi-web-access, and pi-subagents, and the verified setup checklist.
+- Added Pie distribution branding, pinned first-run defaults for pi-web-access and pi-subagents, and the verified setup checklist.
 - Shipped web search with terminal-only defaults: a fresh config seeds `workflow: auto-summary` and `autoOpenBrowser: false` in `web-search.json`, so web search returns a summary in the terminal without opening a browser curator or asking for approval. Existing user config is never overwritten.
 - Added default-on Headroom request compression for large tool results, with bounded exact retrieval through `headroom_retrieve` and `/headroom` controls.
 - Added complete dark and light Nippon-color palettes for the Pie terminal interface.

@@ -122,13 +122,16 @@ function parseHosts(value: unknown[], label: string): string[] {
 
 function parseHost(value: string, label: string): string {
 	const host = normalizeHostname(value.trim());
-	if (!host || host.startsWith(".") || host.endsWith(".") || /\s|[\\/?:#@*]/.test(host)) {
+	// A leading dot is the explicit opt-in for "this domain and its subdomains".
+	const bare = host.startsWith(".") ? host.slice(1) : host;
+	if (!bare || bare.startsWith(".") || bare.endsWith(".") || /\s|[\\/?:#@*]/.test(bare)) {
 		throw new Error(`${label} in ${WEB_SEARCH_CONFIG_PATH} contains an invalid hostname: ${JSON.stringify(value)}`);
 	}
-	if (host.length > 253 || !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(host)) {
+	const validated = bare;
+	if (validated.length > 253 || !/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(validated)) {
 		throw new Error(`${label} in ${WEB_SEARCH_CONFIG_PATH} contains an invalid hostname: ${JSON.stringify(value)}`);
 	}
-	return host;
+	return host.startsWith(".") ? `.${validated}` : validated;
 }
 
 function parseChromeProfile(value: unknown, label: string): string | undefined {
@@ -145,6 +148,19 @@ function normalizeHostname(hostname: string): string {
 	return hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
 }
 
+/**
+ * Exact host match, unless the entry opts into subdomain coverage with a leading dot
+ * (`.example.com`), mirroring Chrome's own domain-cookie convention.
+ *
+ * A bare host used to cover every subdomain, so `hosts: ["example.com"]` authorized
+ * `attacker.example.com`. Cookie selection is by exact `host_key`, so the profile's
+ * `example.com` cookies were then attached to a request against an
+ * attacker-controlled subdomain. Subdomain coverage is now explicit.
+ */
 function hostMatches(hostname: string, allowedHost: string): boolean {
-	return hostname === allowedHost || hostname.endsWith(`.${allowedHost}`);
+	if (allowedHost.startsWith(".")) {
+		const base = allowedHost.slice(1);
+		return hostname === base || hostname.endsWith(`.${base}`);
+	}
+	return hostname === allowedHost;
 }

@@ -10,6 +10,7 @@ import { resolveModelScopesForAgent } from "../runs/shared/model-scope.ts";
 import { applyThinkingSuffix, resolvePiLaunchToolPlan, type PiLaunchToolPlan } from "../runs/shared/pi-args.ts";
 import { injectOutputPathSystemPrompt, normalizeSingleOutputOverride, resolveSingleOutputPath } from "../runs/shared/single-output.ts";
 import { getArtifactPaths, getArtifactsDir } from "../shared/artifacts.ts";
+import { isSafeNestedId } from "../runs/shared/nested-events.ts";
 import { resolveEffectiveThinking } from "../shared/model-info.ts";
 import { assertThinkingWithinCeiling, decodeThinkingCeiling, intersectThinkingCeilings, SUBAGENT_THINKING_CEILING_ENV, type ThinkingLevel } from "../shared/thinking-ceiling.ts";
 import { SUBAGENT_LIFECYCLE_ARTIFACT_VERSION, type ArtifactDirPreference, type ArtifactPaths, type JsonSchemaObject, type OutputMode } from "../shared/types.ts";
@@ -40,7 +41,8 @@ export type SubagentLaunchContractReasonCode =
 	| "unsupported_mode"
 	| "restricted_agent"
 	| "thinking_ceiling"
-	| "invalid_extension_bindings";
+	| "invalid_extension_bindings"
+	| "invalid_run_id";
 
 export type SubagentLaunchContractDiagnosticCode = SubagentLaunchContractReasonCode | "host_required" | "snapshot_warning" | "workspace_scope_authority";
 
@@ -293,7 +295,17 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	const effectiveCapabilityCeiling = intersectSubagentCapabilityCeilings(input.capabilityCeiling, input.inheritedCapabilityCeiling);
 	const restrictionMessage = capabilityCeilingAgentRestrictionMessage(agent.name, effectiveCapabilityCeiling);
 	if (restrictionMessage) return { ok: false, code: "restricted_agent", message: restrictionMessage, diagnostics };
+	// `runId` and `nestedRootRunId` are interpolated straight into path.join() below
+	// (artifact paths, session root, lifecycle dir, result file). An unvalidated value
+	// like "../../escape" made preflight report success with paths that escape every
+	// declared root. Same rule the nested-event helpers already enforce.
 	const runId = input.runId ?? "preflight";
+	if (!isSafeNestedId(runId)) {
+		return { ok: false, code: "invalid_run_id", message: `runId '${runId}' must be a non-empty safe id token (no path separators, no dot segments).`, diagnostics };
+	}
+	if (input.nestedRootRunId !== undefined && !isSafeNestedId(input.nestedRootRunId)) {
+		return { ok: false, code: "invalid_run_id", message: `nestedRootRunId '${input.nestedRootRunId}' must be a non-empty safe id token (no path separators, no dot segments).`, diagnostics };
+	}
 	const skillInput = normalizeSkillInput(input.skill);
 	const outputOverride = normalizeSingleOutputOverride(input.output, agent.output);
 	const behavior = resolveStepBehavior(agent, {

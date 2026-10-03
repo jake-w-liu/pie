@@ -402,6 +402,9 @@ export function createGrepToolDefinition(
 						// Split stdout on newlines directly. readline allocates a reader and event
 						// plumbing per line, which is measurable at the 100k+ lines a context search
 						// over a monorepo produces.
+						// Split stdout on newlines directly. readline allocates a reader and event
+						// plumbing per line, which is measurable at the 100k+ lines a context search
+						// over a monorepo produces.
 						let pending = "";
 						child.stdout?.on("data", (chunk: Buffer) => {
 							pending += chunk.toString();
@@ -413,19 +416,26 @@ export function createGrepToolDefinition(
 								newlineIndex = pending.indexOf("\n");
 							}
 						});
-						child.stdout?.on("end", () => {
+						// Drain whatever is still buffered and close any open block. Idempotent: the
+						// "end" handler already did this in the common case, and "close" calls it
+						// again for a child that was killed before stdout reported end.
+						const finishStreaming = (): void => {
 							if (pending.length > 0) {
 								handleLine(pending);
 								pending = "";
 							}
 							flushBlock();
-						});
+						};
+						child.stdout?.on("end", finishStreaming);
 
 						child.on("error", (error) => {
 							cleanup();
 							settle(() => reject(new Error(`Failed to run ripgrep: ${error.message}`)));
 						});
 						child.on("close", (code) => {
+							// A child killed at the match limit can close without ever emitting
+							// stdout "end", so drain the buffer before dropping the listeners.
+							finishStreaming();
 							cleanup();
 							if (aborted) {
 								settle(() => reject(new Error("Operation aborted")));

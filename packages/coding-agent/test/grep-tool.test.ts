@@ -108,7 +108,7 @@ describe("grep content formatting", () => {
 		expect(lines).toHaveLength(3);
 		// ripgrep picks a different first file on each run, so tie the header to the
 		// one match line rather than naming a file.
-		const header = /^=== (.+\.ts) ===$/.exec(lines[0])?.[1];
+		const header = /^=== (\S+) ===$/.exec(lines[0])?.[1];
 		expect(header).toBeTruthy();
 		// The first file ripgrep reports varies per run, and each file's first
 		// match sits on a different line, so check the shared shape only.

@@ -255,7 +255,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		thinkingLevel = clampThinkingLevel(model, thinkingLevel) as ThinkingLevel;
 	}
 
-	const defaultActiveToolNames: ToolName[] = ["read", "bash", "edit", "write"];
+	// grep and find are active by default so the agent searches through the
+	// dedicated tools rather than shelling out to rg/find via bash. grep reuses
+	// the same ripgrep binary bash would, but it streams structured output,
+	// respects the limit, and returns only what fits the context budget.
+	const defaultActiveToolNames: ToolName[] = ["read", "bash", "edit", "write", "grep", "find"];
 	const configuredDefaultToolNames = settingsManager.getDefaultTools();
 	const allowedToolNames = options.tools ?? (options.noTools === "all" ? [] : undefined);
 	const excludedToolNames = options.excludeTools;

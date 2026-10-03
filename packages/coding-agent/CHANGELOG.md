@@ -43,6 +43,7 @@
 - Raised the MLX provider local-model context ceiling from 32k to 128k so models with large native windows and a capable local server (e.g. 27B hybrid-attention 4-bit) are reported with up to 131072 tokens; models without a readable local config still default to 32k.
 
 ### Fixed
+- The session-selector delete regression test no longer races the async trash/unlink fallback chain, which made it flake under full-suite load.
 - An `authFetch` profile host now matches exactly that host. A bare host used to cover every subdomain, which sent the profile's cookies to `attacker.example.com`; prefix the entry with a dot (`.example.com`) to opt into subdomain coverage.
 - Subagent preflight rejects a `runId` or `nestedRootRunId` that is not a safe id token, instead of reporting success with artifact, session and lifecycle paths that escaped every declared root.
 - Authenticated Git URLs no longer leak credentials into progress output or command errors.

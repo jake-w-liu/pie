@@ -43,6 +43,21 @@ async function flushPromises(): Promise<void> {
 	});
 }
 
+/**
+ * Wait until `render()` shows `needle`, bounded so a genuine failure still fails the
+ * test. A fixed number of `flushPromises()` calls races the async trash -> unlink
+ * fallback chain and flaked under full-suite load.
+ */
+async function renderEventually(selector: SessionSelectorComponent, needle: string, attempts = 50): Promise<string> {
+	let output = "";
+	for (let attempt = 0; attempt < attempts; attempt++) {
+		await flushPromises();
+		output = stripAnsi(selector.render(200).join("\n"));
+		if (output.includes(needle)) return output;
+	}
+	return output;
+}
+
 function stripAnsi(text: string): string {
 	return text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
 }
@@ -378,7 +393,7 @@ describe("session selector path/delete interactions", () => {
 		await flushPromises();
 		await flushPromises();
 
-		const output = stripAnsi(selector.render(200).join("\n"));
+		const output = await renderEventually(selector, "Failed to delete");
 		expect(output).toContain("Failed to delete");
 		expect(output).toContain("timed out after 5000ms");
 		expect(output).not.toContain("Session moved to trash");

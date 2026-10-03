@@ -8,6 +8,7 @@
 - NVIDIA and OpenRouter now refresh their model catalogs live from their own `/models` endpoints at runtime instead of relying only on the shipped static catalog, so new models appear in the `/model` picker without waiting for a release. NVIDIA keeps its curated static baseline and adds newly-available chat models (filtering out embeddings, safety guards, and code/vision-only endpoints); OpenRouter replaces baseline entries with current metadata (context window, pricing, reasoning, tool support).
 
 ### Fixed
+- Anthropic tool calls keep arguments supplied in `content_block_start`. A gateway that sends complete `input` there and no (or an empty) `input_json_delta` previously lost the arguments entirely.
 - A throwing `onResponse` callback no longer resubmits an already accepted Codex response; the callback runs after the retry loop, and a failed callback cancels the response body.
 - `timeoutMs` now covers the Codex SSE response body, not only the response headers, so a stalled body can no longer wait indefinitely.
 - The Bedrock adapter honors `maxRetries` and `timeoutMs` and destroys its per-request client, so retries can be disabled, requests are bounded, and connections are released on every path.

@@ -566,7 +566,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 						const block = blocks[index];
 						if (block && block.type === "toolCall") {
 							block.partialJson += event.delta.partial_json;
-							block.arguments = parseStreamingJson(block.partialJson);
+							if (block.partialJson.trim().length > 0) block.arguments = parseStreamingJson(block.partialJson);
 							stream.push({
 								type: "toolcall_delta",
 								contentIndex: index,
@@ -602,7 +602,11 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 								partial: output,
 							});
 						} else if (block.type === "toolCall") {
-							block.arguments = parseStreamingJson(block.partialJson);
+							// Only re-derive arguments from the streaming buffer when deltas
+							// actually contributed. A gateway that sends complete `input` in
+							// content_block_start and no input_json_delta lost its arguments
+							// here, because the buffer was still empty.
+							if (block.partialJson.trim().length > 0) block.arguments = parseStreamingJson(block.partialJson);
 							// Finalize in-place and strip the scratch buffer so replay only
 							// carries parsed arguments.
 							delete (block as { partialJson?: string }).partialJson;

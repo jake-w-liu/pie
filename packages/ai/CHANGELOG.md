@@ -4,10 +4,13 @@
 
 ### Added
 
+- Added GPT-6 Astra, GPT-6 Luna, GPT-6 Sol, and GPT-6.1 Sol to the OpenAI Codex (ChatGPT OAuth) model list, with the effort ladder each build advertises (`none` only on Sol and Luna) and 272K context.
+- GPT-6 models on the OpenAI API and Azure OpenAI now use the 272K short-context tier and carry long-context pricing tiers plus tool-search and `additional_tools` support, matching the OpenAI list prices the gateway catalogs report.
 - Added `RetryCallbacks.onResponse` to report every physical attempt, including failed and aborted responses, for complete usage accounting.
 - NVIDIA and OpenRouter now refresh their model catalogs live from their own `/models` endpoints at runtime instead of relying only on the shipped static catalog, so new models appear in the `/model` picker without waiting for a release. NVIDIA keeps its curated static baseline and adds newly-available chat models (filtering out embeddings, safety guards, and code/vision-only endpoints); OpenRouter replaces baseline entries with current metadata (context window, pricing, reasoning, tool support).
 
 ### Fixed
+- GPT-5.6 Sol pricing now uses OpenAI's reduced 4/20/0.4/5 list rates on Codex and the Cloudflare AI Gateway, which still reported the pre-reduction 5/30/0.5/6.25 rates.
 - Anthropic tool calls keep arguments supplied in `content_block_start`. A gateway that sends complete `input` there and no (or an empty) `input_json_delta` previously lost the arguments entirely.
 - A throwing `onResponse` callback no longer resubmits an already accepted Codex response; the callback runs after the retry loop, and a failed callback cancels the response body.
 - `timeoutMs` now covers the Codex SSE response body, not only the response headers, so a stalled body can no longer wait indefinitely.

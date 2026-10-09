@@ -465,7 +465,14 @@ export function createShellToolDefinition(
 					});
 					exitCode = result.exitCode;
 				} catch (err) {
-					const snapshot = await finishOutput();
+					let snapshot: Awaited<ReturnType<typeof finishOutput>>;
+					try {
+						snapshot = await finishOutput();
+					} catch (spoolError) {
+						throw new AggregateError([err, spoolError], "Command execution and output persistence failed", {
+							cause: err,
+						});
+					}
 					const { text } = formatOutput(snapshot, "");
 					if (err instanceof Error && err.message === "aborted") {
 						throw new Error(appendStatus(text, "Command aborted"));

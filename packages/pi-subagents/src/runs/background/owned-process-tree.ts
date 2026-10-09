@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import type { ProcessTreeTerminalV1 } from "../../shared/types.ts";
 
 const DEFAULT_TERM_GRACE_MS = 3000;
@@ -101,4 +101,18 @@ export function createOwnedProcessTreeController(
 	};
 
 	return { terminate, finishAfterWriterClose: terminate };
+}
+
+/**
+ * Terminate a spawned process tree: POSIX uses the owned process group via the
+ * controller, Windows uses taskkill's recursive tree kill, falling back to the
+ * controller's best-effort signal when taskkill cannot run.
+ */
+export function terminateSpawnedProcessTree(pid: number, controller: OwnedProcessTreeController): Promise<unknown> {
+	if (process.platform !== "win32") return controller.terminate();
+	return new Promise((resolve) => {
+		const cleanup = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+		cleanup.once("error", () => { void controller.terminate().then(resolve); });
+		cleanup.once("close", () => { void controller.terminate().then(resolve); });
+	});
 }

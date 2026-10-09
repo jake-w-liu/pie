@@ -1324,7 +1324,7 @@ Important behavior:
 
 For predictable behavior, treat reload as terminal for that handler (`await ctx.reload(); return;`).
 
-Tools run with `ExtensionContext`, so they cannot call `ctx.reload()` directly. Use a command as the reload entrypoint, then expose a tool that queues that command as a follow-up user message.
+Tools run with `ExtensionContext`, so they cannot call `ctx.reload()` directly. Use a command as the reload entrypoint, then expose a tool that dispatches that command through `sendUserMessage` with `expandPromptTemplates: true`. Dispatch is immediate and reload refuses to run while the agent streams, so a tool called mid-turn defers dispatch to `agent_settled`.
 
 Example tool the LLM can call to trigger reload:
 
@@ -1341,15 +1341,32 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  let reloadQueued = false;
+  pi.on("agent_settled", () => {
+    if (!reloadQueued) {
+      return;
+    }
+    reloadQueued = false;
+    // Run after the settled emit unwinds; reload tears down the extension
+    // runtime that is still iterating handlers.
+    setTimeout(() => {
+      pi.sendUserMessage("/reload-runtime", { expandPromptTemplates: true });
+    }, 0);
+  });
+
   pi.registerTool({
     name: "reload_runtime",
     label: "Reload Runtime",
     description: "Reload extensions, skills, prompts, themes, and context files",
     parameters: Type.Object({}),
-    async execute() {
-      pi.sendUserMessage("/reload-runtime", { deliverAs: "followUp" });
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      if (ctx.isIdle()) {
+        pi.sendUserMessage("/reload-runtime", { expandPromptTemplates: true });
+      } else {
+        reloadQueued = true;
+      }
       return {
-        content: [{ type: "text", text: "Queued /reload-runtime as a follow-up command." }],
+        content: [{ type: "text", text: "Scheduled /reload-runtime to run when the agent finishes." }],
       };
     },
   });

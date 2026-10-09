@@ -10,10 +10,14 @@
 - NVIDIA and OpenRouter now refresh their model catalogs live from their own `/models` endpoints at runtime instead of relying only on the shipped static catalog, so new models appear in the `/model` picker without waiting for a release. NVIDIA keeps its curated static baseline and adds newly-available chat models (filtering out embeddings, safety guards, and code/vision-only endpoints); OpenRouter replaces baseline entries with current metadata (context window, pricing, reasoning, tool support).
 
 ### Fixed
+- Terminal event pushes settle every pending stream consumer; indexed FIFOs clear consumed payload references and periodically reclaim backing storage instead of shifting a queued backlog on every event.
+- Image generation preserves the never-reject contract for asynchronous failures without configured auth, and image catalog refresh retries after synchronous callback failures while retaining concurrent deduplication and the last successful catalog.
+- Invalid proxy URL diagnostics no longer include credential-bearing configuration or parser details.
 - GPT-5.6 Sol pricing now uses OpenAI's reduced 4/20/0.4/5 list rates on Codex and the Cloudflare AI Gateway, which still reported the pre-reduction 5/30/0.5/6.25 rates.
 - Anthropic tool calls keep arguments supplied in `content_block_start`. A gateway that sends complete `input` there and no (or an empty) `input_json_delta` previously lost the arguments entirely.
 - A throwing `onResponse` callback no longer resubmits an already accepted Codex response; the callback runs after the retry loop, and a failed callback cancels the response body.
 - `timeoutMs` now covers the Codex SSE response body, not only the response headers, so a stalled body can no longer wait indefinitely.
+- Released Codex SSE abort subscriptions and abandoned response bodies on observer, parser, and missing-body failures as well as successful completion.
 - The Bedrock adapter honors `maxRetries` and `timeoutMs` and destroys its per-request client, so retries can be disabled, requests are bounded, and connections are released on every path.
 - Re-registering the built-in API providers no longer marks a custom override as the built-in implementation and routes built-in models around it.
 - Image model catalogs no longer emit negative per-million prices from OpenRouter's `-1` unknown-price sentinel.

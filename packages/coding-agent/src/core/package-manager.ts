@@ -2229,9 +2229,16 @@ export class DefaultPackageManager implements PackageManager {
 		metadata: PathMetadata,
 	): void {
 		const manifest = readPiManifest(join(packageRoot, "package.json"));
-		const entries = manifest?.[resourceType as keyof PiManifest];
-		if (entries) {
-			this.addManifestEntries(entries, packageRoot, resourceType, target, metadata);
+		if (manifest) {
+			// A present manifest is the allowed-resource universe: an empty or omitted
+			// field means no resources of this type, never a convention-directory scan.
+			this.addManifestEntries(
+				manifest[resourceType as keyof PiManifest],
+				packageRoot,
+				resourceType,
+				target,
+				metadata,
+			);
 			return;
 		}
 		const dir = join(packageRoot, resourceType);
@@ -2298,8 +2305,10 @@ export class DefaultPackageManager implements PackageManager {
 		resourceType: ResourceType,
 	): { allFiles: string[]; enabledByManifest: Set<string> } {
 		const manifest = readPiManifest(join(packageRoot, "package.json"));
-		const entries = manifest?.[resourceType as keyof PiManifest];
-		if (entries && entries.length > 0) {
+		if (manifest) {
+			// A present manifest is the allowed-resource universe: empty or omitted
+			// fields contribute nothing, and convention directories are not scanned.
+			const entries = manifest[resourceType as keyof PiManifest] ?? [];
 			const allFiles = this.collectFilesFromManifestEntries(entries, packageRoot, resourceType);
 			const manifestPatterns = entries.filter(isOverridePattern);
 			const enabledByManifest =

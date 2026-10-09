@@ -23,6 +23,7 @@ import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { iterateSseMessages } from "../utils/sse.ts";
 import { getJsonSchemaToolParameters, resolveJsonSchemaStrictSampling } from "./constrained-sampling.ts";
+import { lazyStream } from "./lazy.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
 
@@ -185,27 +186,32 @@ export const streamSimple: StreamFunction<"mistral-conversations", SimpleStreamO
 	model: Model<"mistral-conversations">,
 	context: Context,
 	options?: SimpleStreamOptions,
-): AssistantMessageEventStream => {
-	const apiKey = options?.apiKey;
-	if (!apiKey) {
-		throw new Error(`No API key for provider: ${model.provider}`);
-	}
+): AssistantMessageEventStream =>
+	lazyStream(
+		model,
+		async () => {
+			const apiKey = options?.apiKey;
+			if (!apiKey) {
+				throw new Error(`No API key for provider: ${model.provider}`);
+			}
 
-	const base = {
-		...buildBaseOptions(model, context, options, apiKey),
-		toolChoice: options?.toolChoice,
-	} satisfies MistralOptions;
-	const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
-	const reasoning = clampedReasoning === "off" ? undefined : clampedReasoning;
-	const shouldUseReasoning = model.reasoning && reasoning !== undefined;
+			const base = {
+				...buildBaseOptions(model, context, options, apiKey),
+				toolChoice: options?.toolChoice,
+			} satisfies MistralOptions;
+			const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
+			const reasoning = clampedReasoning === "off" ? undefined : clampedReasoning;
+			const shouldUseReasoning = model.reasoning && reasoning !== undefined;
 
-	return stream(model, context, {
-		...base,
-		promptMode: shouldUseReasoning && usesPromptModeReasoning(model) ? "reasoning" : undefined,
-		reasoningEffort:
-			shouldUseReasoning && usesReasoningEffort(model) ? mapReasoningEffort(model, reasoning) : undefined,
-	} satisfies MistralOptions);
-};
+			return stream(model, context, {
+				...base,
+				promptMode: shouldUseReasoning && usesPromptModeReasoning(model) ? "reasoning" : undefined,
+				reasoningEffort:
+					shouldUseReasoning && usesReasoningEffort(model) ? mapReasoningEffort(model, reasoning) : undefined,
+			} satisfies MistralOptions);
+		},
+		options?.signal,
+	);
 
 function createOutput(model: Model<"mistral-conversations">): AssistantMessage {
 	return {

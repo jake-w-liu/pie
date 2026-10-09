@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { finished } from "node:stream/promises";
 import type { ExternalProcessStatus } from "../../shared/types.ts";
 import { attachPostExitStdioGuard } from "../../shared/post-exit-stdio-guard.ts";
-import { createOwnedProcessTreeController, type OwnedProcessTreeController } from "../background/owned-process-tree.ts";
+import { createOwnedProcessTreeController, terminateSpawnedProcessTree, type OwnedProcessTreeController } from "../background/owned-process-tree.ts";
 import { omitExtensionBindingsEnv } from "./extension-bindings.ts";
 import {
 	invalidateExternalCliPreflight,
@@ -124,15 +124,22 @@ function createByteTail(maxBytes: number): { push(chunk: Buffer): void; text(): 
 	};
 }
 
-function writeBoundedLog(source: NodeJS.ReadableStream, stream: fs.WriteStream, chunk: Buffer, state: { bytes: number; total: number }, limit: number): void {
+function writeBoundedLog(source: NodeJS.ReadableStream, stream: fs.WriteStream, chunk: Buffer, state: { bytes: number; total: number }, limit: number, paused: Map<fs.WriteStream, NodeJS.ReadableStream>): void {
 	state.total += chunk.length;
+	// A stream that already failed never drains; writing to it can throw and
+	// pausing its source would deadlock the child's pipe.
+	if (stream.destroyed || stream.errored) return;
 	const remaining = limit - state.bytes;
 	if (remaining <= 0) return;
 	const bytes = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
 	state.bytes += bytes.length;
 	if (!stream.write(bytes)) {
 		source.pause();
-		stream.once("drain", () => source.resume());
+		paused.set(stream, source);
+		stream.once("drain", () => {
+			paused.delete(stream);
+			source.resume();
+		});
 	}
 }
 
@@ -143,12 +150,7 @@ function classifyInvalidation(error: string): "auth" | "permission" | "launch" {
 }
 
 function terminateExternalProcessTree(pid: number, controller: OwnedProcessTreeController): Promise<unknown> {
-	if (process.platform !== "win32") return controller.terminate();
-	return new Promise((resolve) => {
-		const cleanup = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
-		cleanup.once("error", () => { void controller.terminate().then(resolve); });
-		cleanup.once("close", () => { void controller.terminate().then(resolve); });
-	});
+	return terminateSpawnedProcessTree(pid, controller);
 }
 
 export function runExternalCli(input: {
@@ -241,6 +243,24 @@ export function runExternalCli(input: {
 		let processTree: OwnedProcessTreeController | undefined;
 		let processPid: number | undefined;
 		let termination: Promise<unknown> | undefined;
+		const pausedLogSources = new Map<fs.WriteStream, NodeJS.ReadableStream>();
+		let logStreamError: Error | undefined;
+		// A log stream that fails (ENOSPC, EIO) never emits drain, so a paused
+		// child pipe would block the child forever. Release the pipe and kill the
+		// process tree; the close path then surfaces the stream failure.
+		const onLogStreamError = (stream: fs.WriteStream, error: Error) => {
+			logStreamError ??= error;
+			const source = pausedLogSources.get(stream);
+			if (source) {
+				pausedLogSources.delete(stream);
+				source.resume();
+			}
+			if (processTree && processPid !== undefined && !termination) {
+				termination = terminateExternalProcessTree(processPid, processTree);
+			}
+		};
+		stdoutStream.once("error", (error) => onLogStreamError(stdoutStream, error));
+		stderrStream.once("error", (error) => onLogStreamError(stderrStream, error));
 		const flushProgress = () => {
 			if (!latestProgress) return;
 			input.onParserProgress?.(latestProgress);
@@ -351,12 +371,12 @@ export function runExternalCli(input: {
 		input.onProcess?.(initialProcess);
 		child.stdout.on("data", (chunk: Buffer) => {
 			parseChunk(chunk);
-			writeBoundedLog(child.stdout, stdoutStream, chunk, stdoutLog, limits.stdoutLogBytes);
+			writeBoundedLog(child.stdout, stdoutStream, chunk, stdoutLog, limits.stdoutLogBytes, pausedLogSources);
 			input.onStdout?.(chunk);
 			stdoutTail.push(chunk);
 		});
 		child.stderr.on("data", (chunk: Buffer) => {
-			writeBoundedLog(child.stderr, stderrStream, chunk, stderrLog, limits.stderrLogBytes);
+			writeBoundedLog(child.stderr, stderrStream, chunk, stderrLog, limits.stderrLogBytes, pausedLogSources);
 			input.onStderr?.(chunk);
 			stderrTail.push(chunk);
 		});
@@ -411,11 +431,11 @@ export function runExternalCli(input: {
 					? input.stopMessage ?? "Subagent stopped by user."
 					: timedOut
 						? input.timeoutMessage ?? "Subagent timed out."
-						: spawnError?.message ?? parserFailure ?? (exitCode === 0 ? undefined : stderr || `External CLI exited with code ${exitCode}.`);
+						: spawnError?.message ?? parserFailure ?? logStreamError?.message ?? (exitCode === 0 ? undefined : stderr || `External CLI exited with code ${exitCode}.`);
 				if (error && input.preflight && !parserError) invalidateExternalCliPreflight(input.command, input.preflight, classifyInvalidation(error));
 				const result: ExternalCliRunResult = {
 					output: (!parserError && parserTerminal?.state === "completed" ? parserTerminal.output ?? "" : stdoutTail.text()).trim(),
-					exitCode: timedOut || stopped || spawnError || parserFailure ? 1 : exitCode,
+					exitCode: timedOut || stopped || spawnError || parserFailure || logStreamError ? 1 : exitCode,
 					...(error ? { error } : {}),
 					...(timedOut ? { timedOut: true } : {}),
 					...(stopped ? { stopped: true } : {}),

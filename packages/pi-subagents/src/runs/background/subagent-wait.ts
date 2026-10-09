@@ -209,10 +209,8 @@ function matchesId(run: AsyncRunSummary, id: string): boolean {
 	return run.id === id || run.id.startsWith(id);
 }
 
-function activeDetachedForegroundRuns(params: SubagentWaitParams, deps: SubagentWaitDeps): ForegroundResumeRun[] {
+function activeDetachedForegroundRuns(params: SubagentWaitParams, deps: SubagentWaitDeps, sessionId: string): ForegroundResumeRun[] {
 	if (!params.id || !deps.state.foregroundRuns) return [];
-	const sessionId = deps.state.currentSessionId;
-	if (!sessionId) return [];
 	return [...deps.state.foregroundRuns.values()].filter((run) =>
 		(run.runId === params.id || run.runId.startsWith(params.id!))
 		&& run.sessionId === sessionId
@@ -255,19 +253,17 @@ function backgroundWorkIdentity(item: RegisteredBackgroundWorkItem): string {
 	return `${item.provider}\0${item.sessionId}\0${item.id}`;
 }
 
-function backgroundWorkForSession(deps: SubagentWaitDeps, nowMs: number): BackgroundWorkSnapshot {
-	const sessionId = deps.state.currentSessionId;
-	if (!sessionId) throw new Error("subagent_wait requires an active session identity to scope background work safely.");
+function backgroundWorkForSession(deps: SubagentWaitDeps, nowMs: number, sessionId: string): BackgroundWorkSnapshot {
 	return deps.backgroundWork?.snapshot(sessionId, nowMs) ?? snapshotBackgroundWork(sessionId, nowMs);
 }
 
 /** Queued/running runs from this session, including runs that need attention. */
-function activeRunsForSession(params: SubagentWaitParams, deps: SubagentWaitDeps): AsyncRunSummary[] {
+function activeRunsForSession(params: SubagentWaitParams, deps: SubagentWaitDeps, sessionId: string): AsyncRunSummary[] {
 	const asyncDirRoot = deps.asyncDirRoot ?? DIRS.async;
 	const resultsDir = deps.resultsDir ?? DIRS.results;
 	const runs = listAsyncRuns(asyncDirRoot, {
 		states: [...ACTIVE_STATES],
-		sessionId: deps.state.currentSessionId ?? undefined,
+		sessionId,
 		resultsDir,
 		kill: deps.kill,
 		now: deps.now,
@@ -278,16 +274,16 @@ function activeRunsForSession(params: SubagentWaitParams, deps: SubagentWaitDeps
 }
 
 /** Runs (from the initial set) currently flagged needs_attention, for reporting. */
-function attentionRunsForSession(params: SubagentWaitParams, deps: SubagentWaitDeps, initialIds: Set<string>): AsyncRunSummary[] {
-	return activeRunsForSession(params, deps).filter((run) => needsAttention(run) && initialIds.has(run.id));
+function attentionRunsForSession(params: SubagentWaitParams, deps: SubagentWaitDeps, initialIds: Set<string>, sessionId: string): AsyncRunSummary[] {
+	return activeRunsForSession(params, deps, sessionId).filter((run) => needsAttention(run) && initialIds.has(run.id));
 }
 
 /** Exact initial runs in any state, for the final summary. */
-function runsForIds(runIds: Iterable<string>, deps: SubagentWaitDeps): AsyncRunSummary[] {
+function runsForIds(runIds: Iterable<string>, deps: SubagentWaitDeps, sessionId: string): AsyncRunSummary[] {
 	const asyncDirRoot = deps.asyncDirRoot ?? DIRS.async;
 	const resultsDir = deps.resultsDir ?? DIRS.results;
 	return [...runIds].flatMap((runId) => listAsyncRuns(asyncDirRoot, {
-		sessionId: deps.state.currentSessionId ?? undefined,
+		sessionId,
 		resultsDir,
 		kill: deps.kill,
 		now: deps.now,
@@ -493,7 +489,8 @@ export async function waitForSubagents(
 	if (deps.enabled === false) {
 		return result("subagent_wait is disabled by config.waitTool or PI_SUBAGENT_WAIT_TOOL_ENABLED; returning immediately without blocking background work. Active work keeps going, and you can inspect subagents with subagent({ action: \"status\" }) or rely on completion notifications.");
 	}
-	if (!deps.state.currentSessionId) {
+	const sessionId = deps.state.currentSessionId;
+	if (!sessionId) {
 		return result("subagent_wait requires an active session identity to scope background work safely.", true);
 	}
 
@@ -513,9 +510,9 @@ export async function waitForSubagents(
 	let foreground: ForegroundResumeRun[];
 	let providerSnapshot: BackgroundWorkSnapshot;
 	try {
-		active = activeRunsForSession(params, deps);
-		foreground = activeDetachedForegroundRuns(params, deps);
-		providerSnapshot = params.id ? { providers: [], items: [] } : backgroundWorkForSession(deps, startedAt);
+		active = activeRunsForSession(params, deps, sessionId);
+		foreground = activeDetachedForegroundRuns(params, deps, sessionId);
+		providerSnapshot = params.id ? { providers: [], items: [] } : backgroundWorkForSession(deps, startedAt, sessionId);
 	} catch (error) {
 		return result(error instanceof Error ? error.message : String(error), true);
 	}
@@ -593,9 +590,12 @@ export async function waitForSubagents(
 		}
 		try {
 			await waitForWake(pollIntervalMs, signal, deps);
-			active = activeRunsForSession(waitParams, deps);
-			attention = attentionRunsForSession(waitParams, deps, initialAsyncIds);
-			providerSnapshot = params.id ? providerSnapshot : backgroundWorkForSession(deps, now());
+			if (deps.state.currentSessionId !== sessionId) {
+				return result(`Session identity changed while subagent_wait was tracking ${initialAsyncIds.size} async run(s) and ${initialProviderIds.size} provider item(s); terminal state for the original session cannot be confirmed.`, true);
+			}
+			active = activeRunsForSession(waitParams, deps, sessionId);
+			attention = attentionRunsForSession(waitParams, deps, initialAsyncIds, sessionId);
+			providerSnapshot = params.id ? providerSnapshot : backgroundWorkForSession(deps, now(), sessionId);
 			for (const provider of initialProviderNames) {
 				if (!providerSnapshot.providers.includes(provider)) {
 					return result(`Background-work provider '${provider}' disappeared while subagent_wait was tracking its active work; completion cannot be confirmed.`, true);
@@ -615,7 +615,14 @@ export async function waitForSubagents(
 	const activeProviderIds = new Set(providerActive.map(backgroundWorkIdentity));
 	const providerFinishedCount = [...initialProviderIds].filter((id) => !activeProviderIds.has(id)).length;
 	try {
-		const allNow = runsForIds(initialAsyncIds, deps);
+		const allNow = runsForIds(initialAsyncIds, deps, sessionId);
+		// Leaving the active list is not proof of a terminal state: a deleted or
+		// unreadable status file also vanishes from the listing. Every tracked id
+		// must produce a record, or the wait fails closed instead of reporting done.
+		const lostIds = [...initialAsyncIds].filter((id) => !allNow.some((run) => run.id === id));
+		if (lostIds.length > 0) {
+			return result(`Waited ${formatDuration(now() - startedAt)} but ${lostIds.length} tracked run(s) lost their status records (${lostIds.join(", ")}); terminal state cannot be confirmed. Inspect with subagent({ action: "status" }) before assuming completion.`, true);
+		}
 		const terminal = allNow.filter((run) => !ACTIVE_STATES.includes(run.state) && initialAsyncIds.has(run.id));
 		finishedAsyncCount = terminal.length;
 		failedAsyncCount = terminal.filter((run) => run.state === "failed").length;

@@ -3,6 +3,7 @@
  */
 
 import { GITHUB_COPILOT_MODELS } from "../../providers/github-copilot.models.ts";
+import { cancelResponseBody } from "../../utils/http-response.ts";
 import { sleep } from "../../utils/sleep.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
@@ -416,7 +417,9 @@ async function enableGitHubCopilotModel(
 	if (response.status === 429) {
 		throw new Error(`${response.status} ${response.statusText}: ${await response.text()}`);
 	}
-	return response.ok;
+	const ok = response.ok;
+	await cancelResponseBody(response);
+	return ok;
 }
 
 /**

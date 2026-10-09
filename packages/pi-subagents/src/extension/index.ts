@@ -947,6 +947,13 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			completionNotifier.dispose();
 			mainWatchdog.dispose();
 			scheduledRunManager.stop();
+			// In-process workflows own Worker threads; dropping the runtime without
+			// aborting them leaves workers alive with no reachable control route.
+			// Abort is synchronous; settlement drains on the event loop.
+			executorScheduled = undefined;
+			void executor.dispose().catch((error) => {
+				console.error("Subagent executor disposal failed during runtime cleanup:", error);
+			});
 			supervisorChannel.dispose();
 			waitSubscriptionManager.dispose();
 			fleetStatus?.dispose();

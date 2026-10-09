@@ -170,8 +170,8 @@ function trimPartialClosingFences(tokens: readonly Token[]): void {
 }
 
 const BLOCK_MARKDOWN_PATTERN =
-	/(?:^|\n) {0,3}(?:#{1,6}[ \t]|>|[-+*][ \t]|\d{1,9}[.)][ \t]|(?:`{3,}|~{3,})|(?:-{3,}|\*{3,}|_{3,})[ \t]*(?:\n|$)|\$\$|\\\[)/;
-const INLINE_MARKDOWN_PATTERN = /[*_~`[\]$\\|<&]|https?:\/\/|\bwww\./;
+	/(?:^|\n)(?: {4}| {0,3}(?:#{1,6}[ \t]|>|[-+*][ \t]|\d{1,9}[.)][ \t]|(?:`{3,}|~{3,})|(?:=+|-{3,}|\*{3,}|_{3,})[ \t]*(?:\n|$)|\$\$|\\\[))/;
+const INLINE_MARKDOWN_PATTERN = /[*_~`[\]$\\|<&@]|(?:https?|ftp):\/\/|\bwww\./i;
 
 function isPlainMarkdown(source: string): boolean {
 	return !BLOCK_MARKDOWN_PATTERN.test(source) && !INLINE_MARKDOWN_PATTERN.test(source);

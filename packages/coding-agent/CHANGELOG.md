@@ -43,6 +43,16 @@
 - Raised the MLX provider local-model context ceiling from 32k to 128k so models with large native windows and a capable local server (e.g. 27B hybrid-attention 4-bit) are reported with up to 131072 tokens; models without a readable local config still default to 32k.
 
 ### Fixed
+- Project-local subagent schedules now require a project trust decision, including projects with no other protected resources.
+- Cross-project forks now migrate legacy session entries before writing the current-format header, preserving history and compaction links without modifying the source.
+- Session loading and forking reject invalid entry IDs, duplicate IDs, and parent cycles before rewriting or publishing candidates; failed switches retain the current session.
+- Direct SDK branch creation now completes required atomic publication before replacing the session owner, preserving the original session and append state after write failure; no-assistant branches remain deferred.
+- Legacy migration reserves generated entry IDs, and full-UUID allocation remains collision-checked after short-ID retries; bounded exhaustion fails without appending an entry.
+- Output spools observe creation and write failures immediately and propagate artifact failures through both shell tools and user Bash, including cancellation, instead of crashing or advertising incomplete output.
+- Custom user-Bash output callbacks are ignored after command settlement, including while artifacts drain, preventing late output from creating unowned streams or post-completion updates.
+- Headroom only compresses a request-capacity-feasible set of originals and protects newly emitted hashes from same-request eviction; duplicate content shares the byte and entry budget.
+- HTML exports reject malformed numeric read arguments and escape persisted scalar fields before DOM parsing; exported labels now replay clearing events.
+- Command timeout and abort escalation now checks whether the child exited, not whether SIGTERM was sent, and clears the pending SIGKILL timer after settlement.
 - The session-selector delete regression test no longer races the async trash/unlink fallback chain, which made it flake under full-suite load.
 - An `authFetch` profile host now matches exactly that host. A bare host used to cover every subdomain, which sent the profile's cookies to `attacker.example.com`; prefix the entry with a dot (`.example.com`) to opt into subdomain coverage.
 - Subagent preflight rejects a `runId` or `nestedRootRunId` that is not a safe id token, instead of reporting success with artifact, session and lifecycle paths that escaped every declared root.

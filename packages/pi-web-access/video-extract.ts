@@ -1,4 +1,5 @@
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { resolve, extname, basename, join, dirname } from "node:path";
@@ -7,7 +8,7 @@ import { canAttachImages } from "./feature-config.ts";
 import { isGeminiWebAvailable, queryWithCookies } from "./gemini-web.ts";
 import { queryGeminiApiWithVideo, getApiKey, fetchGeminiApi, getVersionedApiBase, getUploadBase, redactGeminiApiResponse } from "./gemini-api.ts";
 import { extractHeadingTitle, type ExtractedContent, type ExtractOptions, type FrameResult } from "./extract.ts";
-import { readExecError, trimErrorText, mapFfmpegError, getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
+import { readExecError, trimErrorText, mapFfmpegError, getWebSearchConfigPath, jsonParseDiagnostic, proxyChildEnv } from "./utils.ts";
 
 const CONFIG_PATH = getWebSearchConfigPath();
 
@@ -196,7 +197,7 @@ export async function extractVideo(
 
 	if (result) {
 		if (canAttachImages()) {
-			const thumbnail = await extractVideoFrame(info.absolutePath);
+			const thumbnail = await extractVideoFrame(info.absolutePath, 1, signal);
 			if (!("error" in thumbnail)) {
 				result.thumbnail = thumbnail;
 			}
@@ -221,31 +222,37 @@ function mapFfprobeError(err: unknown): string {
 	return snippet ? `ffprobe failed: ${snippet}` : "ffprobe failed";
 }
 
-export async function extractVideoFrame(filePath: string, seconds: number = 1): Promise<FrameResult> {
+const execFileAsync = promisify(execFile);
+
+export async function extractVideoFrame(filePath: string, seconds: number = 1, signal?: AbortSignal): Promise<FrameResult> {
 	try {
-		const buffer = execFileSync("ffmpeg", [
+		const { stdout } = await execFileAsync("ffmpeg", [
 			"-ss", String(seconds), "-i", filePath,
 			"-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
-		], { maxBuffer: 5 * 1024 * 1024, timeout: 10000, stdio: ["pipe", "pipe", "pipe"] });
+		], { maxBuffer: 5 * 1024 * 1024, timeout: 10000, env: proxyChildEnv(), ...(signal ? { signal } : {}) });
+		const buffer = typeof stdout === "string" ? Buffer.from(stdout) : stdout;
 		if (buffer.length === 0) return { error: "ffmpeg failed: empty output" };
 		return { data: buffer.toString("base64"), mimeType: "image/jpeg" };
 	} catch (err) {
+		if (signal?.aborted) return { error: "Aborted" };
 		return { error: mapFfmpegError(err) };
 	}
 }
 
-export async function getLocalVideoDuration(filePath: string): Promise<number | { error: string }> {
+export async function getLocalVideoDuration(filePath: string, signal?: AbortSignal): Promise<number | { error: string }> {
 	try {
-		const output = execFileSync("ffprobe", [
+		const { stdout } = await execFileAsync("ffprobe", [
 			"-v", "quiet",
 			"-show_entries", "format=duration",
 			"-of", "csv=p=0",
 			filePath,
-		], { timeout: 10000, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+		], { timeout: 10000, encoding: "utf-8", ...(signal ? { signal } : {}) });
+		const output = stdout.trim();
 		const duration = Number.parseFloat(output);
 		if (!Number.isFinite(duration)) return { error: "ffprobe failed: invalid duration output" };
 		return duration;
 	} catch (err) {
+		if (signal?.aborted) return { error: "Aborted" };
 		return { error: mapFfprobeError(err) };
 	}
 }
@@ -359,6 +366,8 @@ async function uploadToFilesApi(
 	}
 
 	const uploadUrl = initRes.headers.get("x-goog-upload-url");
+	// Only the header is consumed; release the unread body before proceeding.
+	await initRes.body?.cancel();
 	if (!uploadUrl) throw new Error("No upload URL in response headers");
 
 	const fileData = await readFile(info.absolutePath);
@@ -394,7 +403,10 @@ async function pollFileState(
 		if (signal?.aborted) throw new Error("Aborted");
 
 		const res = await fetchGeminiApi(`${getVersionedApiBase()}/${fileName}`, { signal }, apiKey);
-		if (!res.ok) throw new Error(`File state check failed: ${res.status}`);
+		if (!res.ok) {
+			await res.body?.cancel();
+			throw new Error(`File state check failed: ${res.status}`);
+		}
 
 		const data = await res.json() as { state: string };
 		if (data.state === "ACTIVE") return;
@@ -407,10 +419,16 @@ async function pollFileState(
 }
 
 function deleteGeminiFile(fileName: string, apiKey: string): void {
-	void fetchGeminiApi(`${getVersionedApiBase()}/${fileName}`, { method: "DELETE" }, apiKey).catch((err) => {
-		const message = err instanceof Error ? err.message : String(err);
-		console.error(`Failed to delete Gemini file ${fileName}: ${message}`);
-	});
+	// Detached cleanup still needs a bounded lifetime and a consumed body.
+	void fetchGeminiApi(`${getVersionedApiBase()}/${fileName}`, {
+		method: "DELETE",
+		signal: AbortSignal.timeout(10_000),
+	}, apiKey)
+		.then((res) => res.body?.cancel())
+		.catch((err) => {
+			const message = err instanceof Error ? err.message : String(err);
+			console.error(`Failed to delete Gemini file ${fileName}: ${message}`);
+		});
 }
 
 function extractVideoTitle(text: string, filePath: string): string {

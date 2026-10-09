@@ -11,7 +11,10 @@ const fixture = vi.hoisted(() => ({
 		throw new Error("Clone fixture not configured");
 	},
 }));
-vi.mock("../../pi-web-access/utils.ts", () => ({ getWebSearchConfigPath: () => fixture.configPath }));
+vi.mock("../../pi-web-access/utils.ts", () => ({
+	getWebSearchConfigPath: () => fixture.configPath,
+	proxyChildEnv: (env: NodeJS.ProcessEnv) => env,
+}));
 vi.mock("../../pi-web-access/github-api.ts", () => ({
 	checkGhAvailable: async () => true,
 	checkRepoSize: async () => 1,

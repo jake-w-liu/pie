@@ -3,6 +3,7 @@ import { fetchWithResponseErrors } from "@earendil-works/pi-coding-agent";
 import { basename } from "node:path";
 import { getLastGoogleCookieDiagnostic, getLastGoogleCookieDiagnosticDetails, type BrowserCookieDiagnosticDetails, type CookieMap, getGoogleCookies } from "./chrome-cookies.ts";
 import { getBrowserCookieSelectionFromConfig, isBrowserCookieAccessAllowed, normalizeChromeProfile } from "./gemini-web-config.ts";
+import { getActiveProxy, hasScopedProxyDecision } from "./utils.ts";
 
 const GEMINI_APP_URL = "https://gemini.google.com/app";
 const GEMINI_STREAM_GENERATE_URL =
@@ -56,18 +57,44 @@ export const GEMINI_MAX_HEADER_SIZE = 4 * 1024 * 1024;
 // header budget than the host agent's global dispatcher allows. Exported for
 // tests so the agent configuration can be asserted without network access.
 export function createGeminiFetch(undiciImpl: typeof import("undici")): typeof fetch {
-	const agent = new undiciImpl.EnvHttpProxyAgent({
+	const baseOptions = {
 		allowH2: false,
 		connectTimeout: 30_000,
 		maxHeaderSize: GEMINI_MAX_HEADER_SIZE,
 		pipelining: 1,
-	});
+	};
+	// EnvHttpProxyAgent reads ambient proxy env once at construction; a scoped
+	// per-call proxy decision must win per request — including explicit direct
+	// access, which has to bypass an ambient proxy. Dispatchers are pooled per
+	// routing decision so requests share connections.
+	type UndiciDispatcher = InstanceType<typeof undiciImpl.Dispatcher>;
+	const dispatchers = new Map<string, UndiciDispatcher>();
+	const dispatcherFor = (): UndiciDispatcher => {
+		if (!hasScopedProxyDecision()) {
+			let dispatcher = dispatchers.get("env");
+			if (!dispatcher) {
+				dispatcher = new undiciImpl.EnvHttpProxyAgent(baseOptions);
+				dispatchers.set("env", dispatcher);
+			}
+			return dispatcher;
+		}
+		const proxy = getActiveProxy();
+		const key = proxy ?? "direct";
+		let dispatcher = dispatchers.get(key);
+		if (!dispatcher) {
+			dispatcher = proxy
+				? new undiciImpl.ProxyAgent({ ...baseOptions, uri: proxy })
+				: new undiciImpl.Agent(baseOptions);
+			dispatchers.set(key, dispatcher);
+		}
+		return dispatcher;
+	};
 	// undici 8 types its fetch request/response structurally differently from
 	// the DOM lib types (duplex/textStream on Request, Symbol.dispose on
 	// Headers); the shape this module uses (status, ok, headers.get, text) is
 	// identical, so bridge the two.
 	type UndiciFetch = typeof undiciImpl.fetch;
-	return (input, init) => fetchWithResponseErrors(agent, (dispatcher) =>
+	return (input, init) => fetchWithResponseErrors(dispatcherFor(), (dispatcher) =>
 		undiciImpl.fetch(
 			input as unknown as Parameters<UndiciFetch>[0],
 			{ ...init, dispatcher } as unknown as Parameters<UndiciFetch>[1],

@@ -88,21 +88,33 @@ function toTranscriptEvents(messages: AgentSession["messages"]): TranscriptEvent
 	return events;
 }
 
-async function promptAgent(session: AgentSession, input: string, signal: AbortSignal | undefined): Promise<string> {
+async function promptAgent(
+	session: AgentSession,
+	input: string,
+	signal: AbortSignal | undefined,
+	transcript: AgentSession["messages"],
+): Promise<string> {
 	signal?.throwIfAborted();
-	const previousMessageCount = session.messages.length;
-	await session.prompt(input);
-	const assistant = session.messages
-		.slice(previousMessageCount)
-		.reverse()
-		.find((message) => message.role === "assistant");
+	let assistant: Extract<AgentSession["messages"][number], { role: "assistant" }> | undefined;
+	const unsubscribe = session.subscribe((event) => {
+		if (event.type !== "message_end") return;
+		// Completed messages remain authoritative even if compaction replaces
+		// the context. Normalize the complete trace once, outside this observer.
+		transcript.push(event.message);
+		if (event.message.role === "assistant") assistant = event.message;
+	});
+	try {
+		await session.prompt(input);
+	} finally {
+		unsubscribe();
+	}
 	if (!assistant) throw new Error("Agent run completed without an assistant message.");
 	if (assistant.stopReason !== "stop") {
 		throw new Error(
 			assistant.errorMessage ?? `Agent run ended with unexpected stop reason: ${assistant.stopReason}.`,
 		);
 	}
-	const output = session.getLastAssistantText();
+	const output = contentText(assistant.content);
 	if (!output) throw new Error("Agent run produced no assistant text.");
 	return output;
 }
@@ -190,9 +202,10 @@ async function runPiCodingAgent<TOutput extends JsonValue>(
 			}
 			const steps = typeof input === "string" ? [{ type: "prompt" as const, content: input }] : input;
 			let response: string | undefined;
+			const transcript: AgentSession["messages"] = [];
 			for (const step of steps) {
 				if (step.type === "prompt") {
-					response = await promptAgent(evalSession, step.content, signal);
+					response = await promptAgent(evalSession, step.content, signal, transcript);
 				} else {
 					await evalSession.reload();
 				}
@@ -207,7 +220,7 @@ async function runPiCodingAgent<TOutput extends JsonValue>(
 				success: true,
 				result: {
 					output,
-					events: toTranscriptEvents(evalSession.messages),
+					events: toTranscriptEvents(transcript),
 					usage: {
 						provider: model.provider,
 						model: model.id,

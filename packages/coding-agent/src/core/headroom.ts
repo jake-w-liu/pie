@@ -569,8 +569,8 @@ export class HeadroomController {
 	}
 
 	transformContext(messages: AgentMessage[], retrievalAvailable: boolean): AgentMessage[] {
-		return this.mapContext(messages, retrievalAvailable, (text, toolCallId, blockIndex) =>
-			this.compressContent(text, toolCallId, blockIndex),
+		return this.mapContext(messages, retrievalAvailable, (text, toolCallId, blockIndex, selectedHashes) =>
+			this.compressContent(text, toolCallId, blockIndex, selectedHashes),
 		);
 	}
 
@@ -582,7 +582,12 @@ export class HeadroomController {
 	private mapContext(
 		messages: AgentMessage[],
 		retrievalAvailable: boolean,
-		mapText: (text: string, toolCallId: string, blockIndex: number) => string | undefined,
+		mapText: (
+			text: string,
+			toolCallId: string,
+			blockIndex: number,
+			selectedHashes: ReadonlySet<string>,
+		) => string | undefined,
 	): AgentMessage[] {
 		if (!this.isEnabled() || !retrievalAvailable) return messages;
 		// Only compress "historical" results the model has already seen. A tool
@@ -597,6 +602,11 @@ export class HeadroomController {
 			}
 		}
 		let remaining = this.maxSegments();
+		const selectedHashes = new Set<string>();
+		let selectedBytes = 0;
+		const maxEntries = this.maxStoreEntries();
+		const maxBytes = this.maxStoreChars();
+		const minBytes = this.minChars();
 		let output: AgentMessage[] | undefined;
 		for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
 			const message = messages[messageIndex]!;
@@ -611,11 +621,26 @@ export class HeadroomController {
 				for (let blockIndex = 0; blockIndex < message.content.length; blockIndex += 1) {
 					const block = message.content[blockIndex]!;
 					let transformedBlock = block;
-					if (remaining > 0 && block.type === "text") {
-						const mapped = mapText(block.text, message.toolCallId, blockIndex);
-						if (mapped) {
-							remaining -= 1;
-							transformedBlock = { ...block, text: mapped };
+					if (remaining > 0 && block.type === "text" && !isProtectedContent(block.text)) {
+						const bytes = utf8Length(block.text);
+						if (bytes < minBytes || bytes > maxBytes) {
+							content?.push(block);
+							continue;
+						}
+						const hash = createHash("sha256").update(block.text, "utf8").digest("hex");
+						const alreadySelected = selectedHashes.has(hash);
+						// A request may evict old originals, but never an original it is
+						// about to reference. Projection uses this same capacity policy.
+						if (alreadySelected || (selectedHashes.size < maxEntries && selectedBytes + bytes <= maxBytes)) {
+							const mapped = mapText(block.text, message.toolCallId, blockIndex, selectedHashes);
+							if (mapped) {
+								remaining -= 1;
+								if (!alreadySelected) {
+									selectedHashes.add(hash);
+									selectedBytes += bytes;
+								}
+								transformedBlock = { ...block, text: mapped };
+							}
 						}
 					}
 					if (transformedBlock !== block && !content) content = message.content.slice(0, blockIndex);
@@ -644,7 +669,12 @@ export class HeadroomController {
 		return utf8Length(projected) < originalBytes ? projected : undefined;
 	}
 
-	private compressContent(text: string, toolCallId: string | undefined, blockIndex?: number): string | undefined {
+	private compressContent(
+		text: string,
+		toolCallId: string | undefined,
+		blockIndex?: number,
+		selectedHashes: ReadonlySet<string> = new Set(),
+	): string | undefined {
 		if (!this.isEnabled()) return undefined;
 		const originalBytes = utf8Length(text);
 		if (originalBytes < this.minChars() || isProtectedContent(text)) return undefined;
@@ -678,7 +708,8 @@ export class HeadroomController {
 			compressedChars: compressedBytes,
 			...(toolCallId ? { toolCallId } : {}),
 		};
-		if (!this.remember(entry, maxStoreEntries, maxStoreChars)) return this.noteFailure("store rejected entry");
+		if (!this.remember(entry, maxStoreEntries, maxStoreChars, selectedHashes))
+			return this.noteFailure("store rejected entry");
 
 		if (cacheKey) {
 			this.compressionCache.delete(cacheKey);
@@ -791,7 +822,12 @@ export class HeadroomController {
 		return Math.min(maxStoreEntries, Math.max(1, this.maxSegments() * 2));
 	}
 
-	private remember(entry: HeadroomStoredContent, maxEntries: number, maxChars: number): boolean {
+	private remember(
+		entry: HeadroomStoredContent,
+		maxEntries: number,
+		maxChars: number,
+		selectedHashes: ReadonlySet<string>,
+	): boolean {
 		if (entry.originalChars > maxChars) return false;
 		const existing = this.entries.get(entry.hash);
 		if (existing) {
@@ -799,7 +835,13 @@ export class HeadroomController {
 			this.totalBytes = Math.max(0, this.totalBytes - existing.originalChars);
 		}
 		while (this.entries.size >= maxEntries || this.totalBytes + entry.originalChars > maxChars) {
-			const oldestHash = this.entries.keys().next().value;
+			let oldestHash: string | undefined;
+			for (const hash of this.entries.keys()) {
+				if (!selectedHashes.has(hash)) {
+					oldestHash = hash;
+					break;
+				}
+			}
 			if (oldestHash === undefined) return false;
 			const oldest = this.entries.get(oldestHash);
 			this.entries.delete(oldestHash);

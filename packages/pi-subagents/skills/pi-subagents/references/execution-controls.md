@@ -103,6 +103,8 @@ Use `async:false` only when the parent must block until completion. Async mode s
 
 Async does not mean parallel writes. Do not edit the same active worktree while an async worker is changing it. Parent-side overlap should be reading, validation prep, synthesis, command planning, or review of unaffected context unless the writer is isolated in a separate worktree.
 
+Async workflow startup prepares the initial status and required start-receipt projections before marking its reservation started or scheduling the Worker. Child-summary identifiers must contain non-whitespace text and fit within 256 UTF-8 bytes; their original spelling is preserved. A prelaunch failure releases only proven-unstarted reservations and disposes both persistence writers, including queued retries. Already-persisted, owned, never-launched status is marked failed and its active, tool-call and terminal indexes are synchronized, including when capacity is unlimited. Any cleanup I/O failure is reported alongside the original error. Started or uncertain ownership is not force-reclaimed or rewritten as stopped; mission attachment after admission keeps its existing warning behavior and the actual started receipt.
+
 Do not end your turn immediately after launching an async child if you promised to keep working. Continue the local inspection, synthesis, or validation prep, then check the async run when its result is needed. If no safe independent work remains, return control and let Pi wake the session; do not convert the child to foreground.
 
 In an interactive chat, normally return control when ready to yield and let Pi wake the session on completion; do not call `subagent_wait()` merely to wait. A run-to-completion user request is not by itself a reason to use foreground children. Override the normal yield-and-wake flow only when this exact turn cannot safely end without the result, such as a headless provider flow or a skill contract that must produce a same-turn artifact. Use `subagent_wait()`, not `async:false`, for that current-turn dependency. Never substitute sleep or status-polling loops.
@@ -181,7 +183,7 @@ A cooperating terminal runtime can register read-only external records through `
 
 ### Scheduled subagent runs
 
-Schedules are durable project records under `.pi/subagents/schedules/`. They are enabled by default; set `{ "scheduledRuns": { "enabled": false } }` in `~/.pi/agent/extensions/subagent/config.json` to disable them. Only schedule explicit work the user asked for.
+Schedules are durable project records under `.pi/subagents/schedules/`. They are enabled by default; set `{ "scheduledRuns": { "enabled": false } }` in `~/.pi/agent/extensions/subagent/config.json` to disable them. Only schedule explicit work the user asked for. Project trust is required to restore/activate schedules and to create, resume, run, or run due work. Trust is checked for the schedule's captured project immediately before execution; revocation cancels pending timers, not already-launched work. Listing, showing, history, pause, and delete remain available without activating untrusted schedules. Invalid persisted triggers are reported per record during restoration without blocking valid schedules.
 
 ```typescript
 // One-shot reviewer
@@ -200,7 +202,7 @@ subagent({ action: "schedule.run-due" })
 subagent({ action: "schedule.delete", id: "backlog" })
 ```
 
-`schedule.create` accepts exactly one target, `workflowScript`, and exactly one trigger (`at`, or a fixed `every` interval using `m`, `h`, `d`, or `w`). Runs always launch async with fresh context and no automatic mission; mission attachment is deferred from this first slice. `overlap` is currently `skip`; `catchUp` supports `latest` and `none`. `schedule.run-due` is the headless external-launcher seam. Calendar recurrence, cron, and the schedule inspector are deferred from this first safe slice. Definitions, bounded history, append-only events, and per-run receipts remain project-scoped across Pi sessions.
+`schedule.create` accepts exactly one target, `workflowScript`, and exactly one trigger (`at`, or a fixed `every` interval using `m`, `h`, `d`, or `w`). Runs always launch async with fresh context and no automatic mission; mission attachment is deferred from this first slice. `overlap` is currently `skip`; `catchUp` supports `latest` and `none`. With `none`, restoration and explicit due scans skip missed work; late delivery of a genuinely armed, still-current occurrence does not cancel that occurrence. Automatic recurrence advancement must fit the supported date range before claiming work. A future-advancement error is diagnosed but cannot suppress an already-known child outcome; failure to persist that outcome keeps completion observation owned and reports both failures. `schedule.run-due` is the headless external-launcher seam. Calendar recurrence, cron, and the schedule inspector are deferred from this first safe slice. Definitions, bounded history, append-only events, and per-run receipts remain project-scoped across Pi sessions.
 
 Humans can use `/subagents-doctor` for the same read-only report. It checks runtime paths, discovery counts, async support, current session context, and intercom bridge state.
 

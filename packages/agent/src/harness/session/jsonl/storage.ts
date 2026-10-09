@@ -48,10 +48,11 @@ async function publishFileAtomically(
 export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata> {
 	private readonly fs: JsonlSessionRepoFileSystem;
 	private readonly metadata: JsonlSessionMetadata;
-	private readonly state = new SessionState();
+	private state = new SessionState();
 	private tail: Promise<void> = Promise.resolve();
 	private acknowledgedContent: string;
 	private recoveryError: SessionError | undefined;
+	private deleted = false;
 
 	private constructor(fs: JsonlSessionRepoFileSystem, metadata: JsonlSessionMetadata, content: string) {
 		this.fs = fs;
@@ -70,8 +71,21 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 		return new JsonlSessionStorage(fs, metadataFromHeader(header, path, fileInfo.mtimeMs), content);
 	}
 
-	static async load(fs: JsonlSessionRepoFileSystem, path: string): Promise<JsonlSessionStorage> {
+	static async load(
+		fs: JsonlSessionRepoFileSystem,
+		path: string,
+		acknowledgedPrefix?: string,
+	): Promise<JsonlSessionStorage> {
 		const content = fileResult(await fs.readTextFile(path), `Failed to read session ${path}`);
+		// Never repair or import a replacement that removed an acknowledged write.
+		// A missing final newline is the only allowed change to the accepted prefix.
+		if (
+			acknowledgedPrefix !== undefined &&
+			!content.startsWith(acknowledgedPrefix) &&
+			content !== acknowledgedPrefix.slice(0, -1)
+		) {
+			throw new SessionError("invalid_entry", `Acknowledged session prefix changed: ${path}`);
+		}
 		const physicalLines = content.split("\n");
 		if (physicalLines.at(-1) === "") physicalLines.pop();
 		if (physicalLines.length === 0 || !physicalLines[0]) {
@@ -117,6 +131,30 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 		return storage;
 	}
 
+	/** Validate/replay disk under the writer queue without creating a second writer. */
+	reopen(): Promise<void> {
+		return this.enqueue(async () => {
+			try {
+				const loaded = await JsonlSessionStorage.load(this.fs, this.metadata.path, this.acknowledgedContent);
+				this.state = loaded.state;
+				Object.assign(this.metadata, loaded.metadata);
+				this.acknowledgedContent = loaded.acknowledgedContent;
+				this.recoveryError = undefined;
+			} catch (error) {
+				// Once an open has observed damage, old handles cannot safely append.
+				this.recoveryError =
+					error instanceof SessionError
+						? error
+						: new SessionError(
+								"storage",
+								`Failed to reopen session ${this.metadata.path}`,
+								error instanceof Error ? error : undefined,
+							);
+				throw error;
+			}
+		}, true);
+	}
+
 	async fork(path: string, header: JsonlV4Header, options: ForkOptions): Promise<JsonlSessionStorage> {
 		// Snapshot under the same queue as appends; never replay/repair a live writer's file.
 		const mutations = await this.enqueue(async () => this.state.createForkMutations(options));
@@ -128,6 +166,17 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 			}
 		});
 		return JsonlSessionStorage.load(this.fs, path);
+	}
+
+	/** Remove under the writer queue, then seal mutations while retaining readable history. */
+	delete(): Promise<void> {
+		return this.enqueue(async () => {
+			fileResult(
+				await this.fs.remove(this.metadata.path, { force: true }),
+				`Failed to delete session ${this.metadata.path}`,
+			);
+			this.deleted = true;
+		}, true);
 	}
 
 	async drain(): Promise<void> {
@@ -266,9 +315,10 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 		return structuredClone(this.state.getStats());
 	}
 
-	private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+	private enqueue<T>(operation: () => Promise<T>, reopening = false): Promise<T> {
 		const result = this.tail.then(() => {
-			if (this.recoveryError) throw this.recoveryError;
+			if (this.deleted) throw new SessionError("not_found", `Session was deleted: ${this.metadata.id}`);
+			if (this.recoveryError && !reopening) throw this.recoveryError;
 			return operation();
 		});
 		this.tail = result.then(

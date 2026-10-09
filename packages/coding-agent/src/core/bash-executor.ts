@@ -7,12 +7,12 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { createWriteStream, type WriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stripAnsi } from "../utils/ansi.ts";
 import { sanitizeBinaryOutput } from "../utils/shell.ts";
 import type { BashOperations } from "./tools/bash.ts";
+import { OutputSpool } from "./tools/output-spool.ts";
 import { DEFAULT_MAX_BYTES, truncateTail } from "./tools/truncate.ts";
 
 // ============================================================================
@@ -57,41 +57,23 @@ export async function executeBashWithOperations(
 	let outputBytes = 0;
 	const maxOutputBytes = DEFAULT_MAX_BYTES * 2;
 
-	let tempFilePath: string | undefined;
-	let tempFileStream: WriteStream | undefined;
+	let spool: OutputSpool | undefined;
 	let totalBytes = 0;
 
 	const ensureTempFile = () => {
-		if (tempFilePath) {
-			return;
-		}
+		if (spool) return;
 		const id = randomBytes(8).toString("hex");
-		tempFilePath = join(tmpdir(), `pi-bash-${id}.log`);
-		tempFileStream = createWriteStream(tempFilePath);
+		spool = new OutputSpool(join(tmpdir(), `pi-bash-${id}.log`));
 		for (const chunk of outputChunks) {
-			tempFileStream.write(chunk);
+			spool.write(chunk);
 		}
-	};
-
-	// Close the temp file and await the write stream draining BEFORE exposing
-	// fullOutputPath. Without this, a caller reading the returned path can read a
-	// file that is still being written (worst case on the abort path).
-	const endTempFile = (): Promise<void> => {
-		if (!tempFileStream) return Promise.resolve();
-		const stream = tempFileStream;
-		tempFileStream = undefined;
-		if (stream.writableEnded) return Promise.resolve();
-		return new Promise<void>((resolve) => {
-			const done = (): void => resolve();
-			stream.once("finish", done);
-			stream.once("error", done);
-			stream.end();
-		});
 	};
 
 	const decoder = new TextDecoder();
+	let acceptingOutput = true;
 
 	const onData = (data: Buffer) => {
+		if (!acceptingOutput) return;
 		totalBytes += data.length;
 
 		// Sanitize: strip ANSI, replace binary garbage, normalize newlines
@@ -102,9 +84,7 @@ export async function executeBashWithOperations(
 			ensureTempFile();
 		}
 
-		if (tempFileStream) {
-			tempFileStream.write(text);
-		}
+		spool?.write(text);
 
 		// Keep rolling buffer
 		outputChunks.push(text);
@@ -120,47 +100,43 @@ export async function executeBashWithOperations(
 		}
 	};
 
+	let exitCode: number | null;
 	try {
-		const result = await operations.exec(command, cwd, {
-			onData,
-			signal: options?.signal,
-		});
-
+		const result = await operations.exec(command, cwd, { onData, signal: options?.signal });
+		acceptingOutput = false;
+		exitCode = result.exitCode;
+	} catch (err) {
+		acceptingOutput = false;
 		const fullOutput = outputChunks.join("");
 		const truncationResult = truncateTail(fullOutput);
-		if (truncationResult.truncated) {
-			ensureTempFile();
+		if (options?.signal?.aborted && truncationResult.truncated) ensureTempFile();
+		try {
+			await spool?.close();
+		} catch (spoolError) {
+			throw new AggregateError([err, spoolError], "Command execution and output persistence failed", { cause: err });
 		}
-		await endTempFile();
-		const cancelled = options?.signal?.aborted ?? false;
-
+		if (!options?.signal?.aborted) throw err;
 		return {
 			output: truncationResult.truncated ? truncationResult.content : fullOutput,
-			exitCode: cancelled ? undefined : (result.exitCode ?? undefined),
-			cancelled,
+			exitCode: undefined,
+			cancelled: true,
 			truncated: truncationResult.truncated,
-			fullOutputPath: tempFilePath,
+			fullOutputPath: spool?.getPath(),
 		};
-	} catch (err) {
-		// Check if it was an abort
-		if (options?.signal?.aborted) {
-			const fullOutput = outputChunks.join("");
-			const truncationResult = truncateTail(fullOutput);
-			if (truncationResult.truncated) {
-				ensureTempFile();
-			}
-			await endTempFile();
-			return {
-				output: truncationResult.truncated ? truncationResult.content : fullOutput,
-				exitCode: undefined,
-				cancelled: true,
-				truncated: truncationResult.truncated,
-				fullOutputPath: tempFilePath,
-			};
-		}
-
-		await endTempFile();
-
-		throw err;
 	}
+
+	const fullOutput = outputChunks.join("");
+	const truncationResult = truncateTail(fullOutput);
+	if (truncationResult.truncated) ensureTempFile();
+	// Artifact failure is not cancellation success, even if cancellation raced
+	// successful command completion. Close outside the command-error boundary.
+	await spool?.close();
+	const cancelled = options?.signal?.aborted ?? false;
+	return {
+		output: truncationResult.truncated ? truncationResult.content : fullOutput,
+		exitCode: cancelled ? undefined : (exitCode ?? undefined),
+		cancelled,
+		truncated: truncationResult.truncated,
+		fullOutputPath: spool?.getPath(),
+	};
 }

@@ -515,6 +515,7 @@ export class Editor implements Component, Focusable {
 			const draft = this.historyDraft;
 			this.historyDraft = null;
 			if (draft) {
+				this.clearSelection();
 				this.state = draft;
 				this.preferredVisualCol = null;
 				this.snappedFromCursorCol = null;
@@ -535,6 +536,7 @@ export class Editor implements Component, Focusable {
 
 	/** Internal setText that doesn't reset history state - used by navigateHistory */
 	private setTextInternal(text: string, cursorPlacement: "start" | "end" = "end"): void {
+		this.clearSelection();
 		const lines = text.split("\n");
 		this.state.lines = lines.length === 0 ? [""] : lines;
 		this.state.cursorLine = cursorPlacement === "start" ? 0 : this.state.lines.length - 1;
@@ -1244,6 +1246,67 @@ export class Editor implements Component, Focusable {
 		return this.expandPasteMarkers(this.state.lines.join("\n"));
 	}
 
+	/**
+	 * Drop registry entries whose owning marker is gone, then renumber the
+	 * survivors so ids stay dense. Runs after marker text is removed by
+	 * backspace, forward delete, or selection cut.
+	 *
+	 * A marker-shaped run only owns its entry while a byte-identical
+	 * `[paste #id <size>]` remains in the buffer. Lookalike text the user
+	 * typed deletes as plain text and never drops the real payload; a real
+	 * marker that is partially deleted stops matching and releases its entry
+	 * the same way. Surviving entries keep insertion order and take ids
+	 * 1..n, and only markers that were owned before the rewrite are
+	 * renumbered, so renumbering can never promote a lookalike into an
+	 * owned marker.
+	 */
+	private prunePasteRegistry(): void {
+		if (this.pastes.size === 0) return;
+		const text = this.state.lines.join("\n");
+		const alive = new Set<number>();
+		for (const match of text.matchAll(PASTE_MARKER_REGEX)) {
+			const id = Number(match[1]);
+			const content = this.pastes.get(id);
+			if (content !== undefined && match[0] === expectedPasteMarker(id, content)) alive.add(id);
+		}
+		const orphaned = [...this.pastes.keys()].some((id) => !alive.has(id));
+		if (!orphaned) return;
+
+		const idMap = new Map<number, number>();
+		const surviving = new Map<number, string>();
+		for (const id of [...this.pastes.keys()].sort((a, b) => a - b)) {
+			if (!alive.has(id)) continue;
+			const nextId = idMap.size + 1;
+			idMap.set(id, nextId);
+			surviving.set(nextId, this.pastes.get(id)!);
+		}
+		const oldContents = this.pastes;
+		this.pastes = surviving;
+		this.pasteCounter = idMap.size;
+
+		const cursorLine = this.state.cursorLine;
+		const cursorCol = this.state.cursorCol;
+		const renumberLine = (line: string) =>
+			line.replace(PASTE_MARKER_REGEX, (fullMatch, idGroup: string, suffixGroup: string) => {
+				const oldId = Number(idGroup);
+				const mapped = idMap.get(oldId);
+				const content = oldContents.get(oldId);
+				if (mapped === undefined || content === undefined || fullMatch !== expectedPasteMarker(oldId, content)) {
+					return fullMatch;
+				}
+				return `[paste #${mapped}${suffixGroup}]`;
+			});
+		this.state.lines = this.state.lines.map((line, i) => {
+			// A surviving marker before the cursor can shrink when its id
+			// crosses a digit boundary (e.g. #10 -> #9); keep the cursor
+			// anchored to the same text.
+			if (i === cursorLine && cursorCol > 0) {
+				this.state.cursorCol = renumberLine(line.slice(0, cursorCol)).length;
+			}
+			return renumberLine(line);
+		});
+	}
+
 	getLines(): string[] {
 		return [...this.state.lines];
 	}
@@ -1370,8 +1433,6 @@ export class Editor implements Component, Focusable {
 		this.pushUndoSnapshot();
 		this.lastAction = null;
 		this.exitHistoryBrowsing();
-		// Typing over a selection replaces it rather than appending at the cursor.
-		if (this.hasSelection()) this.deleteSelection();
 		this.insertTextAtCursorInternal(text);
 	}
 
@@ -1388,6 +1449,18 @@ export class Editor implements Component, Focusable {
 		const anchor = this.selectionAnchor;
 		const focus = this.selectionFocus;
 		if (!anchor || !focus) return null;
+		for (const position of [anchor, focus]) {
+			const line = this.state.lines[position.line];
+			if (
+				!Number.isInteger(position.line) ||
+				!Number.isInteger(position.col) ||
+				line === undefined ||
+				position.col < 0 ||
+				position.col > line.length
+			) {
+				return null;
+			}
+		}
 		const start = comparePositions(anchor, focus) <= 0 ? anchor : focus;
 		const end = comparePositions(anchor, focus) <= 0 ? focus : anchor;
 		if (start.line === end.line && start.col === end.col) return null;
@@ -1425,6 +1498,18 @@ export class Editor implements Component, Focusable {
 	 * to their normal single-character behaviour.
 	 */
 	deleteSelection(): boolean {
+		if (!this.hasSelection()) return false;
+		this.cancelAutocomplete();
+		this.exitHistoryBrowsing();
+		this.lastAction = null;
+		this.pushUndoSnapshot();
+		this.deleteSelectionInternal();
+		this.onChange?.(this.getText());
+		return true;
+	}
+
+	/** Buffer-only removal used inside a replacement's single undo/notification unit. */
+	private deleteSelectionInternal(): boolean {
 		const range = this.selectionRange();
 		if (!range) return false;
 		const { start, end } = range;
@@ -1443,6 +1528,7 @@ export class Editor implements Component, Focusable {
 		this.state.cursorLine = start.line;
 		this.setCursorCol(start.col);
 		this.clearSelection();
+		this.prunePasteRegistry();
 		return true;
 	}
 
@@ -1500,6 +1586,7 @@ export class Editor implements Component, Focusable {
 	 */
 	private insertTextAtCursorInternal(text: string): void {
 		if (!text) return;
+		this.deleteSelectionInternal();
 
 		// Normalize line endings and tabs
 		const normalized = this.normalizeText(text);
@@ -1551,10 +1638,14 @@ export class Editor implements Component, Focusable {
 		// - Each space is separately undoable
 		// Skip coalescing when called from atomic operations (e.g., handlePaste)
 		if (!skipUndoCoalescing) {
-			if (isWhitespaceChar(char) || this.lastAction !== "type-word") {
+			if (this.hasSelection() || isWhitespaceChar(char) || this.lastAction !== "type-word") {
 				this.pushUndoSnapshot();
 			}
 			this.lastAction = "type-word";
+		}
+		if (this.hasSelection()) {
+			this.cancelAutocomplete();
+			this.deleteSelectionInternal();
 		}
 
 		const line = this.state.lines[this.state.cursorLine] || "";
@@ -1632,6 +1723,9 @@ export class Editor implements Component, Focusable {
 			.filter((char) => char === "\n" || char.charCodeAt(0) >= 32)
 			.join("");
 
+		if (!filteredText) return;
+		this.deleteSelectionInternal();
+
 		// If pasting a file path (starts with /, ~, or .) and the character before
 		// the cursor is a word character, prepend a space for better readability
 		if (/^[/~.]/.test(filteredText)) {
@@ -1678,6 +1772,7 @@ export class Editor implements Component, Focusable {
 		this.lastAction = null;
 
 		this.pushUndoSnapshot();
+		this.deleteSelectionInternal();
 
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
 
@@ -1712,6 +1807,7 @@ export class Editor implements Component, Focusable {
 		this.cancelAutocomplete();
 		const result = this.expandPasteMarkers(this.state.lines.join("\n")).trim();
 
+		this.clearSelection();
 		this.state = { lines: [""], cursorLine: 0, cursorCol: 0 };
 		this.pastes.clear();
 		this.pasteCounter = 0;
@@ -1729,57 +1825,26 @@ export class Editor implements Component, Focusable {
 		this.lastAction = null;
 
 		// A live selection is the deletion target; the cursor position is ignored.
-		if (this.hasSelection()) {
-			this.pushUndoSnapshot();
-			this.deleteSelection();
-			return;
-		}
+		if (this.deleteSelection()) return;
 
 		if (this.state.cursorCol > 0) {
 			this.pushUndoSnapshot();
 
 			// Delete grapheme before cursor (handles emojis, combining characters, etc.)
-			let line = this.state.lines[this.state.cursorLine] || "";
+			const line = this.state.lines[this.state.cursorLine] || "";
 			const beforeCursor = line.slice(0, this.state.cursorCol);
 
 			// Find the last grapheme in the text before cursor
 			const graphemes = [...this.segment(beforeCursor, "grapheme")];
 			const lastGrapheme = graphemes[graphemes.length - 1];
 			const graphemeLength = lastGrapheme ? lastGrapheme.segment.length : 1;
-			const isPastedSegmented = PASTE_MARKER_SINGLE.exec(lastGrapheme.segment);
-
-			if (isPastedSegmented) {
-				// This contains the id part e.g 4 from [paste #4 +123 lines]
-				const targetId = Number(isPastedSegmented[1]);
-				this.pastes.delete(targetId);
-				this.pasteCounter--;
-
-				// Shift registry entries down in ascending id order, independent
-				// of marker order in the text ([paste #3] becomes [paste #2] when
-				// [paste #1] is removed).
-				const higherIds = [...this.pastes.keys()].filter((id) => id > targetId).sort((a, b) => a - b);
-				for (const id of higherIds) {
-					this.pastes.set(id - 1, this.pastes.get(id)!);
-					this.pastes.delete(id);
-				}
-
-				// Renumber markers with ids greater than the removed one.
-				this.state.lines = this.state.lines.map((line) =>
-					line.replace(PASTE_MARKER_REGEX, (fullMatch, idGroup, suffixGroup) => {
-						const x = Number(idGroup);
-						if (x <= targetId) return fullMatch;
-						return `[paste #${x - 1}${suffixGroup}]`;
-					}),
-				);
-			}
-
-			line = this.state.lines[this.state.cursorLine] || "";
 
 			const before = line.slice(0, this.state.cursorCol - graphemeLength);
 			const after = line.slice(this.state.cursorCol);
 
 			this.state.lines[this.state.cursorLine] = before + after;
 			this.setCursorCol(this.state.cursorCol - graphemeLength);
+			this.prunePasteRegistry();
 		} else if (this.state.cursorLine > 0) {
 			this.pushUndoSnapshot();
 
@@ -1845,29 +1910,60 @@ export class Editor implements Component, Focusable {
 		let currentVisualCol: number;
 		if (this.snappedFromCursorCol !== null) {
 			const vlIndex = this.findVisualLineAt(visualLines, currentVL.logicalLine, this.snappedFromCursorCol);
-			currentVisualCol = this.snappedFromCursorCol - visualLines[vlIndex].startCol;
+			currentVisualCol = visibleWidth(
+				(this.state.lines[currentVL.logicalLine] || "").slice(
+					visualLines[vlIndex].startCol,
+					this.snappedFromCursorCol,
+				),
+			);
 		} else {
-			currentVisualCol = this.state.cursorCol - currentVL.startCol;
+			currentVisualCol = visibleWidth(
+				(this.state.lines[currentVL.logicalLine] || "").slice(currentVL.startCol, this.state.cursorCol),
+			);
 		}
 
 		// For non-last segments, clamp to length-1 to stay within the segment
 		const isLastSourceSegment =
 			currentVisualLine === visualLines.length - 1 ||
 			visualLines[currentVisualLine + 1]?.logicalLine !== currentVL.logicalLine;
-		const sourceMaxVisualCol = isLastSourceSegment ? currentVL.length : Math.max(0, currentVL.length - 1);
+		const sourceText = (this.state.lines[currentVL.logicalLine] || "").slice(
+			currentVL.startCol,
+			currentVL.startCol + currentVL.length,
+		);
+		const sourceEnd = isLastSourceSegment
+			? sourceText.length
+			: ([...graphemeSegmenter.segment(sourceText)].at(-1)?.index ?? 0);
+		const sourceMaxVisualCol = visibleWidth(sourceText.slice(0, sourceEnd));
 
 		const isLastTargetSegment =
 			targetVisualLine === visualLines.length - 1 ||
 			visualLines[targetVisualLine + 1]?.logicalLine !== targetVL.logicalLine;
-		const targetMaxVisualCol = isLastTargetSegment ? targetVL.length : Math.max(0, targetVL.length - 1);
+		const targetText = (this.state.lines[targetVL.logicalLine] || "").slice(
+			targetVL.startCol,
+			targetVL.startCol + targetVL.length,
+		);
+		const targetEnd = isLastTargetSegment
+			? targetText.length
+			: ([...graphemeSegmenter.segment(targetText)].at(-1)?.index ?? 0);
+		const targetMaxVisualCol = visibleWidth(targetText.slice(0, targetEnd));
 
 		const moveToVisualCol = this.computeVerticalMoveColumn(currentVisualCol, sourceMaxVisualCol, targetMaxVisualCol);
 
 		// Set cursor position
 		this.state.cursorLine = targetVL.logicalLine;
-		const targetCol = targetVL.startCol + moveToVisualCol;
+		let targetOffset = 0;
+		let cells = 0;
+		let distance = moveToVisualCol;
+		for (const segment of graphemeSegmenter.segment(targetText.slice(0, targetEnd))) {
+			cells += visibleWidth(segment.segment);
+			const nextDistance = Math.abs(cells - moveToVisualCol);
+			if (nextDistance < distance) {
+				distance = nextDistance;
+				targetOffset = segment.index + segment.segment.length;
+			}
+		}
 		const logicalLine = this.state.lines[targetVL.logicalLine] || "";
-		this.state.cursorCol = Math.min(targetCol, logicalLine.length);
+		this.state.cursorCol = Math.min(targetVL.startCol + targetOffset, logicalLine.length);
 
 		// Snap cursor to atomic segment boundary (e.g. paste markers)
 		// so the cursor never lands in the middle of a multi-grapheme unit.
@@ -2135,11 +2231,7 @@ export class Editor implements Component, Focusable {
 		this.lastAction = null;
 
 		// A live selection is the deletion target; the cursor position is ignored.
-		if (this.hasSelection()) {
-			this.pushUndoSnapshot();
-			this.deleteSelection();
-			return;
-		}
+		if (this.deleteSelection()) return;
 
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
 
@@ -2157,6 +2249,7 @@ export class Editor implements Component, Focusable {
 			const before = currentLine.slice(0, this.state.cursorCol);
 			const after = currentLine.slice(this.state.cursorCol + graphemeLength);
 			this.state.lines[this.state.cursorLine] = before + after;
+			this.prunePasteRegistry();
 		} else if (this.state.cursorLine < this.state.lines.length - 1) {
 			this.pushUndoSnapshot();
 
@@ -2283,7 +2376,7 @@ export class Editor implements Component, Focusable {
 					// At end of last line - can't move, but set preferredVisualCol for up/down navigation
 					const currentVL = visualLines[currentVisualLine];
 					if (currentVL) {
-						this.preferredVisualCol = this.state.cursorCol - currentVL.startCol;
+						this.preferredVisualCol = visibleWidth(currentLine.slice(currentVL.startCol, this.state.cursorCol));
 					}
 				}
 			} else {
@@ -2480,8 +2573,10 @@ export class Editor implements Component, Focusable {
 
 	private undo(): void {
 		this.exitHistoryBrowsing();
+		this.cancelAutocomplete();
 		const snapshot = this.undoStack.pop();
 		if (!snapshot) return;
+		this.clearSelection();
 		Object.assign(this.state, snapshot.state);
 		this.pastes = snapshot.pastes;
 		this.pasteCounter = snapshot.pasteCounter;
@@ -2815,6 +2910,7 @@ export class Editor implements Component, Focusable {
 		try {
 			const result = apply();
 			if (!result || !Array.isArray(result.lines)) throw new Error("applyCompletion returned no lines");
+			this.clearSelection();
 			this.state.lines = result.lines;
 			this.state.cursorLine = result.cursorLine;
 			this.setCursorCol(result.cursorCol);

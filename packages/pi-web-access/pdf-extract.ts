@@ -348,12 +348,18 @@ async function writeMarkdownResult(options: {
 	}
 
 	const content = lines.join("\n");
-	const outputFilename =
-		options.filename || sanitizeFilename(options.title) + ".md";
-	const outputPath = join(options.outputDir, outputFilename);
 
 	await mkdir(options.outputDir, { recursive: true });
-	await writeFile(outputPath, content, "utf-8");
+	// An explicit filename stays caller-controlled and may overwrite; generated
+	// names must not: every returned artifact has to keep containing the document
+	// it was returned for, so derive a fresh unique name with exclusive create.
+	let outputPath: string;
+	if (options.filename) {
+		outputPath = join(options.outputDir, options.filename);
+		await writeFile(outputPath, content, "utf-8");
+	} else {
+		outputPath = await writeUnique(options.outputDir, sanitizeFilename(options.title) || "document", content);
+	}
 
 	return {
 		title: options.title,
@@ -361,6 +367,19 @@ async function writeMarkdownResult(options: {
 		chars: content.length,
 		outputPath,
 	};
+}
+
+async function writeUnique(dir: string, baseName: string, content: string): Promise<string> {
+	for (let i = 0; i < 100; i++) {
+		const outputPath = join(dir, i === 0 ? `${baseName}.md` : `${baseName}-${i}.md`);
+		try {
+			await writeFile(outputPath, content, { encoding: "utf-8", flag: "wx" });
+			return outputPath;
+		} catch (err) {
+			if ((err as { code?: string }).code !== "EEXIST") throw err;
+		}
+	}
+	throw new Error(`Could not create a unique PDF artifact in ${dir}`);
 }
 
 function countPageMarkers(markdown: string): number {

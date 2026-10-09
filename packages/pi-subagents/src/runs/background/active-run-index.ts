@@ -27,23 +27,29 @@ function markerPath(asyncDir: string): string {
 	return path.join(indexDir(path.dirname(asyncDir)), path.basename(asyncDir));
 }
 
-function removeEmptyAncestors(start: string, stop: string): void {
+function removeEmptyAncestors(start: string, stop: string, strictCleanup: boolean): void {
 	let current = start;
 	while (current !== stop && current.startsWith(`${stop}${path.sep}`)) {
 		try {
 			fs.rmdirSync(current);
-		} catch {
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (strictCleanup && code !== "ENOENT" && code !== "ENOTDIR" && code !== "ENOTEMPTY" && code !== "EEXIST") throw error;
 			return;
 		}
 		current = path.dirname(current);
 	}
 }
 
+function throwCleanupFailures(errors: unknown[], operation: string): void {
+	if (errors.length > 0) throw new AggregateError(errors, `${operation}: ${errors.map((error) => error instanceof Error ? error.message : String(error)).join("; ")}`);
+}
+
 export function isActiveAsyncState(state: AsyncStatus["state"]): boolean {
 	return state === "queued" || state === "running";
 }
 
-function releaseToolCallAliases(asyncDir: string): void {
+function releaseToolCallAliases(asyncDir: string, strictCleanup: boolean): void {
 	const root = path.join(indexDir(path.dirname(asyncDir)), TOOL_CALL_INDEX_DIR);
 	let entries: fs.Dirent[];
 	try {
@@ -51,32 +57,47 @@ function releaseToolCallAliases(asyncDir: string): void {
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
 		if (code !== "ENOENT" && code !== "ENOTDIR") {
+			if (strictCleanup) throw error;
 			console.error(`Failed to inspect async active-run tool-call index root '${root}':`, error);
 		}
 		return;
 	}
+	const errors: unknown[] = [];
 	for (const entry of entries) {
 		if (!entry.isDirectory()) continue;
 		const aliasMarker = path.join(root, entry.name, path.basename(asyncDir));
 		try {
 			fs.rmSync(aliasMarker, { force: true });
-			removeEmptyAncestors(path.dirname(aliasMarker), root);
-		} catch {
-			// Alias cleanup must not affect the authoritative active-run marker.
+			removeEmptyAncestors(path.dirname(aliasMarker), root, strictCleanup);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (strictCleanup && code !== "ENOENT" && code !== "ENOTDIR") errors.push(error);
+			// Ordinary aliases are advisory. Strict cleanup attempts every owned alias.
 		}
 	}
+	throwCleanupFailures(errors, `Failed to remove async tool-call aliases for '${asyncDir}'`);
 }
 
-export function releaseActiveRunIndex(asyncDir: string): void {
+export function releaseActiveRunIndex(asyncDir: string, options: { strictCleanup?: boolean } = {}): void {
+	const errors: unknown[] = [];
 	try {
 		fs.rmSync(markerPath(asyncDir));
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code !== "ENOENT" && !(options.strictCleanup && code === "ENOTDIR")) {
+			if (!options.strictCleanup) throw error;
+			errors.push(error);
+		}
 	}
-	releaseToolCallAliases(asyncDir);
+	try {
+		releaseToolCallAliases(asyncDir, options.strictCleanup === true);
+	} catch (error) {
+		errors.push(error);
+	}
+	throwCleanupFailures(errors, `Failed to release async active-run index for '${asyncDir}'`);
 }
 
-export function updateActiveRunIndex(asyncDir: string, state: AsyncStatus["state"], toolCallId?: string, options: { retryCapacityErrors?: boolean } = {}): void {
+export function updateActiveRunIndex(asyncDir: string, state: AsyncStatus["state"], toolCallId?: string, options: { retryCapacityErrors?: boolean; strictCleanup?: boolean } = {}): void {
 	const marker = markerPath(asyncDir);
 	if (isActiveAsyncState(state)) {
 		fs.mkdirSync(path.dirname(marker), { recursive: true });
@@ -94,16 +115,30 @@ export function updateActiveRunIndex(asyncDir: string, state: AsyncStatus["state
 		}
 		return;
 	}
-	releaseActiveRunIndex(asyncDir);
-	const status = readStatus(asyncDir);
-	if (status && status.state === state) {
-		try {
-			updateTerminalRunIndex(asyncDir, status);
-		} catch (error) {
-			if (options.retryCapacityErrors && isStorageCapacityError(error)) throw error;
-			console.error(`Failed to write async terminal-run index for '${asyncDir}':`, error);
-		}
+	const errors: unknown[] = [];
+	try {
+		releaseActiveRunIndex(asyncDir, options);
+	} catch (error) {
+		if (!options.strictCleanup) throw error;
+		errors.push(error);
 	}
+	try {
+		const status = readStatus(asyncDir);
+		if (status && status.state === state) {
+			try {
+				updateTerminalRunIndex(asyncDir, status);
+			} catch (error) {
+				if (options.strictCleanup || (options.retryCapacityErrors && isStorageCapacityError(error))) throw error;
+				console.error(`Failed to write async terminal-run index for '${asyncDir}':`, error);
+			}
+		} else if (options.strictCleanup) {
+			throw new Error(`Cannot publish async terminal-run index for '${asyncDir}': status is ${status ? status.state : "missing"}, expected ${state}.`);
+		}
+	} catch (error) {
+		if (!options.strictCleanup) throw error;
+		errors.push(error);
+	}
+	throwCleanupFailures(errors, `Failed to update async terminal-run index for '${asyncDir}'`);
 }
 
 export function activeRunMarkerAgeMs(asyncDir: string, now = Date.now()): number | undefined {

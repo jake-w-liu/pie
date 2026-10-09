@@ -65,6 +65,25 @@ describe("node HTTP proxy resolution", () => {
 		).toBe("http://scoped-proxy.example:8080/");
 	});
 
+	it.each([
+		"http://audit-user:audit-secret@proxy.example:bad",
+		"http://audit-user:audit-secret@[broken",
+		"http://audit-user:audit-secret@",
+	])("redacts malformed authenticated proxy configuration", (proxy) => {
+		resetProxyEnv();
+		let failure: unknown;
+		try {
+			resolveHttpProxyUrlForTarget("https://api.example", { HTTPS_PROXY: proxy });
+		} catch (error) {
+			failure = error;
+		}
+		expect(failure).toBeInstanceOf(Error);
+		expect(String(failure)).toContain("Invalid proxy URL");
+		expect(String(failure)).not.toContain("audit-user");
+		expect(String(failure)).not.toContain("audit-secret");
+		expect(String(failure)).not.toContain(proxy);
+	});
+
 	it("rejects SOCKS and PAC proxy URLs explicitly", () => {
 		resetProxyEnv();
 		process.env.HTTPS_PROXY = "socks5://proxy.example:1080";

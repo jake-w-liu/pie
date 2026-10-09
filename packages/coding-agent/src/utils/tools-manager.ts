@@ -299,18 +299,19 @@ async function downloadTool(tool: "fd" | "rg"): Promise<string> {
 	const binaryExt = plat === "win32" ? ".exe" : "";
 	const binaryPath = join(TOOLS_DIR, config.binaryName + binaryExt);
 
-	// Download
-	await downloadFile(downloadUrl, archivePath);
-
 	// Extract into a unique temp directory. fd and rg downloads can run concurrently
 	// during startup, so sharing a fixed directory causes races.
 	const extractDir = join(
 		TOOLS_DIR,
 		`extract_tmp_${config.binaryName}_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
 	);
-	mkdirSync(extractDir, { recursive: true });
 
 	try {
+		// Download and extraction-directory creation sit inside the cleanup scope:
+		// a body/write/mkdir failure must not leave the partial archive behind.
+		await downloadFile(downloadUrl, archivePath);
+		mkdirSync(extractDir, { recursive: true });
+
 		if (assetName.endsWith(".tar.gz")) {
 			extractTarGzArchive(archivePath, extractDir, assetName);
 		} else if (assetName.endsWith(".zip")) {

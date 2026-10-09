@@ -18,6 +18,7 @@ import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
+import { lazyStream } from "./lazy.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
@@ -171,24 +172,29 @@ export const streamSimple: StreamFunction<"azure-openai-responses", SimpleStream
 	model: Model<"azure-openai-responses">,
 	context: Context,
 	options?: SimpleStreamOptions,
-): AssistantMessageEventStream => {
-	const apiKey = options?.apiKey;
-	if (!apiKey) {
-		throw new Error(`No API key for provider: ${model.provider}`);
-	}
+): AssistantMessageEventStream =>
+	lazyStream(
+		model,
+		async () => {
+			const apiKey = options?.apiKey;
+			if (!apiKey) {
+				throw new Error(`No API key for provider: ${model.provider}`);
+			}
 
-	const base = {
-		...buildBaseOptions(model, context, options, apiKey),
-		toolChoice: options?.toolChoice,
-	} satisfies AzureOpenAIResponsesOptions;
-	const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
-	const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
+			const base = {
+				...buildBaseOptions(model, context, options, apiKey),
+				toolChoice: options?.toolChoice,
+			} satisfies AzureOpenAIResponsesOptions;
+			const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
+			const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
 
-	return stream(model, context, {
-		...base,
-		reasoningEffort,
-	} satisfies AzureOpenAIResponsesOptions);
-};
+			return stream(model, context, {
+				...base,
+				reasoningEffort,
+			} satisfies AzureOpenAIResponsesOptions);
+		},
+		options?.signal,
+	);
 
 function normalizeAzureBaseUrl(baseUrl: string): string {
 	const trimmed = baseUrl.trim().replace(/\/+$/, "");

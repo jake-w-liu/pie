@@ -5,7 +5,7 @@ import { basename, dirname, extname, join, resolve as resolvePath, sep as pathSe
 import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent } from "./extract.ts";
 import { checkGhAvailable, checkRepoSize, fetchViaApi, showGhHint } from "./github-api.ts";
-import { getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
+import { getWebSearchConfigPath, jsonParseDiagnostic, proxyChildEnv } from "./utils.ts";
 
 const CONFIG_PATH = getWebSearchConfigPath();
 
@@ -283,12 +283,12 @@ function execClone(args: string[], destination: CloneDestination, timeoutMs: num
 
 		const child = spawn(args[0], args.slice(1), {
 			detached: process.platform !== "win32",
-			env: {
+			env: proxyChildEnv({
 				...process.env,
 				GIT_TERMINAL_PROMPT: "0",
 				GCM_INTERACTIVE: "Never",
 				GH_PROMPT_DISABLED: "1",
-			},
+			}),
 			stdio: "ignore",
 			windowsHide: true,
 		});

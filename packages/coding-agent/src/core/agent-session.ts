@@ -349,7 +349,15 @@ export class AgentSession {
 
 	// Bash execution state
 	private readonly _bashAbortControllers = new Set<AbortController>();
+	/**
+	 * In-flight executeBash operations, including their recordBashResult write.
+	 * Teardown awaits this set so a cancelled command cannot land on a session
+	 * manager that has already been handed to the replacement.
+	 */
+	private readonly _pendingBashOperations = new Set<Promise<unknown>>();
 	private _pendingBashMessages: BashExecutionMessage[] = [];
+	/** Set by dispose(): late Bash completions must not mutate a reused session manager. */
+	private _disposed = false;
 
 	// Extension system
 	private _extensionRunner!: ExtensionRunner;
@@ -653,7 +661,9 @@ export class AgentSession {
 
 	/** Emit an event to all listeners */
 	private _emit(event: AgentSessionEvent): void {
-		for (const l of this._eventListeners) {
+		// Snapshot: a listener that unsubscribes itself mid-dispatch must not shift
+		// the live array under the iterator and skip the next listener.
+		for (const l of [...this._eventListeners]) {
 			l(event);
 		}
 	}
@@ -946,6 +956,7 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		this._disposed = true;
 		try {
 			this.abortRetry();
 			this.abortCompaction();
@@ -3119,6 +3130,20 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
 	): Promise<BashResult> {
+		const operation = this.executeBashOperation(command, onChunk, options);
+		this._pendingBashOperations.add(operation);
+		try {
+			return await operation;
+		} finally {
+			this._pendingBashOperations.delete(operation);
+		}
+	}
+
+	private async executeBashOperation(
+		command: string,
+		onChunk?: (chunk: string) => void,
+		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
+	): Promise<BashResult> {
 		const abortController = new AbortController();
 		this._bashAbortControllers.add(abortController);
 
@@ -3153,6 +3178,10 @@ export class AgentSession {
 	 * Used by executeBash and by extensions that handle bash execution themselves.
 	 */
 	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
+		// After disposal the session manager may already belong to a replacement
+		// session; a late completion still returns its result to the caller but
+		// must not append to shared state.
+		if (this._disposed) return;
 		const bashMessage: BashExecutionMessage = {
 			role: "bashExecution",
 			command,
@@ -3185,6 +3214,16 @@ export class AgentSession {
 		for (const abortController of [...this._bashAbortControllers]) {
 			abortController.abort();
 		}
+	}
+
+	/**
+	 * Signal every owned bash command and wait for each operation to finish,
+	 * including its session record. Teardown calls this before the manager is
+	 * reused so a cooperatively-cancelled command cannot write late.
+	 */
+	async abortBashAndWait(): Promise<void> {
+		this.abortBash();
+		await Promise.allSettled([...this._pendingBashOperations]);
 	}
 
 	/** Whether a bash command is currently running */

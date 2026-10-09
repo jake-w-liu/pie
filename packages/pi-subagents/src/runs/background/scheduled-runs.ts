@@ -134,7 +134,12 @@ export function parseScheduleInterval(every: string): number {
 }
 
 function timestamp(value: number): string {
+	if (!Number.isSafeInteger(value) || !Number.isFinite(new Date(value).getTime())) throw new Error("Schedule timestamp is outside the supported range.");
 	return new Date(value).toISOString();
+}
+
+function validatePersistedDate(value: string, file: string): void {
+	if (!value.trim() || !Number.isFinite(Date.parse(value))) throw new Error(`Schedule record '${file}' has an invalid timestamp.`);
 }
 
 function validateScheduleId(id: string): string {
@@ -211,10 +216,17 @@ function parseSchedule(value: unknown, file: string): ScheduleRecord {
 	validateScheduleId(record.id);
 	if (!record.trigger || typeof record.trigger !== "object" || !record.target || typeof record.target !== "object") throw new Error(`Schedule record '${file}' has invalid trigger or target.`);
 	if (record.overlap !== "skip" || (record.catchUp !== "none" && record.catchUp !== "latest")) throw new Error(`Schedule record '${file}' has unsupported policy fields.`);
+	validatePersistedDate(record.createdAt, file);
+	validatePersistedDate(record.updatedAt, file);
 	if (record.trigger.kind === "once") {
-		if (typeof record.trigger.at !== "string" || (record.trigger.nextRunAt !== undefined && typeof record.trigger.nextRunAt !== "string")) throw new Error(`Schedule record '${file}' has an invalid one-shot trigger.`);
+		if (typeof record.trigger.at !== "string" || !record.trigger.at.trim() || (record.trigger.nextRunAt !== undefined && typeof record.trigger.nextRunAt !== "string")) throw new Error(`Schedule record '${file}' has an invalid one-shot trigger.`);
+		// `at` also retains the original relative creation input, such as +10m.
+		if (!/^\+\d+(s|m|h|d)$/.test(record.trigger.at.trim())) validatePersistedDate(record.trigger.at, file);
+		if (record.trigger.nextRunAt !== undefined) validatePersistedDate(record.trigger.nextRunAt, file);
 	} else if (record.trigger.kind === "interval") {
-		if (typeof record.trigger.every !== "string" || typeof record.trigger.everyMs !== "number" || typeof record.trigger.anchorAt !== "string" || typeof record.trigger.nextRunAt !== "string") throw new Error(`Schedule record '${file}' has an invalid interval trigger.`);
+		if (typeof record.trigger.every !== "string" || !Number.isSafeInteger(record.trigger.everyMs) || record.trigger.everyMs <= 0 || typeof record.trigger.anchorAt !== "string" || typeof record.trigger.nextRunAt !== "string" || parseScheduleInterval(record.trigger.every) !== record.trigger.everyMs) throw new Error(`Schedule record '${file}' has an invalid interval trigger.`);
+		validatePersistedDate(record.trigger.anchorAt, file);
+		validatePersistedDate(record.trigger.nextRunAt, file);
 	} else throw new Error(`Schedule record '${file}' has an unsupported trigger.`);
 	return { ...record, target: parseScheduleTarget(record.target, file) } as ScheduleRecord;
 }
@@ -244,6 +256,21 @@ class ScheduleStore {
 		return this.ids().map((id) => this.find(id)).filter((record): record is ScheduleRecord => record !== undefined);
 	}
 
+	/** All readable records plus per-record load failures, for bulk operations that must not be blocked by one invalid entry. */
+	listDetailed(): { records: ScheduleRecord[]; invalid: Array<{ id: string; error: string }> } {
+		const records: ScheduleRecord[] = [];
+		const invalid: Array<{ id: string; error: string }> = [];
+		for (const id of this.ids()) {
+			try {
+				const record = this.find(id);
+				if (record) records.push(record);
+			} catch (error) {
+				invalid.push({ id, error: error instanceof Error ? error.message : String(error) });
+			}
+		}
+		return { records, invalid };
+	}
+
 	get(id: string): ScheduleRecord {
 		const record = this.find(id);
 		if (!record) throw new Error(`Schedule '${id}' not found.`);
@@ -255,6 +282,19 @@ class ScheduleStore {
 		const file = path.join(scheduleDir(this.root, id, false, this.projectCwd), "schedule.json");
 		if (!fs.existsSync(file)) return undefined;
 		return parseSchedule(readJson(file, "schedule record"), file);
+	}
+
+	/** Raw record JSON for management actions (pause/delete) on entries too damaged to parse. */
+	readRaw(id: string): Record<string, unknown> | undefined {
+		const file = path.join(scheduleDir(this.root, id, false, this.projectCwd), "schedule.json");
+		if (!fs.existsSync(file)) return undefined;
+		const value = readJson(file, "schedule record");
+		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+		return value as Record<string, unknown>;
+	}
+
+	writeRaw(id: string, value: Record<string, unknown>): void {
+		writePrivateAtomicJson(path.join(scheduleDir(this.root, id, true, this.projectCwd), "schedule.json"), value);
 	}
 
 	write(record: ScheduleRecord): void {
@@ -300,9 +340,13 @@ function hasPendingScheduleWork(schedule: ScheduleRecord): boolean {
 
 function nextAfter(trigger: ScheduleTrigger, plannedAt: number, now: number): string | undefined {
 	if (trigger.kind === "once") return undefined;
-	let next = plannedAt + trigger.everyMs;
-	while (next <= now) next += trigger.everyMs;
-	return timestamp(next);
+	if (!Number.isSafeInteger(plannedAt) || !Number.isSafeInteger(now)) throw new Error("Schedule recurrence requires integer timestamps.");
+	const interval = BigInt(trigger.everyMs);
+	const planned = BigInt(plannedAt);
+	const periods = now < plannedAt ? 1n : (BigInt(now) - planned) / interval + 1n;
+	// BigInt keeps extreme valid past dates exact, without an unbounded loop or
+	// overflowing intermediate differences. timestamp rejects Date overflow.
+	return timestamp(Number(planned + periods * interval));
 }
 
 function nextRunAt(schedule: ScheduleRecord): number | undefined {
@@ -316,7 +360,9 @@ function nextRunAt(schedule: ScheduleRecord): number | undefined {
 function duePlannedAt(schedule: ScheduleRecord, now: number): number | undefined {
 	const next = nextRunAt(schedule);
 	if (next === undefined || next > now || schedule.catchUp !== "latest" || schedule.trigger.kind !== "interval") return next;
-	return next + Math.floor((now - next) / schedule.trigger.everyMs) * schedule.trigger.everyMs;
+	if (!Number.isSafeInteger(now)) throw new Error("Schedule recurrence requires integer timestamps.");
+	const interval = BigInt(schedule.trigger.everyMs);
+	return Number(BigInt(next) + (BigInt(now) - BigInt(next)) / interval * interval);
 }
 
 function textResult(text: string, schedules?: ScheduleRecord[], runs?: ScheduleRunRecord[], isError = false): AgentToolResult<Details> {
@@ -379,6 +425,7 @@ export class ScheduledRunManager {
 	private store?: ScheduleStore;
 	private readonly stores = new Map<string, ScheduleStore>();
 	private readonly contexts = new Map<string, ExtensionContext>();
+	private readonly activatedStores = new Set<string>();
 	private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
 	private readonly observedAsyncIds = new Set<string>();
 	private readonly now: () => number;
@@ -395,7 +442,8 @@ export class ScheduledRunManager {
 
 	bindSession(ctx: ExtensionContext): void {
 		if (!scheduledRunsEnabled(this.deps.config)) return;
-		this.selectProject(ctx.cwd, ctx);
+		const store = this.selectProject(ctx.cwd, ctx);
+		this.activateStore(store);
 	}
 
 	stop(): void {
@@ -403,13 +451,18 @@ export class ScheduledRunManager {
 		this.store = undefined;
 		this.stores.clear();
 		this.contexts.clear();
+		this.activatedStores.clear();
 		this.observedAsyncIds.clear();
 	}
 
 	async handleToolCall(params: SubagentParamsLike, ctx: ExtensionContext): Promise<AgentToolResult<Details>> {
 		try {
 			if (!scheduledRunsEnabled(this.deps.config)) return textResult("Scheduled runs are disabled by scheduledRuns.enabled=false.", undefined, undefined, true);
-			this.selectProject(params.cwd ?? ctx.cwd, ctx);
+			const store = this.selectProject(params.cwd ?? ctx.cwd, ctx);
+			if (["schedule.create", "schedule.resume", "schedule.run", "schedule.run-due"].includes(params.action ?? "")) {
+				this.requireTrustedStore(store);
+				this.activateStore(store);
+			}
 			switch (params.action) {
 				case "schedule.create": return this.create(params, ctx);
 				case "schedule.list": return this.list();
@@ -483,7 +536,7 @@ export class ScheduledRunManager {
 		if (params.on !== undefined || params.timezone !== undefined || every === "day" || every === "week" || every === "month" || every === "year") return textResult("Calendar schedules are deferred from this first safe slice. Use a fixed interval such as every:'24h' or every:'7d'.", undefined, undefined, true);
 		const sessionId = ctx.sessionManager.getSessionId() ?? "unknown";
 		if (this.deps.resolveCapabilityCeiling?.(sessionId)) return textResult("Cannot persist a schedule while a capability ceiling is active.", undefined, undefined, true);
-		const pendingCount = store.list().filter(hasPendingScheduleWork).length;
+		const pendingCount = store.listDetailed().records.filter(hasPendingScheduleWork).length;
 		const maxPending = resolveMaxPending(this.deps.config);
 		if (pendingCount >= maxPending) return textResult(`Schedule limit reached (${maxPending}).`, undefined, undefined, true);
 		const id = validateScheduleId((params.id?.trim() || this.randomId()));
@@ -518,9 +571,10 @@ export class ScheduledRunManager {
 	}
 
 	private list(): AgentToolResult<Details> {
-		const schedules = this.requireStore().list().sort((a, b) => (a.trigger.nextRunAt ?? "").localeCompare(b.trigger.nextRunAt ?? ""));
-		if (!schedules.length) return textResult("No project schedules.", []);
-		return textResult([`Project schedules: ${schedules.length}`, ...schedules.map((item) => `- ${item.id} | ${item.paused ? "paused" : item.activeRunId ? "running" : "scheduled"} | ${item.trigger.nextRunAt ?? "no next run"} | ${item.name}`)].join("\n"), schedules);
+		const { records, invalid } = this.requireStore().listDetailed();
+		const schedules = records.sort((a, b) => (a.trigger.nextRunAt ?? "").localeCompare(b.trigger.nextRunAt ?? ""));
+		if (!schedules.length && !invalid.length) return textResult("No project schedules.", []);
+		return textResult([`Project schedules: ${schedules.length}`, ...schedules.map((item) => `- ${item.id} | ${item.paused ? "paused" : item.activeRunId ? "running" : "scheduled"} | ${item.trigger.nextRunAt ?? "no next run"} | ${item.name}`), ...invalid.map((item) => `- ${item.id} | invalid | ${item.error}`)].join("\n"), schedules);
 	}
 
 	private show(params: SubagentParamsLike): AgentToolResult<Details> {
@@ -535,13 +589,32 @@ export class ScheduledRunManager {
 	}
 
 	private pause(params: SubagentParamsLike, paused: boolean): AgentToolResult<Details> {
-		const schedule = this.resolve(params);
+		const store = this.requireStore();
+		const id = params.id?.trim();
+		if (!id) throw new Error(`${params.action} requires id.`);
+		let schedule: ScheduleRecord | undefined;
+		try {
+			schedule = store.get(id);
+		} catch (error) {
+			// A damaged record must still be pausable so a bad trigger can be
+			// disabled without repairing it first. Pause patches only the fields
+			// it owns and never revalidates the executable trigger.
+			const raw = store.readRaw(id);
+			if (!raw) throw error;
+			const message = error instanceof Error ? error.message : String(error);
+			if (!paused) return textResult(`Schedule '${id}' cannot be resumed: ${message}`, undefined, undefined, true);
+			if (raw.paused === true) return textResult(`Schedule ${id} is already paused.`);
+			raw.paused = true;
+			raw.updatedAt = timestamp(this.now());
+			store.writeRaw(id, raw);
+			this.clearTimer(store, id);
+			return textResult(`Paused schedule ${id} (its record is invalid: ${message}).`);
+		}
 		if (schedule.paused === paused) return textResult(`Schedule ${schedule.id} is already ${paused ? "paused" : "active"}.`, [schedule]);
 		schedule.paused = paused;
 		schedule.updatedAt = timestamp(this.now());
-		this.requireStore().write(schedule);
-		this.requireStore().appendEvent(schedule, paused ? "schedule.paused" : "schedule.resumed");
-		const store = this.requireStore();
+		store.write(schedule);
+		store.appendEvent(schedule, paused ? "schedule.paused" : "schedule.resumed");
 		if (paused) this.clearTimer(store, schedule.id); else this.restoreOne(store, schedule);
 		return textResult(`${paused ? "Paused" : "Resumed"} schedule ${schedule.id}.`, [schedule]);
 	}
@@ -555,20 +628,36 @@ export class ScheduledRunManager {
 
 	private async runDue(): Promise<AgentToolResult<Details>> {
 		const store = this.requireStore();
-		const due = store.list().filter((schedule) => !schedule.paused && nextRunAt(schedule) !== undefined && nextRunAt(schedule)! <= this.now());
+		const { records, invalid } = store.listDetailed();
+		const due = records.filter((schedule) => !schedule.paused && nextRunAt(schedule) !== undefined && nextRunAt(schedule)! <= this.now());
 		const runs: ScheduleRunRecord[] = [];
 		for (const schedule of due) {
 			const planned = duePlannedAt(schedule, this.now())!;
 			if (!schedule.activeRunId && schedule.catchUp === "none" && planned < this.now()) runs.push(this.recordMissed(store, schedule, planned, "run-due"));
 			else runs.push(await this.launch(store, schedule, planned, "run-due", true));
 		}
-		return textResult(runs.length ? `Processed ${runs.length} due schedule(s).` : "No schedules are due.", store.list(), runs);
+		const skippedNote = invalid.length ? ` Skipped ${invalid.length} invalid record(s): ${invalid.map((item) => item.id).join(", ")}.` : "";
+		return textResult(`${runs.length ? `Processed ${runs.length} due schedule(s).` : "No schedules are due."}${skippedNote}`, records, runs);
 	}
 
 	private remove(params: SubagentParamsLike): AgentToolResult<Details> {
-		const schedule = this.resolve(params);
-		if (schedule.activeRunId) return textResult(`Schedule ${schedule.id} has active run ${schedule.activeRunId}; stop that run before deleting the schedule.`, [schedule], undefined, true);
 		const store = this.requireStore();
+		const id = params.id?.trim();
+		if (!id) throw new Error(`${params.action} requires id.`);
+		let schedule: ScheduleRecord | undefined;
+		try {
+			schedule = store.get(id);
+		} catch (error) {
+			// Deletion is a recovery path: a record too damaged to parse must
+			// still be removable after checking the raw activeRunId claim.
+			const raw = store.readRaw(id);
+			if (!raw) throw error;
+			if (typeof raw.activeRunId === "string" && raw.activeRunId) return textResult(`Schedule ${id} has active run ${raw.activeRunId}; stop that run before deleting the schedule.`, undefined, undefined, true);
+			this.clearTimer(store, id);
+			store.delete(id);
+			return textResult(`Deleted schedule ${id} (its record was invalid).`);
+		}
+		if (schedule.activeRunId) return textResult(`Schedule ${schedule.id} has active run ${schedule.activeRunId}; stop that run before deleting the schedule.`, [schedule], undefined, true);
 		this.clearTimer(store, schedule.id);
 		store.appendEvent(schedule, "schedule.deleted");
 		store.delete(schedule.id);
@@ -576,7 +665,14 @@ export class ScheduledRunManager {
 	}
 
 	private restore(store: ScheduleStore): void {
-		for (const schedule of store.list()) this.restoreOne(store, schedule);
+		for (const id of store.ids()) {
+			try {
+				const schedule = store.find(id);
+				if (schedule) this.restoreOne(store, schedule);
+			} catch (error) {
+				console.warn(`[pi-subagents] Schedule '${id}' could not be restored: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
 	}
 
 	private restoreOne(store: ScheduleStore, schedule: ScheduleRecord, notBefore?: number, rearm = true): void {
@@ -592,7 +688,12 @@ export class ScheduledRunManager {
 					if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof Error && /ENOENT/.test(error.message))) throw error;
 				}
 			}
-			if (schedule.activeRunId && (!run || run.state !== "running" || (!run.asyncId && Number.isFinite(startedAt) && startedAt + STALE_LAUNCH_CLAIM_MS <= this.now()))) {
+			// activeRunId without a history entry can be another process
+			// mid-claim: the schedule write lands before the run receipt. Defer
+			// cleanup while the claim is fresh; a stale claim or a terminal run
+			// is safe to recover.
+			const claimPending = !run && Date.parse(schedule.updatedAt) + STALE_LAUNCH_CLAIM_MS > this.now();
+			if (schedule.activeRunId && !claimPending && (!run || run.state !== "running" || (!run.asyncId && Number.isFinite(startedAt) && startedAt + STALE_LAUNCH_CLAIM_MS <= this.now()))) {
 				if (run?.state === "running") {
 					run.state = "failed_launch";
 					run.completedAt = timestamp(this.now());
@@ -617,7 +718,18 @@ export class ScheduledRunManager {
 					claimedRunId = "";
 				}
 				const claimed = claimedRunId ? store.history(schedule.id).find((item) => item.id === claimedRunId) : undefined;
-				if (!claimed || claimed.state !== "running") fs.rmSync(lockPath, { force: true });
+				if (claimed === undefined) {
+					// No history entry: the claim is either mid-flight in another
+					// process (lock written, run receipt pending) or orphaned by a
+					// crash. Only a stale lock is safe to remove.
+					try {
+						if (this.now() - fs.statSync(lockPath).mtimeMs >= STALE_LAUNCH_CLAIM_MS) fs.rmSync(lockPath, { force: true });
+					} catch {
+						// Lock vanished or is unreadable; nothing to clean up.
+					}
+				} else if (claimed.state !== "running") {
+					fs.rmSync(lockPath, { force: true });
+				}
 			}
 		}
 		if (!rearm || schedule.paused) return;
@@ -636,14 +748,14 @@ export class ScheduledRunManager {
 
 	private arm(schedule: ScheduleRecord, store: ScheduleStore, notBefore?: number): void {
 		this.clearTimer(store, schedule.id);
-		if (schedule.paused) return;
+		if (!this.canActivateStore(store) || schedule.paused) return;
 		const next = nextRunAt(schedule);
 		if (next === undefined) return;
 		const timer = this.timersApi.setTimeout(() => {
 			// A timer callback is outside every caller's try/catch, so an escaping
 			// rejection here reaches the process as an uncaught exception and exits
 			// Pi. Contain every failure to this one schedule.
-			void this.fire(store, schedule.id).catch((error) => {
+			void this.fire(store, schedule.id, next).catch((error) => {
 				console.warn(`[pi-subagents] Scheduled run '${schedule.id}' failed to fire: ${error instanceof Error ? error.message : String(error)}`);
 				this.restoreAfterFireError(store, schedule.id);
 			});
@@ -665,8 +777,9 @@ export class ScheduledRunManager {
 		}
 	}
 
-	private async fire(store: ScheduleStore, id: string): Promise<void> {
+	private async fire(store: ScheduleStore, id: string, armedPlannedAt: number): Promise<void> {
 		this.clearTimer(store, id);
+		if (!this.canActivateStore(store)) return;
 		// Schedules are project-scoped and shared, and `delete` only clears the
 		// timer inside the deleting process. Another session can therefore remove
 		// a schedule while this process still holds an armed timer for it; there
@@ -676,9 +789,10 @@ export class ScheduledRunManager {
 		const planned = duePlannedAt(schedule, this.now());
 		if (planned === undefined || schedule.paused) return;
 		if (planned > this.now()) return this.arm(schedule, store);
-		// Mirror restoreOne/runDue: a missed occurrence must not run when catchUp is
-		// "none". Only this timer path used to launch regardless of catchUp.
-		if (!schedule.activeRunId && schedule.catchUp === "none" && planned < this.now()) {
+		// Timer delivery can be late without making its still-current armed
+		// occurrence missed work. A replacement occurrence has no such authority;
+		// like restoreOne/runDue, it still follows the catch-up policy.
+		if (!schedule.activeRunId && schedule.catchUp === "none" && planned < this.now() && nextRunAt(schedule) !== armedPlannedAt) {
 			this.recordMissed(store, schedule, planned, "timer");
 			this.arm(schedule, store);
 			return;
@@ -687,13 +801,17 @@ export class ScheduledRunManager {
 	}
 
 	private async launch(store: ScheduleStore, schedule: ScheduleRecord, planned: number, dueReason: ScheduleRunRecord["dueReason"], advance: boolean): Promise<ScheduleRunRecord> {
+		this.requireTrustedStore(store);
 		const now = this.now();
+		// Required recurrence admission must succeed before acquiring a claim or
+		// publishing a running receipt. Manual runs do not advance recurrence.
+		const next = advance ? nextAfter(schedule.trigger, planned, now) : schedule.trigger.nextRunAt;
 		const run: ScheduleRunRecord = { schemaVersion: 1, id: this.randomId(), scheduleId: schedule.id, plannedAt: timestamp(planned), dueReason, state: "running", startedAt: timestamp(now) };
 		if (schedule.activeRunId) {
 			run.state = "skipped";
 			run.completedAt = timestamp(now);
 			if (advance) {
-				schedule.trigger.nextRunAt = nextAfter(schedule.trigger, planned, now);
+				schedule.trigger.nextRunAt = next;
 				schedule.updatedAt = timestamp(now);
 				store.write(schedule);
 			}
@@ -712,22 +830,24 @@ export class ScheduledRunManager {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 			run.state = "skipped";
 			run.completedAt = timestamp(now);
-			if (advance) {
-				schedule.trigger.nextRunAt = nextAfter(schedule.trigger, planned, now);
-				schedule.updatedAt = timestamp(now);
-				store.write(schedule);
-			}
+			// The lock owner is another process mid-claim; this schedule object
+			// predates its write, so persisting it here would erase the winner's
+			// activeRunId. The winner's own write advances the recurrence, and
+			// the in-memory activeRunId branch above advances it for manual runs.
 			store.writeRun(schedule, run, "schedule.skipped_overlap");
 			this.arm(schedule, store);
 			return run;
 		}
 		schedule.activeRunId = run.id;
 		schedule.lastRunId = run.id;
-		if (advance) schedule.trigger.nextRunAt = nextAfter(schedule.trigger, planned, now);
+		if (advance) schedule.trigger.nextRunAt = next;
 		schedule.updatedAt = timestamp(now);
 		store.write(schedule);
 		store.writeRun(schedule, run, "schedule.run.started");
 		try {
+			// Durable claim writes can call host code. Recheck the captured project's
+			// current decision immediately before execution, not just before the tick.
+			this.requireTrustedStore(store);
 			const result = await this.deps.launch(executionParams(schedule), this.requireContext(store), new AbortController().signal);
 			const asyncId = result.details?.asyncId ?? result.details?.runId;
 			if (result.isError || !asyncId) throw new Error(result.content.find((item) => item.type === "text")?.text ?? "Scheduled launch failed.");
@@ -754,6 +874,7 @@ export class ScheduledRunManager {
 	private finishRun(store: ScheduleStore, schedule: ScheduleRecord, run: ScheduleRunRecord, success: boolean, error?: string): void {
 		const now = this.now();
 		const next = nextRunAt(schedule);
+		let projectionFailure: { error: unknown } | undefined;
 		if (next !== undefined && next <= now) {
 			const planned = duePlannedAt(schedule, now)!;
 			const skipped: ScheduleRunRecord = {
@@ -765,18 +886,34 @@ export class ScheduledRunManager {
 				state: "skipped",
 				completedAt: timestamp(now),
 			};
-			schedule.trigger.nextRunAt = nextAfter(schedule.trigger, planned, now);
-			store.writeRun(schedule, skipped, "schedule.skipped_overlap");
+			try {
+				schedule.trigger.nextRunAt = nextAfter(schedule.trigger, planned, now);
+			} catch (error) {
+				// Future recurrence cannot erase the already-known child outcome.
+				// Only pure projection is deferred; actual receipt I/O still fails.
+				projectionFailure = { error };
+			}
+			if (!projectionFailure) store.writeRun(schedule, skipped, "schedule.skipped_overlap");
 		}
-		if (run.asyncId) this.observedAsyncIds.delete(run.asyncId);
 		run.state = success ? "completed" : "failed_run";
 		run.completedAt = timestamp(now);
 		if (!success && error) run.error = error;
 		schedule.activeRunId = undefined;
 		schedule.updatedAt = timestamp(now);
-		store.write(schedule);
-		fs.rmSync(path.join(store.directory(schedule.id), "active.lock"), { force: true });
-		store.writeRun(schedule, run, success ? "schedule.run.completed" : "schedule.run.failed");
+		try {
+			store.write(schedule);
+			fs.rmSync(path.join(store.directory(schedule.id), "active.lock"), { force: true });
+			store.writeRun(schedule, run, success ? "schedule.run.completed" : "schedule.run.failed");
+		} catch (error) {
+			if (projectionFailure) {
+				const projectionMessage = projectionFailure.error instanceof Error ? projectionFailure.error.message : String(projectionFailure.error);
+				const publicationMessage = error instanceof Error ? error.message : String(error);
+				throw new AggregateError([projectionFailure.error, error], `Schedule recurrence projection failed: ${projectionMessage}; terminal publication failed: ${publicationMessage}`);
+			}
+			throw error;
+		}
+		if (run.asyncId) this.observedAsyncIds.delete(run.asyncId);
+		if (projectionFailure) throw projectionFailure.error;
 		this.arm(schedule, store);
 	}
 
@@ -797,7 +934,8 @@ export class ScheduledRunManager {
 		return run;
 	}
 
-	private selectProject(cwd: string, ctx: ExtensionContext): void {
+	/** Select metadata without activating repository-supplied work. */
+	private selectProject(cwd: string, ctx: ExtensionContext): ScheduleStore {
 		const projectCwd = path.resolve(cwd);
 		const root = scheduledRunStorePath(projectCwd, undefined, this.deps.storeRoot);
 		if (path.resolve(ctx.cwd) === projectCwd) this.contexts.set(root, snapshotContext(ctx, projectCwd));
@@ -806,9 +944,31 @@ export class ScheduledRunManager {
 		if (!store) {
 			store = new ScheduleStore(root, this.deps.storeRoot === undefined ? projectCwd : undefined);
 			this.stores.set(root, store);
-			this.restore(store);
 		}
 		this.store = store;
+		this.canActivateStore(store);
+		return store;
+	}
+
+	private canActivateStore(store: ScheduleStore): boolean {
+		if (this.requireContext(store).isProjectTrusted()) return true;
+		this.activatedStores.delete(store.root);
+		for (const [key, timer] of this.timers) {
+			if (!key.startsWith(`${store.root}\0`)) continue;
+			this.timersApi.clearTimeout(timer);
+			this.timers.delete(key);
+		}
+		return false;
+	}
+
+	private requireTrustedStore(store: ScheduleStore): void {
+		if (!this.canActivateStore(store)) throw new Error("Project schedules require project trust before activation or execution.");
+	}
+
+	private activateStore(store: ScheduleStore): void {
+		if (!this.canActivateStore(store) || this.activatedStores.has(store.root)) return;
+		this.restore(store);
+		this.activatedStores.add(store.root);
 	}
 
 	private resolve(params: SubagentParamsLike): ScheduleRecord {

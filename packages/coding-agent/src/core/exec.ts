@@ -48,14 +48,16 @@ export async function execCommand(
 		let stderr = "";
 		let killed = false;
 		let timeoutId: NodeJS.Timeout | undefined;
+		let forceKillId: NodeJS.Timeout | undefined;
 
 		const killProcess = () => {
-			if (!killed) {
+			if (!killed && proc.exitCode === null && proc.signalCode === null) {
 				killed = true;
 				proc.kill("SIGTERM");
 				// Force kill after 5 seconds if SIGTERM doesn't work
-				setTimeout(() => {
-					if (!proc.killed) {
+				forceKillId = setTimeout(() => {
+					// `killed` means a signal was sent, not that the child exited.
+					if (proc.exitCode === null && proc.signalCode === null) {
 						proc.kill("SIGKILL");
 					}
 				}, 5000);
@@ -91,6 +93,7 @@ export async function execCommand(
 		waitForChildProcess(proc)
 			.then((code) => {
 				if (timeoutId) clearTimeout(timeoutId);
+				if (forceKillId) clearTimeout(forceKillId);
 				if (options?.signal) {
 					options.signal.removeEventListener("abort", killProcess);
 				}
@@ -98,6 +101,7 @@ export async function execCommand(
 			})
 			.catch((_err) => {
 				if (timeoutId) clearTimeout(timeoutId);
+				if (forceKillId) clearTimeout(forceKillId);
 				if (options?.signal) {
 					options.signal.removeEventListener("abort", killProcess);
 				}

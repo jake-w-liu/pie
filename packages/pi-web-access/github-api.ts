@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { proxyChildEnv } from "./utils.ts";
 import type { ExtractedContent } from "./extract.ts";
 import type { GitHubUrlInfo } from "./github-extract.ts";
 
@@ -12,7 +13,7 @@ export async function checkGhAvailable(signal?: AbortSignal): Promise<boolean> {
 	if (ghAvailable !== null) return ghAvailable;
 
 	return new Promise((resolve) => {
-		execFile("gh", ["--version"], { timeout: 5000, ...(signal ? { signal } : {}) }, (err) => {
+		execFile("gh", ["--version"], { timeout: 5000, env: proxyChildEnv(), ...(signal ? { signal } : {}) }, (err) => {
 			const available = !err;
 			if (!signal?.aborted) ghAvailable = available;
 			resolve(available);
@@ -31,7 +32,7 @@ export async function checkRepoSize(owner: string, repo: string): Promise<number
 	if (!(await checkGhAvailable())) return null;
 
 	return new Promise((resolve) => {
-		execFile("gh", ["api", `repos/${owner}/${repo}`, "--jq", ".size"], { timeout: 10000 }, (err, stdout) => {
+		execFile("gh", ["api", `repos/${owner}/${repo}`, "--jq", ".size"], { timeout: 10000, env: proxyChildEnv() }, (err, stdout) => {
 			if (err) {
 				resolve(null);
 				return;
@@ -46,7 +47,7 @@ async function getDefaultBranch(owner: string, repo: string): Promise<string | n
 	if (!(await checkGhAvailable())) return null;
 
 	return new Promise((resolve) => {
-		execFile("gh", ["api", `repos/${owner}/${repo}`, "--jq", ".default_branch"], { timeout: 10000 }, (err, stdout) => {
+		execFile("gh", ["api", `repos/${owner}/${repo}`, "--jq", ".default_branch"], { timeout: 10000, env: proxyChildEnv() }, (err, stdout) => {
 			if (err) {
 				resolve(null);
 				return;
@@ -64,7 +65,7 @@ async function fetchTreeViaApi(owner: string, repo: string, ref: string): Promis
 		execFile(
 			"gh",
 			["api", `repos/${owner}/${repo}/git/trees/${ref}?recursive=1`, "--jq", ".tree[].path"],
-			{ timeout: 15000, maxBuffer: 5 * 1024 * 1024 },
+			{ timeout: 15000, maxBuffer: 5 * 1024 * 1024, env: proxyChildEnv() },
 			(err, stdout) => {
 				if (err) {
 					resolve(null);
@@ -90,7 +91,7 @@ async function fetchReadmeViaApi(owner: string, repo: string, ref: string): Prom
 		execFile(
 			"gh",
 			["api", `repos/${owner}/${repo}/readme?ref=${ref}`, "--jq", ".content"],
-			{ timeout: 10000 },
+			{ timeout: 10000, env: proxyChildEnv() },
 			(err, stdout) => {
 				if (err) {
 					resolve(null);
@@ -114,7 +115,7 @@ async function fetchFileViaApi(owner: string, repo: string, path: string, ref: s
 		execFile(
 			"gh",
 			["api", `repos/${owner}/${repo}/contents/${path}?ref=${ref}`, "--jq", ".content"],
-			{ timeout: 10000, maxBuffer: 2 * 1024 * 1024 },
+			{ timeout: 10000, maxBuffer: 2 * 1024 * 1024, env: proxyChildEnv() },
 			(err, stdout) => {
 				if (err) {
 					resolve(null);

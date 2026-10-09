@@ -26,7 +26,7 @@ import {
 	type StoredSearchData,
 } from "./storage.ts";
 import { activityMonitor, type ActivityEntry } from "./activity.ts";
-import { startCuratorServer, type CuratorSearchEntry, type CuratorServerHandle, type IndexedCuratorSearchEntry } from "./curator-server.ts";
+import { createCuratorResultIndexAllocator, startCuratorServer, type CuratorResultIndexAllocator, type CuratorSearchEntry, type CuratorServerHandle, type IndexedCuratorSearchEntry } from "./curator-server.ts";
 import {
 	buildDeterministicSummary,
 	generateSummaryDraft,
@@ -596,6 +596,7 @@ interface PendingCurate {
 	summaryContext: SummaryGenerationContext;
 	searchResults: Map<number, QueryResultData>;
 	resultSlots: Map<number, number>;
+	resultIndexAllocator: CuratorResultIndexAllocator;
 	allInlineContent: ExtractedContent[];
 	queryList: string[];
 	includeContent: boolean;
@@ -1619,6 +1620,7 @@ export default function (pi: ExtensionAPI) {
 							pc.searchResults.set(entry.queryIndex, indexedCuratorEntryToQueryResult(entry));
 						}
 					},
+					indexAllocator: pc.resultIndexAllocator,
 					async onRewriteQuery(query, rewriteSignal) {
 						return runWithProxy(pc.proxy, async () => {
 							if (pendingCurates.get(callId) !== pc) throw new Error("Curator session is no longer active.");
@@ -1810,7 +1812,7 @@ export default function (pi: ExtensionAPI) {
 				const searchResults = new Map<number, QueryResultData>();
 				const resultSlots = new Map<number, number>();
 				const allInlineContent: ExtractedContent[] = [];
-				let nextResultIndex = queryList.length;
+				const resultIndexAllocator = createCuratorResultIndexAllocator(queryList.length);
 				const searchAbort = new AbortController();
 				const searchSignal = signal
 					? AbortSignal.any([signal, searchAbort.signal])
@@ -1842,6 +1844,7 @@ export default function (pi: ExtensionAPI) {
 					summaryContext,
 					searchResults,
 					resultSlots,
+					resultIndexAllocator,
 					allInlineContent,
 					queryList,
 					includeContent,
@@ -1917,7 +1920,7 @@ export default function (pi: ExtensionAPI) {
 						const curator = activeCurators.get(callId);
 						for (let entryIndex = 0; entryIndex < entries.length; entryIndex++) {
 							const entry = entries[entryIndex];
-							const resultIndex = entryIndex === 0 ? qi : nextResultIndex++;
+							const resultIndex = entryIndex === 0 ? qi : resultIndexAllocator.reserve();
 							const indexedEntry: IndexedCuratorSearchEntry = {
 								...entry,
 								queryIndex: resultIndex,
@@ -3146,6 +3149,7 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify("Opening web search curator...", "info");
 
 			const collected = new Map<number, QueryResultData>();
+			const resultIndexAllocator = createCuratorResultIndexAllocator(queries.length);
 			const searchAbort = new AbortController();
 			let aborted = false;
 			let commandHandle: CuratorServerHandle | null = null;
@@ -3265,6 +3269,7 @@ export default function (pi: ExtensionAPI) {
 								collected.set(entry.queryIndex, indexedCuratorEntryToQueryResult(entry));
 							}
 						},
+						indexAllocator: resultIndexAllocator,
 						async onRewriteQuery(query, rewriteSignal) {
 							if (commandHandle && !isCommandActive()) {
 								throw new Error("Curator session is no longer active.");
@@ -3316,7 +3321,6 @@ export default function (pi: ExtensionAPI) {
 
 				if (queries.length > 0) {
 					(async () => {
-						let nextResultIndex = queries.length;
 						for (let qi = 0; qi < queries.length; qi++) {
 							if (aborted || !isCommandActive()) break;
 							const requestedProvider = currentSearchProvider;
@@ -3330,7 +3334,7 @@ export default function (pi: ExtensionAPI) {
 								const entries = toCuratorSearchEntries(response);
 								for (let entryIndex = 0; entryIndex < entries.length; entryIndex++) {
 									const entry = entries[entryIndex];
-									const resultIndex = entryIndex === 0 ? qi : nextResultIndex++;
+									const resultIndex = entryIndex === 0 ? qi : resultIndexAllocator.reserve();
 									const indexedEntry: IndexedCuratorSearchEntry = {
 										...entry,
 										queryIndex: resultIndex,
@@ -3464,17 +3468,20 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			// Option labels embed the full id: timestamp-prefixed ids share short
+			// prefixes within the same ms bucket, so prefix resolution can select
+			// (and delete) a different stored result.
 			const options = results.map((r) => {
 				const age = Math.floor((Date.now() - r.timestamp) / 60000);
 				const ageStr = age < 60 ? `${age}m ago` : `${Math.floor(age / 60)}h ago`;
 				if (r.type === "search" && r.queries) {
 					const query = r.queries[0]?.query || "unknown";
-					return `[${r.id.slice(0, 6)}] "${query}" (${r.queries.length} queries) - ${ageStr}`;
+					return `[${r.id}] "${query}" (${r.queries.length} queries) - ${ageStr}`;
 				}
 				if (r.type === "fetch" && (r.urls || r.urlMetadata)) {
-					return `[${r.id.slice(0, 6)}] ${(r.urls ?? r.urlMetadata ?? []).length} URLs fetched - ${ageStr}`;
+					return `[${r.id}] ${(r.urls ?? r.urlMetadata ?? []).length} URLs fetched - ${ageStr}`;
 				}
-				return `[${r.id.slice(0, 6)}] ${r.type} - ${ageStr}`;
+				return `[${r.id}] ${r.type} - ${ageStr}`;
 			});
 
 			const choice = await ctx.ui.select("Stored Search Results", options);
@@ -3483,7 +3490,7 @@ export default function (pi: ExtensionAPI) {
 			const match = choice.match(/^\[([a-z0-9]+)\]/);
 			if (!match) return;
 
-			const selected = results.find((r) => r.id.startsWith(match[1]));
+			const selected = results.find((r) => r.id === match[1]);
 			if (!selected) return;
 
 			const actions = ["View details", "Delete"];

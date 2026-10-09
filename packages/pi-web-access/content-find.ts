@@ -15,6 +15,12 @@ interface Range {
 	matches: Match[];
 }
 
+function splitsSurrogatePair(text: string, offset: number): boolean {
+	const before = text.charCodeAt(offset - 1);
+	const after = text.charCodeAt(offset);
+	return before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff;
+}
+
 function normalize(value: string): string {
 	return value.normalize("NFD").replace(/\p{Diacritic}/gu, "").toLocaleLowerCase();
 }
@@ -49,27 +55,31 @@ function editDistanceWithin(left: string, right: string, maximum: number): boole
  * the same place in the original text and slicing the original with it returned
  * unrelated snippets. Folding per code point keeps `map` exact.
  */
-function foldWithOffsets(text: string): { folded: string; map: number[] } {
+function foldWithOffsets(text: string): { folded: string; starts: number[]; ends: number[] } {
 	let folded = "";
-	const map: number[] = [];
+	const starts: number[] = [];
+	const ends: number[] = [];
 	let originalIndex = 0;
 	for (const char of text) {
-		const lowered = char.toLocaleLowerCase();
-		for (const loweredChar of lowered) map.push(originalIndex);
+		// Final and ordinary sigma have the same case-insensitive identity.
+		const lowered = char.toLocaleLowerCase().replace(/ς/g, "σ");
+		for (let unit = 0; unit < lowered.length; unit++) {
+			starts.push(originalIndex);
+			ends.push(originalIndex + char.length);
+		}
 		folded += lowered;
 		originalIndex += char.length;
 	}
-	map.push(text.length);
-	return { folded, map };
+	return { folded, starts, ends };
 }
 
 function literalMatches(text: string, query: string, caseInsensitive: boolean): Match[] {
 	if (caseInsensitive) {
-		const { folded, map } = foldWithOffsets(text);
-		const needle = query.toLocaleLowerCase();
+		const { folded, starts, ends } = foldWithOffsets(text);
+		const needle = foldWithOffsets(query).folded;
 		const matches: Match[] = [];
 		for (let start = folded.indexOf(needle); start >= 0; start = folded.indexOf(needle, start + Math.max(needle.length, 1))) {
-			matches.push({ query, start: map[start] ?? text.length, end: map[start + needle.length] ?? text.length });
+			matches.push({ query, start: starts[start] ?? text.length, end: ends[start + needle.length - 1] ?? text.length });
 		}
 		return matches;
 	}
@@ -142,24 +152,38 @@ export function findContent(
 	const sections = [heading];
 	let formattedLength = heading.length;
 	let returnedMatches = 0;
+	// Reserve the longest possible truncation footer before admitting excerpts.
+	const footerReserve = matches.length > 0 ? 2 + `Showing ${matches.length} of ${matches.length} matches.`.length : 0;
 	for (const range of mergeRanges(text.length, matches)) {
-		const prefix = range.start > 0 ? "…" : "";
-		const suffix = range.end < text.length ? "…" : "";
-		const snippet = `${prefix}${text.slice(range.start, range.end).replace(/\s+/g, " ").trim()}${suffix}`;
-		const counts = [...new Set(range.matches.map(match => match.query))]
+		// Expand natural context edges to whole scalars before applying the budget.
+		const start = range.start - (splitsSurrogatePair(text, range.start) ? 1 : 0);
+		const contextEnd = range.end + (splitsSurrogatePair(text, range.end) ? 1 : 0);
+		const fullCounts = [...new Set(range.matches.map(match => match.query))]
 			.map(query => `\"${query}\" ×${range.matches.filter(match => match.query === query).length}`)
 			.join(", ");
+		const maxSnippetChars = MAX_OUTPUT_CHARS - formattedLength - 2 - `${sections.length}. ${fullCounts}\n`.length - 2 - footerReserve;
+		if (maxSnippetChars <= 0) break;
+		let end = Math.min(contextEnd, start + maxSnippetChars);
+		// A budget crop must also stay between scalars; never repair the text itself.
+		if (splitsSurrogatePair(text, end)) end--;
+		const represented = range.matches.filter(match => match.start >= start && match.end <= end);
+		if (represented.length === 0) continue;
+		const prefix = start > 0 ? "…" : "";
+		const suffix = end < text.length ? "…" : "";
+		const snippet = `${prefix}${text.slice(start, end).replace(/\s+/g, " ").trim()}${suffix}`;
+		const counts = [...new Set(represented.map(match => match.query))]
+			.map(query => `\"${query}\" ×${represented.filter(match => match.query === query).length}`)
+			.join(", ");
 		const section = `${sections.length}. ${counts}\n${snippet}`;
-		if (formattedLength + 2 + section.length > MAX_OUTPUT_CHARS) break;
 		sections.push(section);
 		formattedLength += 2 + section.length;
-		returnedMatches += range.matches.length;
+		returnedMatches += represented.length;
 	}
 
 	const missing = queryResults.filter(result => result.matchCount === 0).map(result => `\"${result.query}\"`);
 	const footer = [
-		...(missing.length > 0 ? [`No matches: ${missing.join(", ")}`] : []),
 		...(returnedMatches < matches.length ? [`Showing ${returnedMatches} of ${matches.length} matches.`] : []),
+		...(missing.length > 0 ? [`No matches: ${missing.join(", ")}`] : []),
 	];
 	for (const section of footer) {
 		if (formattedLength + 2 + section.length > MAX_OUTPUT_CHARS) break;

@@ -22,6 +22,8 @@
 - Extended slash-command autocomplete to a whitespace-bounded `/` token anywhere on the first line, so `please run /` opens the same command menu as a line-start `/`; slashes inside words and paths with a second separator still complete as files.
 
 ### Fixed
+- Real keyboard input and bracketed paste replace editor selections as one undoable edit, and selected-range deletion emits one change notification.
+- Cleared editor selections before text replacement, submission, history navigation, completion, and undo callbacks, preventing stale coordinates from corrupting the next buffer.
 - Input is decoded as a byte stream: a multi-byte character split across reads is decoded once complete, and the legacy single high-byte Meta conversion still applies to bytes that never complete a UTF-8 sequence.
 - Astral characters (emoji) are emitted as one sequence instead of a lone high surrogate followed by a lone low surrogate.
 - Keys queued before a bracketed paste (a lone Escape, a split mouse report) are emitted before the paste instead of replayed after it.

@@ -4,13 +4,14 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	statSync,
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { NodeExecutionEnv } from "../../../src/harness/env/nodejs.ts";
 import { type JsonlSessionMetadata, JsonlSessionRepo, type SessionRepo } from "../../../src/harness/session/index.ts";
@@ -54,7 +55,7 @@ function withDefaultSessionCwd(repository: JsonlSessionRepo, cwd: string): Sessi
 function expectedSessionPath(root: string, cwd: string, createdAt: number, id: string): string {
 	const directory = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
 	const timestamp = new Date(createdAt).toISOString().replace(/[:.]/g, "-");
-	return join(root, directory, `${timestamp}_${id}.jsonl`);
+	return join(realpathSync(root), directory, `${timestamp}_${id}.jsonl`);
 }
 
 function writeRawSession(root: string, id: string, mutations: Record<string, unknown>[]): JsonlSessionMetadata {
@@ -96,6 +97,54 @@ describe("JsonlSessionRepo conformance", () => {
 });
 
 describe("JSONL v4 persistence", () => {
+	it("shares one writer across sequential, concurrent, and normalized-path opens", async () => {
+		const root = createTempDir();
+		const repository = createRepository(root);
+		const first = await repository.create({ id: "shared-writer", cwd: root });
+		const metadata = await first.getMetadata();
+		const second = await repository.open(metadata);
+		const a = await first.appendCustomEntry("a");
+		const b = await second.appendCustomEntry("b");
+		const [third, fourth] = await Promise.all([
+			repository.open(metadata),
+			repository.open({ ...metadata, path: `${dirname(metadata.path)}/./${basename(metadata.path)}` }),
+		]);
+		await Promise.all([third.appendCustomEntry("c"), fourth.appendCustomEntry("d")]);
+		const entries = await first.findEntries({ order: "oldestFirst" });
+		expect(entries.map((entry) => entry.seq)).toEqual([1, 2, 3, 4]);
+		expect(entries.map((entry) => entry.parentId)).toEqual([null, a, b, entries[2].id]);
+		expect(await fourth.getLog()).toEqual(await first.getLog());
+		const fork = await repository.fork(metadata, { id: "shared-fork", cwd: root, scope: "tree" });
+		expect((await fork.findEntries()).map((entry) => entry.id)).toEqual(
+			(await first.findEntries()).map((entry) => entry.id),
+		);
+		const reopened = await createRepository(root).open(metadata);
+		expect(await reopened.getLog()).toEqual(await first.getLog());
+		await expect(repository.open({ ...metadata, id: "wrong-id" })).rejects.toMatchObject({ code: "invalid_entry" });
+	});
+
+	it("deduplicates concurrent initial opens before admitting writes", async () => {
+		const root = createTempDir();
+		const source = await createRepository(root).create({ id: "initial-opens", cwd: root });
+		const metadata = await source.getMetadata();
+		const repository = createRepository(root);
+		const handles = await Promise.all(Array.from({ length: 5 }, () => repository.open(metadata)));
+		await Promise.all(handles.map((handle, index) => handle.appendCustomEntry(`entry-${index}`)));
+		expect((await handles[0].getLog()).map((item) => item.seq)).toEqual([1, 2, 3, 4, 5]);
+		expect(await (await createRepository(root).open(metadata)).getLog()).toEqual(await handles[0].getLog());
+	});
+
+	it("imports valid external appends into the shared storage on open", async () => {
+		const root = createTempDir();
+		const repository = createRepository(root);
+		const first = await repository.create({ id: "external-append", cwd: root });
+		const metadata = await first.getMetadata();
+		appendFileSync(metadata.path, `${JSON.stringify({ kind: "fact", seq: 1, fact: "name", name: "external" })}\n`);
+		const reopened = await repository.open(metadata);
+		expect(await first.getName()).toBe("external");
+		await reopened.appendCustomEntry("next");
+		expect((await first.getLog()).map((item) => item.seq)).toEqual([1, 2]);
+	});
 	it("exposes the complete metadata contract", async () => {
 		const root = createTempDir();
 		const repository = createRepository(root);
@@ -537,7 +586,7 @@ describe("JSONL v4 persistence", () => {
 		const repository = createRepository(root);
 		await expect(repository.open(metadata)).rejects.toMatchObject({
 			code: "invalid_entry",
-			message: `Invalid JSONL v4 session ${path}: line 2 Invalid session mutation: references missing parent missing`,
+			message: `Invalid JSONL v4 session ${realpathSync(path)}: line 2 Invalid session mutation: references missing parent missing`,
 		});
 	});
 

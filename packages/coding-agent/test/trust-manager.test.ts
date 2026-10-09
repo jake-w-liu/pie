@@ -2,6 +2,7 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { resolveProjectTrusted } from "../src/core/project-trust.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../src/core/trust-manager.ts";
 
 describe("ProjectTrustStore", () => {
@@ -35,6 +36,32 @@ describe("ProjectTrustStore", () => {
 		store.set(childDir, null);
 		expect(store.get(childDir)).toBe(true);
 	});
+
+	it.each([undefined, true, false])(
+		"gates schedules-only projects, retaining explicit trust override %s",
+		async (trustOverride) => {
+			mkdirSync(join(cwd, ".pi", "subagents", "schedules"), { recursive: true });
+			expect(hasTrustRequiringProjectResources(cwd)).toBe(true);
+			const result = await resolveProjectTrusted({
+				cwd,
+				trustStore: new ProjectTrustStore(agentDir),
+				trustOverride,
+				defaultProjectTrust: "never",
+				projectTrustContext: {
+					cwd,
+					mode: "print",
+					hasUI: false,
+					ui: {
+						select: async () => undefined,
+						confirm: async () => false,
+						input: async () => undefined,
+						notify: () => {},
+					},
+				},
+			});
+			expect(result).toBe(trustOverride ?? false);
+		},
+	);
 
 	it("detects trust-requiring project resources", () => {
 		const originalHome = process.env.HOME;

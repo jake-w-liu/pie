@@ -206,7 +206,8 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 				}
 			};
 
-			while (true) {
+			while (!terminalPushed) {
+				if (options.signal?.aborted) throw new Error("Request aborted by user");
 				const { done, value } = await reader.read();
 				if (done) break;
 
@@ -218,7 +219,10 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 				const lines = buffer.split("\n");
 				buffer = lines.pop() || "";
 
-				for (const line of lines) processLine(line);
+				for (const line of lines) {
+					processLine(line);
+					if (terminalPushed) break;
+				}
 			}
 
 			// Flush decoder-carried bytes, then process a final data line stranded
@@ -226,7 +230,7 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 			// ignore it and fall through to the missing-terminal error below
 			// rather than masking it with a parse error.
 			buffer += decoder.decode();
-			if (buffer.trim()) {
+			if (!terminalPushed && buffer.trim()) {
 				try {
 					processLine(buffer);
 				} catch {
@@ -234,7 +238,7 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 				}
 			}
 
-			if (options.signal?.aborted) {
+			if (!terminalPushed && options.signal?.aborted) {
 				throw new Error("Request aborted by user");
 			}
 
@@ -261,8 +265,17 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 			});
 			stream.end();
 		} finally {
-			if (options.signal) {
-				options.signal.removeEventListener("abort", abortHandler);
+			options.signal?.removeEventListener("abort", abortHandler);
+			if (reader) {
+				try {
+					// Cancellation belongs to the transport and may never settle. Observe
+					// rejection immediately, but release our local lock independently.
+					void reader.cancel().catch(() => {});
+				} catch {
+					// Preserve the terminal outcome even when transport cleanup rejects.
+				} finally {
+					reader.releaseLock();
+				}
 			}
 		}
 	})();

@@ -36,6 +36,7 @@ import {
 	retryGoogleRequest,
 	supportsGoogleStrictToolSampling,
 } from "./google-shared.ts";
+import { lazyStream } from "./lazy.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
 export interface GoogleOptions extends StreamOptions {
@@ -298,42 +299,47 @@ export const streamSimple: StreamFunction<"google-generative-ai", SimpleStreamOp
 	model: Model<"google-generative-ai">,
 	context: Context,
 	options?: SimpleStreamOptions,
-): AssistantMessageEventStream => {
-	const apiKey = options?.apiKey;
-	if (!apiKey) {
-		throw new Error(`No API key for provider: ${model.provider}`);
-	}
+): AssistantMessageEventStream =>
+	lazyStream(
+		model,
+		async () => {
+			const apiKey = options?.apiKey;
+			if (!apiKey) {
+				throw new Error(`No API key for provider: ${model.provider}`);
+			}
 
-	const base = {
-		...buildBaseOptions(model, context, options, apiKey),
-		toolChoice: options?.toolChoice,
-	} satisfies GoogleOptions;
-	if (!options?.reasoning) {
-		return stream(model, context, { ...base, thinking: { enabled: false } } satisfies GoogleOptions);
-	}
+			const base = {
+				...buildBaseOptions(model, context, options, apiKey),
+				toolChoice: options?.toolChoice,
+			} satisfies GoogleOptions;
+			if (!options?.reasoning) {
+				return stream(model, context, { ...base, thinking: { enabled: false } } satisfies GoogleOptions);
+			}
 
-	const clampedReasoning = clampThinkingLevel(model, options.reasoning);
-	const resolvedLevel = resolveGoogleThinkingLevel(model, clampedReasoning);
-	const googleModel = model as Model<"google-generative-ai">;
+			const clampedReasoning = clampThinkingLevel(model, options.reasoning);
+			const resolvedLevel = resolveGoogleThinkingLevel(model, clampedReasoning);
+			const googleModel = model as Model<"google-generative-ai">;
 
-	if (isGemini3ProModel(googleModel) || isGemini3FlashModel(googleModel) || isGemma4Model(googleModel)) {
-		return stream(model, context, {
-			...base,
-			thinking: {
-				enabled: true,
-				level: getThinkingLevel(resolvedLevel, googleModel),
-			},
-		} satisfies GoogleOptions);
-	}
+			if (isGemini3ProModel(googleModel) || isGemini3FlashModel(googleModel) || isGemma4Model(googleModel)) {
+				return stream(model, context, {
+					...base,
+					thinking: {
+						enabled: true,
+						level: getThinkingLevel(resolvedLevel, googleModel),
+					},
+				} satisfies GoogleOptions);
+			}
 
-	return stream(model, context, {
-		...base,
-		thinking: {
-			enabled: true,
-			budgetTokens: getGoogleBudget(googleModel, resolvedLevel, options.thinkingBudgets),
+			return stream(model, context, {
+				...base,
+				thinking: {
+					enabled: true,
+					budgetTokens: getGoogleBudget(googleModel, resolvedLevel, options.thinkingBudgets),
+				},
+			} satisfies GoogleOptions);
 		},
-	} satisfies GoogleOptions);
-};
+		options?.signal,
+	);
 
 function createClient(
 	model: Model<"google-generative-ai">,

@@ -98,10 +98,9 @@ export function resolveHttpProxyUrlForTarget(targetUrl: string | URL, env?: Prov
 	let proxyUrl: URL;
 	try {
 		proxyUrl = new URL(proxy);
-	} catch (error) {
-		throw new Error(
-			`Invalid proxy URL ${JSON.stringify(proxy)}: ${error instanceof Error ? error.message : String(error)}`,
-		);
+	} catch {
+		// Both the raw input and parser diagnostics may contain proxy credentials.
+		throw new Error("Invalid proxy URL: expected a valid HTTP or HTTPS proxy URL.");
 	}
 
 	if (proxyUrl.protocol !== "http:" && proxyUrl.protocol !== "https:") {

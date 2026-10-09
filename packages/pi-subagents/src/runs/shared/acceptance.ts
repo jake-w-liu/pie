@@ -23,6 +23,7 @@ import type {
 	SubagentRunMode,
 } from "../../shared/types.ts";
 import { isAgentContractV1 } from "./agent-contract.ts";
+import { createOwnedProcessTreeController, terminateSpawnedProcessTree, type OwnedProcessTreeController } from "../background/owned-process-tree.ts";
 import { classifyTaskMutationIntent, stripSeverityCompounds, taskMayMutate } from "./task-intent.ts";
 
 const LEVEL_RANK: Record<Exclude<AcceptanceLevel, "auto">, number> = {
@@ -1147,6 +1148,46 @@ interface VerifyWorkspaceState {
 // bytes than this is not fingerprinted at all, and the verify command runs instead.
 const UNTRACKED_FINGERPRINT_MAX_BYTES = 64 * 1024 * 1024;
 
+// Ignored directories are stat-fingerprinted, not read; a tree with more entries
+// than this cannot be proven unchanged and the verify command runs instead.
+const IGNORED_FINGERPRINT_MAX_ENTRIES = 8192;
+
+/** Bounded recursive fingerprint of an ignored directory's mutable state (path, size, mtime per entry). */
+function fingerprintIgnoredTree(absolute: string, relative: string, budget: number): { entries: number; digest: string } | undefined {
+	const lines: string[] = [];
+	const stack = [""];
+	let entries = 0;
+	while (stack.length > 0) {
+		const sub = stack.pop()!;
+		let dirents: fs.Dirent[];
+		try {
+			dirents = fs.readdirSync(path.join(absolute, sub), { withFileTypes: true });
+		} catch {
+			return undefined;
+		}
+		for (const dirent of dirents) {
+			if (++entries > budget) return undefined;
+			const rel = sub ? `${sub}/${dirent.name}` : dirent.name;
+			let stats: fs.Stats;
+			try {
+				stats = fs.lstatSync(path.join(absolute, rel));
+			} catch {
+				return undefined;
+			}
+			const repoRel = `${relative}/${rel}`;
+			if (stats.isSymbolicLink()) {
+				lines.push(`${repoRel} link ${stats.size} ${stats.mtimeMs}`);
+			} else if (stats.isDirectory()) {
+				lines.push(`${repoRel} dir`);
+				stack.push(rel);
+			} else {
+				lines.push(`${repoRel} file ${stats.size} ${stats.mtimeMs}`);
+			}
+		}
+	}
+	return { entries, digest: createHash("sha256").update(lines.sort().join("\n")).digest("hex") };
+}
+
 function readVerifyWorkspaceState(cwd: string): VerifyWorkspaceState | undefined {
 	const repo = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf-8", windowsHide: true });
 	if (repo.status !== 0 || !repo.stdout.trim()) return undefined;
@@ -1185,6 +1226,7 @@ function readUntrackedWorkspaceHash(repoRoot: string): string | undefined {
 	const records = status.stdout.split("\0");
 	const fingerprints: string[] = [];
 	let budget = UNTRACKED_FINGERPRINT_MAX_BYTES;
+	let ignoredEntryBudget = IGNORED_FINGERPRINT_MAX_ENTRIES;
 	for (let index = 0; index < records.length; index++) {
 		const record = records[index]!;
 		if (!record) continue;
@@ -1206,6 +1248,17 @@ function readUntrackedWorkspaceHash(repoRoot: string): string | undefined {
 			// Never follow a link out of the workspace; its target is not the
 			// workspace's state. Size and mtime still change when the link is retargeted.
 			fingerprints.push(`${code} ${relative} link ${stats.size} ${stats.mtimeMs}`);
+			continue;
+		}
+		if (stats.isDirectory() && code === "!!") {
+			// --ignored=matching collapses an ignored directory to one entry, so
+			// editing a file inside it changes nothing here. A directory name is
+			// not content evidence: fingerprint its mutable entries (path, size,
+			// mtime) under a bound, or abandon the fingerprint entirely.
+			const tree = fingerprintIgnoredTree(absolute, relative, ignoredEntryBudget);
+			if (tree === undefined) return undefined;
+			ignoredEntryBudget -= tree.entries;
+			fingerprints.push(`${code} ${relative} dir ${tree.digest}`);
 			continue;
 		}
 		if (!stats.isFile()) {
@@ -1378,13 +1431,18 @@ function runVerifyCommand(command: AcceptanceVerifyCommand, defaultCwd: string, 
 		let timedOut = false;
 		let settled = false;
 		let hardKill: NodeJS.Timeout | undefined;
+		let treeTermination: Promise<unknown> | undefined;
 		const child = spawn(quoteExecutableForShell(command.command), {
 			cwd,
 			env: effectiveVerifyEnv(command.env),
 			shell: true,
 			stdio: ["ignore", "pipe", "pipe"],
 			windowsHide: true,
+			// Own process group so timeout/abort kills the shell's descendants too.
+			detached: process.platform !== "win32",
 		});
+		const processTree: OwnedProcessTreeController | undefined =
+			typeof child.pid === "number" ? createOwnedProcessTreeController(child.pid) : undefined;
 		const finish = (result: Omit<AcceptanceVerifyResult, "id" | "command" | "cwd" | "durationMs">) => {
 			if (settled) return;
 			settled = true;
@@ -1402,17 +1460,26 @@ function runVerifyCommand(command: AcceptanceVerifyCommand, defaultCwd: string, 
 		const abortVerification = () => {
 			if (settled || timedOut) return;
 			timedOut = true;
-			child.kill("SIGTERM");
-			hardKill = setTimeout(() => {
-				child.kill("SIGKILL");
-				finish({
-					exitCode: null,
-					status: "timed-out",
-					stdout: verifyStreamText(stdout, command.env),
-					stderr: verifyStreamText(stderr, command.env, resolveAbortMessage(options.abortMessage), "Acceptance verification timed out."),
-				});
-			}, 1000);
-			hardKill.unref?.();
+			const finishTimedOut = () => finish({
+				exitCode: null,
+				status: "timed-out",
+				stdout: verifyStreamText(stdout, command.env),
+				stderr: verifyStreamText(stderr, command.env, resolveAbortMessage(options.abortMessage), "Acceptance verification timed out."),
+			});
+			if (!processTree || child.pid === undefined) {
+				child.kill("SIGTERM");
+				hardKill = setTimeout(() => {
+					child.kill("SIGKILL");
+					finishTimedOut();
+				}, 1000);
+				hardKill.unref?.();
+				return;
+			}
+			// Signalling the shell alone leaves spawned descendants running after
+			// the result reports timed-out. Kill the process tree and settle only
+			// after teardown resolves; `close` must not settle early while the
+			// tree is still being verified.
+			treeTermination = terminateSpawnedProcessTree(child.pid, processTree).then(finishTimedOut);
 		};
 		const timeout = setTimeout(abortVerification, command.timeoutMs ?? DEFAULT_VERIFY_TIMEOUT_MS);
 		timeout.unref?.();
@@ -1425,6 +1492,9 @@ function runVerifyCommand(command: AcceptanceVerifyCommand, defaultCwd: string, 
 			stderr.push(chunk);
 		});
 		child.on("close", (exitCode) => {
+			// Timeout/abort teardown settles from the tree-termination completion
+			// instead: the shell closing first does not prove descendants exited.
+			if (timedOut && treeTermination) return;
 			const passed = exitCode === 0 && !timedOut;
 			finish({
 				exitCode,

@@ -588,6 +588,12 @@ export class InteractiveMode {
 	// Extension UI state
 	private extensionSelector: ExtensionSelectorComponent | undefined = undefined;
 	private extensionSelectorAbort?: { signal: AbortSignal; handler: () => void };
+	/**
+	 * Cancel functions for in-flight showExtensionCustom invocations. Reset must
+	 * retire every owned invocation: hideOverlay() only removes the top overlay,
+	 * and a pending factory could otherwise still mount into the next lifetime.
+	 */
+	private readonly extensionCustomInvocations = new Set<() => void>();
 	private extensionInput: ExtensionInputComponent | undefined = undefined;
 	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
 	private extensionTerminalInputSubscriptions = new Set<{
@@ -2354,6 +2360,9 @@ export class InteractiveMode {
 		if (this.extensionEditor) {
 			this.hideExtensionEditor();
 		}
+		for (const cancel of [...this.extensionCustomInvocations]) {
+			cancel();
+		}
 		this.ui.hideOverlay();
 		this.clearExtensionTerminalInputListeners();
 		this.setExtensionFooter(undefined);
@@ -2910,11 +2919,21 @@ export class InteractiveMode {
 					disposeComponent();
 				}
 			};
+			const cancel = () => {
+				if (closed) return;
+				closed = true;
+				outcome = {
+					status: "rejected",
+					error: new Error("Custom UI closed because the session was replaced or reloaded"),
+				};
+				settle();
+			};
 			const settle = () => {
 				const result = outcome;
 				// A reentrant done() must wait for showOverlay to return its handle.
 				if (!result || mounting || settled) return;
 				settled = true;
+				this.extensionCustomInvocations.delete(cancel);
 				try {
 					cleanup();
 				} catch (error) {
@@ -2987,6 +3006,7 @@ export class InteractiveMode {
 					settle();
 				}
 			};
+			this.extensionCustomInvocations.add(cancel);
 			try {
 				Promise.resolve(factory(this.ui, theme, this.keybindings, close))
 					.then(mount)

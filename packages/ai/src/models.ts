@@ -808,8 +808,24 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 		const merged = [...baselineModels];
 		for (const model of dynamicModels) {
 			const index = merged.findIndex((entry) => entry.id === model.id);
-			if (index >= 0) merged[index] = model;
-			else merged.push(model);
+			if (index >= 0) {
+				const baseline = merged[index]!;
+				merged[index] = {
+					...baseline,
+					...model,
+					...(baseline.compat || model.compat
+						? { compat: { ...baseline.compat, ...model.compat } as Model<TApi>["compat"] }
+						: {}),
+					...(baseline.thinkingLevelMap || model.thinkingLevelMap
+						? {
+								thinkingLevelMap:
+									model.thinkingLevelMap === undefined
+										? baseline.thinkingLevelMap
+										: { ...baseline.thinkingLevelMap, ...model.thinkingLevelMap },
+							}
+						: {}),
+				};
+			} else merged.push(model);
 		}
 		return merged;
 	};

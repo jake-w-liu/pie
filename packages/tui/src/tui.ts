@@ -490,6 +490,7 @@ export abstract class TuiBase extends Container implements TUI {
 	private pendingOsc11BackgroundReplies = 0;
 	private pendingOsc11BackgroundQueries: PendingOsc11Slot[] = [];
 	private terminalColorSchemeListeners = new Set<(scheme: TerminalColorScheme) => void>();
+	private pendingTerminalColorSchemeQueries = new Set<() => void>();
 	private terminalColorSchemeNotificationsEnabled = false;
 	protected readonly logDirectory: string;
 	private mouseReportingActive = false;
@@ -1033,6 +1034,7 @@ export abstract class TuiBase extends Container implements TUI {
 		}
 		this.pendingOsc11BackgroundQueries = [];
 		this.pendingOsc11BackgroundReplies = 0;
+		for (const cancel of this.pendingTerminalColorSchemeQueries) cancel();
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031l");
 		}
@@ -1618,7 +1620,7 @@ export abstract class TuiBase extends Container implements TUI {
 	 * `CSI ? 997 ; 1 n` for dark or `CSI ? 997 ; 2 n` for light.
 	 */
 	queryTerminalColorScheme({ timeoutMs }: { timeoutMs: number }): Promise<TerminalColorScheme | undefined> {
-		return new Promise((resolve) => {
+		return new Promise((resolve, reject) => {
 			let settled = false;
 			let timer: NodeJS.Timeout | undefined;
 			let unsubscribe: () => void = () => {};
@@ -1630,12 +1632,23 @@ export abstract class TuiBase extends Container implements TUI {
 					timer = undefined;
 				}
 				unsubscribe();
+				this.pendingTerminalColorSchemeQueries.delete(cancel);
 				resolve(scheme);
 			};
+			const cancel = () => settle(undefined);
 
 			unsubscribe = this.onTerminalColorSchemeChange(settle);
-			timer = setTimeout(() => settle(undefined), timeoutMs);
-			this.terminal.write("\x1b[?996n");
+			this.pendingTerminalColorSchemeQueries.add(cancel);
+			timer = setTimeout(cancel, timeoutMs);
+			try {
+				this.terminal.write("\x1b[?996n");
+			} catch (error) {
+				settled = true;
+				clearTimeout(timer);
+				unsubscribe();
+				this.pendingTerminalColorSchemeQueries.delete(cancel);
+				reject(error);
+			}
 		});
 	}
 }

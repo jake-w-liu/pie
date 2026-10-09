@@ -45,11 +45,17 @@ function findWorkflowStep(status: AsyncStatus, childRunId: string, workflowKey?:
 		?? (workflowKey ? status.steps?.find((candidate) => candidate.workflowKey === workflowKey) : undefined) as WorkflowStatusStep | undefined;
 }
 
-function applyDetachedChildToPausedWorkflow(
+function applyDetachedChildToWorkflow(
 	status: AsyncStatus,
 	input: { childRunId: string; result: Pick<SingleResult, "exitCode" | "error" | "interrupted" | "sessionFile" | "stopped">; workflowKey?: string },
 ): AsyncStatus | undefined {
-	if (status.mode !== "workflow" || status.state !== "paused") return undefined;
+	if (status.mode !== "workflow") return undefined;
+	// Paused roots absorb the child and may promote; already-terminal roots keep
+	// their outcome but still take the child's true terminal state. Running or
+	// queued roots cannot absorb the completion yet; the caller retains it.
+	const rootPaused = status.state === "paused";
+	const rootTerminal = status.state === "failed" || status.state === "stopped" || status.state === "complete" || status.state === "rejected";
+	if (!rootPaused && !rootTerminal) return undefined;
 	const next = cloneWorkflowStatus(status);
 	const step = findWorkflowStep(next, input.childRunId, input.workflowKey);
 	if (!step) return undefined;
@@ -82,7 +88,9 @@ function applyDetachedChildToPausedWorkflow(
 		if (input.result.error) step.error = input.result.error;
 	}
 	next.lastUpdate = updatedAt;
-	const promoted = promotePausedWorkflowIfSettled(next);
+	// Terminal roots are not promoted: a late detached completion refreshes child
+	// truth without reopening or succeeding an already-settled workflow.
+	const promoted = rootPaused ? promotePausedWorkflowIfSettled(next) : undefined;
 	if (promoted?.state === "failed" && failedSiblingError) promoted.error = failedSiblingError;
 	else if (promoted?.state === "failed" && (input.result.interrupted || input.result.stopped)) promoted.error = input.result.error ?? INTERRUPTED_DETACHED_CHILD;
 	else if (promoted?.state === "failed" && input.result.error) promoted.error = input.result.error;
@@ -305,6 +313,86 @@ function appendDetachedWorkflowEvent(asyncDir: string, event: Record<string, unk
 	}
 }
 
+const PENDING_DETACHED_COMPLETIONS_FILE = "detached-child-completions.jsonl";
+
+function retainDetachedChildCompletion(
+	asyncDir: string,
+	input: { childRunId: string; result: SingleResult; workflowKey?: string },
+): void {
+	fs.appendFileSync(
+		path.join(asyncDir, PENDING_DETACHED_COMPLETIONS_FILE),
+		`${JSON.stringify({ ts: Date.now(), childRunId: input.childRunId, workflowKey: input.workflowKey, result: input.result })}\n`,
+		"utf-8",
+	);
+}
+
+/**
+ * Replays detached-child completions retained while the workflow root was still
+ * running. The ledger is renamed aside before processing so late arrivals append
+ * to a fresh file; each record goes through the canonical reconcile path.
+ */
+export function drainRetainedDetachedCompletions(input: {
+	state: SubagentState;
+	workflowRunId: string;
+	asyncDir?: string;
+	events?: IntercomEventBus;
+}): void {
+	const job = input.state.asyncJobs.get(input.workflowRunId);
+	const asyncDir = input.asyncDir ?? job?.asyncDir ?? path.join(DIRS.async, input.workflowRunId);
+	const pendingPath = path.join(asyncDir, PENDING_DETACHED_COMPLETIONS_FILE);
+	const processingPath = `${pendingPath}.processing`;
+	try {
+		fs.renameSync(pendingPath, processingPath);
+	} catch {
+		return;
+	}
+	let lines: string[];
+	try {
+		lines = fs.readFileSync(processingPath, "utf-8").split("\n").filter((line) => line.trim().length > 0);
+	} catch (error) {
+		// Restore the ledger rather than dropping retained completions.
+		try { fs.renameSync(processingPath, pendingPath); } catch { /* ledger stays aside; reported below */ }
+		appendDetachedWorkflowEvent(asyncDir, {
+			ts: Date.now(),
+			runId: input.workflowRunId,
+			type: "subagent.workflow.detached_replay_failed",
+			error: `Failed to read retained detached completions: ${error instanceof Error ? error.message : String(error)}`,
+		});
+		return;
+	}
+	for (const line of lines) {
+		try {
+			const record = JSON.parse(line) as { childRunId?: string; workflowKey?: string; result?: SingleResult };
+			if (typeof record.childRunId !== "string" || !record.result) continue;
+			reconcileDetachedWorkflowChildCompletion({
+				state: input.state,
+				workflowRunId: input.workflowRunId,
+				childRunId: record.childRunId,
+				workflowKey: record.workflowKey,
+				result: record.result,
+				events: input.events,
+			});
+		} catch (error) {
+			appendDetachedWorkflowEvent(asyncDir, {
+				ts: Date.now(),
+				runId: input.workflowRunId,
+				type: "subagent.workflow.detached_replay_failed",
+				error: `Failed to replay retained detached completion: ${error instanceof Error ? error.message : String(error)}`,
+			});
+		}
+	}
+	try {
+		fs.unlinkSync(processingPath);
+	} catch (error) {
+		appendDetachedWorkflowEvent(asyncDir, {
+			ts: Date.now(),
+			runId: input.workflowRunId,
+			type: "subagent.workflow.detached_replay_failed",
+			error: `Failed to remove drained detached completions: ${error instanceof Error ? error.message : String(error)}`,
+		});
+	}
+}
+
 export function reconcileDetachedWorkflowChildCompletion(input: {
 	state: SubagentState;
 	workflowRunId: string;
@@ -315,9 +403,26 @@ export function reconcileDetachedWorkflowChildCompletion(input: {
 }): boolean {
 	const job = input.state.asyncJobs.get(input.workflowRunId);
 	const asyncDir = job?.asyncDir ?? path.join(DIRS.async, input.workflowRunId);
-	const status = readStatus(asyncDir);
+	let status = readStatus(asyncDir);
 	if (!status) return false;
-	const next = applyDetachedChildToPausedWorkflow(status, {
+	if (status.mode !== "workflow") return false;
+	if (status.state === "running" || status.state === "queued") {
+		// The pause publication has not landed yet; dropping the completion here
+		// would leave the detached step permanently needs_attention. Retain it so
+		// settlement replays it through this same path.
+		if (!findWorkflowStep(status, input.childRunId, input.workflowKey)) return false;
+		retainDetachedChildCompletion(asyncDir, input);
+		return true;
+	}
+	drainRetainedDetachedCompletions({ state: input.state, workflowRunId: input.workflowRunId, asyncDir, events: input.events });
+	status = readStatus(asyncDir) ?? status;
+	if (status.state === "running" || status.state === "queued") {
+		if (!findWorkflowStep(status, input.childRunId, input.workflowKey)) return false;
+		retainDetachedChildCompletion(asyncDir, input);
+		return true;
+	}
+	const rootWasTerminal = status.state !== "paused";
+	const next = applyDetachedChildToWorkflow(status, {
 		childRunId: input.childRunId,
 		result: input.result,
 		workflowKey: input.workflowKey,
@@ -363,7 +468,9 @@ export function reconcileDetachedWorkflowChildCompletion(input: {
 			reconciledFromDetachedChild: input.childRunId,
 		});
 	}
-	if (next.state === "complete" || next.state === "failed") {
+	// An already-terminal root emitted its completion when it settled; a late
+	// detached child refreshes the receipts above without re-announcing the run.
+	if (!rootWasTerminal && (next.state === "complete" || next.state === "failed")) {
 		if (!resolution) throw new Error(`Terminal detached workflow '${input.workflowRunId}' has no resolution classification.`);
 		appendDetachedWorkflowEvent(asyncDir, {
 			ts: Date.now(),

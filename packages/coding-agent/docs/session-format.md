@@ -178,11 +178,15 @@ All entries (except `SessionHeader`) extend `SessionEntryBase`:
 ```typescript
 interface SessionEntryBase {
   type: string;
-  id: string;           // 8-char hex ID
+  id: string;           // Opaque, nonempty entry ID
   parentId: string | null;  // Parent entry ID (null for first entry)
   timestamp: string;    // ISO timestamp
 }
 ```
+
+Generated entry IDs normally use 8-character UUID prefixes. Allocation tries at most 100 short candidates, then 100 full UUID candidates, checking every candidate against existing entry IDs. Exhaustion throws without appending an entry. Legacy migration reserves each generated ID before allocating the next one.
+
+Loading and forking validate the privately parsed and migrated graph before rewriting or publishing it. Entry IDs must be unique nonempty strings, `parentId` must be a string or `null`, and parent cycles are rejected with an `Invalid session graph` error. IDs have no additional character grammar, and missing parents remain orphan roots. Validation is iterative with linear parent-lookup work and no depth cap. A failed session-file switch preserves the current session and its indexes; invalid source bytes are not rewritten.
 
 ## Entry Types
 
@@ -402,6 +406,8 @@ Key methods for working with sessions programmatically.
 - `newSession(options?)` - Start a new session (options: `{ parentSession?: string }`)
 - `setSessionFile(path)` - Switch to a different session file
 - `createBranchedSession(leafId)` - Extract branch to new session file
+
+For persisted branches containing an assistant message, the complete candidate is written atomically before replacing the manager's identity, path, entries, or indexes. A failed write leaves the original session and its append state intact. Branches without an assistant message still defer file creation until a later persistence-ready append; that first flush writes one complete header and the retained history. In-memory branches perform no file I/O.
 
 ### Instance Methods - Appending (all return entry ID)
 - `appendMessage(message)` - Add message

@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
+- Reject writer heartbeat cadences above Node's signed 32-bit timer maximum (2,147,483,647 ms), instead of silently overflowing to a 1 ms heartbeat.
 - Operations after `close()` are rejected instead of reopening a database handle that the already-resolved close promise never closed.
 
 ## [0.84.3] - 2026-08-24

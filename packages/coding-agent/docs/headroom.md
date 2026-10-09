@@ -15,7 +15,7 @@ Compression applies only to historical results — tool results the model has al
 
 Images, tool-result metadata, and block ordering are preserved. Compression is suspended whenever `headroom_retrieve` is not active, including an explicit `--tools` allowlist that excludes it. This prevents unrecoverable preview markers.
 
-The store is intentionally not persisted. A resumed process reconstructs requests from the original session data and stores new entries as it compresses them. Old hashes may be evicted when limits are reached. Unchanged blocks reuse a bounded cached marker only while the exact original and hash remain in the retrieval store.
+The store is intentionally not persisted. A resumed process reconstructs requests from the original session data and stores new entries as it compresses them. Old hashes may be evicted when limits are reached. Originals referenced by previews in the same request are protected from eviction; blocks that cannot fit together within the entry and UTF-8 byte limits remain uncompressed. Duplicate originals count once toward those limits. Unchanged blocks reuse a bounded cached marker only while the exact original and hash remain in the retrieval store.
 
 ## Commands
 

@@ -1,5 +1,7 @@
 import type { RefreshModelsContext } from "../models.ts";
 import type { Model, OpenAICompletionsCompat } from "../types.ts";
+import { cancelResponseBody } from "../utils/http-response.ts";
+import { getOpenRouterThinkingLevelMap, type OpenRouterReasoningMetadata } from "../utils/reasoning-options.ts";
 
 /**
  * Live model discovery for OpenAI-compatible `GET /models` endpoints.
@@ -23,6 +25,7 @@ export interface OpenAIModelsListEntry {
 	max_tokens?: number;
 	max_completion_tokens?: number;
 	supported_parameters?: string[];
+	reasoning?: OpenRouterReasoningMetadata;
 	architecture?: { modality?: string };
 	pricing?: {
 		prompt?: string;
@@ -96,6 +99,7 @@ export async function fetchOpenAIModels(options: FetchOpenAIModelsOptions): Prom
 		signal: options.signal,
 	});
 	if (!response.ok) {
+		await cancelResponseBody(response);
 		throw new Error(`Could not fetch models from ${options.provider}: HTTP ${response.status}`);
 	}
 	const payload = (await response.json()) as OpenAIModelsListResponse;
@@ -114,6 +118,8 @@ export async function fetchOpenAIModels(options: FetchOpenAIModelsOptions): Prom
 		const input: ("text" | "image")[] = ["text"];
 		if (entry.architecture?.modality?.includes("image")) input.push("image");
 
+		const thinkingLevelMap =
+			options.provider === "openrouter" ? getOpenRouterThinkingLevelMap(entry.reasoning) : undefined;
 		models.push({
 			id: entry.id,
 			name: entry.name || entry.id,
@@ -121,6 +127,7 @@ export async function fetchOpenAIModels(options: FetchOpenAIModelsOptions): Prom
 			provider: options.provider,
 			baseUrl,
 			reasoning: isReasoning(entry),
+			...(thinkingLevelMap ? { thinkingLevelMap } : {}),
 			input,
 			cost: costFromPricing(entry.pricing),
 			contextWindow:

@@ -267,6 +267,28 @@ export function hasScopedProxyDecision(): boolean {
 	return proxyStorage.getStore() !== undefined;
 }
 
+const CHILD_PROXY_ENV_PATTERN = /^(?:http|https|all|no)_proxy$/i;
+const CHILD_PROXY_ENV_KEYS = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"];
+
+/**
+ * Environment for a spawned child so it honors the scoped per-call proxy
+ * decision: an explicit proxy is applied through the standard proxy variables
+ * and an explicit direct decision removes ambient proxy and NO_PROXY routing.
+ * Without a scoped decision the ambient environment is returned unchanged.
+ */
+export function proxyChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+	if (!hasScopedProxyDecision()) return env;
+	const result: NodeJS.ProcessEnv = { ...env };
+	for (const key of Object.keys(result)) {
+		if (CHILD_PROXY_ENV_PATTERN.test(key)) delete result[key];
+	}
+	const proxy = getActiveProxy();
+	if (proxy) {
+		for (const key of CHILD_PROXY_ENV_KEYS) result[key] = proxy;
+	}
+	return result;
+}
+
 function noProxyEntryMatches(url: URL, entry: string): boolean {
 	if (!entry) return false;
 	if (entry === "*") return true;

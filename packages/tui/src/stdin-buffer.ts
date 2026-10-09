@@ -101,6 +101,11 @@ function isCompleteCsiSequence(data: string): "complete" | "incomplete" {
 
 	const payload = data.slice(2);
 
+	// Linux-console F keys/page keys have a second '['; rxvt modifier
+	// sequences terminate with '$' or '^' instead of a generic CSI final byte.
+	if (payload === "[" || /^\[[56]$/.test(payload)) return "incomplete";
+	if (/^[235678][$^]$/.test(payload)) return "complete";
+
 	// CSI sequences end with a byte in the range 0x40-0x7E (@-~)
 	// This includes all letters and several special characters
 	const lastChar = payload[payload.length - 1];

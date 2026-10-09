@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { finished } from "node:stream/promises";
 import { pathToFileURL } from "node:url";
 import type { Message } from "@earendil-works/pi-ai";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
@@ -636,6 +637,14 @@ function runPiStreaming(
 			}
 		}
 		let error: string | undefined = writerRegistrationError;
+		// The writer runs detached; without an owner, an async stream failure
+		// (ENOSPC, EIO) escapes as an unhandled error and kills this runner while
+		// the child keeps running. Capture it, terminate the owned tree, and let
+		// the close path report the failure.
+		outputStream.on("error", (streamError) => {
+			error ??= `Output stream failed: ${streamError instanceof Error ? streamError.message : String(streamError)}`;
+			if (processTreeController) void processTreeController.terminate();
+		});
 		let assistantError: string | undefined;
 		let interrupted = false;
 		let timedOut = false;
@@ -701,7 +710,7 @@ function runPiStreaming(
 
 		const writeOutputLine = (line: string) => {
 			if (!line.trim()) return;
-			outputStream.write(`${line}\n`);
+			if (!outputStream.destroyed && !outputStream.errored) outputStream.write(`${line}\n`);
 			orcaProgressTab?.append(`${line}\n`);
 		};
 
@@ -1088,9 +1097,10 @@ function runPiStreaming(
 			stdoutReader.end();
 			stderrReader.end();
 			outputStream.end();
+			const outputStreamFailure = await finished(outputStream).then(() => undefined, (streamError: unknown) => `Output stream failed: ${streamError instanceof Error ? streamError.message : String(streamError)}`);
 			const stderr = stderrTail.text();
 			const finalOutput = getFinalOutput(messages) || rawStdoutTail.text().trim();
-			const finalError = error ?? assistantError;
+			const finalError = error ?? assistantError ?? outputStreamFailure;
 			const forcedDrainAfterFinalSuccess = Boolean(forcedTerminationSignal || signal) && (cleanTerminalAssistantStopReceived || agentSettledReceived) && !finalError;
 			const signalError = isUnexplainedProcessSignal({
 				processSignal: signal,
@@ -1149,10 +1159,18 @@ function runPiStreaming(
 			stdoutReader.end();
 			stderrReader.end();
 			outputStream.end();
-			const stderr = stderrTail.text();
-			const finalOutput = getFinalOutput(messages) || rawStdoutTail.text().trim();
-			const spawnErrorMessage = spawnError instanceof Error ? spawnError.message : String(spawnError);
-			resolve(omitUndefinedProperties({ stderr, exitCode: 1, messages, usage, toolCount, durationMs: Date.now() - startedAt, model, error: stopped ? (stopMessage ?? "Subagent stopped by user.") : timedOut ? (timeoutMessage ?? "Subagent timed out.") : turnBudgetExceeded ? turnBudgetMessage : error ?? assistantError ?? spawnErrorMessage, protocolError, finalOutput: (timedOut || stopped) && !finalOutput.trim() ? (stopped ? stopMessage ?? "Subagent stopped by user." : timeoutMessage ?? "Subagent timed out.") : finalOutput, outputState: finalOutput.trim() ? "present" : "absent", timedOut, stopped, turnBudget, turnBudgetExceeded, wrapUpRequested: turnBudget?.outcome === "wrap-up-requested" || turnBudget?.outcome === "termination-deferred" || turnBudgetExceeded || undefined, observedMutationAttempt, structuredOutputToolInvoked, structuredOutputMessageStartIndex, watchdog: childWatchdogState, processInstanceId, processTree: { state: "unknown", reason: "verification-failed", diagnostic: spawnErrorMessage } }));
+			void finished(outputStream).then(() => {
+				const stderr = stderrTail.text();
+				const finalOutput = getFinalOutput(messages) || rawStdoutTail.text().trim();
+				const spawnErrorMessage = spawnError instanceof Error ? spawnError.message : String(spawnError);
+				resolve(omitUndefinedProperties({ stderr, exitCode: 1, messages, usage, toolCount, durationMs: Date.now() - startedAt, model, error: stopped ? (stopMessage ?? "Subagent stopped by user.") : timedOut ? (timeoutMessage ?? "Subagent timed out.") : turnBudgetExceeded ? turnBudgetMessage : error ?? assistantError ?? spawnErrorMessage, protocolError, finalOutput: (timedOut || stopped) && !finalOutput.trim() ? (stopped ? stopMessage ?? "Subagent stopped by user." : timeoutMessage ?? "Subagent timed out.") : finalOutput, outputState: finalOutput.trim() ? "present" : "absent", timedOut, stopped, turnBudget, turnBudgetExceeded, wrapUpRequested: turnBudget?.outcome === "wrap-up-requested" || turnBudget?.outcome === "termination-deferred" || turnBudgetExceeded || undefined, observedMutationAttempt, structuredOutputToolInvoked, structuredOutputMessageStartIndex, watchdog: childWatchdogState, processInstanceId, processTree: { state: "unknown", reason: "verification-failed", diagnostic: spawnErrorMessage } }));
+			}, (streamError: unknown) => {
+				const stderr = stderrTail.text();
+				const finalOutput = getFinalOutput(messages) || rawStdoutTail.text().trim();
+				const spawnErrorMessage = spawnError instanceof Error ? spawnError.message : String(spawnError);
+				const streamFailure = `Output stream failed: ${streamError instanceof Error ? streamError.message : String(streamError)}`;
+				resolve(omitUndefinedProperties({ stderr, exitCode: 1, messages, usage, toolCount, durationMs: Date.now() - startedAt, model, error: stopped ? (stopMessage ?? "Subagent stopped by user.") : timedOut ? (timeoutMessage ?? "Subagent timed out.") : turnBudgetExceeded ? turnBudgetMessage : error ?? assistantError ?? spawnErrorMessage ?? streamFailure, protocolError, finalOutput: (timedOut || stopped) && !finalOutput.trim() ? (stopped ? stopMessage ?? "Subagent stopped by user." : timeoutMessage ?? "Subagent timed out.") : finalOutput, outputState: finalOutput.trim() ? "present" : "absent", timedOut, stopped, turnBudget, turnBudgetExceeded, wrapUpRequested: turnBudget?.outcome === "wrap-up-requested" || turnBudget?.outcome === "termination-deferred" || turnBudgetExceeded || undefined, observedMutationAttempt, structuredOutputToolInvoked, structuredOutputMessageStartIndex, watchdog: childWatchdogState, processInstanceId, processTree: { state: "unknown", reason: "verification-failed", diagnostic: spawnErrorMessage } }));
+			});
 		});
 	});
 }
@@ -4396,6 +4414,8 @@ async function runSubagent(
 					watchdog: pr.watchdog,
 					capabilityCeiling: pr.capabilityCeiling,
 					capabilityAudit: pr.capabilityAudit,
+					writerProcesses: pr.writerProcesses,
+					writerAttemptCount: pr.writerAttemptCount,
 				}));
 			}
 			pendingParallelUsageCost = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
@@ -4838,6 +4858,8 @@ async function runSubagent(
 						structuredOutputSchemaPath: pr.structuredOutputSchemaPath,
 						acceptance: pr.acceptance,
 						watchdog: pr.watchdog,
+						writerProcesses: pr.writerProcesses,
+						writerAttemptCount: pr.writerAttemptCount,
 					}));
 				}
 				pendingParallelUsageCost = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
@@ -5091,6 +5113,8 @@ async function runSubagent(
 				runner: singleResult.runner,
 				externalProcess: singleResult.externalProcess,
 				externalJob: singleResult.externalJob,
+				writerProcesses: singleResult.writerProcesses,
+				writerAttemptCount: singleResult.writerAttemptCount,
 			}));
 			if (seqStep.outputName) {
 				outputs[seqStep.outputName] = outputEntryFromAsyncResult({
@@ -5396,8 +5420,11 @@ async function runSubagent(
 			id,
 			agent: agentName,
 			mode: resultMode,
-			success: !stopped && !timedOut && !turnBudgetExceeded && !usageBudgetExceeded && !interrupted && !signalTerminated && results.every((r) => r.success),
-			state: stopped || signalTerminated ? "stopped" : timedOut || turnBudgetExceeded || usageBudgetExceeded ? "failed" : interrupted ? "paused" : results.every((r) => r.success) ? "complete" : "failed",
+			// One terminal outcome feeds every receipt: an acceptance-gate
+			// rejection records statusPayload.error without flipping the child's
+			// own success flag, so results.every() alone is not authoritative.
+			success: statusPayload.state === "complete",
+			state: statusPayload.state,
 			summary: stopped ? stopMessage : signalTerminated ? (statusPayload.error ?? "Subagent process terminated by signal.") : timedOut ? (timeoutMessage ?? "Subagent timed out.") : turnBudgetExceeded ? (statusPayload.error ?? "Subagent exceeded turn budget.") : usageBudgetExceeded ? (statusPayload.error ?? "Usage budget exhausted.") : interrupted ? "Paused after interrupt. Waiting for explicit next action." : summary,
 			...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
 			...(config.deadlineAt !== undefined ? { deadlineAt: config.deadlineAt } : {}),
@@ -5407,7 +5434,8 @@ async function runSubagent(
 			...(statusPayload.toolBudget ? { toolBudget: statusPayload.toolBudget } : {}),
 			...(statusPayload.toolBudgetBlocked ? { toolBudgetBlocked: true } : {}),
 			...(statusPayload.usageBudget ? { usageBudget: statusPayload.usageBudget } : {}),
-			...(stopped ? { stopped: true, error: stopMessage } : timedOut ? { timedOut: true, error: timeoutMessage ?? "Subagent timed out." } : turnBudgetExceeded ? { error: statusPayload.error ?? "Subagent exceeded turn budget." } : usageBudgetExceeded ? { error: statusPayload.error ?? "Usage budget exhausted." } : {}),
+			...(stopped ? { stopped: true } : timedOut ? { timedOut: true } : {}),
+			...(statusPayload.error ? { error: statusPayload.error } : {}),
 			results: results.map((r) => omitUndefinedProperties({
 				agent: r.agent,
 				context: r.context,
@@ -5457,6 +5485,8 @@ async function runSubagent(
 				timeoutRecovery: r.timeoutRecovery,
 				capabilityCeiling: r.capabilityCeiling,
 				capabilityAudit: r.capabilityAudit,
+				writerProcesses: r.writerProcesses,
+				writerAttemptCount: r.writerAttemptCount,
 			})),
 			outputs,
 			workflowGraph: statusPayload.workflowGraph,
@@ -5465,7 +5495,7 @@ async function runSubagent(
 			capabilityAudit: statusPayload.capabilityAudit,
 			...(config.parentWorkflowRunId ? { parentWorkflowRunId: config.parentWorkflowRunId } : {}),
 			...(config.workflowKey ? { workflowKey: config.workflowKey } : {}),
-			exitCode: stopped || timedOut || turnBudgetExceeded || usageBudgetExceeded ? 1 : interrupted || results.every((r) => r.success) ? 0 : 1,
+			exitCode: statusPayload.state === "complete" || statusPayload.state === "paused" ? 0 : 1,
 			timestamp: runEndedAt,
 			durationMs: runEndedAt - overallStartTime,
 			totalTokens: statusPayload.totalTokens,

@@ -29,6 +29,8 @@ import {
 import { getSummaryUsage } from "./usage-totals.ts";
 
 const MAX_SESSION_FILE_COLLISION_ATTEMPTS = 100;
+// Allocation policy: at most 100 short candidates, then 100 full UUID candidates.
+const MAX_ENTRY_ID_COLLISION_ATTEMPTS = 100;
 export const CURRENT_SESSION_VERSION = 3;
 
 export interface SessionHeader {
@@ -236,6 +238,22 @@ function createSessionId(): string {
 	return uuidv7();
 }
 
+function createSessionHeader(cwd: string, options?: NewSessionOptions): SessionHeader {
+	if (options?.id !== undefined) assertValidSessionId(options.id);
+	return {
+		type: "session",
+		version: CURRENT_SESSION_VERSION,
+		id: options?.id ?? createSessionId(),
+		timestamp: new Date().toISOString(),
+		cwd,
+		parentSession: options?.parentSession,
+	};
+}
+
+function writeSessionFile(path: string, entries: FileEntry[]): void {
+	atomicWriteFileSync(path, entries.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+}
+
 export function assertValidSessionId(id: string): void {
 	if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(id)) {
 		throw new Error(
@@ -244,14 +262,19 @@ export function assertValidSessionId(id: string): void {
 	}
 }
 
-/** Generate a unique short ID (8 hex chars, collision-checked) */
+/** Generate a collision-checked ID under the bounded short/full UUID retry policy. */
 function generateId(byId: { has(id: string): boolean }): string {
-	for (let i = 0; i < 100; i++) {
+	for (let i = 0; i < MAX_ENTRY_ID_COLLISION_ATTEMPTS; i++) {
 		const id = randomUUID().slice(0, 8);
 		if (!byId.has(id)) return id;
 	}
-	// Fallback to full UUID if somehow we have collisions
-	return randomUUID();
+	for (let i = 0; i < MAX_ENTRY_ID_COLLISION_ATTEMPTS; i++) {
+		const id = randomUUID();
+		if (!byId.has(id)) return id;
+	}
+	throw new Error(
+		`Could not generate a unique session entry ID after ${MAX_ENTRY_ID_COLLISION_ATTEMPTS * 2} attempts`,
+	);
 }
 
 /** Migrate v1 → v2: add id/parentId tree structure. Mutates in place. */
@@ -266,6 +289,7 @@ function migrateV1ToV2(entries: FileEntry[]): void {
 		}
 
 		entry.id = generateId(ids);
+		ids.add(entry.id);
 		entry.parentId = prevId;
 		prevId = entry.id;
 
@@ -349,13 +373,58 @@ export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEnt
 	return null;
 }
 
+function assertEntryIdentity(entry: SessionEntry): void {
+	if (!entry || typeof entry !== "object" || typeof entry.id !== "string" || entry.id.length === 0) {
+		throw new Error("Invalid session graph: entry IDs must be nonempty strings");
+	}
+	if (entry.parentId !== null && typeof entry.parentId !== "string") {
+		throw new Error(`Invalid session graph: parentId must be a string or null for entry ${entry.id}`);
+	}
+}
+
 function buildEntryIndex(entries: SessionEntry[], byId?: Map<string, SessionEntry>): Map<string, SessionEntry> {
 	if (byId) return byId;
 	const index = new Map<string, SessionEntry>();
 	for (const entry of entries) {
+		assertEntryIdentity(entry);
+		if (index.has(entry.id)) throw new Error(`Invalid session graph: duplicate entry ID ${entry.id}`);
 		index.set(entry.id, entry);
 	}
 	return index;
+}
+
+/** Walk parents once; completed ancestors let whole-graph validation remain linear. */
+function walkSessionParents(
+	index: Map<string, SessionEntry>,
+	leaf: SessionEntry | undefined,
+	completed?: ReadonlySet<string>,
+): SessionEntry[] {
+	const path: SessionEntry[] = [];
+	const visited = new Set<string>();
+	let current = leaf;
+	while (current && !completed?.has(current.id)) {
+		assertEntryIdentity(current);
+		if (visited.has(current.id)) throw new Error(`Invalid session graph: parent cycle at entry ${current.id}`);
+		visited.add(current.id);
+		path.push(current);
+		current = current.parentId === null ? undefined : index.get(current.parentId);
+	}
+	return path.reverse();
+}
+
+/** Validate privately parsed/migrated entries without rejecting missing-parent orphans. */
+function validateSessionGraph(fileEntries: FileEntry[]): void {
+	const entries: SessionEntry[] = [];
+	for (const entry of fileEntries) {
+		if (!entry || typeof entry !== "object") throw new Error("Invalid session graph: entries must be objects");
+		if (entry.type !== "session") entries.push(entry);
+	}
+	const index = buildEntryIndex(entries);
+	const completed = new Set<string>();
+	for (const entry of entries) {
+		if (completed.has(entry.id)) continue;
+		for (const ancestor of walkSessionParents(index, entry, completed)) completed.add(ancestor.id);
+	}
 }
 
 function buildSessionPath(
@@ -376,14 +445,7 @@ function buildSessionPath(
 		return [];
 	}
 
-	const path: SessionEntry[] = [];
-	let current: SessionEntry | undefined = leaf;
-	while (current) {
-		path.push(current);
-		current = current.parentId ? index.get(current.parentId) : undefined;
-	}
-	path.reverse();
-	return path;
+	return walkSessionParents(index, leaf);
 }
 
 function getSessionContextSettings(path: SessionEntry[]): Pick<SessionContext, "thinkingLevel" | "model"> {
@@ -1007,54 +1069,44 @@ export class SessionManager {
 	}
 
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
-		this.sessionFile = resolvePath(sessionFile);
-		if (existsSync(this.sessionFile)) {
-			this.fileEntries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
-
-			// If file was empty, initialize it with a valid session header. If it was
-			// non-empty but did not parse as a pi session, fail without modifying it.
-			if (this.fileEntries.length === 0) {
-				const explicitPath = this.sessionFile;
-				if (statSync(explicitPath).size > 0) {
-					throw new Error(`Session file is not a valid ${APP_NAME} session: ${explicitPath}`);
-				}
-				this.newSession();
-				this.sessionFile = explicitPath;
-				this._rewriteFile();
-				this.flushed = true;
-				return;
+		const path = resolvePath(sessionFile);
+		let entries: FileEntry[];
+		let sessionId: string;
+		let flushed = false;
+		if (existsSync(path)) {
+			entries = preloadedFileEntries ?? loadEntriesFromFile(path);
+			// Stage migration and graph validation privately. A failed switch must
+			// neither rewrite corrupt input nor publish it over the current owner.
+			if (entries.length === 0) {
+				if (statSync(path).size > 0) throw new Error(`Session file is not a valid ${APP_NAME} session: ${path}`);
+				const header = createSessionHeader(this.cwd);
+				entries = [header];
+				sessionId = header.id;
+				if (this.persist) writeSessionFile(path, entries);
+			} else {
+				const header = entries.find((entry) => entry.type === "session");
+				sessionId = header?.id ?? createSessionId();
+				const migrated = migrateToCurrentVersion(entries);
+				validateSessionGraph(entries);
+				if (migrated && this.persist) writeSessionFile(path, entries);
 			}
-
-			const header = this.fileEntries.find((e) => e.type === "session") as SessionHeader | undefined;
-			this.sessionId = header?.id ?? createSessionId();
-
-			if (migrateToCurrentVersion(this.fileEntries)) {
-				this._rewriteFile();
-			}
-
-			this._buildIndex();
-			this.flushed = true;
+			flushed = true;
 		} else {
-			const explicitPath = this.sessionFile;
-			this.newSession();
-			this.sessionFile = explicitPath; // preserve explicit path from --session flag
+			const header = createSessionHeader(this.cwd);
+			entries = [header];
+			sessionId = header.id;
 		}
+		this.sessionFile = path;
+		this.fileEntries = entries;
+		this.sessionId = sessionId;
+		this._buildIndex();
+		this.flushed = flushed;
 	}
 
 	newSession(options?: NewSessionOptions): string | undefined {
-		if (options?.id !== undefined) {
-			assertValidSessionId(options.id);
-		}
-		this.sessionId = options?.id ?? createSessionId();
-		const timestamp = new Date().toISOString();
-		const header: SessionHeader = {
-			type: "session",
-			version: CURRENT_SESSION_VERSION,
-			id: this.sessionId,
-			timestamp,
-			cwd: this.cwd,
-			parentSession: options?.parentSession,
-		};
+		const header = createSessionHeader(this.cwd, options);
+		this.sessionId = header.id;
+		const timestamp = header.timestamp;
 		this.fileEntries = [header];
 		this.byId.clear();
 		this.labelsById.clear();
@@ -1090,10 +1142,10 @@ export class SessionManager {
 		}
 	}
 
-	private _rewriteFile(): void {
-		if (!this.persist || !this.sessionFile) return;
+	private _rewriteFile(sessionFile = this.sessionFile, entries = this.fileEntries): void {
+		if (!this.persist || !sessionFile) return;
 		// Atomic tmp+rename: a crash never leaves a truncated session file behind.
-		atomicWriteFileSync(this.sessionFile, this.fileEntries.map((entry) => `${JSON.stringify(entry)}\n`).join(""));
+		writeSessionFile(sessionFile, entries);
 	}
 
 	isPersisted(): boolean {
@@ -1432,15 +1484,8 @@ export class SessionManager {
 	 * Use buildSessionContext() to get the resolved messages for the LLM.
 	 */
 	getBranch(fromId?: string): SessionEntry[] {
-		const path: SessionEntry[] = [];
 		const startId = fromId ?? this.leafId;
-		let current = startId ? this.byId.get(startId) : undefined;
-		while (current) {
-			path.push(current);
-			current = current.parentId ? this.byId.get(current.parentId) : undefined;
-		}
-		path.reverse();
-		return path;
+		return walkSessionParents(this.byId, startId ? this.byId.get(startId) : undefined);
 	}
 
 	/**
@@ -1648,23 +1693,18 @@ export class SessionManager {
 				parentId = labelEntry.id;
 			}
 
-			this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
+			const entries: FileEntry[] = [header, ...pathWithoutLabels, ...labelEntries];
+			// Required publication precedes replacing the owner. A failed atomic
+			// write must leave its entries, indexes and append state unchanged.
+			// Without an assistant, defer creation to _persist() as for newSession().
+			const hasAssistant = entries.some((e) => e.type === "message" && e.message.role === "assistant");
+			if (hasAssistant) this._rewriteFile(newSessionFile, entries);
+
+			this.fileEntries = entries;
 			this.sessionId = newSessionId;
 			this.sessionFile = newSessionFile;
 			this._buildIndex();
-
-			// Only write the file now if it contains an assistant message.
-			// Otherwise defer to _persist(), which creates the file on the
-			// first assistant response, matching the newSession() contract
-			// and avoiding the duplicate-header bug when _persist()'s
-			// no-assistant guard later resets flushed to false.
-			const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-			if (hasAssistant) {
-				this._rewriteFile();
-				this.flushed = true;
-			} else {
-				this.flushed = false;
-			}
+			this.flushed = hasAssistant;
 
 			return newSessionFile;
 		}
@@ -1772,6 +1812,11 @@ export class SessionManager {
 		if (!sourceHeader) {
 			throw new Error(`Cannot fork: source session has no header: ${resolvedSourcePath}`);
 		}
+
+		// Migrate the private parsed copy before replacing its versioned header.
+		// Marking legacy entries as current would otherwise bypass migration on open.
+		migrateToCurrentVersion(sourceEntries);
+		validateSessionGraph(sourceEntries);
 
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(resolvedTargetCwd);
 		if (!existsSync(dir)) {

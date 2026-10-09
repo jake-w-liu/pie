@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
-import { createWriteStream, type WriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { OutputSpool } from "./output-spool.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, type TruncationResult, truncateTail } from "./truncate.ts";
 
 export interface OutputAccumulatorOptions {
@@ -51,8 +51,7 @@ export class OutputAccumulator {
 	private hasOpenLine = false;
 	private finished = false;
 
-	private tempFilePath: string | undefined;
-	private tempFileStream: WriteStream | undefined;
+	private spool: OutputSpool | undefined;
 
 	constructor(options: OutputAccumulatorOptions = {}) {
 		this.maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
@@ -69,9 +68,9 @@ export class OutputAccumulator {
 		this.totalRawBytes += data.length;
 		this.appendDecodedText(this.decoder.decode(data, { stream: true }));
 
-		if (this.tempFileStream || this.shouldUseTempFile()) {
+		if (this.spool || this.shouldUseTempFile()) {
 			this.ensureTempFile();
-			this.tempFileStream?.write(data);
+			this.spool?.write(data);
 		} else if (data.length > 0) {
 			this.rawChunks.push(data);
 		}
@@ -114,31 +113,12 @@ export class OutputAccumulator {
 		return {
 			content: truncation.content,
 			truncation,
-			fullOutputPath: this.tempFilePath,
+			fullOutputPath: this.spool?.getPath(),
 		};
 	}
 
 	async closeTempFile(): Promise<void> {
-		if (!this.tempFileStream) {
-			return;
-		}
-
-		const stream = this.tempFileStream;
-		this.tempFileStream = undefined;
-
-		await new Promise<void>((resolve, reject) => {
-			const onError = (error: Error) => {
-				stream.off("finish", onFinish);
-				reject(error);
-			};
-			const onFinish = () => {
-				stream.off("error", onError);
-				resolve();
-			};
-			stream.once("error", onError);
-			stream.once("finish", onFinish);
-			stream.end();
-		});
+		await this.spool?.close();
 	}
 
 	getLastLineBytes(): number {
@@ -209,13 +189,10 @@ export class OutputAccumulator {
 	}
 
 	private ensureTempFile(): void {
-		if (this.tempFilePath) {
-			return;
-		}
-		this.tempFilePath = defaultTempFilePath(this.tempFilePrefix);
-		this.tempFileStream = createWriteStream(this.tempFilePath);
+		if (this.spool) return;
+		this.spool = new OutputSpool(defaultTempFilePath(this.tempFilePrefix));
 		for (const chunk of this.rawChunks) {
-			this.tempFileStream.write(chunk);
+			this.spool.write(chunk);
 		}
 		this.rawChunks = [];
 	}

@@ -11,7 +11,10 @@ const fixture = vi.hoisted(() => ({
 	clones: [] as Array<{ path: string; finish: () => void }>,
 	sizeCheck: vi.fn(async (): Promise<number> => 1),
 }));
-vi.mock("../../pi-web-access/utils.ts", () => ({ getWebSearchConfigPath: () => fixture.configPath }));
+vi.mock("../../pi-web-access/utils.ts", () => ({
+	getWebSearchConfigPath: () => fixture.configPath,
+	proxyChildEnv: (env: NodeJS.ProcessEnv) => env,
+}));
 vi.mock("../../pi-web-access/github-api.ts", () => ({
 	checkGhAvailable: async () => true,
 	checkRepoSize: fixture.sizeCheck,

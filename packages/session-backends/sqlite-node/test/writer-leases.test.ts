@@ -15,6 +15,54 @@ function createRepository(root: string, databasePath: string, lease?: { ttlMs: n
 }
 
 describe("SQLite session writer leases", () => {
+	it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648, Number.MAX_SAFE_INTEGER])(
+		"rejects unsupported Node heartbeat cadence %s before opening storage",
+		(heartbeatIntervalMs) => {
+			const root = createTempDir();
+			expect(() =>
+				createRepository(root, join(root, "sessions.sqlite"), { ttlMs: 3_000_000_000, heartbeatIntervalMs }),
+			).toThrow(RangeError);
+		},
+	);
+
+	it("retains the heartbeat-below-TTL policy", () => {
+		const root = createTempDir();
+		expect(() =>
+			createRepository(root, join(root, "sessions.sqlite"), { ttlMs: 1000, heartbeatIntervalMs: 1000 }),
+		).toThrow(/less than ttlMs/);
+	});
+
+	it("uses the actual maximum Node timer delay without overflow and closes its owned timer", async () => {
+		const root = createTempDir();
+		const maximum = 2_147_483_647;
+		const timers = vi.spyOn(globalThis, "setTimeout");
+		const warnings: Error[] = [];
+		const warning = (error: Error) => {
+			if (error.name === "TimeoutOverflowWarning") warnings.push(error);
+		};
+		process.on("warning", warning);
+		const repository = createRepository(root, join(root, "sessions.sqlite"), {
+			ttlMs: maximum + 1,
+			heartbeatIntervalMs: maximum,
+		});
+		try {
+			await repository.create({ cwd: root, id: "maximum-cadence" });
+			const index = timers.mock.calls.findIndex((call) => call[1] === maximum);
+			expect(index).toBeGreaterThanOrEqual(0);
+			const timer = timers.mock.results[index].value as NodeJS.Timeout;
+			expect(Reflect.get(timer, "_idleTimeout")).toBe(maximum);
+			expect(timer.hasRef()).toBe(false);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(warnings).toEqual([]);
+			await repository.close();
+			expect(Reflect.get(timer, "_destroyed")).toBe(true);
+		} finally {
+			await repository.close();
+			process.off("warning", warning);
+			timers.mockRestore();
+		}
+	});
+
 	it("shares one write queue across repeated opens in one repository", async () => {
 		const root = createTempDir();
 		const databasePath = join(root, "sessions.sqlite");

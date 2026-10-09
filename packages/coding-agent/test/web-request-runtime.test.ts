@@ -40,8 +40,8 @@ it.each(["native", "host"])(
 				runtime: process.versions.bun ? `Bun ${process.versions.bun}` : process.version,
 				mode,
 				success: true,
-				rootUndici: "8.9.0",
-				webUndici: "8.10.0",
+				rootUndici: "8.11.2",
+				webUndici: "8.10.2",
 			});
 		} finally {
 			rmSync(root, { recursive: true, force: true });

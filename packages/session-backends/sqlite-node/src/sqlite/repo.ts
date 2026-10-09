@@ -95,7 +95,7 @@ import type {
 export interface SqliteWriterLeaseOptions {
 	/** Time without a successful heartbeat before another writer may take over. Default: 30 seconds. */
 	ttlMs?: number;
-	/** Idle heartbeat cadence. Default: 10 seconds. Must be less than ttlMs. */
+	/** Idle heartbeat cadence. Default: 10 seconds. Positive integer, less than ttlMs and at most Node's 2_147_483_647 ms timer limit. */
 	heartbeatIntervalMs?: number;
 }
 
@@ -115,8 +115,15 @@ function resolveWriterLeaseOptions(options: SqliteWriterLeaseOptions | undefined
 	const ttlMs = options?.ttlMs ?? 30_000;
 	const heartbeatIntervalMs = options?.heartbeatIntervalMs ?? 10_000;
 	if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) throw new RangeError("writerLease.ttlMs must be positive");
-	if (!Number.isSafeInteger(heartbeatIntervalMs) || heartbeatIntervalMs <= 0 || heartbeatIntervalMs >= ttlMs) {
-		throw new RangeError("writerLease.heartbeatIntervalMs must be positive and less than ttlMs");
+	if (
+		!Number.isSafeInteger(heartbeatIntervalMs) ||
+		heartbeatIntervalMs <= 0 ||
+		heartbeatIntervalMs >= ttlMs ||
+		heartbeatIntervalMs > 2_147_483_647
+	) {
+		throw new RangeError(
+			"writerLease.heartbeatIntervalMs must be positive and less than ttlMs, and at most 2147483647",
+		);
 	}
 	return { ttlMs, heartbeatIntervalMs };
 }

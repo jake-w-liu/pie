@@ -343,62 +343,114 @@ async function streamAssistantResponse(
 
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;
+	let completedMessage: AssistantMessage | undefined;
 
-	for await (const event of response) {
-		switch (event.type) {
-			case "start":
-				partialMessage = event.partial;
-				context.messages.push(partialMessage);
-				addedPartial = true;
-				await emit({ type: "message_start", message: { ...partialMessage } });
-				break;
-
-			case "text_start":
-			case "text_delta":
-			case "text_end":
-			case "thinking_start":
-			case "thinking_delta":
-			case "thinking_end":
-			case "toolcall_start":
-			case "toolcall_delta":
-			case "toolcall_end":
-				if (partialMessage) {
+	try {
+		for await (const event of response) {
+			switch (event.type) {
+				case "start":
 					partialMessage = event.partial;
-					context.messages[context.messages.length - 1] = partialMessage;
-					await emit({
-						type: "message_update",
-						assistantMessageEvent: event,
-						message: { ...partialMessage },
-					});
-				}
-				break;
+					context.messages.push(partialMessage);
+					addedPartial = true;
+					await emit({ type: "message_start", message: { ...partialMessage } });
+					break;
 
-			case "done":
-			case "error": {
-				const finalMessage = await response.result();
-				if (addedPartial) {
-					context.messages[context.messages.length - 1] = finalMessage;
-				} else {
-					context.messages.push(finalMessage);
-				}
-				if (!addedPartial) {
-					await emit({ type: "message_start", message: { ...finalMessage } });
-				}
-				await emit({ type: "message_end", message: finalMessage });
-				return finalMessage;
+				case "text_start":
+				case "text_delta":
+				case "text_end":
+				case "thinking_start":
+				case "thinking_delta":
+				case "thinking_end":
+				case "toolcall_start":
+				case "toolcall_delta":
+				case "toolcall_end":
+					if (partialMessage) {
+						partialMessage = event.partial;
+						context.messages[context.messages.length - 1] = partialMessage;
+						await emit({
+							type: "message_update",
+							assistantMessageEvent: event,
+							message: { ...partialMessage },
+						});
+					}
+					break;
+
+				case "done":
+				case "error":
+					// Completion must precede automatic iterator close. Record only
+					// an accepted barrier; rejection already settled its requests.
+					completedMessage = await completeAssistantResponse(await response.result(), addedPartial, context, emit);
+					return completedMessage;
 			}
 		}
+	} catch (error) {
+		if (completedMessage) {
+			const notifications = settleToolNotifications(emit);
+			await publishUnadmittedToolResults(
+				completedMessage,
+				context,
+				notifications.emit,
+				"response iterator cleanup failed",
+			);
+		}
+		// This resource-boundary failure was selected before later observers.
+		// Drain their results, but never replace the original null/undefined.
+		throw error;
 	}
 
-	const finalMessage = await response.result();
+	return completeAssistantResponse(await response.result(), addedPartial, context, emit);
+}
+
+async function completeAssistantResponse(
+	message: AssistantMessage,
+	addedPartial: boolean,
+	context: AgentContext,
+	emit: AgentEventSink,
+): Promise<AssistantMessage> {
 	if (addedPartial) {
-		context.messages[context.messages.length - 1] = finalMessage;
+		context.messages[context.messages.length - 1] = message;
 	} else {
-		context.messages.push(finalMessage);
-		await emit({ type: "message_start", message: { ...finalMessage } });
+		context.messages.push(message);
+		await emit({ type: "message_start", message: { ...message } });
 	}
-	await emit({ type: "message_end", message: finalMessage });
-	return finalMessage;
+	await publishAssistantMessageEnd(message, context, emit);
+	return message;
+}
+
+/** A failed completion barrier must answer published requests without admitting their effects. */
+async function publishAssistantMessageEnd(
+	message: AssistantMessage,
+	context: AgentContext,
+	emit: AgentEventSink,
+): Promise<void> {
+	const notifications = settleToolNotifications(emit);
+	await notifications.emit({ type: "message_end", message });
+	if (notifications.failed) {
+		await publishUnadmittedToolResults(message, context, notifications.emit, "assistant message completion failed");
+	}
+	// Retain the original barrier error, including null/undefined, after draining
+	// any later result observers. No tool preparation, execution, or hooks ran.
+	notifications.throwIfFailed();
+}
+
+/** Callers provide their settled notification sink and preserve the selected primary failure. */
+async function publishUnadmittedToolResults(
+	message: AssistantMessage,
+	context: AgentContext,
+	emit: AgentEventSink,
+	reason: string,
+): Promise<void> {
+	for (const toolCall of message.content.filter((block) => block.type === "toolCall")) {
+		const result = createToolResultMessage({
+			toolCall,
+			result: createErrorToolResult(
+				`Tool call "${toolCall.name}" was not executed: ${reason} before tool admission.`,
+			),
+			isError: true,
+		});
+		await emitToolResultMessage(result, emit);
+		context.messages.push(result);
+	}
 }
 
 /**
@@ -413,26 +465,13 @@ async function failToolCallsFromTruncatedMessage(
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
 	const messages: ToolResultMessage[] = [];
-	// A throwing event listener is recorded, not propagated immediately: every call in
-	// this assistant message still needs a toolResult event (that is what puts it in
-	// the transcript) before the run fails. Same rule as `Agent.processEvents` and the
-	// parallel executor -- deliver everything, then surface the first failure.
-	let firstError: unknown;
-	const emitSafely = async (emitEvents: () => Promise<void>): Promise<void> => {
-		try {
-			await emitEvents();
-		} catch (error) {
-			firstError ??= error;
-		}
-	};
+	const notifications = settleToolNotifications(emit);
 	for (const toolCall of toolCalls) {
-		await emitSafely(async () => {
-			await emit({
-				type: "tool_execution_start",
-				toolCallId: toolCall.id,
-				toolName: toolCall.name,
-				args: toolCall.arguments,
-			});
+		await notifications.emit({
+			type: "tool_execution_start",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			args: toolCall.arguments,
 		});
 		const finalized: FinalizedToolCallOutcome = {
 			toolCall,
@@ -441,13 +480,13 @@ async function failToolCallsFromTruncatedMessage(
 			),
 			isError: true,
 		};
-		await emitSafely(() => emitToolExecutionEnd(finalized, emit));
+		await emitToolExecutionEnd(finalized, notifications.emit);
 		const toolResultMessage = createToolResultMessage(finalized);
-		await emitSafely(() => emitToolResultMessage(toolResultMessage, emit));
+		await emitToolResultMessage(toolResultMessage, notifications.emit);
 		messages.push(toolResultMessage);
 	}
 
-	if (firstError !== undefined) throw firstError;
+	notifications.throwIfFailed();
 	return { messages, terminate: false };
 }
 
@@ -465,10 +504,41 @@ async function executeToolCalls(
 	const hasSequentialToolCall = toolCalls.some(
 		(tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
 	);
-	if (config.toolExecution === "sequential" || hasSequentialToolCall) {
-		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit);
-	}
-	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit);
+	const notifications = settleToolNotifications(emit);
+	const batch = await (config.toolExecution === "sequential" || hasSequentialToolCall
+		? executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, notifications.emit)
+		: executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, notifications.emit));
+	notifications.throwIfFailed();
+	return batch;
+}
+
+/**
+ * Notifications cannot change an executed tool's outcome or abandon requested
+ * calls. Capture only observer failures, drain every notification/result, then
+ * surface the first failure to the run owner. The object also preserves thrown
+ * null/undefined values rather than using them as a no-failure sentinel.
+ */
+function settleToolNotifications(emit: AgentEventSink): {
+	emit: AgentEventSink;
+	readonly failed: boolean;
+	throwIfFailed: () => void;
+} {
+	let failure: { error: unknown } | undefined;
+	return {
+		get failed() {
+			return failure !== undefined;
+		},
+		emit: async (event) => {
+			try {
+				await emit(event);
+			} catch (error) {
+				failure ??= { error };
+			}
+		},
+		throwIfFailed: () => {
+			if (failure) throw failure.error;
+		},
+	};
 }
 
 type ExecutedToolCallBatch = {
@@ -486,31 +556,12 @@ async function executeToolCallsSequential(
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallOutcome[] = [];
 	const messages: ToolResultMessage[] = [];
-	// Every toolCall in the assistant message needs a toolResult, or the persisted
-	// transcript carries an unanswered tool call and providers reject the next
-	// request. A listener throwing on tool_execution_start/tool_execution_end/
-	// message_start/message_end therefore must not abandon the remaining calls, so
-	// emission failures are recorded and the loop continues; the first failure is
-	// rethrown once every result has been published. The tool-result `message_end`
-	// events are what put the messages in the transcript, so they must run even when
-	// an earlier listener failed. Same rule as the parallel executor below.
-	let firstError: unknown;
-	const emitSafely = async (emitEvents: () => Promise<void>): Promise<void> => {
-		try {
-			await emitEvents();
-		} catch (error) {
-			firstError ??= error;
-		}
-	};
-
 	for (const toolCall of toolCalls) {
-		await emitSafely(async () => {
-			await emit({
-				type: "tool_execution_start",
-				toolCallId: toolCall.id,
-				toolName: toolCall.name,
-				args: toolCall.arguments,
-			});
+		await emit({
+			type: "tool_execution_start",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			args: toolCall.arguments,
 		});
 
 		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
@@ -533,9 +584,9 @@ async function executeToolCallsSequential(
 			);
 		}
 
-		await emitSafely(() => emitToolExecutionEnd(finalized, emit));
+		await emitToolExecutionEnd(finalized, emit);
 		const toolResultMessage = createToolResultMessage(finalized);
-		await emitSafely(() => emitToolResultMessage(toolResultMessage, emit));
+		await emitToolResultMessage(toolResultMessage, emit);
 		finalizedCalls.push(finalized);
 		messages.push(toolResultMessage);
 
@@ -545,10 +596,6 @@ async function executeToolCallsSequential(
 		// "not-executed" error result immediately once the signal is aborted, so
 		// the remaining calls settle without dispatching.
 	}
-
-	// Surface the first listener failure after every result is published, so the run
-	// still fails loudly instead of masquerading as a clean tool batch.
-	if (firstError !== undefined) throw firstError;
 
 	return {
 		messages,
@@ -774,7 +821,6 @@ async function executePreparedToolCall(
 		return { kind: "not-executed", result: createErrorToolResult("Operation aborted"), isError: true };
 	}
 	const updateEvents: Promise<void>[] = [];
-	let updateFailure: { error: unknown } | undefined;
 	let acceptingUpdates = true;
 	let outcome: ExecutedToolCallOutcome;
 
@@ -787,19 +833,13 @@ async function executePreparedToolCall(
 				if (!acceptingUpdates) return;
 				updateEvents.push(
 					(async () => {
-						try {
-							await emit({
-								type: "tool_execution_update",
-								toolCallId: prepared.toolCall.id,
-								toolName: prepared.toolCall.name,
-								args: prepared.toolCall.arguments,
-								partialResult,
-							});
-						} catch (error) {
-							// Observe rejection immediately, even while execute is still running.
-							// Re-throw only after every admitted update listener has settled.
-							updateFailure ??= { error };
-						}
+						await emit({
+							type: "tool_execution_update",
+							toolCallId: prepared.toolCall.id,
+							toolName: prepared.toolCall.name,
+							args: prepared.toolCall.arguments,
+							partialResult,
+						});
 					})(),
 				);
 			},
@@ -816,7 +856,6 @@ async function executePreparedToolCall(
 		// Even an unexpected normalization failure cannot abandon admitted listeners.
 		await Promise.all(updateEvents);
 	}
-	if (updateFailure) throw updateFailure.error;
 	return outcome;
 }
 
@@ -885,6 +924,7 @@ async function emitToolExecutionEnd(finalized: FinalizedToolCallOutcome, emit: A
 }
 
 function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResultMessage {
+	const { details, usage } = finalized.result;
 	return {
 		role: "toolResult",
 		toolCallId: finalized.toolCall.id,
@@ -892,8 +932,8 @@ function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResul
 		// Untyped tools (JS extensions) can return results without content; normalize
 		// so the null never enters session history or provider payloads.
 		content: finalized.result.content ?? [],
-		details: finalized.result.details,
-		usage: finalized.result.usage,
+		...(details === undefined ? {} : { details }),
+		...(usage === undefined ? {} : { usage }),
 		...(finalized.result.addedToolNames?.length ? { addedToolNames: finalized.result.addedToolNames } : {}),
 		isError: finalized.isError,
 		timestamp: Date.now(),

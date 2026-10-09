@@ -45,7 +45,7 @@ import {
 } from "../../shared/settings.ts";
 import { normalizeSkillInput } from "../../agents/skills.ts";
 import { buildAsyncRunnerSteps, DEFAULT_ASYNC_TIMEOUT_MS, executeAsyncChain, executeAsyncSingle, formatAsyncStartedMessage, isAsyncAvailable, workflowAwaitedAsyncResultPath } from "../background/async-execution.ts";
-import { updateActiveRunIndex } from "../background/active-run-index.ts";
+import { releaseActiveRunIndex, updateActiveRunIndex } from "../background/active-run-index.ts";
 import { steeringReceipt } from "../background/steering.ts";
 import { acquireActiveAsyncCapacity, ActiveAsyncCapacityError, getActiveAsyncCapacitySnapshot, resolveAbandonedSlotReleaseAfterMs, resolveMaxActiveAsyncRunsPerSession, transferActiveAsyncCapacity, type ActiveAsyncCapacityHandle } from "../background/active-async-capacity.ts";
 import { isScheduledRunAction } from "../background/scheduled-runs.ts";
@@ -124,7 +124,7 @@ import {
 } from "./workflow-foreground-steering.ts";
 import { stopAsyncRun } from "./async-stop-action.ts";
 import { dismissRecoveredWorkflow } from "./async-dismiss-action.ts";
-import { promotePausedWorkflowIfSettled, reconcileDetachedWorkflowChildCompletion } from "./workflow-detach-reconcile.ts";
+import { drainRetainedDetachedCompletions, promotePausedWorkflowIfSettled, reconcileDetachedWorkflowChildCompletion } from "./workflow-detach-reconcile.ts";
 import { reconcileAsyncRun } from "../background/stale-run-reconciler.ts";
 import { resolveAsyncRootResultPath, waitForImportedAsyncRoot } from "../background/chain-root-attachment.ts";
 import { resultFilePath, writeAsyncResultFile } from "../background/result-files.ts";
@@ -145,9 +145,9 @@ import { createMissionWorkflowState } from "../../missions/workflow-state.ts";
 import { resolveAuthorityDecision } from "../../policy/authority.ts";
 import { handleHerdrInspectorAction, HERDR_INSPECTOR_ACTIONS } from "../../inspectors/herdr/actions.ts";
 import { handleHerdrProjectPaneAction, HERDR_PROJECT_PANE_ACTIONS } from "../../inspectors/herdr/project-panes.ts";
-import { previewSimpleWorkflowRun, runWorkflowScript, validateWorkflowScript, WorkflowScriptError, type WorkflowReceiptResumeReference, type WorkflowScriptChildResult, type WorkflowSteerOptions, type WorkflowSteerResult } from "../../workflows/scripted-workflow.ts";
+import { previewSimpleWorkflowRun, runWorkflowScript, validateWorkflowScript, WorkflowScriptError, WORKFLOW_SETTLEMENT_DRAIN_MS, type WorkflowReceiptResumeReference, type WorkflowScriptChildResult, type WorkflowSteerOptions, type WorkflowSteerResult } from "../../workflows/scripted-workflow.ts";
 import { buildWorkflowReceipt, resolveWorkflowReceiptResumeEntry, writeWorkflowReceipt, type WorkflowReceipt, type WorkflowReceiptState } from "../../workflows/workflow-receipt.ts";
-import { workflowChildSummary } from "../../workflows/workflow-child-summary.ts";
+import { parseWorkflowChildSummary, workflowChildSummary } from "../../workflows/workflow-child-summary.ts";
 import { resolveWorkflowChatProgress, type WorkflowChatProgressProjection } from "../../workflows/chat-progress.ts";
 import { claimWorkflowChildPermit, validateWorkflowChildPermitRoot, type WorkflowChildPermit, type WorkflowChildPermitContext } from "../../shared/workflow-child-permit.ts";
 import {
@@ -4355,6 +4355,12 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		signal: AbortSignal,
 		ctx: ExtensionContext,
 	) => Promise<AgentToolResult<Details>>;
+	/**
+	 * Runtime teardown: aborts every in-process workflow owned by this executor
+	 * (ordinary and scheduled-owner state) and waits bounded for settlement.
+	 * Detached runner processes are intentionally persistent and untouched.
+	 */
+	dispose: () => Promise<void>;
 } {
 	const delegatedThinkingOverrides = new WeakMap<object, AgentConfig["thinking"]>();
 	const delegatedZeroToolBudgets = new WeakSet<object>();
@@ -4362,6 +4368,19 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 	const workflowPermitContexts = new WeakMap<object, { root: WorkflowChildPermit } | { child: WorkflowChildPermitContext }>();
 	const warnedArtifactPackageDirs = new Set<string>();
 	const scheduledOwnerExecutors = new Map<string, ReturnType<typeof createSubagentExecutor>>();
+	// Scheduled runs execute on private owner executors whose workflow controls
+	// live on separate state objects; keep the states reachable so control
+	// actions can route to the actual owner instead of acknowledging blindly.
+	const scheduledOwnerStates = new Map<string, SubagentState>();
+	const findWorkflowControllerOwner = (runId: string): { ownerState: SubagentState; controller: AbortController } | undefined => {
+		const own = deps.state.workflowControllers?.get(runId);
+		if (own) return { ownerState: deps.state, controller: own };
+		for (const ownerState of scheduledOwnerStates.values()) {
+			const controller = ownerState.workflowControllers?.get(runId);
+			if (controller) return { ownerState, controller };
+		}
+		return undefined;
+	};
 	const execute = async (
 		_id: string,
 		params: SubagentParamsLike,
@@ -4451,51 +4470,15 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				&& !requestParams.workflowParentRunId;
 			const workflowRunId = asyncWorkflow ? randomUUID() : undefined;
 			let workflowCapacity: ActiveAsyncCapacityHandle | undefined;
-			if (workflowRunId && topLevelAsyncWorkflow) {
-				const currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
-				try {
-					workflowCapacity = acquireActiveAsyncCapacity({
-						sessionId: currentSessionId,
-						limit: resolveMaxActiveAsyncRunsPerSession(deps.config.maxActiveAsyncRunsPerSession),
-						runId: workflowRunId,
-						kind: "workflow",
-						asyncDir: path.join(DIRS.async, workflowRunId),
-					}, { liveWorkflowRunIds: new Set(deps.state.workflowControllers?.keys() ?? []), abandonedSlotReleaseAfterMs: resolveAbandonedSlotReleaseAfterMs(deps.config.capacity?.abandonedSlotReleaseAfterMs) });
-				} catch (error) {
-					if (error instanceof ActiveAsyncCapacityError) {
-						deps.state.activeAsyncCapacity = error.snapshot;
-						return { content: [{ type: "text", text: error.message }], isError: true, details: { mode: "workflow", results: [], activeAsyncCapacity: error.snapshot } };
-					}
-					throw error;
-				}
-			}
 			let workflowFanoutBudget: RunFanoutBudgetDescriptor;
-			try {
-				workflowFanoutBudget = requestParams.runFanoutBudget
-					?? decodeRunFanoutBudgetDescriptor(process.env[RUN_FANOUT_BUDGET_ENV])
-					?? createRunFanoutBudget(_id, resolveMaxSubagentSpawnsPerRun(deps.config.maxSubagentSpawnsPerRun));
-			} catch (error) {
-				workflowCapacity?.rollback();
-				return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], isError: true, details: { mode: "workflow", results: [] } };
-			}
 			let missionBinding: MissionLaunchBinding | undefined;
 			let missionWarning: string | undefined;
-			try {
-				missionBinding = prepareMissionLaunch({
-					params: autoMission ? { ...requestParams, task: derivedObjective } : requestParams,
-					projectRoot: workflowCwd,
-					...(deps.config.missions ? { config: deps.config.missions } : {}),
-					ownerSessionId: resolveCurrentSessionId(ctx.sessionManager),
-				});
-			} catch (error) {
-				if (explicitMission) {
-					workflowCapacity?.rollback();
-					return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], isError: true, details: { mode: "workflow", results: [] } };
-				}
-				missionWarning = `Mission tracking unavailable: ${error instanceof Error ? error.message : String(error)}`;
-			}
-			const detachWorkflowChildMissions = autoMission || missionBinding !== undefined || requestParams.mission === false;
-			const workflowState = missionBinding ? createMissionWorkflowState(missionBinding.location, missionBinding.missionId) : undefined;
+			let workflowState: ReturnType<typeof createMissionWorkflowState> | undefined;
+			let detachWorkflowChildMissions: boolean;
+			let prelaunchStatus: AsyncStatus | undefined;
+			let launchPreparedWorkflow: (() => AgentToolResult<Details>) | undefined;
+			const prelaunchWriters: Array<ReturnType<typeof createCapacityResilientJsonWriter>> = [];
+			let persistClosed = false;
 			const attachWorkflowMission = (result: AgentToolResult<Details>): AgentToolResult<Details> => {
 				if (!missionBinding) return missionWarning ? { ...result, details: { ...result.details, missionWarning } } : result;
 				try {
@@ -4507,475 +4490,580 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						: { ...result, details: { ...result.details, missionWarning: warning } };
 				}
 			};
-			if (workflowRunId) {
-				const toolCallId = _id;
-				const workflowSessionRoot = requestParams.sessionDir
-					? path.resolve(deps.expandTilde(requestParams.sessionDir))
-					: trustedSessionRootsForStatus(ctx, deps)[0];
-				const asyncDir = path.join(DIRS.async, workflowRunId);
-				const resultPath = resultFilePath(DIRS.results, workflowRunId);
-				const statusPath = path.join(asyncDir, "status.json");
-				const eventsPath = path.join(asyncDir, "events.jsonl");
-				const startedAt = Date.now();
-				const currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
-				const workflowCapabilityCeiling = intersectSubagentCapabilityCeilings(requestParams.capabilityCeiling, resolveCurrentSubagentCapabilityCeiling(currentSessionId));
-				const completionOwnerId = deps.state.completionOwnerId ?? currentCompletionOwnerId();
-				deps.state.completionOwnerId = completionOwnerId;
+			try {
+				if (workflowRunId && topLevelAsyncWorkflow) {
+					const currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
+					try {
+						workflowCapacity = acquireActiveAsyncCapacity({
+							sessionId: currentSessionId,
+							limit: resolveMaxActiveAsyncRunsPerSession(deps.config.maxActiveAsyncRunsPerSession),
+							runId: workflowRunId,
+							kind: "workflow",
+							asyncDir: path.join(DIRS.async, workflowRunId),
+						}, { liveWorkflowRunIds: new Set(deps.state.workflowControllers?.keys() ?? []), abandonedSlotReleaseAfterMs: resolveAbandonedSlotReleaseAfterMs(deps.config.capacity?.abandonedSlotReleaseAfterMs) });
+					} catch (error) {
+						if (error instanceof ActiveAsyncCapacityError) {
+							deps.state.activeAsyncCapacity = error.snapshot;
+							return { content: [{ type: "text", text: error.message }], isError: true, details: { mode: "workflow", results: [], activeAsyncCapacity: error.snapshot } };
+						}
+						throw error;
+					}
+				}
+				workflowFanoutBudget = requestParams.runFanoutBudget
+					?? decodeRunFanoutBudgetDescriptor(process.env[RUN_FANOUT_BUDGET_ENV])
+					?? createRunFanoutBudget(_id, resolveMaxSubagentSpawnsPerRun(deps.config.maxSubagentSpawnsPerRun));
 				try {
+					missionBinding = prepareMissionLaunch({
+						params: autoMission ? { ...requestParams, task: derivedObjective } : requestParams,
+						projectRoot: workflowCwd,
+						...(deps.config.missions ? { config: deps.config.missions } : {}),
+						ownerSessionId: resolveCurrentSessionId(ctx.sessionManager),
+					});
+				} catch (error) {
+					if (explicitMission) throw error;
+					missionWarning = `Mission tracking unavailable: ${error instanceof Error ? error.message : String(error)}`;
+				}
+				detachWorkflowChildMissions = autoMission || missionBinding !== undefined || requestParams.mission === false;
+				workflowState = missionBinding ? createMissionWorkflowState(missionBinding.location, missionBinding.missionId) : undefined;
+				if (workflowRunId) {
+					const toolCallId = _id;
+					const asyncDir = path.join(DIRS.async, workflowRunId);
+					const resultPath = resultFilePath(DIRS.results, workflowRunId);
+					const statusPath = path.join(asyncDir, "status.json");
+					const eventsPath = path.join(asyncDir, "events.jsonl");
+					const startedAt = Date.now();
+					const currentSessionId = workflowCapacity?.owner.ownerSessionId ?? resolveCurrentSessionId(ctx.sessionManager);
+					const completionOwnerId = deps.state.completionOwnerId ?? currentCompletionOwnerId();
+					deps.state.completionOwnerId = completionOwnerId;
+					const workflowSessionRoot = requestParams.sessionDir
+						? path.resolve(deps.expandTilde(requestParams.sessionDir))
+						: trustedSessionRootsForStatus(ctx, deps)[0];
+					const workflowCapabilityCeiling = intersectSubagentCapabilityCeilings(requestParams.capabilityCeiling, resolveCurrentSubagentCapabilityCeiling(currentSessionId));
+					const workflowFanoutSnapshot = getRunFanoutBudgetSnapshot(workflowFanoutBudget);
 					fs.mkdirSync(asyncDir, { recursive: true });
 					writeRunFanoutBudgetDescriptor(asyncDir, workflowFanoutBudget);
 					fs.mkdirSync(DIRS.results, { recursive: true });
-				} catch (error) {
-					workflowCapacity?.rollback();
-					return { content: [{ type: "text", text: `Failed to create async workflow storage: ${error instanceof Error ? error.message : String(error)}` }], isError: true, details: { mode: "workflow", results: [] } };
-				}
-				const controller = new AbortController();
-				deps.state.workflowControllers ??= new Map();
-				deps.state.workflowChildStops ??= new Map();
-				deps.state.workflowControllers.set(workflowRunId, controller);
-				workflowCapacity?.markWorkflowStarted();
-				if (workflowCapacity) deps.state.activeAsyncCapacity = getActiveAsyncCapacitySnapshot(currentSessionId, resolveMaxActiveAsyncRunsPerSession(deps.config.maxActiveAsyncRunsPerSession), { liveWorkflowRunIds: new Set(deps.state.workflowControllers.keys()), abandonedSlotReleaseAfterMs: resolveAbandonedSlotReleaseAfterMs(deps.config.capacity?.abandonedSlotReleaseAfterMs) });
-				let status: AsyncStatus = {
-					runId: workflowRunId,
-					toolCallId,
-					sessionId: currentSessionId ?? undefined,
-					completionOwnerId,
-					mode: "workflow",
-					state: "running",
-					startedAt,
-					lastUpdate: startedAt,
-					...(timeout !== undefined ? { deadlineAt: startedAt + timeout, timeoutMs: timeout } : {}),
-					cwd: workflowCwd,
-					...(workflowSessionRoot ? { sessionRoot: workflowSessionRoot } : {}),
-					...(requestParams.scheduleOrigin ? { scheduleOrigin: requestParams.scheduleOrigin } : {}),
-					pid: process.pid,
-					steps: [],
-					workflow: { trace: [], emits: [], console: [] },
-					workflowChildren: workflowChildSummary({ parentToolCallId: toolCallId, workflowRunId, workflowState: "running", inventoryComplete: false }),
-					runFanoutBudget: getRunFanoutBudgetSnapshot(workflowFanoutBudget),
-				};
-				const appendWorkflowEvent = (event: Record<string, unknown>) => {
-					try {
-						fs.appendFileSync(eventsPath, `${JSON.stringify({ ts: Date.now(), runId: workflowRunId, ...event })}\n`, "utf-8");
-					} catch (error) {
-						// The event log is a journal, not workflow truth. Callers append from
-						// inside run-result handling, so losing an entry to a full disk or to a
-						// transient Windows lock must not fail the run being recorded.
-						console.error(`Failed to append async workflow event '${eventsPath}':`, error);
-					}
-				};
-				let indexedState: AsyncStatus["state"] | undefined;
-				const indexPersistence = createCapacityResilientJsonWriter({
-					keepAlive: true,
-					onSuccess: (_filePath, payload) => { indexedState = (payload as { state: AsyncStatus["state"] }).state; },
-					onError: (error, filePath) => console.error(`Failed to update async workflow index '${filePath}':`, error),
-				});
-				const queueActiveRunIndex = (): void => {
-					const state = status.state;
-					if (indexedState === state && indexPersistence.pendingCount() === 0) return;
-					indexPersistence.write(asyncDir, { state, toolCallId: status.toolCallId }, (_filePath, payload) => {
-						const indexPayload = payload as { state: AsyncStatus["state"]; toolCallId?: string };
-						updateActiveRunIndex(asyncDir, indexPayload.state, indexPayload.toolCallId, { retryCapacityErrors: true });
-					});
-				};
-				const runPersistence = createCapacityResilientJsonWriter({
-					keepAlive: true,
-					onSuccess: (filePath) => { if (filePath === statusPath) queueActiveRunIndex(); },
-					onError: (error, filePath) => console.error(`Failed to persist async workflow state '${filePath}':`, error),
-					write: (filePath, payload) => filePath === resultPath
-						? writeAsyncResultFile(filePath, payload as Record<string, unknown>)
-						: writeAtomicJson(filePath, payload),
-				});
-				let initialPersistenceComplete = false;
-				let persistClosed = false;
-				let statusPersistenceDegraded = false;
-				// Progress journalling runs from admit, launch, the launch and progress observers,
-				// onTrace and onEmit -- all inside the promises a workflowScript awaits. Those
-				// callers pass tolerateStatusWriteFailure so a transient lock on status.json cannot
-				// mark a finished child failed or abort its still-running siblings. Initial and
-				// terminal writes stay fail-fast on purpose: no child work is at risk by then, and
-				// silently dropping a terminal write would leave status.json and the active-run
-				// index pinned at "running" after the result already says complete.
-				const persist = (options: { tolerateStatusWriteFailure?: boolean } = {}) => {
-					if (persistClosed) return;
-					const liveJob = deps.state.asyncJobs.get(workflowRunId);
-					if (liveJob && (liveJob.status === "complete" || liveJob.status === "failed") && status.state !== "complete" && status.state !== "failed") return;
-					const workflowState = status.state === "complete" ? "completed" : status.state === "failed" || status.state === "rejected" ? "failed" : status.state === "paused" ? "paused" : status.state === "stopped" ? "stopped" : "running";
-					status.workflowChildren = workflowChildSummary({ parentToolCallId: toolCallId, workflowRunId, workflowState, inventoryComplete: workflowState !== "running", trace: status.workflow?.trace, steps: status.steps });
-					status.lastUpdate = Date.now();
-					if (!initialPersistenceComplete) {
-						writeAtomicJson(statusPath, status);
-						initialPersistenceComplete = true;
-						queueActiveRunIndex();
-					} else if (options.tolerateStatusWriteFailure) {
+					const controller = new AbortController();
+					let status: AsyncStatus = {
+						runId: workflowRunId,
+						toolCallId,
+						sessionId: currentSessionId ?? undefined,
+						completionOwnerId,
+						mode: "workflow",
+						state: "running",
+						startedAt,
+						lastUpdate: startedAt,
+						...(timeout !== undefined ? { deadlineAt: startedAt + timeout, timeoutMs: timeout } : {}),
+						cwd: workflowCwd,
+						...(workflowSessionRoot ? { sessionRoot: workflowSessionRoot } : {}),
+						...(requestParams.scheduleOrigin ? { scheduleOrigin: requestParams.scheduleOrigin } : {}),
+						pid: process.pid,
+						steps: [],
+						workflow: { trace: [], emits: [], console: [] },
+						workflowChildren: workflowChildSummary({ parentToolCallId: toolCallId, workflowRunId, workflowState: "running", inventoryComplete: false }),
+						runFanoutBudget: workflowFanoutSnapshot,
+					};
+					prelaunchStatus = status;
+					const appendWorkflowEvent = (event: Record<string, unknown>) => {
 						try {
-							runPersistence.write(statusPath, status);
-							statusPersistenceDegraded = false;
+							fs.appendFileSync(eventsPath, `${JSON.stringify({ ts: Date.now(), runId: workflowRunId, ...event })}\n`, "utf-8");
 						} catch (error) {
-							const message = `Failed to persist async workflow state ${statusPath}: ${error instanceof Error ? error.message : String(error)}`;
-							console.error(message, error);
-							if (!statusPersistenceDegraded) {
-								statusPersistenceDegraded = true;
-								try {
-									appendWorkflowEvent({ type: "subagent.workflow.status_write_failed", error: message });
-								} catch (eventError) {
-									console.error(`Failed to record degraded status persistence for '${statusPath}':`, eventError);
+							// The event log is a journal, not workflow truth. Callers append from
+							// inside run-result handling, so losing an entry to a full disk or to a
+							// transient Windows lock must not fail the run being recorded.
+							console.error(`Failed to append async workflow event '${eventsPath}':`, error);
+						}
+					};
+					let indexedState: AsyncStatus["state"] | undefined;
+					const indexPersistence = createCapacityResilientJsonWriter({
+						keepAlive: true,
+						onSuccess: (_filePath, payload) => { indexedState = (payload as { state: AsyncStatus["state"] }).state; },
+						onError: (error, filePath) => console.error(`Failed to update async workflow index '${filePath}':`, error),
+					});
+					prelaunchWriters.push(indexPersistence);
+					const queueActiveRunIndex = (): void => {
+						const state = status.state;
+						if (indexedState === state && indexPersistence.pendingCount() === 0) return;
+						indexPersistence.write(asyncDir, { state, toolCallId: status.toolCallId }, (_filePath, payload) => {
+							const indexPayload = payload as { state: AsyncStatus["state"]; toolCallId?: string };
+							updateActiveRunIndex(asyncDir, indexPayload.state, indexPayload.toolCallId, { retryCapacityErrors: true });
+						});
+					};
+					const runPersistence = createCapacityResilientJsonWriter({
+						keepAlive: true,
+						onSuccess: (filePath) => { if (filePath === statusPath) queueActiveRunIndex(); },
+						onError: (error, filePath) => console.error(`Failed to persist async workflow state '${filePath}':`, error),
+						write: (filePath, payload) => filePath === resultPath
+							? writeAsyncResultFile(filePath, payload as Record<string, unknown>)
+							: writeAtomicJson(filePath, payload),
+					});
+					prelaunchWriters.push(runPersistence);
+					let initialPersistenceComplete = false;
+					let statusPersistenceDegraded = false;
+					// Progress journalling runs from admit, launch, the launch and progress observers,
+					// onTrace and onEmit -- all inside the promises a workflowScript awaits. Those
+					// callers pass tolerateStatusWriteFailure so a transient lock on status.json cannot
+					// mark a finished child failed or abort its still-running siblings. Initial and
+					// terminal writes stay fail-fast on purpose: no child work is at risk by then, and
+					// silently dropping a terminal write would leave status.json and the active-run
+					// index pinned at "running" after the result already says complete.
+					const persist = (options: { tolerateStatusWriteFailure?: boolean } = {}) => {
+						if (persistClosed) return;
+						const liveJob = deps.state.asyncJobs.get(workflowRunId);
+						if (liveJob && (liveJob.status === "complete" || liveJob.status === "failed") && status.state !== "complete" && status.state !== "failed") return;
+						const workflowState = status.state === "complete" ? "completed" : status.state === "failed" || status.state === "rejected" ? "failed" : status.state === "paused" ? "paused" : status.state === "stopped" ? "stopped" : "running";
+						status.workflowChildren = workflowChildSummary({ parentToolCallId: toolCallId, workflowRunId, workflowState, inventoryComplete: workflowState !== "running", trace: status.workflow?.trace, steps: status.steps });
+						status.lastUpdate = Date.now();
+						if (!initialPersistenceComplete) {
+							writeAtomicJson(statusPath, status);
+							initialPersistenceComplete = true;
+							queueActiveRunIndex();
+						} else if (options.tolerateStatusWriteFailure) {
+							try {
+								runPersistence.write(statusPath, status);
+								statusPersistenceDegraded = false;
+							} catch (error) {
+								const message = `Failed to persist async workflow state ${statusPath}: ${error instanceof Error ? error.message : String(error)}`;
+								console.error(message, error);
+								if (!statusPersistenceDegraded) {
+									statusPersistenceDegraded = true;
+									try {
+										appendWorkflowEvent({ type: "subagent.workflow.status_write_failed", error: message });
+									} catch (eventError) {
+										console.error(`Failed to record degraded status persistence for '${statusPath}':`, eventError);
+									}
 								}
 							}
-						}
-					} else {
-						runPersistence.write(statusPath, status);
-					}
-					if (liveJob) {
-						liveJob.status = status.state;
-						liveJob.updatedAt = status.lastUpdate;
-						liveJob.activityState = status.activityState;
-						liveJob.lastActivityAt = status.lastActivityAt;
-						liveJob.currentTool = status.currentTool;
-						liveJob.currentToolStartedAt = status.currentToolStartedAt;
-						liveJob.currentPath = status.currentPath;
-						liveJob.turnCount = status.turnCount;
-						liveJob.toolCount = status.toolCount;
-						liveJob.currentStep = status.currentStep;
-						if (status.steps) {
-							liveJob.steps = status.steps.map((step, index) => ({ ...step, index }));
-							liveJob.agents = status.steps.map((step) => step.agent);
 						} else {
-							delete liveJob.steps;
-							delete liveJob.agents;
+							runPersistence.write(statusPath, status);
 						}
-						liveJob.workflow = status.workflow;
-						liveJob.workflowChildren = status.workflowChildren;
-					}
-				};
-				const writeWorkflowResult = (payload: Record<string, unknown>): boolean => {
-					try {
-						runPersistence.write(resultPath, payload);
-						return true;
-					} catch (error) {
-						const message = `Failed to write async workflow result ${resultPath}: ${error instanceof Error ? error.message : String(error)}`;
-						console.error(message, error);
-						appendWorkflowEvent({ type: "subagent.workflow.result_write_failed", error: message });
-						return false;
-					}
-				};
-				const projectWorkflowActivity = () => {
-					const steps = status.steps ?? [];
-					const runningSteps = steps.filter((step) => step.status === "running");
-					const lastActivityAt = runningSteps.reduce<number | undefined>((latest, step) => step.lastActivityAt === undefined ? latest : Math.max(latest ?? step.lastActivityAt, step.lastActivityAt), undefined);
-					const activeToolStep = runningSteps
-						.filter((step) => step.currentTool)
-						.sort((left, right) => (left.lastActivityAt ?? 0) - (right.lastActivityAt ?? 0))
-						.at(-1);
-					status.activityState = runningSteps.some((step) => step.activityState === "needs_attention")
-						? "needs_attention"
-						: runningSteps.some((step) => step.activityState === "active_long_running") ? "active_long_running" : undefined;
-					status.lastActivityAt = lastActivityAt;
-					status.currentTool = activeToolStep?.currentTool;
-					status.currentToolStartedAt = activeToolStep?.currentToolStartedAt;
-					status.currentPath = activeToolStep?.currentPath;
-					const turnCounts = steps.flatMap((step) => step.turnCount === undefined ? [] : [step.turnCount]);
-					const toolCounts = steps.flatMap((step) => step.toolCount === undefined ? [] : [step.toolCount]);
-					status.turnCount = turnCounts.length > 0 ? turnCounts.reduce((total, count) => total + count, 0) : undefined;
-					status.toolCount = toolCounts.length > 0 ? toolCounts.reduce((total, count) => total + count, 0) : undefined;
-					status.currentStep = runningSteps.length === 1 ? steps.indexOf(runningSteps[0]!) : undefined;
-				};
-				const workflowJob: AsyncJobState = { asyncId: workflowRunId, asyncDir, toolCallId, cwd: workflowCwd, ...(workflowSessionRoot ? { sessionRoot: workflowSessionRoot } : {}), status: "running", sessionId: currentSessionId ?? undefined, mode: "workflow", agents: [], steps: [], startedAt, updatedAt: startedAt, ...(requestParams.scheduleOrigin ? { scheduleOrigin: requestParams.scheduleOrigin } : {}), ...(timeout !== undefined ? { timeoutMs: timeout, deadlineAt: startedAt + timeout } : {}), workflow: status.workflow, workflowChildren: status.workflowChildren };
-				deps.state.asyncJobs.set(workflowRunId, workflowJob);
-				deps.state.fleetJobs ??= new Map();
-				deps.state.fleetJobs.set(workflowRunId, workflowJob);
-				try {
-					persist();
-				} catch (error) {
-					deps.state.workflowControllers?.delete(workflowRunId);
-					deps.state.asyncJobs.delete(workflowRunId);
-					deps.state.fleetJobs?.delete(workflowRunId);
-					workflowCapacity?.rollback();
-					indexPersistence.dispose();
-					return { content: [{ type: "text", text: `Failed to create async workflow storage: ${error instanceof Error ? error.message : String(error)}` }], isError: true, details: { mode: "workflow", results: [] } };
-				}
-				appendWorkflowEvent({ type: "subagent.workflow.started" });
-				const { workflowScript, async: _workflowAsync, chatProgress: _chatProgress, ...workflowRequest } = requestParams;
-				void Promise.resolve().then(async () => {
-					const workflowDeadlineAt = timeout === undefined ? undefined : Date.now() + timeout;
-					const workflowResults: SingleResult[] = [];
-					const workflowChildRunIds = new Map<string, string>();
-					const { action: _action, agent: _agent, task: _task, resume: _resume, tasks: _tasks, chain: _chain, concurrency: _concurrency, foregroundOnly: _foregroundOnly, clarify: _clarify, timeoutMs: _timeoutMs, maxRuntimeMs: _maxRuntimeMs, usageBudget: _usageBudget, missionId: _missionId, mission: _mission, ...workflowChildDefaults } = workflowRequest;
-					const workflowOutput = typeof workflowChildDefaults.output === "string" || typeof workflowChildDefaults.output === "boolean" ? workflowChildDefaults.output : undefined;
-					const configuredOutputBaseDir = resolveConfiguredSingleRunOutputBaseDir(deps);
-					const workflowAggregateOutputPath = resolveWorkflowAggregateOutputPath(workflowOutput, ctx.cwd, workflowCwd, resolveSingleRunOutputBaseDir(deps, workflowArtifactsDir, workflowRunId));
-					const claimedOutputPaths = new Map<string, string>();
-					const childOutputOverrides = new Map<string, string>();
-					const producedChildOutputPaths = new Set<string>();
-					const workflowSteps = new Map<string, NonNullable<AsyncStatus["steps"]>[number]>();
-					let projectedTraceLength = 0;
-					let projectedTraceTail: NonNullable<Details["workflow"]>["trace"][number] | undefined;
-					const updateTrace = (trace: NonNullable<Details["workflow"]>["trace"]) => {
-						status.workflow = { ...(status.workflow ?? { emits: [], console: [] }), trace };
-						const rebuild = trace.length < projectedTraceLength
-							|| (projectedTraceLength > 0 && trace[projectedTraceLength - 1] !== projectedTraceTail);
-						if (rebuild) {
-							workflowSteps.clear();
-							for (const step of status.steps ?? []) {
-								if (step.workflowKey) workflowSteps.set(step.workflowKey, step);
-							}
-							projectedTraceLength = 0;
-						}
-						for (let index = projectedTraceLength; index < trace.length; index += 1) {
-							const entry = trace[index]!;
-							if (entry.operation !== "run") continue;
-							const existing = workflowSteps.get(entry.key);
-							if (entry.state === "reused" && existing) continue;
-							const mapped = entry.state === "started" || entry.state === "reused"
-								? "running"
-								: entry.state === "completed"
-									? "completed"
-									: entry.state === "stopped"
-										? "stopped"
-										: entry.state === "detached"
-											? "paused"
-											: "failed";
-							if (existing) {
-								existing.status = mapped;
-								if (entry.agent) existing.agent = entry.agent;
-								if (entry.runId) existing.runId = entry.runId;
-								if (entry.state === "failed" && !entry.runId && existing.async === undefined) existing.async = false;
-								if (entry.state === "detached") existing.activityState = "needs_attention";
-								else if (existing.status !== "running") delete existing.activityState;
-								if (entry.state === "stopped") existing.stopped = true;
-								else delete existing.stopped;
-								if (entry.error === undefined) delete existing.error;
-								else existing.error = entry.error;
-								if (entry.durationMs === undefined) delete existing.durationMs;
-								else existing.durationMs = entry.durationMs;
+						if (liveJob) {
+							liveJob.status = status.state;
+							liveJob.updatedAt = status.lastUpdate;
+							liveJob.activityState = status.activityState;
+							liveJob.lastActivityAt = status.lastActivityAt;
+							liveJob.currentTool = status.currentTool;
+							liveJob.currentToolStartedAt = status.currentToolStartedAt;
+							liveJob.currentPath = status.currentPath;
+							liveJob.turnCount = status.turnCount;
+							liveJob.toolCount = status.toolCount;
+							liveJob.currentStep = status.currentStep;
+							if (status.steps) {
+								liveJob.steps = status.steps.map((step, index) => ({ ...step, index }));
+								liveJob.agents = status.steps.map((step) => step.agent);
 							} else {
-								const step: NonNullable<AsyncStatus["steps"]>[number] = {
-									agent: entry.agent ?? entry.key,
-									label: entry.key,
-									workflowKey: entry.key,
-									parentWorkflowRunId: workflowRunId,
-									status: mapped,
-									startedAt: Date.now(),
-									...(entry.runId ? { runId: entry.runId } : {}),
-									...(entry.state === "failed" && !entry.runId ? { async: false } : {}),
-									...(entry.state === "detached" ? { activityState: "needs_attention" as const } : {}),
-									...(entry.state === "stopped" ? { stopped: true } : {}),
-								};
-								status.steps?.push(step);
-								workflowSteps.set(entry.key, step);
+								delete liveJob.steps;
+								delete liveJob.agents;
 							}
-							const projectedStep = workflowSteps.get(entry.key);
-							if (entry.state === "stopped" && projectedStep) {
-								appendWorkflowEvent({
-									type: "subagent.child-status",
-									version: 1,
-									childId: entry.key,
-									status: "stopped",
-									reason: "subagent-action",
-									source: "async",
-									stepIndex: status.steps?.indexOf(projectedStep),
-									agent: projectedStep.agent,
-									...(projectedStep.runId ? { childRunId: projectedStep.runId } : {}),
-									workflowKey: entry.key,
-									...(projectedStep.phase ? { phase: projectedStep.phase } : {}),
-									...(projectedStep.label ? { label: projectedStep.label } : {}),
-								});
-							}
+							liveJob.workflow = status.workflow;
+							liveJob.workflowChildren = status.workflowChildren;
 						}
-						projectedTraceLength = trace.length;
-						projectedTraceTail = trace.at(-1);
-						projectWorkflowActivity();
-						persist({ tolerateStatusWriteFailure: true });
-						appendWorkflowEvent({ type: "subagent.workflow.trace", trace });
 					};
-					try {
-						const workflow = await runWorkflowScript({
-							script: workflowScript,
-							timeoutMs: timeout,
-							signal: controller.signal,
-							registerStopChild: (stop) => {
-								if (stop) deps.state.workflowChildStops?.set(workflowRunId, stop);
-								else deps.state.workflowChildStops?.delete(workflowRunId);
-							},
-							...(workflowState ? { state: workflowState } : {}),
-							onTrace: updateTrace,
-							admit: (calls) => {
-								const outputClaims = workflowChildOutputClaims({ ctxCwd: ctx.cwd, workflowCwd, artifactsDir: workflowArtifactsDir, workflowRunId, aggregateOutputPath: workflowAggregateOutputPath, configuredOutputBaseDir, discoverAgents: deps.discoverAgents, agents: workflowAgents, workflowAgentScope: workflowChildDefaults.agentScope, state: deps.state, claimedOutputPaths, entries: calls });
-								if (outputClaims.error) throw new Error(outputClaims.error);
-								status.runFanoutBudget = claimRunFanoutBatch(workflowFanoutBudget, calls.map(({ key }) => `workflow[${key}]`));
-								if (outputClaims.claims) applyWorkflowChildOutputClaims(claimedOutputPaths, outputClaims.claims);
-								if (outputClaims.overrides) for (const [key, output] of outputClaims.overrides) childOutputOverrides.set(key, output);
+					const writeWorkflowResult = (payload: Record<string, unknown>): boolean => {
+						try {
+							runPersistence.write(resultPath, payload);
+							return true;
+						} catch (error) {
+							const message = `Failed to write async workflow result ${resultPath}: ${error instanceof Error ? error.message : String(error)}`;
+							console.error(message, error);
+							appendWorkflowEvent({ type: "subagent.workflow.result_write_failed", error: message });
+							return false;
+						}
+					};
+					const projectWorkflowActivity = () => {
+						const steps = status.steps ?? [];
+						const runningSteps = steps.filter((step) => step.status === "running");
+						const lastActivityAt = runningSteps.reduce<number | undefined>((latest, step) => step.lastActivityAt === undefined ? latest : Math.max(latest ?? step.lastActivityAt, step.lastActivityAt), undefined);
+						const activeToolStep = runningSteps
+							.filter((step) => step.currentTool)
+							.sort((left, right) => (left.lastActivityAt ?? 0) - (right.lastActivityAt ?? 0))
+							.at(-1);
+						status.activityState = runningSteps.some((step) => step.activityState === "needs_attention")
+							? "needs_attention"
+							: runningSteps.some((step) => step.activityState === "active_long_running") ? "active_long_running" : undefined;
+						status.lastActivityAt = lastActivityAt;
+						status.currentTool = activeToolStep?.currentTool;
+						status.currentToolStartedAt = activeToolStep?.currentToolStartedAt;
+						status.currentPath = activeToolStep?.currentPath;
+						const turnCounts = steps.flatMap((step) => step.turnCount === undefined ? [] : [step.turnCount]);
+						const toolCounts = steps.flatMap((step) => step.toolCount === undefined ? [] : [step.toolCount]);
+						status.turnCount = turnCounts.length > 0 ? turnCounts.reduce((total, count) => total + count, 0) : undefined;
+						status.toolCount = toolCounts.length > 0 ? toolCounts.reduce((total, count) => total + count, 0) : undefined;
+						status.currentStep = runningSteps.length === 1 ? steps.indexOf(runningSteps[0]!) : undefined;
+					};
+					const workflowJob: AsyncJobState = { asyncId: workflowRunId, asyncDir, toolCallId, cwd: workflowCwd, ...(workflowSessionRoot ? { sessionRoot: workflowSessionRoot } : {}), status: "running", sessionId: currentSessionId ?? undefined, mode: "workflow", agents: [], steps: [], startedAt, updatedAt: startedAt, ...(requestParams.scheduleOrigin ? { scheduleOrigin: requestParams.scheduleOrigin } : {}), ...(timeout !== undefined ? { timeoutMs: timeout, deadlineAt: startedAt + timeout } : {}), workflow: status.workflow, workflowChildren: status.workflowChildren };
+					deps.state.workflowControllers ??= new Map();
+					deps.state.workflowChildStops ??= new Map();
+					deps.state.workflowControllers.set(workflowRunId, controller);
+					deps.state.asyncJobs.set(workflowRunId, workflowJob);
+					deps.state.fleetJobs ??= new Map();
+					deps.state.fleetJobs.set(workflowRunId, workflowJob);
+					const capacitySnapshot = workflowCapacity
+						? getActiveAsyncCapacitySnapshot(currentSessionId, resolveMaxActiveAsyncRunsPerSession(deps.config.maxActiveAsyncRunsPerSession), { liveWorkflowRunIds: new Set(deps.state.workflowControllers.keys()), abandonedSlotReleaseAfterMs: resolveAbandonedSlotReleaseAfterMs(deps.config.capacity?.abandonedSlotReleaseAfterMs) })
+						: undefined;
+					persist();
+					const receiptCapacity = capacitySnapshot ?? deps.state.activeAsyncCapacity;
+					const startResult = withSubagentUsage(withRunFanoutBudget({
+						content: [{ type: "text", text: formatAsyncStartedMessage(`Async workflow [${workflowRunId}]`, ctx.hasUI === true) }],
+						details: { mode: "workflow", runId: workflowRunId, toolCallId, asyncId: workflowRunId, asyncDir, results: [], workflowChildren: status.workflowChildren, chatProgress, ...(receiptCapacity ? { activeAsyncCapacity: receiptCapacity } : {}) },
+					}, workflowFanoutBudget));
+					const { workflowScript, async: _workflowAsync, chatProgress: _chatProgress, ...workflowRequest } = requestParams;
+					launchPreparedWorkflow = () => {
+						appendWorkflowEvent({ type: "subagent.workflow.started" });
+						void Promise.resolve().then(async () => {
+							const workflowDeadlineAt = timeout === undefined ? undefined : Date.now() + timeout;
+							const workflowResults: SingleResult[] = [];
+							const workflowChildRunIds = new Map<string, string>();
+							const { action: _action, agent: _agent, task: _task, resume: _resume, tasks: _tasks, chain: _chain, concurrency: _concurrency, foregroundOnly: _foregroundOnly, clarify: _clarify, timeoutMs: _timeoutMs, maxRuntimeMs: _maxRuntimeMs, usageBudget: _usageBudget, missionId: _missionId, mission: _mission, ...workflowChildDefaults } = workflowRequest;
+							const workflowOutput = typeof workflowChildDefaults.output === "string" || typeof workflowChildDefaults.output === "boolean" ? workflowChildDefaults.output : undefined;
+							const configuredOutputBaseDir = resolveConfiguredSingleRunOutputBaseDir(deps);
+							const workflowAggregateOutputPath = resolveWorkflowAggregateOutputPath(workflowOutput, ctx.cwd, workflowCwd, resolveSingleRunOutputBaseDir(deps, workflowArtifactsDir, workflowRunId));
+							const claimedOutputPaths = new Map<string, string>();
+							const childOutputOverrides = new Map<string, string>();
+							const producedChildOutputPaths = new Set<string>();
+							const workflowSteps = new Map<string, NonNullable<AsyncStatus["steps"]>[number]>();
+							let projectedTraceLength = 0;
+							let projectedTraceTail: NonNullable<Details["workflow"]>["trace"][number] | undefined;
+							const updateTrace = (trace: NonNullable<Details["workflow"]>["trace"]) => {
+								status.workflow = { ...(status.workflow ?? { emits: [], console: [] }), trace };
+								const rebuild = trace.length < projectedTraceLength
+									|| (projectedTraceLength > 0 && trace[projectedTraceLength - 1] !== projectedTraceTail);
+								if (rebuild) {
+									workflowSteps.clear();
+									for (const step of status.steps ?? []) {
+										if (step.workflowKey) workflowSteps.set(step.workflowKey, step);
+									}
+									projectedTraceLength = 0;
+								}
+								for (let index = projectedTraceLength; index < trace.length; index += 1) {
+									const entry = trace[index]!;
+									if (entry.operation !== "run") continue;
+									const existing = workflowSteps.get(entry.key);
+									if (entry.state === "reused" && existing) continue;
+									const mapped = entry.state === "started" || entry.state === "reused"
+										? "running"
+										: entry.state === "completed"
+											? "completed"
+											: entry.state === "stopped"
+												? "stopped"
+												: entry.state === "detached"
+													? "paused"
+													: "failed";
+									if (existing) {
+										existing.status = mapped;
+										if (entry.agent) existing.agent = entry.agent;
+										if (entry.runId) existing.runId = entry.runId;
+										if (entry.state === "failed" && !entry.runId && existing.async === undefined) existing.async = false;
+										if (entry.state === "detached") existing.activityState = "needs_attention";
+										else if (existing.status !== "running") delete existing.activityState;
+										if (entry.state === "stopped") existing.stopped = true;
+										else delete existing.stopped;
+										if (entry.error === undefined) delete existing.error;
+										else existing.error = entry.error;
+										if (entry.durationMs === undefined) delete existing.durationMs;
+										else existing.durationMs = entry.durationMs;
+									} else {
+										const step: NonNullable<AsyncStatus["steps"]>[number] = {
+											agent: entry.agent ?? entry.key,
+											label: entry.key,
+											workflowKey: entry.key,
+											parentWorkflowRunId: workflowRunId,
+											status: mapped,
+											startedAt: Date.now(),
+											...(entry.runId ? { runId: entry.runId } : {}),
+											...(entry.state === "failed" && !entry.runId ? { async: false } : {}),
+											...(entry.state === "detached" ? { activityState: "needs_attention" as const } : {}),
+											...(entry.state === "stopped" ? { stopped: true } : {}),
+										};
+										status.steps?.push(step);
+										workflowSteps.set(entry.key, step);
+									}
+									const projectedStep = workflowSteps.get(entry.key);
+									if (entry.state === "stopped" && projectedStep) {
+										appendWorkflowEvent({
+											type: "subagent.child-status",
+											version: 1,
+											childId: entry.key,
+											status: "stopped",
+											reason: "subagent-action",
+											source: "async",
+											stepIndex: status.steps?.indexOf(projectedStep),
+											agent: projectedStep.agent,
+											...(projectedStep.runId ? { childRunId: projectedStep.runId } : {}),
+											workflowKey: entry.key,
+											...(projectedStep.phase ? { phase: projectedStep.phase } : {}),
+											...(projectedStep.label ? { label: projectedStep.label } : {}),
+										});
+									}
+								}
+								projectedTraceLength = trace.length;
+								projectedTraceTail = trace.at(-1);
+								projectWorkflowActivity();
 								persist({ tolerateStatusWriteFailure: true });
-							},
-							onEmit: (emits) => {
-								// Each emit is validated at the host boundary in runWorkflowScript before onEmit fires.
-								status.workflow = { ...(status.workflow ?? { trace: [], console: [] }), emits };
-								persist({ tolerateStatusWriteFailure: true });
-								appendWorkflowEvent({ type: "subagent.workflow.emit", value: emits.at(-1) });
-							},
-							launch: async (key, childParams, workflowSignal, admission) => {
-								if (workflowUsageBudget.budget && childParams.async === true) return workflowChildResult(key, buildRequestedModeError(childParams as SubagentParamsLike, "workflow usageBudget does not support async runs.run launches."), childParams, deps.state);
-								const budgetState = usageBudgetState(workflowUsageBudget.budget, sumResultsCost(workflowResults));
-								if (budgetState?.exhausted) return workflowChildResult(key, buildRequestedModeError(childParams as SubagentParamsLike, usageBudgetExceededMessage(budgetState)), childParams, deps.state, { state: "partial", reason: "budget_exhausted" });
-								const childPhase = typeof childParams.phase === "string" && childParams.phase.trim() ? childParams.phase.trim() : undefined;
-								const childLabel = typeof childParams.label === "string" && childParams.label.trim() ? childParams.label.trim() : undefined;
-								recordMissionWorkflowChild(missionBinding, workflowRunId, key, {
-									status: "running",
-									...(typeof childParams.agent === "string" && childParams.agent.trim() ? { agent: childParams.agent.trim() } : {}),
-									...(childLabel ? { label: childLabel } : {}),
-									...(childPhase ? { phase: childPhase } : {}),
-									heartbeat: { status: "running", ...(childPhase ? { phase: childPhase } : {}) },
-								});
-								const result = await runMissionWorkflowChild(missionBinding, workflowRunId, key, childPhase, () => {
-									const childRequest = bindMissionWorkflowChildAsyncLaunch(
-										{ ...prepareWorkflowChildLaunchParams({ workflowDefaults: workflowChildDefaults, childParams, parentWorkflowRunId: workflowRunId, workflowKey: key, ctxCwd: ctx.cwd, workflowCwd, artifactsDir: workflowArtifactsDir, aggregateOutputPath: workflowAggregateOutputPath, configuredOutputBaseDir, discoverAgents: deps.discoverAgents, agents: workflowAgents, workflowAgentScope: workflowChildDefaults.agentScope, outputOverride: childOutputOverrides.get(key), options: { missionDetached: detachWorkflowChildMissions, runFanoutBudget: workflowFanoutBudget, parentDeadlineAt: workflowDeadlineAt, capabilityCeiling: workflowCapabilityCeiling } }), runFanoutAdmitted: admission.admitted },
-										missionBinding,
-										deps.asyncByDefault,
-									);
-									workflowLaunchObservers.set(childRequest, (launch) => {
+								appendWorkflowEvent({ type: "subagent.workflow.trace", trace });
+							};
+							try {
+								const workflow = await runWorkflowScript({
+									script: workflowScript,
+									timeoutMs: timeout,
+									signal: controller.signal,
+									registerStopChild: (stop) => {
+										if (stop) deps.state.workflowChildStops?.set(workflowRunId, stop);
+										else deps.state.workflowChildStops?.delete(workflowRunId);
+									},
+									...(workflowState ? { state: workflowState } : {}),
+									onTrace: updateTrace,
+									admit: (calls) => {
+										const outputClaims = workflowChildOutputClaims({ ctxCwd: ctx.cwd, workflowCwd, artifactsDir: workflowArtifactsDir, workflowRunId, aggregateOutputPath: workflowAggregateOutputPath, configuredOutputBaseDir, discoverAgents: deps.discoverAgents, agents: workflowAgents, workflowAgentScope: workflowChildDefaults.agentScope, state: deps.state, claimedOutputPaths, entries: calls });
+										if (outputClaims.error) throw new Error(outputClaims.error);
+										status.runFanoutBudget = claimRunFanoutBatch(workflowFanoutBudget, calls.map(({ key }) => `workflow[${key}]`));
+										if (outputClaims.claims) applyWorkflowChildOutputClaims(claimedOutputPaths, outputClaims.claims);
+										if (outputClaims.overrides) for (const [key, output] of outputClaims.overrides) childOutputOverrides.set(key, output);
+										persist({ tolerateStatusWriteFailure: true });
+									},
+									onEmit: (emits) => {
+										// Each emit is validated at the host boundary in runWorkflowScript before onEmit fires.
+										status.workflow = { ...(status.workflow ?? { trace: [], console: [] }), emits };
+										persist({ tolerateStatusWriteFailure: true });
+										appendWorkflowEvent({ type: "subagent.workflow.emit", value: emits.at(-1) });
+									},
+									launch: async (key, childParams, workflowSignal, admission) => {
+										if (workflowUsageBudget.budget && childParams.async === true) return workflowChildResult(key, buildRequestedModeError(childParams as SubagentParamsLike, "workflow usageBudget does not support async runs.run launches."), childParams, deps.state);
+										const budgetState = usageBudgetState(workflowUsageBudget.budget, sumResultsCost(workflowResults));
+										if (budgetState?.exhausted) return workflowChildResult(key, buildRequestedModeError(childParams as SubagentParamsLike, usageBudgetExceededMessage(budgetState)), childParams, deps.state, { state: "partial", reason: "budget_exhausted" });
+										const childPhase = typeof childParams.phase === "string" && childParams.phase.trim() ? childParams.phase.trim() : undefined;
+										const childLabel = typeof childParams.label === "string" && childParams.label.trim() ? childParams.label.trim() : undefined;
+										recordMissionWorkflowChild(missionBinding, workflowRunId, key, {
+											status: "running",
+											...(typeof childParams.agent === "string" && childParams.agent.trim() ? { agent: childParams.agent.trim() } : {}),
+											...(childLabel ? { label: childLabel } : {}),
+											...(childPhase ? { phase: childPhase } : {}),
+											heartbeat: { status: "running", ...(childPhase ? { phase: childPhase } : {}) },
+										});
+										const result = await runMissionWorkflowChild(missionBinding, workflowRunId, key, childPhase, () => {
+											const childRequest = bindMissionWorkflowChildAsyncLaunch(
+												{ ...prepareWorkflowChildLaunchParams({ workflowDefaults: workflowChildDefaults, childParams, parentWorkflowRunId: workflowRunId, workflowKey: key, ctxCwd: ctx.cwd, workflowCwd, artifactsDir: workflowArtifactsDir, aggregateOutputPath: workflowAggregateOutputPath, configuredOutputBaseDir, discoverAgents: deps.discoverAgents, agents: workflowAgents, workflowAgentScope: workflowChildDefaults.agentScope, outputOverride: childOutputOverrides.get(key), options: { missionDetached: detachWorkflowChildMissions, runFanoutBudget: workflowFanoutBudget, parentDeadlineAt: workflowDeadlineAt, capabilityCeiling: workflowCapabilityCeiling } }), runFanoutAdmitted: admission.admitted },
+												missionBinding,
+												deps.asyncByDefault,
+											);
+											workflowLaunchObservers.set(childRequest, (launch) => {
+												const step = status.steps?.find((candidate) => candidate.workflowKey === key);
+												if (step) {
+													step.agent = launch.agent;
+													step.sessionFile = launch.sessionFile;
+													step.async = launch.async;
+													if (launch.runId) step.runId = launch.runId;
+													persist({ tolerateStatusWriteFailure: true });
+												}
+												recordMissionWorkflowChild(missionBinding, workflowRunId, key, { status: "running", agent: launch.agent, ...(launch.sessionFile ? { sessionPath: launch.sessionFile } : {}) });
+											});
+											return execute(randomUUID(), childRequest, workflowSignal, (update) => {
+												const progress = update.details.progress?.[0];
+												const step = status.steps?.find((candidate) => candidate.workflowKey === key);
+												if (!progress || !step || step.stopped) return;
+												step.status = progress.status === "completed" ? "completed" : progress.status === "failed" ? "failed" : "running";
+												step.activityState = progress.activityState;
+												step.lastActivityAt = progress.lastActivityAt;
+												step.currentTool = progress.currentTool;
+												step.currentToolArgs = progress.currentToolArgs;
+												step.currentToolStartedAt = progress.currentToolStartedAt;
+												step.currentPath = progress.currentPath;
+												step.recentTools = progress.recentTools.map((tool) => ({ ...tool }));
+												step.recentOutput = [...progress.recentOutput];
+												step.turnCount = progress.turnCount;
+												step.toolCount = progress.toolCount;
+												step.model = progress.model;
+												step.thinking = progress.thinking;
+												step.error = progress.error;
+												projectWorkflowActivity();
+												persist({ tolerateStatusWriteFailure: true });
+												recordMissionWorkflowChild(missionBinding, workflowRunId, key, {
+													status: step.status,
+													heartbeat: { status: step.status, ...(childPhase ? { phase: childPhase } : {}) },
+												});
+											}, ctx, preserveActiveSession, workflowParentModel);
+										});
+										workflowResults.push(...result.details.results);
+										for (const childResult of result.details.results) {
+											if (childResult.savedOutputPath) producedChildOutputPaths.add(childResult.savedOutputPath);
+										}
+										const child = workflowChildResult(key, result, childParams, deps.state);
+										if (child.runId) workflowChildRunIds.set(key, child.runId);
 										const step = status.steps?.find((candidate) => candidate.workflowKey === key);
 										if (step) {
-											step.agent = launch.agent;
-											step.sessionFile = launch.sessionFile;
-											step.async = launch.async;
-											if (launch.runId) step.runId = launch.runId;
-											persist({ tolerateStatusWriteFailure: true });
+											step.async = Boolean(result.details.asyncId || result.details.asyncDir);
+											if (child.runId) step.runId = child.runId;
 										}
-										recordMissionWorkflowChild(missionBinding, workflowRunId, key, { status: "running", agent: launch.agent, ...(launch.sessionFile ? { sessionPath: launch.sessionFile } : {}) });
-									});
-									return execute(randomUUID(), childRequest, workflowSignal, (update) => {
-										const progress = update.details.progress?.[0];
-										const step = status.steps?.find((candidate) => candidate.workflowKey === key);
-										if (!progress || !step || step.stopped) return;
-										step.status = progress.status === "completed" ? "completed" : progress.status === "failed" ? "failed" : "running";
-										step.activityState = progress.activityState;
-										step.lastActivityAt = progress.lastActivityAt;
-										step.currentTool = progress.currentTool;
-										step.currentToolArgs = progress.currentToolArgs;
-										step.currentToolStartedAt = progress.currentToolStartedAt;
-										step.currentPath = progress.currentPath;
-										step.recentTools = progress.recentTools.map((tool) => ({ ...tool }));
-										step.recentOutput = [...progress.recentOutput];
-										step.turnCount = progress.turnCount;
-										step.toolCount = progress.toolCount;
-										step.model = progress.model;
-										step.thinking = progress.thinking;
-										step.error = progress.error;
-										projectWorkflowActivity();
-										persist({ tolerateStatusWriteFailure: true });
+										if (result.details.asyncDir && missionBinding) writeMissionAsyncBinding(result.details.asyncDir, missionBinding);
+										const childStatus = missionWorkflowChildStatus(result);
 										recordMissionWorkflowChild(missionBinding, workflowRunId, key, {
-											status: step.status,
-											heartbeat: { status: step.status, ...(childPhase ? { phase: childPhase } : {}) },
+											status: childStatus,
+											...(child.runId ? { runId: child.runId } : {}),
+											...(result.details.results[0]?.agent ? { agent: result.details.results[0].agent } : {}),
+											...(result.details.results[0]?.sessionFile ? { sessionPath: result.details.results[0].sessionFile } : {}),
+											artifactPaths: child.artifactPaths,
+											...(["completed", "failed"].includes(childStatus) ? { completedAt: new Date().toISOString() } : {}),
+											heartbeat: { status: childStatus, ...(childPhase ? { phase: childPhase } : {}) },
 										});
-									}, ctx, preserveActiveSession, workflowParentModel);
+										if (result.details.asyncId) {
+											const childJob = deps.state.asyncJobs.get(result.details.asyncId);
+											if (childJob) { childJob.parentWorkflowRunId = workflowRunId; childJob.workflowKey = key; }
+										}
+										return child;
+									},
+									status: async (keyOrRunId, workflowSignal) => workflowChildResult(keyOrRunId, await execute(randomUUID(), { action: "status", id: keyOrRunId }, workflowSignal, undefined, ctx, preserveActiveSession, workflowParentModel)),
+									resolveResume: (reference) => resolveKeyedWorkflowResume(reference, deps.state),
+									steer: (key, message, options, workflowSignal) => steerWorkflowChildByKey({ state: deps.state, workflowRunId, key, message, options, signal: workflowSignal, resolveRunId: () => workflowChildRunIds.get(key) }),
 								});
-								workflowResults.push(...result.details.results);
-								for (const childResult of result.details.results) {
-									if (childResult.savedOutputPath) producedChildOutputPaths.add(childResult.savedOutputPath);
+								const returnPreview = formatWorkflowValue(workflow.value).slice(0, 1_000);
+								const emitPreview = workflow.emits.length > 0 ? ` Emitted: ${workflow.emits.map(formatWorkflowValue).join(", ").slice(0, 1_000)}` : "";
+								const summary = `Workflow completed with ${workflow.children.length} child run(s). Return: ${returnPreview}${emitPreview} Trace: ${workflow.trace.length} event(s).${workflowOutputPathMappingSummary(workflow.children)}`;
+								const outputWarning = writeWorkflowAggregateOutput(workflowAggregateOutputPath, summary, producedChildOutputPaths);
+								const resultSummary = appendWorkflowOutputWarning(summary, outputWarning);
+								const workflowUsage = sumResultsUsage(workflowResults);
+								const workflowChildren = workflowChildSummary({ parentToolCallId: toolCallId, workflowRunId, workflowState: "completed", inventoryComplete: true, trace: workflow.trace, children: workflow.children, steps: status.steps });
+								status = { ...status, state: "complete", endedAt: Date.now(), workflow: { value: workflow.value, trace: workflow.trace, emits: workflow.emits, console: workflow.console }, workflowChildren, totalTokens: { input: workflowUsage.input, output: workflowUsage.output, total: workflowUsage.input + workflowUsage.output }, totalCost: sumResultsCost(workflowResults) };
+								const receipt = terminalWorkflowReceipt(workflowRunId, "complete", workflow.children, workflowChildren);
+								let workflowReceipt: { path: string; receipt: WorkflowReceipt } | undefined;
+								try {
+									workflowReceipt = { path: writeWorkflowReceipt(asyncDir, receipt), receipt };
+								} catch (receiptError) {
+									appendWorkflowEvent({ type: "subagent.workflow.receipt_write_failed", error: `Failed to persist async workflow receipt: ${receiptError instanceof Error ? receiptError.message : String(receiptError)}` });
 								}
-								const child = workflowChildResult(key, result, childParams, deps.state);
-								if (child.runId) workflowChildRunIds.set(key, child.runId);
-								const step = status.steps?.find((candidate) => candidate.workflowKey === key);
-								if (step) {
-									step.async = Boolean(result.details.asyncId || result.details.asyncDir);
-									if (child.runId) step.runId = child.runId;
+								if (!writeWorkflowResult({ id: workflowRunId, runId: workflowRunId, toolCallId, agent: "workflow", mode: "workflow", success: true, state: "complete", summary: resultSummary, output: resultSummary, workflowChildren, results: workflow.children.map((child) => ({ workflowKey: child.key, ...(child.agent ? { agent: child.agent } : {}), ...(child.runId ? { runId: child.runId } : {}), output: child.output, outputState: child.output.trim() || child.structuredOutput !== undefined ? "present" : "absent", structuredOutput: child.structuredOutput, success: child.ok, ...(child.outputPathMapping ? { outputPathMapping: child.outputPathMapping } : {}), ...(child.stopped ? { stopped: true } : {}), ...(child.interrupted ? { interrupted: true } : {}), ...(child.artifactPaths[0] ? { artifactPaths: { outputPath: child.artifactPaths[0] } } : {}) })), workflow: status.workflow, ...(workflowReceipt ? { workflowReceipt } : {}), asyncDir, cwd: workflowCwd, sessionId: currentSessionId, completionOwnerId, ...(requestParams.scheduleOrigin ? { scheduleOrigin: requestParams.scheduleOrigin } : {}), timestamp: Date.now(), durationMs: Date.now() - startedAt })) return;
+								persist();
+								persistClosed = true;
+								appendWorkflowEvent({ type: "subagent.workflow.completed", state: status.state, ...(status.error ? { error: status.error } : {}) });
+							} catch (error) {
+								const partial = error instanceof WorkflowScriptError ? error.partial : { trace: [], emits: [], console: [], children: [] };
+								const stopped = controller.signal.aborted;
+								const detachedChildKeys = new Set(partial.children.filter((child) => child.detached).map((child) => child.key));
+								const hasRealFailedChild = partial.children.some((child) => !child.ok && !child.detached);
+								const pauseForDetached = !stopped && error instanceof WorkflowScriptError && error.errorKind === "detached-child" && detachedChildKeys.size > 0 && !hasRealFailedChild;
+								const state = stopped ? "stopped" : pauseForDetached ? "paused" : "failed";
+								for (const step of status.steps ?? []) {
+									if (step.workflowKey && detachedChildKeys.has(step.workflowKey)) {
+										if (step.status === "completed" || step.status === "complete" || step.status === "failed") continue;
+										step.status = "paused";
+										step.activityState = "needs_attention";
+									} else if (pauseForDetached && step.status === "running") {
+										step.status = "stopped";
+										step.stopped = true;
+										delete step.activityState;
+									}
 								}
-								if (result.details.asyncDir && missionBinding) writeMissionAsyncBinding(result.details.asyncDir, missionBinding);
-								const childStatus = missionWorkflowChildStatus(result);
-								recordMissionWorkflowChild(missionBinding, workflowRunId, key, {
-									status: childStatus,
-									...(child.runId ? { runId: child.runId } : {}),
-									...(result.details.results[0]?.agent ? { agent: result.details.results[0].agent } : {}),
-									...(result.details.results[0]?.sessionFile ? { sessionPath: result.details.results[0].sessionFile } : {}),
-									artifactPaths: child.artifactPaths,
-									...(["completed", "failed"].includes(childStatus) ? { completedAt: new Date().toISOString() } : {}),
-									heartbeat: { status: childStatus, ...(childPhase ? { phase: childPhase } : {}) },
-								});
-								if (result.details.asyncId) {
-									const childJob = deps.state.asyncJobs.get(result.details.asyncId);
-									if (childJob) { childJob.parentWorkflowRunId = workflowRunId; childJob.workflowKey = key; }
+								const workflowState = state === "paused" ? "paused" : state === "stopped" ? "stopped" : "failed";
+								const workflowChildren = workflowChildSummary({ parentToolCallId: toolCallId, workflowRunId, workflowState, inventoryComplete: true, trace: partial.trace, children: partial.children, steps: status.steps });
+								status = compactOptional<AsyncStatus>({ ...status, state, stopped: stopped || undefined, activityState: pauseForDetached ? "needs_attention" : undefined, error: workflowFailureMessage(error, workflowRunId, partial.children), endedAt: Date.now(), workflow: { trace: partial.trace, emits: partial.emits, console: partial.console }, workflowChildren });
+								if (pauseForDetached) {
+									const promoted = promotePausedWorkflowIfSettled(status);
+									if (promoted) status = promoted;
 								}
-								return child;
-							},
-							status: async (keyOrRunId, workflowSignal) => workflowChildResult(keyOrRunId, await execute(randomUUID(), { action: "status", id: keyOrRunId }, workflowSignal, undefined, ctx, preserveActiveSession, workflowParentModel)),
-							resolveResume: (reference) => resolveKeyedWorkflowResume(reference, deps.state),
-							steer: (key, message, options, workflowSignal) => steerWorkflowChildByKey({ state: deps.state, workflowRunId, key, message, options, signal: workflowSignal, resolveRunId: () => workflowChildRunIds.get(key) }),
-						});
-						const returnPreview = formatWorkflowValue(workflow.value).slice(0, 1_000);
-						const emitPreview = workflow.emits.length > 0 ? ` Emitted: ${workflow.emits.map(formatWorkflowValue).join(", ").slice(0, 1_000)}` : "";
-						const summary = `Workflow completed with ${workflow.children.length} child run(s). Return: ${returnPreview}${emitPreview} Trace: ${workflow.trace.length} event(s).${workflowOutputPathMappingSummary(workflow.children)}`;
-						const outputWarning = writeWorkflowAggregateOutput(workflowAggregateOutputPath, summary, producedChildOutputPaths);
-						const resultSummary = appendWorkflowOutputWarning(summary, outputWarning);
-						const workflowUsage = sumResultsUsage(workflowResults);
-						const workflowChildren = workflowChildSummary({ parentToolCallId: toolCallId, workflowRunId, workflowState: "completed", inventoryComplete: true, trace: workflow.trace, children: workflow.children, steps: status.steps });
-						status = { ...status, state: "complete", endedAt: Date.now(), workflow: { value: workflow.value, trace: workflow.trace, emits: workflow.emits, console: workflow.console }, workflowChildren, totalTokens: { input: workflowUsage.input, output: workflowUsage.output, total: workflowUsage.input + workflowUsage.output }, totalCost: sumResultsCost(workflowResults) };
-						const receipt = terminalWorkflowReceipt(workflowRunId, "complete", workflow.children, workflowChildren);
-						let workflowReceipt: { path: string; receipt: WorkflowReceipt } | undefined;
-						try {
-							workflowReceipt = { path: writeWorkflowReceipt(asyncDir, receipt), receipt };
-						} catch (receiptError) {
-							appendWorkflowEvent({ type: "subagent.workflow.receipt_write_failed", error: `Failed to persist async workflow receipt: ${receiptError instanceof Error ? receiptError.message : String(receiptError)}` });
-						}
-						if (!writeWorkflowResult({ id: workflowRunId, runId: workflowRunId, toolCallId, agent: "workflow", mode: "workflow", success: true, state: "complete", summary: resultSummary, output: resultSummary, workflowChildren, results: workflow.children.map((child) => ({ workflowKey: child.key, ...(child.agent ? { agent: child.agent } : {}), ...(child.runId ? { runId: child.runId } : {}), output: child.output, outputState: child.output.trim() || child.structuredOutput !== undefined ? "present" : "absent", structuredOutput: child.structuredOutput, success: child.ok, ...(child.outputPathMapping ? { outputPathMapping: child.outputPathMapping } : {}), ...(child.stopped ? { stopped: true } : {}), ...(child.interrupted ? { interrupted: true } : {}), ...(child.artifactPaths[0] ? { artifactPaths: { outputPath: child.artifactPaths[0] } } : {}) })), workflow: status.workflow, ...(workflowReceipt ? { workflowReceipt } : {}), asyncDir, cwd: workflowCwd, sessionId: currentSessionId, completionOwnerId, ...(requestParams.scheduleOrigin ? { scheduleOrigin: requestParams.scheduleOrigin } : {}), timestamp: Date.now(), durationMs: Date.now() - startedAt })) return;
-						persist();
-						persistClosed = true;
-						appendWorkflowEvent({ type: "subagent.workflow.completed", state: status.state, ...(status.error ? { error: status.error } : {}) });
-					} catch (error) {
-						const partial = error instanceof WorkflowScriptError ? error.partial : { trace: [], emits: [], console: [], children: [] };
-						const stopped = controller.signal.aborted;
-						const detachedChildKeys = new Set(partial.children.filter((child) => child.detached).map((child) => child.key));
-						const hasRealFailedChild = partial.children.some((child) => !child.ok && !child.detached);
-						const pauseForDetached = !stopped && error instanceof WorkflowScriptError && error.errorKind === "detached-child" && detachedChildKeys.size > 0 && !hasRealFailedChild;
-						const state = stopped ? "stopped" : pauseForDetached ? "paused" : "failed";
-						for (const step of status.steps ?? []) {
-							if (step.workflowKey && detachedChildKeys.has(step.workflowKey)) {
-								if (step.status === "completed" || step.status === "complete" || step.status === "failed") continue;
-								step.status = "paused";
-								step.activityState = "needs_attention";
-							} else if (pauseForDetached && step.status === "running") {
-								step.status = "stopped";
-								step.stopped = true;
-								delete step.activityState;
+								const terminalSummary = `${status.state === "complete"
+									? "Workflow completed after detached child finished."
+									: status.error ?? (pauseForDetached ? "Workflow paused." : "Workflow failed.")}${workflowOutputPathMappingSummary(partial.children)}`;
+								const outputWarning = writeWorkflowAggregateOutput(workflowAggregateOutputPath, terminalSummary, producedChildOutputPaths);
+								const resultSummary = appendWorkflowOutputWarning(terminalSummary, outputWarning);
+								const receiptState: WorkflowReceiptState = status.state === "complete" ? "complete" : status.state === "paused" ? "paused" : status.state === "stopped" ? "stopped" : "failed";
+								const terminalOutcome = workflowFailureTerminalOutcome(error, partial.children, usageBudgetState(workflowUsageBudget.budget, sumResultsCost(workflowResults)));
+								const receipt = terminalWorkflowReceipt(workflowRunId, receiptState, partial.children, workflowChildren, terminalOutcome);
+								let workflowReceipt: { path: string; receipt: WorkflowReceipt } | undefined;
+								try {
+									workflowReceipt = { path: writeWorkflowReceipt(asyncDir, receipt), receipt };
+								} catch (receiptError) {
+									appendWorkflowEvent({ type: "subagent.workflow.receipt_write_failed", error: `Failed to persist async workflow receipt: ${receiptError instanceof Error ? receiptError.message : String(receiptError)}` });
+								}
+								if (!writeWorkflowResult({ id: workflowRunId, runId: workflowRunId, toolCallId, agent: "workflow", mode: "workflow", success: status.state === "complete", state: status.state, summary: resultSummary, error: status.state === "complete" ? undefined : status.error, stopped: status.stopped, activityState: status.activityState, workflowChildren, ...(terminalOutcome ? { terminalOutcome } : {}), results: partial.children.map((child) => ({ workflowKey: child.key, ...(child.agent ? { agent: child.agent } : {}), ...(child.runId ? { runId: child.runId } : {}), output: child.output, outputState: child.output.trim() || child.structuredOutput !== undefined ? "present" : "absent", structuredOutput: child.structuredOutput, success: child.ok, ...(child.terminalOutcome ? { terminalOutcome: child.terminalOutcome } : {}), ...(child.outputPathMapping ? { outputPathMapping: child.outputPathMapping } : {}), ...(child.stopped ? { stopped: true } : {}), ...(child.interrupted ? { interrupted: true } : {}), ...(child.detached && status.state !== "complete" ? { detached: true } : {}), ...(child.artifactPaths[0] ? { artifactPaths: { outputPath: child.artifactPaths[0] } } : {}) })), workflow: status.workflow, ...(workflowReceipt ? { workflowReceipt } : {}), asyncDir, cwd: workflowCwd, sessionId: currentSessionId, completionOwnerId, ...(requestParams.scheduleOrigin ? { scheduleOrigin: requestParams.scheduleOrigin } : {}), timestamp: Date.now(), durationMs: Date.now() - startedAt })) return;
+								persist();
+								persistClosed = true;
+								appendWorkflowEvent({ type: "subagent.workflow.completed", state: status.state, ...(terminalOutcome ? { terminalOutcome } : {}), ...(status.error ? { error: status.error } : {}), ...(status.activityState ? { activityState: status.activityState } : {}) });
+								try {
+									// Detached children may have settled while the root was still
+									// running; the now-durable terminal status can absorb their results.
+									drainRetainedDetachedCompletions({ state: deps.state, workflowRunId, asyncDir, events: deps.pi.events });
+								} catch (replayError) {
+									appendWorkflowEvent({ type: "subagent.workflow.detached_replay_failed", error: `Failed to replay retained detached completions: ${replayError instanceof Error ? replayError.message : String(replayError)}` });
+								}
+							} finally {
+								persistClosed = true;
+								deps.state.workflowControllers?.delete(workflowRunId);
+								deps.state.workflowChildStops?.delete(workflowRunId);
+								deps.state.activeAsyncCapacity = workflowCapacity?.reconcile(new Set(deps.state.workflowControllers?.keys() ?? []))
+									?? deps.state.activeAsyncCapacity;
 							}
+						});
+						return attachWorkflowMission(startResult);
+					};
+					// All mandatory, fallible start projections precede this ownership transition.
+					// Post-admission mission bookkeeping keeps its caught/reported warning contract.
+					workflowCapacity?.markWorkflowStarted();
+					if (capacitySnapshot) deps.state.activeAsyncCapacity = capacitySnapshot;
+				}
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				const cleanupErrors: unknown[] = [];
+				persistClosed = true;
+				if (workflowRunId) {
+					deps.state.workflowControllers?.delete(workflowRunId);
+					deps.state.workflowChildStops?.delete(workflowRunId);
+					deps.state.asyncJobs.delete(workflowRunId);
+					deps.state.fleetJobs?.delete(workflowRunId);
+				}
+				for (const writer of prelaunchWriters) {
+					try { writer.dispose(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+				}
+				// No Worker has been scheduled on this error route. A missing handle is
+				// normal for unlimited/nested workflows, not evidence of started ownership.
+				let knownUnstarted = workflowCapacity === undefined;
+				try {
+					if (workflowCapacity) knownUnstarted = workflowCapacity.rollback();
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+				if (knownUnstarted && prelaunchStatus && workflowRunId) {
+					const asyncDir = path.join(DIRS.async, workflowRunId);
+					try {
+						// A write can commit and then throw. Inspect durable truth rather than
+						// relying on the initialPersistenceComplete flag or inventing process proof.
+						const persistedStatus = readStatus(asyncDir);
+						if (persistedStatus) {
+							const persistedChildren = parseWorkflowChildSummary(persistedStatus.workflowChildren);
+							if (persistedStatus.runId !== prelaunchStatus.runId
+								|| persistedStatus.toolCallId !== prelaunchStatus.toolCallId
+								|| persistedStatus.sessionId !== prelaunchStatus.sessionId
+								|| persistedStatus.completionOwnerId !== prelaunchStatus.completionOwnerId
+								|| persistedStatus.startedAt !== prelaunchStatus.startedAt
+								|| persistedStatus.mode !== "workflow" || persistedStatus.state !== "running"
+								|| (persistedStatus.steps?.length ?? 0) !== 0 || persistedStatus.processTerminal !== undefined
+								|| !persistedChildren || persistedChildren.parentToolCallId !== _id || persistedChildren.workflowRunId !== workflowRunId
+								|| persistedChildren.workflowState !== "running" || persistedChildren.inventoryComplete || persistedChildren.children.length !== 0) {
+								throw new Error(`Async workflow '${workflowRunId}' durable startup ownership changed; retained its status and indexes.`);
+							}
+							const endedAt = Date.now();
+							const failedStatus: AsyncStatus = {
+								...prelaunchStatus, state: "failed", error: message, endedAt, lastUpdate: endedAt,
+								workflowChildren: workflowChildSummary({ parentToolCallId: _id, workflowRunId, workflowState: "failed", inventoryComplete: true }),
+							};
+							try { writeAtomicJson(path.join(asyncDir, "status.json"), failedStatus); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+							try { updateActiveRunIndex(asyncDir, "failed", prelaunchStatus.toolCallId, { strictCleanup: true }); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+						} else {
+							releaseActiveRunIndex(asyncDir, { strictCleanup: true });
 						}
-						const workflowState = state === "paused" ? "paused" : state === "stopped" ? "stopped" : "failed";
-						const workflowChildren = workflowChildSummary({ parentToolCallId: toolCallId, workflowRunId, workflowState, inventoryComplete: true, trace: partial.trace, children: partial.children, steps: status.steps });
-						status = compactOptional<AsyncStatus>({ ...status, state, stopped: stopped || undefined, activityState: pauseForDetached ? "needs_attention" : undefined, error: workflowFailureMessage(error, workflowRunId, partial.children), endedAt: Date.now(), workflow: { trace: partial.trace, emits: partial.emits, console: partial.console }, workflowChildren });
-						if (pauseForDetached) {
-							const promoted = promotePausedWorkflowIfSettled(status);
-							if (promoted) status = promoted;
-						}
-						const terminalSummary = `${status.state === "complete"
-							? "Workflow completed after detached child finished."
-							: status.error ?? (pauseForDetached ? "Workflow paused." : "Workflow failed.")}${workflowOutputPathMappingSummary(partial.children)}`;
-						const outputWarning = writeWorkflowAggregateOutput(workflowAggregateOutputPath, terminalSummary, producedChildOutputPaths);
-						const resultSummary = appendWorkflowOutputWarning(terminalSummary, outputWarning);
-						const receiptState: WorkflowReceiptState = status.state === "complete" ? "complete" : status.state === "paused" ? "paused" : status.state === "stopped" ? "stopped" : "failed";
-						const terminalOutcome = workflowFailureTerminalOutcome(error, partial.children, usageBudgetState(workflowUsageBudget.budget, sumResultsCost(workflowResults)));
-						const receipt = terminalWorkflowReceipt(workflowRunId, receiptState, partial.children, workflowChildren, terminalOutcome);
-						let workflowReceipt: { path: string; receipt: WorkflowReceipt } | undefined;
-						try {
-							workflowReceipt = { path: writeWorkflowReceipt(asyncDir, receipt), receipt };
-						} catch (receiptError) {
-							appendWorkflowEvent({ type: "subagent.workflow.receipt_write_failed", error: `Failed to persist async workflow receipt: ${receiptError instanceof Error ? receiptError.message : String(receiptError)}` });
-						}
-						if (!writeWorkflowResult({ id: workflowRunId, runId: workflowRunId, toolCallId, agent: "workflow", mode: "workflow", success: status.state === "complete", state: status.state, summary: resultSummary, error: status.state === "complete" ? undefined : status.error, stopped: status.stopped, activityState: status.activityState, workflowChildren, ...(terminalOutcome ? { terminalOutcome } : {}), results: partial.children.map((child) => ({ workflowKey: child.key, ...(child.agent ? { agent: child.agent } : {}), ...(child.runId ? { runId: child.runId } : {}), output: child.output, outputState: child.output.trim() || child.structuredOutput !== undefined ? "present" : "absent", structuredOutput: child.structuredOutput, success: child.ok, ...(child.terminalOutcome ? { terminalOutcome: child.terminalOutcome } : {}), ...(child.outputPathMapping ? { outputPathMapping: child.outputPathMapping } : {}), ...(child.stopped ? { stopped: true } : {}), ...(child.interrupted ? { interrupted: true } : {}), ...(child.detached && status.state !== "complete" ? { detached: true } : {}), ...(child.artifactPaths[0] ? { artifactPaths: { outputPath: child.artifactPaths[0] } } : {}) })), workflow: status.workflow, ...(workflowReceipt ? { workflowReceipt } : {}), asyncDir, cwd: workflowCwd, sessionId: currentSessionId, completionOwnerId, ...(requestParams.scheduleOrigin ? { scheduleOrigin: requestParams.scheduleOrigin } : {}), timestamp: Date.now(), durationMs: Date.now() - startedAt })) return;
-						persist();
-						persistClosed = true;
-						appendWorkflowEvent({ type: "subagent.workflow.completed", state: status.state, ...(terminalOutcome ? { terminalOutcome } : {}), ...(status.error ? { error: status.error } : {}), ...(status.activityState ? { activityState: status.activityState } : {}) });
-					} finally {
-						persistClosed = true;
-						deps.state.workflowControllers?.delete(workflowRunId);
-						deps.state.workflowChildStops?.delete(workflowRunId);
-						deps.state.activeAsyncCapacity = workflowCapacity?.reconcile(new Set(deps.state.workflowControllers?.keys() ?? []))
-							?? deps.state.activeAsyncCapacity;
+					} catch (cleanupError) {
+						cleanupErrors.push(cleanupError);
 					}
-				});
-				return withSubagentUsage(attachWorkflowMission(withRunFanoutBudget({
-					content: [{ type: "text", text: formatAsyncStartedMessage(`Async workflow [${workflowRunId}]`, ctx.hasUI === true) }],
-					details: { mode: "workflow", runId: workflowRunId, toolCallId, asyncId: workflowRunId, asyncDir, results: [], workflowChildren: status.workflowChildren, chatProgress, ...(deps.state.activeAsyncCapacity ? { activeAsyncCapacity: deps.state.activeAsyncCapacity } : {}) },
-				}, workflowFanoutBudget)));
+				}
+				return {
+					content: [
+						{ type: "text", text: workflowRunId ? `Failed to create async workflow storage: ${message}` : message },
+						...cleanupErrors.map((cleanupError) => ({ type: "text" as const, text: `Async workflow initialization cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}` })),
+						...(!knownUnstarted ? [{ type: "text" as const, text: "Started or uncertain workflow ownership was not force-reclaimed or terminalized." }] : []),
+					],
+					isError: true,
+					details: { mode: "workflow", results: [] },
+				};
 			}
+			if (launchPreparedWorkflow) return launchPreparedWorkflow();
 			const { workflowScript: _workflowScript, action: _action, agent: _agent, task: _task, resume: _resume, tasks: _tasks, chain: _chain, concurrency: _concurrency, async: _async, foregroundOnly: _foregroundOnly, clarify: _clarify, timeoutMs: _timeoutMs, maxRuntimeMs: _maxRuntimeMs, usageBudget: _usageBudget, chatProgress: _chatProgress, missionId: _missionId, mission: _mission, ...workflowChildDefaults } = requestParams;
 			const workflowOutput = typeof workflowChildDefaults.output === "string" || typeof workflowChildDefaults.output === "boolean" ? workflowChildDefaults.output : undefined;
 			const configuredOutputBaseDir = resolveConfiguredSingleRunOutputBaseDir(deps);
@@ -5589,19 +5677,36 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			}
 			if (action === "stop") {
 				const targetRunId = paramsWithResolvedCwd.runId ?? paramsWithResolvedCwd.id;
-				const workflowController = targetRunId ? deps.state.workflowControllers?.get(targetRunId) : undefined;
-				if (workflowController) {
+				let resolved: ResolvedSubagentRunId | undefined;
+				if (targetRunId) {
+					try {
+						resolved = resolveSubagentRunId(targetRunId, omitUndefinedProperties({ state: deps.state, nested: nestedResolutionScopeForExecutor(deps) }));
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						return { content: [{ type: "text", text: message }], isError: true, details: { mode: "management", results: [] } };
+					}
+					if (resolved?.kind === "nested") return { content: [{ type: "text", text: "action='stop' supports current-session top-level async runs only." }], isError: true, details: { mode: "management", results: [] } };
+					if (resolved?.kind === "foreground") return { content: [{ type: "text", text: "action='stop' supports async runs only. Use action='interrupt' for foreground runs." }], isError: true, details: { mode: "management", results: [] } };
+				}
+				// Resolve to the canonical run id before consulting in-process
+				// workflow controls, and search owner executors too: scheduled
+				// workflows register their controllers on private owner state.
+				const canonicalRunId = resolved?.kind === "async" ? resolved.id : targetRunId;
+				const controllerOwner = canonicalRunId ? findWorkflowControllerOwner(canonicalRunId) : undefined;
+				if (controllerOwner) {
+					const workflowController = controllerOwner.controller;
+					const ownerState = controllerOwner.ownerState;
 					if (paramsWithResolvedCwd.childId !== undefined) {
-						const workflowRunId = targetRunId!;
-						const asyncJob = deps.state.asyncJobs.get(workflowRunId);
+						const workflowRunId = canonicalRunId!;
+						const asyncJob = ownerState.asyncJobs.get(workflowRunId);
 						if (!asyncJob?.asyncDir) return { content: [{ type: "text", text: `Status file not found for async workflow '${workflowRunId}'.` }], isError: true, details: { mode: "management", results: [] } };
 						const status = readStatus(asyncJob.asyncDir);
 						if (!status) return { content: [{ type: "text", text: `Status file not found for async workflow '${workflowRunId}'.` }], isError: true, details: { mode: "management", results: [] } };
 						const resolution = resolveAsyncStatusChild(status, paramsWithResolvedCwd.childId);
 						if (!resolution.ok) return { content: [{ type: "text", text: resolution.message }], isError: true, details: { mode: "management", results: [] } };
 						if (!isStoppableAsyncStatusStep(resolution.child.step)) return { content: [{ type: "text", text: `Child '${paramsWithResolvedCwd.childId}' in async run '${targetRunId}' is ${resolution.child.step.status}; stop only supports pending or running children.` }], isError: true, details: { mode: "management", results: [] } };
-						const stopChild = deps.state.workflowChildStops?.get(targetRunId!);
-						if (!stopChild) return { content: [{ type: "text", text: `Workflow ${targetRunId} child stop is unavailable in this extension runtime.` }], isError: true, details: { mode: "management", results: [] } };
+						const stopChild = ownerState.workflowChildStops?.get(workflowRunId);
+						if (!stopChild) return { content: [{ type: "text", text: `Workflow ${workflowRunId} child stop is unavailable in this extension runtime.` }], isError: true, details: { mode: "management", results: [] } };
 						if (!stopChild(resolution.child.id, `Workflow child '${resolution.child.id}' stopped.`)) return { content: [{ type: "text", text: `Child '${paramsWithResolvedCwd.childId}' in workflow ${workflowRunId} is not available to stop.` }], isError: true, details: { mode: "management", results: [] } };
 						try {
 							fs.appendFileSync(path.join(asyncJob.asyncDir, "events.jsonl"), `${JSON.stringify({
@@ -5626,13 +5731,18 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						return { content: [{ type: "text", text: `Stop requested for child ${resolution.child.id} in async workflow ${workflowRunId}.` }], details: { mode: "management", results: [] } };
 					}
 					workflowController.abort(new Error("Workflow stopped."));
-					return { content: [{ type: "text", text: `Stop requested for async workflow ${targetRunId}.` }], details: { mode: "management", results: [] } };
+					return { content: [{ type: "text", text: `Stop requested for async workflow ${canonicalRunId}.` }], details: { mode: "management", results: [] } };
 				}
-				let resolved: ResolvedSubagentRunId | undefined;
 				if (paramsWithResolvedCwd.dir) {
 					try {
 						const location = resolveAsyncRunLocation(paramsWithResolvedCwd, DIRS.async, DIRS.results);
-						const stopResult = stopAsyncRun(deps.state, location.resolvedId ?? targetRunId ?? path.basename(location.asyncDir ?? paramsWithResolvedCwd.dir), deps.kill, location, paramsWithResolvedCwd.childId);
+						const dirRunId = location.resolvedId ?? targetRunId ?? path.basename(location.asyncDir ?? paramsWithResolvedCwd.dir);
+						const dirControllerOwner = dirRunId ? findWorkflowControllerOwner(dirRunId) : undefined;
+						if (dirControllerOwner) {
+							dirControllerOwner.controller.abort(new Error("Workflow stopped."));
+							return { content: [{ type: "text", text: `Stop requested for async workflow ${dirRunId}.` }], details: { mode: "management", results: [] } };
+						}
+						const stopResult = stopAsyncRun(deps.state, dirRunId, deps.kill, location, paramsWithResolvedCwd.childId);
 						return stopResult ?? { content: [{ type: "text", text: `No running or queued async run was found for '${targetRunId ?? paramsWithResolvedCwd.dir}'.` }], isError: true, details: { mode: "management", results: [] } };
 					} catch (error) {
 						const text = error instanceof Error ? error.message : String(error);
@@ -5640,14 +5750,19 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					}
 				}
 				if (!targetRunId) return { content: [{ type: "text", text: "action='stop' requires id or dir." }], isError: true, details: { mode: "management", results: [] } };
-				try {
-					resolved = resolveSubagentRunId(targetRunId, omitUndefinedProperties({ state: deps.state, nested: nestedResolutionScopeForExecutor(deps) }));
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					return { content: [{ type: "text", text: message }], isError: true, details: { mode: "management", results: [] } };
+				// An in-process workflow owns its control exclusively through a live
+				// controller; no inbox consumer exists. When the controller is gone
+				// the stop-request file would be written but never consumed, so the
+				// honest answer is an explicit failure rather than an ack.
+				const resolvedAsyncDir = resolved?.kind === "async" ? resolved.location.asyncDir : undefined;
+				const resolvedStatus = resolvedAsyncDir ? readStatus(resolvedAsyncDir) : undefined;
+				if (resolvedStatus?.mode === "workflow" && (resolvedStatus.state === "running" || resolvedStatus.state === "queued") && resolvedStatus.pid === process.pid) {
+					return {
+						content: [{ type: "text", text: `Async workflow '${resolved?.kind === "async" ? resolved.id : targetRunId}' runs in this process but has no live control route; stop cannot be delivered.` }],
+						isError: true,
+						details: { mode: "management", results: [] },
+					};
 				}
-				if (resolved?.kind === "nested") return { content: [{ type: "text", text: "action='stop' supports current-session top-level async runs only." }], isError: true, details: { mode: "management", results: [] } };
-				if (resolved?.kind === "foreground") return { content: [{ type: "text", text: "action='stop' supports async runs only. Use action='interrupt' for foreground runs." }], isError: true, details: { mode: "management", results: [] } };
 				const stopResult = stopAsyncRun(
 					deps.state,
 					resolved?.kind === "async" ? resolved.id : targetRunId,
@@ -6409,14 +6524,44 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const ownerSessionId = resolveCurrentSessionId(ctx.sessionManager);
 		let ownerExecutor = scheduledOwnerExecutors.get(ownerSessionId);
 		if (!ownerExecutor) {
+			const ownerState = createScheduledOwnerState(deps.state, ownerSessionId, ctx);
 			ownerExecutor = createSubagentExecutor({
 				...deps,
-				state: createScheduledOwnerState(deps.state, ownerSessionId, ctx),
+				state: ownerState,
 			});
 			scheduledOwnerExecutors.set(ownerSessionId, ownerExecutor);
+			scheduledOwnerStates.set(ownerSessionId, ownerState);
 		}
 		return ownerExecutor.execute(id, params, signal, undefined, ctx);
 	};
 
-	return { execute: executeWithSingleDispatchGuard, executePublic, executeDelegated, executeScheduled };
+	/**
+	 * Aborts every in-process workflow owned by this executor — ordinary runs on
+	 * `deps.state` and scheduled runs on their private owner states — then waits
+	 * bounded for settlement. Each controller's settle path drains its own
+	 * children, terminates its Worker, and persists a stopped status; detached
+	 * runner processes are intentionally untouched (they outlive the runtime).
+	 */
+	const dispose = async (): Promise<void> => {
+		const states = [deps.state, ...scheduledOwnerStates.values()];
+		for (const ownerState of states) {
+			for (const controller of ownerState.workflowControllers?.values() ?? []) {
+				try {
+					controller.abort(new Error("Extension runtime disposed."));
+				} catch (error) {
+					console.error("Failed to abort workflow during runtime disposal:", error);
+				}
+			}
+		}
+		const deadline = Date.now() + WORKFLOW_SETTLEMENT_DRAIN_MS + 5_000;
+		while (Date.now() < deadline) {
+			const remaining = states.reduce((count, ownerState) => count + (ownerState.workflowControllers?.size ?? 0), 0);
+			if (remaining === 0) return;
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		const remaining = states.reduce((count, ownerState) => count + (ownerState.workflowControllers?.size ?? 0), 0);
+		if (remaining > 0) console.error(`Runtime disposal expired with ${remaining} workflow controller(s) still registered.`);
+	};
+
+	return { execute: executeWithSingleDispatchGuard, executePublic, executeDelegated, executeScheduled, dispose };
 }

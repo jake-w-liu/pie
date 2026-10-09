@@ -40,9 +40,9 @@ import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { iterateSseMessages } from "../utils/sse.ts";
-
 import { getJsonSchemaToolParameters, resolveJsonSchemaStrictSampling } from "./constrained-sampling.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
+import { lazyStream } from "./lazy.ts";
 import { adjustMaxTokensForThinking, buildBaseOptions, clampMaxTokensToContext } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
 
@@ -729,49 +729,54 @@ export const streamSimple: StreamFunction<"anthropic-messages", SimpleStreamOpti
 	model: Model<"anthropic-messages">,
 	context: Context,
 	options?: SimpleStreamOptions,
-): AssistantMessageEventStream => {
-	assertRequestAuth(model.provider, options?.apiKey, options?.headers);
+): AssistantMessageEventStream =>
+	lazyStream(
+		model,
+		async () => {
+			assertRequestAuth(model.provider, options?.apiKey, options?.headers);
 
-	const base = {
-		...buildBaseOptions(model, context, options, options?.apiKey),
-		toolChoice: options?.toolChoice,
-	} satisfies AnthropicOptions;
-	if (!options?.reasoning) {
-		return stream(model, context, {
-			...base,
-			thinkingEnabled: false,
-		} satisfies AnthropicOptions);
-	}
+			const base = {
+				...buildBaseOptions(model, context, options, options?.apiKey),
+				toolChoice: options?.toolChoice,
+			} satisfies AnthropicOptions;
+			if (!options?.reasoning) {
+				return stream(model, context, {
+					...base,
+					thinkingEnabled: false,
+				} satisfies AnthropicOptions);
+			}
 
-	// For models with adaptive thinking: use an effort level.
-	// For older models: use budget-based thinking.
-	if (model.compat?.forceAdaptiveThinking === true) {
-		const effort = mapThinkingLevelToEffort(model, options.reasoning);
-		return stream(model, context, {
-			...base,
-			thinkingEnabled: true,
-			effort,
-		} satisfies AnthropicOptions);
-	}
+			// For models with adaptive thinking: use an effort level.
+			// For older models: use budget-based thinking.
+			if (model.compat?.forceAdaptiveThinking === true) {
+				const effort = mapThinkingLevelToEffort(model, options.reasoning);
+				return stream(model, context, {
+					...base,
+					thinkingEnabled: true,
+					effort,
+				} satisfies AnthropicOptions);
+			}
 
-	// Undefined means the caller did not request an output cap; let the helper use the model cap.
-	// Do not coerce to 0 here, or the thinking budget would become the entire max_tokens value.
-	const adjusted = adjustMaxTokensForThinking(
-		base.maxTokens,
-		model.maxTokens,
-		options.reasoning,
-		options.thinkingBudgets,
+			// Undefined means the caller did not request an output cap; let the helper use the model cap.
+			// Do not coerce to 0 here, or the thinking budget would become the entire max_tokens value.
+			const adjusted = adjustMaxTokensForThinking(
+				base.maxTokens,
+				model.maxTokens,
+				options.reasoning,
+				options.thinkingBudgets,
+			);
+
+			const maxTokens = clampMaxTokensToContext(model, context, adjusted.maxTokens);
+
+			return stream(model, context, {
+				...base,
+				maxTokens,
+				thinkingEnabled: true,
+				thinkingBudgetTokens: Math.min(adjusted.thinkingBudget, Math.max(0, maxTokens - 1024)),
+			} satisfies AnthropicOptions);
+		},
+		options?.signal,
 	);
-
-	const maxTokens = clampMaxTokensToContext(model, context, adjusted.maxTokens);
-
-	return stream(model, context, {
-		...base,
-		maxTokens,
-		thinkingEnabled: true,
-		thinkingBudgetTokens: Math.min(adjusted.thinkingBudget, Math.max(0, maxTokens - 1024)),
-	} satisfies AnthropicOptions);
-};
 
 function isOAuthToken(apiKey: string): boolean {
 	return apiKey.includes("sk-ant-oat");

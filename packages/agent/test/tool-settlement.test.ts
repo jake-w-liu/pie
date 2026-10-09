@@ -1,3 +1,6 @@
+import fs from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { setImmediate } from "node:timers/promises";
 import {
 	type AssistantMessage,
@@ -6,9 +9,11 @@ import {
 	type Model,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { describe, expect, it } from "vitest";
-import { Agent } from "../src/agent.ts";
+import { describe, expect, it, vi } from "vitest";
+import { Agent, type AgentOptions } from "../src/agent.ts";
 import { runAgentLoop } from "../src/agent-loop.ts";
+import { NodeExecutionEnv } from "../src/harness/env/nodejs.ts";
+import { JsonlSessionRepo } from "../src/harness/session/jsonl/repo.ts";
 import type { AgentEvent, AgentLoopConfig, AgentMessage, AgentTool, AgentToolResult, StreamFn } from "../src/types.ts";
 
 const model: Model<"openai-responses"> = {
@@ -35,7 +40,7 @@ function gate() {
 	return { promise, resolve };
 }
 
-function streamCalls(ids: string[]): StreamFn {
+function streamCalls(ids: string[], stopReason: "toolUse" | "length" = "toolUse", terminalEvent = true): StreamFn {
 	return () => {
 		const stream = createAssistantMessageEventStream();
 		const message: AssistantMessage = {
@@ -52,10 +57,11 @@ function streamCalls(ids: string[]): StreamFn {
 				totalTokens: 0,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
-			stopReason: "toolUse",
+			stopReason,
 			timestamp: 1,
 		};
-		stream.push({ type: "done", reason: "toolUse", message });
+		if (terminalEvent) stream.push({ type: "done", reason: stopReason, message });
+		else stream.end(message);
 		return stream;
 	};
 }
@@ -511,6 +517,58 @@ describe("tool settlement", () => {
 	);
 });
 
+describe("tool notification failures preserve outcomes", () => {
+	for (const toolExecution of ["sequential", "parallel"] as const) {
+		it.each([
+			"tool_execution_start",
+			"tool_execution_update",
+			"tool_execution_end",
+			"message_start",
+			"message_end",
+		] as const)(`${toolExecution} answers every requested call after a %s failure`, async (phase) => {
+			const executed: string[] = [];
+			const events: AgentEvent[] = [];
+			const agent = new Agent({
+				initialState: {
+					model,
+					tools: [
+						tool(async (id, _args, _signal, update) => {
+							executed.push(id);
+							const actual = { content: [{ type: "text" as const, text: `completed ${id}` }], details: { id } };
+							update?.(actual);
+							return actual;
+						}),
+					],
+				},
+				toolExecution,
+				streamFn: streamCalls(["first", "second"]),
+				shouldStopAfterTurn: () => true,
+			});
+			agent.subscribe((event) => {
+				events.push(event);
+				if (event.type !== phase) return;
+				if ("toolCallId" in event && event.toolCallId === "first") throw new Error(`observer ${phase}`);
+				if ("message" in event && event.message.role === "toolResult" && event.message.toolCallId === "first") {
+					throw new Error(`observer ${phase}`);
+				}
+			});
+			await agent.prompt(prompt);
+			await agent.waitForIdle();
+			const answers = agent.state.messages.filter((message) => message.role === "toolResult");
+			expect(executed).toEqual(["first", "second"]);
+			expect(answers.map((message) => message.toolCallId)).toEqual(["first", "second"]);
+			expect(answers.map((message) => ({ content: message.content, isError: message.isError }))).toEqual([
+				{ content: [{ type: "text", text: "completed first" }], isError: false },
+				{ content: [{ type: "text", text: "completed second" }], isError: false },
+			]);
+			expect(agent.state.errorMessage).toBe(`observer ${phase}`);
+			expect(agent.state.pendingToolCalls.size).toBe(0);
+			expect(agent.state.isStreaming).toBe(false);
+			expect(events.at(-1)?.type).toBe("agent_end");
+		});
+	}
+});
+
 describe("parallel sibling settlement on entry failure", () => {
 	it("parallel publishes sibling toolResults before surfacing the first failure", async () => {
 		const failure = new Error("sibling listener failure");
@@ -532,10 +590,11 @@ describe("parallel sibling settlement on entry failure", () => {
 		});
 		await agent.prompt(prompt);
 		await agent.waitForIdle();
-		// The successful sibling's toolResult must still be paired in the transcript
-		// even though the slow entry failed in its end listener.
+		// Both successful executions must retain their actual results, including
+		// the one whose completion notification failed.
 		const toolResults = agent.state.messages.filter((message) => message.role === "toolResult");
-		expect(toolResults.map((message) => (message as { toolCallId: string }).toolCallId)).toContain("fast");
+		expect(toolResults.map((message) => message.toolCallId)).toEqual(["slow", "fast"]);
+		expect(toolResults.every((message) => !message.isError)).toBe(true);
 		expect(toolResults.find((message) => (message as { toolCallId: string }).toolCallId === "fast")).toMatchObject({
 			isError: false,
 			content: [{ type: "text", text: "done" }],
@@ -634,4 +693,621 @@ describe("sequential sibling settlement on entry failure", () => {
 		expect(answered).toEqual(["cut-1", "cut-2"]);
 		expect(agent.state.errorMessage).toContain("truncated listener failure");
 	});
+});
+
+describe("assistant completion admission barrier", () => {
+	for (const toolExecution of ["sequential", "parallel"] as const) {
+		for (const stopReason of ["toolUse", "length"] as const) {
+			for (const route of ["agent", "loop"] as const) {
+				it.each([
+					{ label: "Error", failure: new Error("completion barrier rejected") },
+					{ label: "null", failure: null },
+					{ label: "undefined", failure: undefined },
+				])(
+					`${route} ${toolExecution}/${stopReason} answers requests without execution after a $label barrier failure`,
+					async ({ failure }) => {
+						const events: AgentEvent[] = [];
+						const execute = vi.fn(async () => result);
+						const beforeToolCall = vi.fn(async () => undefined);
+						const afterToolCall = vi.fn(async () => undefined);
+						const observer = (event: AgentEvent) => {
+							events.push(event);
+							if (
+								event.type === "message_end" &&
+								event.message.role === "assistant" &&
+								event.message.content.some((block) => block.type === "toolCall")
+							)
+								throw failure;
+							if (
+								(event.type === "message_start" || event.type === "message_end") &&
+								event.message.role === "toolResult"
+							)
+								throw new Error("secondary result observer failure");
+						};
+						const tools = [tool(execute)];
+						const config = {
+							model,
+							convertToLlm,
+							toolExecution,
+							beforeToolCall,
+							afterToolCall,
+							shouldStopAfterTurn: () => true,
+						} satisfies AgentLoopConfig;
+						if (route === "agent") {
+							const agent = new Agent({
+								...config,
+								initialState: { model, tools },
+								streamFn: streamCalls(["first", "second"], stopReason),
+							});
+							agent.subscribe(observer);
+							await agent.prompt(prompt);
+							await agent.waitForIdle();
+							expect(agent.state.errorMessage).toBe(
+								failure instanceof Error ? failure.message : String(failure),
+							);
+							expect(
+								agent.state.messages
+									.filter((message) => message.role === "toolResult")
+									.map((message) => message.toolCallId),
+							).toEqual(["first", "second"]);
+							expect(agent.state.pendingToolCalls.size).toBe(0);
+							expect(events.filter((event) => event.type === "turn_start")).toHaveLength(1);
+							expect(events.filter((event) => event.type === "turn_end")).toHaveLength(1);
+							expect(events.filter((event) => event.type === "agent_end")).toHaveLength(1);
+							expect(events.at(-1)?.type).toBe("agent_end");
+						} else {
+							const outcome = await runAgentLoop(
+								[prompt],
+								{ systemPrompt: "", messages: [], tools },
+								config,
+								observer,
+								undefined,
+								streamCalls(["first", "second"], stopReason),
+							).then(
+								() => ({ ok: true as const }),
+								(error: unknown) => ({ ok: false as const, error }),
+							);
+							expect(outcome.ok).toBe(false);
+							if (outcome.ok) throw new Error("Expected original barrier rejection");
+							expect(outcome.error).toBe(failure);
+						}
+						const answers = events.flatMap((event) =>
+							event.type === "message_end" && event.message.role === "toolResult" ? [event.message] : [],
+						);
+						expect(answers.map((message) => message.toolCallId)).toEqual(["first", "second"]);
+						expect(
+							answers.every(
+								(message) =>
+									message.isError &&
+									message.content.length === 1 &&
+									message.content[0].type === "text" &&
+									message.content[0].text.includes("not executed"),
+							),
+						).toBe(true);
+						expect(execute).not.toHaveBeenCalled();
+						expect(beforeToolCall).not.toHaveBeenCalled();
+						expect(afterToolCall).not.toHaveBeenCalled();
+						expect(events.some((event) => event.type.startsWith("tool_execution_"))).toBe(false);
+					},
+				);
+			}
+		}
+	}
+
+	it("answers calls when the stream resolves without a terminal event", async () => {
+		const failure = new Error("completion barrier rejected");
+		const events: AgentEvent[] = [];
+		const execute = vi.fn(async () => result);
+		const observed = runAgentLoop(
+			[prompt],
+			{ systemPrompt: "", messages: [], tools: [tool(execute)] },
+			{ model, convertToLlm },
+			(event) => {
+				events.push(event);
+				if (event.type === "message_end" && event.message.role === "assistant") throw failure;
+			},
+			undefined,
+			streamCalls(["first", "second"], "toolUse", false),
+		);
+		await expect(observed).rejects.toBe(failure);
+		expect(execute).not.toHaveBeenCalled();
+		expect(
+			events.flatMap((event) =>
+				event.type === "message_end" && event.message.role === "toolResult" ? [event.message.toolCallId] : [],
+			),
+		).toEqual(["first", "second"]);
+	});
+
+	it("drains a delayed secondary result observer before prompt and idle completion", async () => {
+		const failure = new Error("completion barrier rejected");
+		const admitted = gate();
+		const release = gate();
+		const events: AgentEvent[] = [];
+		let idle = false;
+		const execute = vi.fn(async () => result);
+		const agent = new Agent({
+			initialState: { model, tools: [tool(execute)] },
+			streamFn: streamCalls(["first", "second"]),
+		});
+		agent.subscribe(async (event) => {
+			events.push(event);
+			if (
+				event.type === "message_end" &&
+				event.message.role === "assistant" &&
+				event.message.content.some((block) => block.type === "toolCall")
+			)
+				throw failure;
+			if (
+				event.type === "message_end" &&
+				event.message.role === "toolResult" &&
+				event.message.toolCallId === "second"
+			) {
+				admitted.resolve();
+				await release.promise;
+				throw new Error("secondary failure");
+			}
+		});
+		const running = agent.prompt(prompt);
+		const waiting = agent.waitForIdle().then(() => {
+			idle = true;
+		});
+		try {
+			await admitted.promise;
+			await setImmediate();
+			expect(idle).toBe(false);
+			expect(agent.state.isStreaming).toBe(true);
+			expect(events.some((event) => event.type === "agent_end")).toBe(false);
+			await expect(agent.prompt("too early")).rejects.toThrow("already processing");
+		} finally {
+			release.resolve();
+			await Promise.all([running, waiting]);
+		}
+		expect(execute).not.toHaveBeenCalled();
+		expect(agent.state.errorMessage).toBe(failure.message);
+		expect(agent.state.messages.filter((message) => message.role === "toolResult")).toHaveLength(2);
+		expect(events.at(-1)?.type).toBe("agent_end");
+	});
+});
+
+describe("assistant terminal iterator ownership", () => {
+	it.each([false, true])("keeps the completion barrier before iterator close (rejected=%s)", async (rejected) => {
+		const order: string[] = [];
+		const failure = new Error("barrier rejected");
+		const streamFn: StreamFn = async (...args) => {
+			const stream = await streamCalls(["first"])(...args);
+			const iterate = stream[Symbol.asyncIterator].bind(stream);
+			vi.spyOn(stream, Symbol.asyncIterator).mockImplementation(async function* () {
+				try {
+					yield* { [Symbol.asyncIterator]: iterate };
+				} finally {
+					order.push("iterator-close");
+				}
+			});
+			return stream;
+		};
+		const execute = vi.fn(async () => {
+			order.push("executed");
+			return result;
+		});
+		const running = runAgentLoop(
+			[prompt],
+			{ systemPrompt: "", messages: [], tools: [tool(execute)] },
+			{ model, convertToLlm, shouldStopAfterTurn: () => true },
+			(event) => {
+				if (event.type !== "message_end") return;
+				if (event.message.role === "assistant") {
+					order.push("barrier");
+					if (rejected) throw failure;
+				} else if (event.message.role === "toolResult") order.push("result");
+			},
+			undefined,
+			streamFn,
+		);
+		if (rejected) {
+			await expect(running).rejects.toBe(failure);
+			expect(order).toEqual(["barrier", "result", "iterator-close"]);
+			expect(execute).not.toHaveBeenCalled();
+		} else {
+			await running;
+			expect(order).toEqual(["barrier", "iterator-close", "executed", "result"]);
+			expect(execute).toHaveBeenCalledTimes(1);
+		}
+	});
+});
+
+describe("published calls before failing response iterator close", () => {
+	const failures = [
+		{ label: "Error", error: new Error("iterator close rejected") },
+		{ label: "null", error: null },
+		{ label: "undefined", error: undefined },
+	];
+
+	function closingStream(ids: string[], stopReason: "toolUse" | "length", error: unknown, order: string[]): StreamFn {
+		return async (...args) => {
+			const stream = await streamCalls(ids, stopReason)(...args);
+			const iterate = stream[Symbol.asyncIterator].bind(stream);
+			vi.spyOn(stream, Symbol.asyncIterator).mockImplementation(() => {
+				const iterator = iterate();
+				return {
+					next: iterator.next.bind(iterator),
+					return: async () => {
+						await iterator.return?.();
+						order.push("iterator-close");
+						throw error;
+					},
+				};
+			});
+			return stream;
+		};
+	}
+
+	for (const mode of ["parallel", "sequential"] as const) {
+		for (const stopReason of ["toolUse", "length"] as const) {
+			it.each(failures)(
+				`${mode}/${stopReason} settles accepted calls before preserving $label close failure`,
+				async ({ error }) => {
+					const order: string[] = [];
+					const events: AgentEvent[] = [];
+					const execute = vi.fn(async () => result);
+					const beforeToolCall = vi.fn(async () => undefined);
+					const afterToolCall = vi.fn(async () => undefined);
+					const running = runAgentLoop(
+						[prompt],
+						{ systemPrompt: "", messages: [], tools: [tool(execute)] },
+						{
+							model,
+							convertToLlm,
+							toolExecution: mode,
+							beforeToolCall,
+							afterToolCall,
+							shouldStopAfterTurn: () => true,
+						},
+						(event) => {
+							events.push(event);
+							if (event.type !== "message_end") return;
+							if (event.message.role === "assistant") order.push("barrier");
+							else if (event.message.role === "toolResult") order.push(`result:${event.message.toolCallId}`);
+						},
+						undefined,
+						closingStream(["first", "second"], stopReason, error, order),
+					);
+					await expect(running).rejects.toBe(error);
+					expect(order).toEqual(["barrier", "iterator-close", "result:first", "result:second"]);
+					const answers = events.flatMap((event) =>
+						event.type === "message_end" && event.message.role === "toolResult" ? [event.message] : [],
+					);
+					expect(answers.map((answer) => answer.toolCallId)).toEqual(["first", "second"]);
+					expect(answers.every((answer) => answer.isError)).toBe(true);
+					expect(answers.map((answer) => answer.content)).toEqual([
+						[{ type: "text", text: expect.stringContaining("not executed") }],
+						[{ type: "text", text: expect.stringContaining("not executed") }],
+					]);
+					expect(execute).not.toHaveBeenCalled();
+					expect(beforeToolCall).not.toHaveBeenCalled();
+					expect(afterToolCall).not.toHaveBeenCalled();
+					expect(events.some((event) => event.type.startsWith("tool_execution_"))).toBe(false);
+				},
+			);
+		}
+	}
+
+	it.each(failures)("does not settle a rejected barrier twice when cleanup also throws $label", async ({ error }) => {
+		const order: string[] = [];
+		const failure = new Error("barrier rejected before close");
+		const execute = vi.fn(async () => result);
+		const running = runAgentLoop(
+			[prompt],
+			{ systemPrompt: "", messages: [], tools: [tool(execute)] },
+			{ model, convertToLlm, shouldStopAfterTurn: () => true },
+			(event) => {
+				if (event.type !== "message_end") return;
+				if (event.message.role === "assistant") {
+					order.push("barrier");
+					throw failure;
+				}
+				if (event.message.role === "toolResult") order.push(`result:${event.message.toolCallId}`);
+			},
+			undefined,
+			closingStream(["first", "second"], "toolUse", error, order),
+		);
+		await expect(running).rejects.toBe(failure);
+		expect(order).toEqual(["barrier", "result:first", "result:second", "iterator-close"]);
+		expect(execute).not.toHaveBeenCalled();
+	});
+
+	it.each(failures)(
+		"drains a delayed rejecting result observer before reporting $label close failure and idle",
+		async ({ error }) => {
+			const order: string[] = [];
+			const events: AgentEvent[] = [];
+			const admitted = gate();
+			const release = gate();
+			const execute = vi.fn(async () => result);
+			const beforeToolCall = vi.fn(async () => undefined);
+			const afterToolCall = vi.fn(async () => undefined);
+			const agent = new Agent({
+				initialState: { model, tools: [tool(execute)] },
+				streamFn: closingStream(["first", "second"], "toolUse", error, order),
+				beforeToolCall,
+				afterToolCall,
+				shouldStopAfterTurn: () => true,
+			});
+			agent.subscribe(async (event) => {
+				events.push(event);
+				if (
+					event.type === "message_start" &&
+					event.message.role === "toolResult" &&
+					event.message.toolCallId === "first"
+				) {
+					admitted.resolve();
+					await release.promise;
+					throw new Error("secondary result-start observer failure");
+				}
+				if (event.type === "message_end" && event.message.role === "toolResult") {
+					order.push(`result:${event.message.toolCallId}`);
+					if (event.message.toolCallId === "first") throw null;
+				}
+			});
+			let idle = false;
+			const running = agent.prompt(prompt);
+			const waiting = agent.waitForIdle().then(() => {
+				idle = true;
+			});
+			try {
+				const reachedResult = await Promise.race([admitted.promise.then(() => true), running.then(() => false)]);
+				expect(reachedResult).toBe(true);
+				await setImmediate();
+				expect(idle).toBe(false);
+				expect(agent.state.isStreaming).toBe(true);
+				expect(events.some((event) => event.type === "agent_end")).toBe(false);
+				await expect(agent.prompt("too early")).rejects.toThrow("already processing");
+			} finally {
+				release.resolve();
+				await Promise.all([running, waiting]);
+			}
+			expect(agent.state.errorMessage).toBe(error instanceof Error ? error.message : String(error));
+			expect(
+				agent.state.messages.flatMap((message) => (message.role === "toolResult" ? [message.toolCallId] : [])),
+			).toEqual(["first", "second"]);
+			expect(order).toEqual(["iterator-close", "result:first", "result:second"]);
+			expect(execute).not.toHaveBeenCalled();
+			expect(beforeToolCall).not.toHaveBeenCalled();
+			expect(afterToolCall).not.toHaveBeenCalled();
+			expect(events.filter((event) => event.type === "turn_end")).toHaveLength(1);
+			expect(events.filter((event) => event.type === "agent_end")).toHaveLength(1);
+			expect(events.at(-1)?.type).toBe("agent_end");
+		},
+	);
+
+	it("preserves cleanup failure without inventing results for a completed message with no calls", async () => {
+		const failure = new Error("close without calls");
+		const events: AgentEvent[] = [];
+		const running = runAgentLoop(
+			[prompt],
+			{ systemPrompt: "", messages: [] },
+			{ model, convertToLlm, shouldStopAfterTurn: () => true },
+			(event) => {
+				events.push(event);
+			},
+			undefined,
+			closingStream([], "toolUse", failure, []),
+		);
+		await expect(running).rejects.toBe(failure);
+		expect(events.some((event) => event.type === "message_end" && event.message.role === "toolResult")).toBe(false);
+	});
+});
+
+describe("canonical tool-result durable payloads", () => {
+	const detailsCases = [
+		{ label: "undefined", details: undefined },
+		{ label: "null", details: null },
+		{ label: "false", details: false },
+		{ label: "zero", details: 0 },
+		{ label: "empty string", details: "" },
+		{ label: "object", details: { nested: true } },
+	];
+	const toolUsage: AssistantMessage["usage"] = {
+		input: 2,
+		output: 3,
+		cacheRead: 4,
+		cacheWrite: 5,
+		totalTokens: 14,
+		cost: { input: 0.01, output: 0.02, cacheRead: 0.03, cacheWrite: 0.04, total: 0.1 },
+	};
+
+	async function persistRun(options: AgentOptions, configure?: (agent: Agent) => void) {
+		const directory = await fs.mkdtemp(join(tmpdir(), "pi-agent-result-payload-"));
+		try {
+			const root = join(directory, "sessions");
+			const env = new NodeExecutionEnv({ cwd: directory });
+			const repo = new JsonlSessionRepo({ fs: env, sessionsRoot: root });
+			const persisted = await repo.create({ id: "result", cwd: directory });
+			const metadata = await persisted.getMetadata();
+			const errors: unknown[] = [];
+			const events: AgentEvent[] = [];
+			const agent = new Agent(options);
+			agent.subscribe(async (event) => {
+				events.push(event);
+				if (event.type !== "message_end") return;
+				try {
+					await persisted.appendMessage(event.message);
+				} catch (error) {
+					errors.push(error);
+					throw error;
+				}
+			});
+			configure?.(agent);
+			await agent.prompt(prompt);
+			const verified = await new JsonlSessionRepo({ fs: env, sessionsRoot: root }).open(metadata);
+			const entries = await verified.findEntries({ order: "oldestFirst" });
+			return { agent, events, errors, entries };
+		} finally {
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	}
+
+	for (const mode of ["parallel", "sequential"] as const) {
+		for (const withUsage of [false, true]) {
+			it.each(detailsCases)(
+				`${mode}, usage=${withUsage}: preserves $label details through strict persistence`,
+				async ({ details }) => {
+					const executed: AgentToolResult<unknown> = {
+						content: [{ type: "text", text: "done" }],
+						details,
+						...(withUsage ? { usage: toolUsage } : {}),
+					};
+					const run = await persistRun({
+						initialState: { model, tools: [tool(async () => executed)] },
+						toolExecution: mode,
+						streamFn: streamCalls(["first", "second"]),
+						shouldStopAfterTurn: () => true,
+					});
+					expect(run.errors).toEqual([]);
+					expect(run.agent.state.errorMessage).toBeUndefined();
+					const answers = run.entries.flatMap((entry) =>
+						entry.type === "message" && entry.message.role === "toolResult" ? [entry.message] : [],
+					);
+					expect(answers.map((answer) => answer.toolCallId)).toEqual(["first", "second"]);
+					for (const answer of answers) {
+						expect(answer.details).toEqual(details);
+						expect(Object.hasOwn(answer, "details")).toBe(details !== undefined);
+						expect(answer.usage).toEqual(withUsage ? toolUsage : undefined);
+						expect(Object.hasOwn(answer, "usage")).toBe(withUsage);
+					}
+				},
+			);
+		}
+
+		it.each(["tool-error", "truncated", "barrier-rejected", "iterator-rejected"] as const)(
+			`${mode}: persists honest ordered results from %s through the canonical factory`,
+			async (route) => {
+				const failure = new Error(`${route} primary failure`);
+				const execute = vi.fn(async () => {
+					throw failure;
+				});
+				const beforeToolCall = vi.fn(async () => undefined);
+				const afterToolCall = vi.fn(async () => undefined);
+				const streamFn: StreamFn = async (...args) => {
+					const stream = await streamCalls(
+						["first", "second"],
+						route === "truncated" ? "length" : "toolUse",
+					)(...args);
+					if (route === "iterator-rejected") {
+						const iterate = stream[Symbol.asyncIterator].bind(stream);
+						vi.spyOn(stream, Symbol.asyncIterator).mockImplementation(() => {
+							const iterator = iterate();
+							return {
+								next: iterator.next.bind(iterator),
+								return: async () => {
+									await iterator.return?.();
+									throw failure;
+								},
+							};
+						});
+					}
+					return stream;
+				};
+				const run = await persistRun(
+					{
+						initialState: { model, tools: [tool(execute)] },
+						toolExecution: mode,
+						streamFn,
+						beforeToolCall,
+						afterToolCall,
+						shouldStopAfterTurn: () => true,
+					},
+					(agent) => {
+						let rejected = false;
+						agent.subscribe((event) => {
+							if (
+								!rejected &&
+								route === "barrier-rejected" &&
+								event.type === "message_end" &&
+								event.message.role === "assistant"
+							) {
+								rejected = true;
+								throw failure;
+							}
+						});
+					},
+				);
+				expect(run.errors).toEqual([]);
+				const requests = run.entries.flatMap((entry) =>
+					entry.type === "message" && entry.message.role === "assistant"
+						? entry.message.content.filter((block) => block.type === "toolCall").map((block) => block.id)
+						: [],
+				);
+				const answers = run.entries.flatMap((entry) =>
+					entry.type === "message" && entry.message.role === "toolResult" ? [entry.message] : [],
+				);
+				expect(requests).toEqual(["first", "second"]);
+				expect(answers.map((answer) => answer.toolCallId)).toEqual(requests);
+				expect(answers.every((answer) => answer.isError && !Object.hasOwn(answer, "usage"))).toBe(true);
+				if (route === "tool-error") expect(execute).toHaveBeenCalledTimes(2);
+				else {
+					expect(execute).not.toHaveBeenCalled();
+					expect(beforeToolCall).not.toHaveBeenCalled();
+					expect(afterToolCall).not.toHaveBeenCalled();
+				}
+				if (route === "barrier-rejected" || route === "iterator-rejected") {
+					expect(run.agent.state.errorMessage).toBe(failure.message);
+					expect(run.events.some((event) => event.type.startsWith("tool_execution_"))).toBe(false);
+				}
+			},
+		);
+
+		it(`${mode}: reads defined optional metadata once before strict persistence`, async () => {
+			const reads: Array<{ details: number; usage: number }> = [];
+			const run = await persistRun({
+				initialState: {
+					model,
+					tools: [
+						tool(async () => {
+							const counts = { details: 0, usage: 0 };
+							reads.push(counts);
+							return {
+								content: [],
+								get details() {
+									return ++counts.details === 1 ? { defined: true } : undefined;
+								},
+								get usage() {
+									return ++counts.usage === 1 ? toolUsage : undefined;
+								},
+							};
+						}),
+					],
+				},
+				toolExecution: mode,
+				streamFn: streamCalls(["first", "second"]),
+				shouldStopAfterTurn: () => true,
+			});
+			expect(run.errors).toEqual([]);
+			expect(reads).toEqual([
+				{ details: 1, usage: 1 },
+				{ details: 1, usage: 1 },
+			]);
+			const answers = run.entries.flatMap((entry) =>
+				entry.type === "message" && entry.message.role === "toolResult" ? [entry.message] : [],
+			);
+			expect(answers.map((answer) => ({ details: answer.details, usage: answer.usage }))).toEqual([
+				{ details: { defined: true }, usage: toolUsage },
+				{ details: { defined: true }, usage: toolUsage },
+			]);
+		});
+
+		it(`${mode}: still rejects nested undefined instead of recursively cleaning details`, async () => {
+			const run = await persistRun({
+				initialState: { model, tools: [tool(async () => ({ content: [], details: { nested: undefined } }))] },
+				toolExecution: mode,
+				streamFn: streamCalls(["first", "second"]),
+				shouldStopAfterTurn: () => true,
+			});
+			expect(run.errors).toHaveLength(2);
+			expect(run.errors).toMatchObject([{ code: "invalid_payload" }, { code: "invalid_payload" }]);
+			expect(run.agent.state.errorMessage).toContain("contains undefined");
+			expect(run.entries.some((entry) => entry.type === "message" && entry.message.role === "toolResult")).toBe(
+				false,
+			);
+		});
+	}
 });

@@ -31,6 +31,59 @@ afterEach(() => {
 });
 
 describe("JSONL append acknowledgement recovery", () => {
+	it("preserves every handle's acknowledged writes while recovering a partial append", async () => {
+		const { root, env, repo } = fixture();
+		const first = await repo.create({ id: "shared", cwd: root });
+		const metadata = await first.getMetadata();
+		const second = await repo.open(metadata);
+		await first.appendCustomEntry("first accepted");
+		await second.appendCustomEntry("second accepted");
+		vi.spyOn(env, "appendFile").mockImplementationOnce(async (path, data) => {
+			appendFileSync(path, data.slice(0, 15));
+			return { ok: false, error: new FileError("unknown", "partial append failed") };
+		});
+		const failed = expect(first.appendCustomEntry("unacknowledged")).rejects.toMatchObject({ code: "storage" });
+		const accepted = second.appendCustomEntry("third accepted");
+		await failed;
+		await accepted;
+		const reopened = await new JsonlSessionRepo({ fs: env, sessionsRoot: root }).open(metadata);
+		expect((await reopened.getLog()).map((item) => item.seq)).toEqual([1, 2, 3]);
+		expect(
+			(await reopened.findEntries({ order: "oldestFirst" })).map(
+				(entry) => entry.type === "custom" && entry.customType,
+			),
+		).toEqual(["first accepted", "second accepted", "third accepted"]);
+	});
+
+	it("waits for a live append before validating an additional open", async () => {
+		const { root, env, repo } = fixture();
+		const source = await repo.create({ id: "live-open", cwd: root });
+		const metadata = await source.getMetadata();
+		const written = gate();
+		const release = gate();
+		vi.spyOn(env, "appendFile").mockImplementationOnce(async (path, data) => {
+			appendFileSync(path, data.slice(0, 15));
+			written.resolve();
+			await release.promise;
+			appendFileSync(path, data.slice(15));
+			return { ok: true, value: undefined };
+		});
+		const writing = source.appendCustomEntry("accepted");
+		await written.promise;
+		const additional = repo.open(metadata);
+		const read = vi.spyOn(env, "readTextFile");
+		try {
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(read).not.toHaveBeenCalled();
+		} finally {
+			release.resolve();
+		}
+		const [id, handle] = await Promise.all([writing, additional]);
+		expect(await handle.getEntry(id)).toBeDefined();
+		await handle.appendCustomEntry("next");
+		expect((await source.getLog()).map((item) => item.seq)).toEqual([1, 2]);
+	});
 	it.each(["zero", "prefix", "multibyte", "complete"] as const)(
 		"rolls back a %s write-then-error before acknowledging queued mutations",
 		async (written) => {

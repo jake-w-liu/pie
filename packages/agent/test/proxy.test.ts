@@ -1,3 +1,5 @@
+import { getEventListeners } from "node:events";
+import { setImmediate } from "node:timers/promises";
 import type { AssistantMessage, AssistantMessageEvent, Model } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type ProxyAssistantMessageEvent, streamProxy } from "../src/proxy.ts";
@@ -29,6 +31,66 @@ afterEach(() => {
 });
 
 describe("streamProxy", () => {
+	it.each(["done", "error", "malformed", "event-failure", "abort", "eof", "cancel-failure"] as const)(
+		"releases the reader and abort subscription after %s",
+		async (mode) => {
+			const controller = new AbortController();
+			const cancel = vi.fn(() => {
+				if (mode === "cancel-failure") throw new Error("cleanup failed");
+			});
+			const body = new ReadableStream<Uint8Array>({
+				start(source) {
+					if (mode === "abort") return;
+					if (mode === "eof") {
+						source.close();
+						return;
+					}
+					const line =
+						mode === "malformed"
+							? "{broken}"
+							: JSON.stringify(
+									mode === "event-failure"
+										? { type: "text_delta", contentIndex: 0, delta: "invalid" }
+										: mode === "error"
+											? { type: "error", reason: "error", usage, errorMessage: "server failed" }
+											: { type: "done", reason: "stop", usage },
+								);
+					// A terminal event must stop both later lines and future reads.
+					source.enqueue(new TextEncoder().encode(`data: ${line}\n\ndata: {bad-after-terminal}\n\n`));
+				},
+				cancel,
+			});
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () => new Response(body)),
+			);
+			const stream = streamProxy(
+				model,
+				{ messages: [] },
+				{
+					authToken: "fixture",
+					proxyUrl: "https://example.invalid",
+					signal: controller.signal,
+				},
+			);
+			if (mode === "abort") {
+				await setImmediate();
+				controller.abort();
+			}
+			const result = await stream.result();
+			await setImmediate();
+			expect(result.stopReason).toBe(
+				mode === "done" || mode === "cancel-failure" ? "stop" : mode === "abort" ? "aborted" : "error",
+			);
+			if (mode === "error") expect(result.errorMessage).toBe("server failed");
+			expect(body.locked).toBe(false);
+			expect(cancel).toHaveBeenCalledTimes(mode === "eof" ? 0 : 1);
+			expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+			const events: AssistantMessageEvent[] = [];
+			for await (const event of stream) events.push(event);
+			expect(events.filter((event) => event.type === "done" || event.type === "error")).toHaveLength(1);
+		},
+	);
 	it("settles an actual Fetch abort with a non-Error reason", async () => {
 		const controller = new AbortController();
 		controller.abort(Object.create(null));
@@ -251,4 +313,66 @@ describe("streamProxy framing robustness", () => {
 		expect(first.partial.content[0]).toMatchObject({ type: "text", text: "hello" });
 		await stream.result();
 	});
+});
+
+describe("proxy cancellation settlement does not own the local reader lock", () => {
+	for (const cancellation of ["pending", "rejecting"] as const) {
+		it.each(["done", "error", "malformed", "abort"] as const)(
+			`${cancellation} cancellation releases the reader after %s`,
+			async (mode) => {
+				const controller = new AbortController();
+				let release = () => {};
+				const cancel = vi.fn(() =>
+					cancellation === "pending"
+						? new Promise<void>((resolve) => {
+								release = resolve;
+							})
+						: Promise.reject(new Error("transport cancellation rejected")),
+				);
+				const body = new ReadableStream<Uint8Array>({
+					start(source) {
+						if (mode === "abort") return;
+						const payload =
+							mode === "malformed"
+								? "{broken}"
+								: JSON.stringify(
+										mode === "error"
+											? { type: "error", reason: "error", usage, errorMessage: "server failure" }
+											: { type: "done", reason: "stop", usage },
+									);
+						source.enqueue(new TextEncoder().encode(`data: ${payload}\n\n`));
+					},
+					cancel,
+				});
+				vi.stubGlobal(
+					"fetch",
+					vi.fn(async () => new Response(body)),
+				);
+				const stream = streamProxy(
+					model,
+					{ messages: [] },
+					{ authToken: "fixture", proxyUrl: "https://example.invalid", signal: controller.signal },
+				);
+				try {
+					if (mode === "abort") {
+						await setImmediate();
+						controller.abort();
+					}
+					const result = await stream.result();
+					await setImmediate();
+					expect(result.stopReason).toBe(mode === "done" ? "stop" : mode === "abort" ? "aborted" : "error");
+					if (mode === "error") expect(result.errorMessage).toBe("server failure");
+					expect(body.locked).toBe(false);
+					expect(cancel).toHaveBeenCalledTimes(1);
+					expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+					const events: AssistantMessageEvent[] = [];
+					for await (const event of stream) events.push(event);
+					expect(events.filter((event) => event.type === "done" || event.type === "error")).toHaveLength(1);
+				} finally {
+					release();
+					await setImmediate();
+				}
+			},
+		);
+	}
 });

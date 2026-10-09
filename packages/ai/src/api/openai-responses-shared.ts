@@ -104,6 +104,7 @@ function convertToolResultOutput<TApi extends Api>(
 }
 
 export interface OpenAIResponsesStreamOptions {
+	onResponseFailed?: (event: Extract<ResponseStreamEvent, { type: "response.failed" }>) => never;
 	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
 	grammarToolInputProperties?: ReadonlyMap<string, string>;
 	resolveServiceTier?: (
@@ -549,7 +550,10 @@ export async function processResponsesStream<TApi extends Api>(
 		}
 	};
 	const finalizeResponse = (
-		response: Extract<ResponseStreamEvent, { type: "response.completed" | "response.incomplete" }>["response"],
+		response: Extract<
+			ResponseStreamEvent,
+			{ type: "response.completed" | "response.incomplete" | "response.failed" }
+		>["response"],
 	): void => {
 		sawTerminalResponseEvent = true;
 		backfillReasoningSignatures(response.output ?? []);
@@ -745,8 +749,8 @@ export async function processResponsesStream<TApi extends Api>(
 				.join(": ");
 			throw new Error(details || "Unknown error");
 		} else if (event.type === "response.failed") {
-			sawTerminalResponseEvent = true;
-			output.rawStopReason = event.response?.status;
+			finalizeResponse(event.response);
+			options?.onResponseFailed?.(event);
 			const error = event.response?.error;
 			const details = event.response?.incomplete_details;
 			const msg = error

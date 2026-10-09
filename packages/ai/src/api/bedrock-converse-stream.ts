@@ -193,12 +193,16 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 				// Region resolution: ARN-embedded > explicit option > env vars > SDK default chain.
 				// When the model ID is an inference profile ARN, extract the region from it.
 				// This avoids conflicts with AWS_REGION set for other services.
+				let resolvedRegion: string | undefined;
 				if (configuredRegion) {
-					config.region = configuredRegion;
+					resolvedRegion = configuredRegion;
 				} else if (endpointRegion && useExplicitEndpoint) {
-					config.region = endpointRegion;
+					resolvedRegion = endpointRegion;
 				} else if (!hasConfiguredProfile) {
-					config.region = "us-east-1";
+					resolvedRegion = "us-east-1";
+				}
+				if (resolvedRegion) {
+					config.region = resolvedRegion;
 				}
 
 				// Support proxies that don't need authentication
@@ -214,7 +218,17 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 					config.credentials = credentials;
 				}
 
-				const proxyUrl = resolveHttpProxyUrlForTarget(model.baseUrl, options.env);
+				// Proxy policy must follow the request's effective endpoint, not the
+				// catalog host: a configured region/ARN/profile can redirect the SDK to
+				// bedrock-runtime.{region}.* while model.baseUrl still names the catalog
+				// region. When the region resolves only through the SDK's profile chain
+				// (resolvedRegion unset), model.baseUrl remains the best known target.
+				const proxyTarget = useExplicitEndpoint
+					? model.baseUrl
+					: resolvedRegion
+						? `https://bedrock-runtime.${resolvedRegion}.${resolvedRegion.startsWith("cn-") ? "amazonaws.com.cn" : "amazonaws.com"}`
+						: model.baseUrl;
+				const proxyUrl = resolveHttpProxyUrlForTarget(proxyTarget, options.env);
 				if (proxyUrl) {
 					// Bedrock runtime uses NodeHttp2Handler by default since v3.798.0, which is based
 					// on `http2` module and has no support for http agent.

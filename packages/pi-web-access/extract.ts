@@ -321,6 +321,7 @@ async function extractWithJinaReader(
 
 		if (!res.ok) {
 			activityMonitor.logComplete(activityId, res.status);
+			await res.body?.cancel();
 			return null;
 		}
 
@@ -413,10 +414,10 @@ function buildFrameResult(
 }
 
 async function extractLocalFrames(
-	filePath: string, timestamps: number[],
+	filePath: string, timestamps: number[], signal?: AbortSignal,
 ): Promise<{ frames: VideoFrame[]; error: string | null }> {
 	const results = await Promise.all(timestamps.map(async (t) => {
-		const frame = await extractVideoFrame(filePath, t);
+		const frame = await extractVideoFrame(filePath, t, signal);
 		if ("error" in frame) return { error: frame.error };
 		return { ...frame, timestamp: formatSeconds(t) };
 	}));
@@ -468,6 +469,8 @@ export async function extractContent(
 		} catch (err) {
 			return { url, title: "", content: "", error: errorMessage(err) };
 		}
+		// Abort may have landed while the DNS/validation awaits above ran.
+		if (signal?.aborted) return abortedResult(url);
 	}
 
 	if (options?.authFetchProfile) {
@@ -491,7 +494,7 @@ export async function extractContent(
 		const frameCount = options.frames;
 		const ytInfo = isYouTubeURL(url);
 		if (ytInfo.isYouTube && ytInfo.videoId) {
-			const streamInfo = await getYouTubeStreamInfo(ytInfo.videoId);
+			const streamInfo = await getYouTubeStreamInfo(ytInfo.videoId, signal);
 			if ("error" in streamInfo) {
 				return { url, title: "Frames", content: streamInfo.error, error: streamInfo.error };
 			}
@@ -501,7 +504,7 @@ export async function extractContent(
 			}
 			const dur = Math.floor(streamInfo.duration);
 			const timestamps = computeRangeTimestamps(0, dur, frameCount);
-			const result = await extractYouTubeFrames(ytInfo.videoId, timestamps, streamInfo);
+			const result = await extractYouTubeFrames(ytInfo.videoId, timestamps, streamInfo, signal);
 			const label = `${formatSeconds(0)}-${formatSeconds(dur)}`;
 			return buildFrameResult(url, label, timestamps.length, result.frames, result.error, streamInfo.duration);
 		}
@@ -511,13 +514,13 @@ export async function extractContent(
 			return { url, title: "", content: "", error: localVideo.error };
 		}
 		if (localVideo.status === "video") {
-			const durationResult = await getLocalVideoDuration(localVideo.info.absolutePath);
+			const durationResult = await getLocalVideoDuration(localVideo.info.absolutePath, signal);
 			if (typeof durationResult !== "number") {
 				return { url, title: "Frames", content: durationResult.error, error: durationResult.error };
 			}
 			const dur = Math.floor(durationResult);
 			const timestamps = computeRangeTimestamps(0, dur, frameCount);
-			const result = await extractLocalFrames(localVideo.info.absolutePath, timestamps);
+			const result = await extractLocalFrames(localVideo.info.absolutePath, timestamps, signal);
 			const label = `${formatSeconds(0)}-${formatSeconds(dur)}`;
 			return buildFrameResult(url, label, timestamps.length, result.frames, result.error, durationResult);
 		}
@@ -539,7 +542,7 @@ export async function extractContent(
 		const frameCount = options.frames;
 		const ytInfo = isYouTubeURL(url);
 		if (ytInfo.isYouTube && ytInfo.videoId) {
-			const streamInfo = await getYouTubeStreamInfo(ytInfo.videoId);
+			const streamInfo = await getYouTubeStreamInfo(ytInfo.videoId, signal);
 			if ("error" in streamInfo) {
 				if (spec.type === "range") {
 					const label = `${formatSeconds(spec.start)}-${formatSeconds(spec.end)}`;
@@ -562,7 +565,7 @@ export async function extractContent(
 				const timestamps = frameCount
 					? computeRangeTimestamps(spec.start, spec.end, frameCount)
 					: computeRangeTimestamps(spec.start, spec.end);
-				const result = await extractYouTubeFrames(ytInfo.videoId, timestamps, streamInfo);
+				const result = await extractYouTubeFrames(ytInfo.videoId, timestamps, streamInfo, signal);
 				return buildFrameResult(url, label, timestamps.length, result.frames, result.error, result.duration ?? undefined);
 			}
 
@@ -574,7 +577,7 @@ export async function extractContent(
 					return { url, title: `Frames ${label}`, content: error, error };
 				}
 				const timestamps = computeRangeTimestamps(spec.seconds, end, frameCount);
-				const result = await extractYouTubeFrames(ytInfo.videoId, timestamps, streamInfo);
+				const result = await extractYouTubeFrames(ytInfo.videoId, timestamps, streamInfo, signal);
 				return buildFrameResult(url, label, timestamps.length, result.frames, result.error, result.duration ?? undefined);
 			}
 
@@ -582,7 +585,7 @@ export async function extractContent(
 				const error = `Timestamp ${formatSeconds(spec.seconds)} exceeds video duration (${formatSeconds(Math.floor(streamInfo.duration))})`;
 				return { url, title: `Frame at ${options.timestamp}`, content: error, error };
 			}
-			const frame = await extractYouTubeFrame(ytInfo.videoId, spec.seconds, streamInfo);
+			const frame = await extractYouTubeFrame(ytInfo.videoId, spec.seconds, streamInfo, signal);
 			if ("error" in frame) {
 				return { url, title: `Frame at ${options.timestamp}`, content: frame.error, error: frame.error };
 			}
@@ -598,7 +601,7 @@ export async function extractContent(
 				const timestamps = frameCount
 					? computeRangeTimestamps(spec.start, spec.end, frameCount)
 					: computeRangeTimestamps(spec.start, spec.end);
-				const result = await extractLocalFrames(localVideo.info.absolutePath, timestamps);
+				const result = await extractLocalFrames(localVideo.info.absolutePath, timestamps, signal);
 				const label = `${formatSeconds(spec.start)}-${formatSeconds(spec.end)}`;
 				return buildFrameResult(url, label, timestamps.length, result.frames, result.error);
 			}
@@ -606,12 +609,12 @@ export async function extractContent(
 			if (frameCount) {
 				const end = spec.seconds + (frameCount - 1) * MIN_FRAME_INTERVAL;
 				const timestamps = computeRangeTimestamps(spec.seconds, end, frameCount);
-				const result = await extractLocalFrames(localVideo.info.absolutePath, timestamps);
+				const result = await extractLocalFrames(localVideo.info.absolutePath, timestamps, signal);
 				const label = `${formatSeconds(spec.seconds)}-${formatSeconds(end)}`;
 				return buildFrameResult(url, label, timestamps.length, result.frames, result.error);
 			}
 
-			const frame = await extractVideoFrame(localVideo.info.absolutePath, spec.seconds);
+			const frame = await extractVideoFrame(localVideo.info.absolutePath, spec.seconds, signal);
 			if ("error" in frame) {
 				return { url, title: `Frame at ${options.timestamp}`, content: frame.error, error: frame.error };
 			}
@@ -1067,6 +1070,10 @@ async function extractViaHttp(
 
 	const onAbort = () => controller.abort();
 	signal?.addEventListener("abort", onAbort);
+	// addEventListener never fires retroactively for an already-aborted signal;
+	// compose the aborted state so a cancellation that landed during awaited URL
+	// validation still prevents the request below.
+	if (signal?.aborted) controller.abort();
 
 	try {
 		const ssrf = loadSsrfConfig();
@@ -1225,6 +1232,21 @@ async function extractViaHttp(
 
 		const { document } = parseHTML(text);
 		const documentTitle = document.title?.trim() ?? "";
+		// linkedom derives baseURI verbatim from an authored <base href> or a
+		// global location; an ordinary document has neither. Readability resolves
+		// relative links against it, so pin the base to the fetched page URL,
+		// resolving an authored relative base against it first.
+		const pageUrl = response.url || url;
+		const baseEl = document.querySelector("base") ?? document.createElement("base");
+		const authoredBase = baseEl.getAttribute("href");
+		let baseHref = pageUrl;
+		if (authoredBase) {
+			try {
+				baseHref = new URL(authoredBase, pageUrl).toString();
+			} catch {}
+		}
+		if (!baseEl.parentNode) (document.head ?? document.documentElement)?.prepend(baseEl);
+		baseEl.setAttribute("href", baseHref);
 		const declaredLinks = discoverDeclaredWebLinks(
 			document as unknown as Document,
 			response.headers.get("link"),
@@ -1348,12 +1370,47 @@ function extractTextTitle(text: string, url: string): string {
 	return extractHeadingTitle(text) ?? (new URL(url).pathname.split("/").pop() || url);
 }
 
+/**
+ * p-limit neither dequeues nor settles a queued callback on abort: the job
+ * promise stays pending until a slot frees. This wrapper settles the caller
+ * promise to an aborted result as soon as the signal fires; the queued callback
+ * still runs when a slot opens, but extractContent's entry abort check returns
+ * immediately so no request starts.
+ */
+function queuedFetch(url: string, signal: AbortSignal | undefined, options: ExtractOptions | undefined): Promise<ExtractedContent> {
+	if (!signal) return fetchLimit(() => extractContent(url, signal, options));
+	if (signal.aborted) return Promise.resolve(abortedResult(url));
+	return new Promise<ExtractedContent>((resolve) => {
+		let settled = false;
+		const onAbort = () => {
+			if (settled) return;
+			settled = true;
+			resolve(abortedResult(url));
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		fetchLimit(() => extractContent(url, signal, options)).then(
+			(result) => {
+				if (settled) return;
+				settled = true;
+				signal.removeEventListener("abort", onAbort);
+				resolve(result);
+			},
+			(err: unknown) => {
+				if (settled) return;
+				settled = true;
+				signal.removeEventListener("abort", onAbort);
+				resolve({ url, title: "", content: "", error: errorMessage(err) });
+			},
+		);
+	});
+}
+
 export async function fetchAllContent(
 	urls: string[],
 	signal?: AbortSignal,
 	options?: ExtractOptions,
 ): Promise<ExtractedContent[]> {
-	const results = await Promise.all(urls.map((url) => fetchLimit(() => extractContent(url, signal, options))));
+	const results = await Promise.all(urls.map((url) => queuedFetch(url, signal, options)));
 	if (options?.mode === "raw") return results;
 	// Inline data: URIs in extracted markdown would otherwise flow into tool
 	// results and the fetch cache as opaque base64; typed thumbnail/frame image

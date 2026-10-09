@@ -258,6 +258,14 @@ export function createFindToolDefinition(
 						if (!insideGitRepo) args.push("--no-require-git");
 						args.push("--max-results", String(effectiveLimit));
 
+						// Cancellation during the awaited probes above settled the promise and
+						// removed the abort listener; without this check a cancelled call still
+						// spawns fd and the child runs unmanaged.
+						if (signal?.aborted) {
+							settle(() => reject(new Error("Operation aborted")));
+							return;
+						}
+
 						// fd --glob matches against the basename unless --full-path is set; in --full-path
 						// mode it matches against the absolute candidate path, so a path-containing
 						// pattern like 'src/**/*.spec.ts' needs a leading '**/' to match anything.

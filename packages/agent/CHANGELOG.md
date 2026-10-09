@@ -4,10 +4,23 @@
 
 ### Breaking Changes
 
+- `JsonlSessionRepoFileSystem` now requires the existing `FileSystem.canonicalPath()` operation. Custom JSONL filesystems must implement symlink-aware canonical resolution and propagate resolution failures. Repository metadata file paths are canonical; header `cwd` spelling is unchanged.
 - Changed `prepareNextTurn` and `prepareNextTurnWithContext` to run only after `shouldStopAfterTurn` and queued-message checks determine that the agent loop will start another assistant turn. They no longer run after final or terminating turns; move end-of-run work to `agent_end` handling ([#6879](https://github.com/earendil-works/pi/issues/6879)).
 
 ### Fixed
-- Tool results are no longer lost when an event listener throws: sequential and truncated tool batches now publish every tool result before rethrowing, so a listener failure can no longer leave an assistant tool call unanswered in the transcript ([deep-debug audit](https://github.com/jake-w-liu/pie)).
+- Revalidated JSONL identities at admission, redirecting only after releasing stale file/directory queues and failing bounded repeated churn. Case-only generation replacement cannot leave a deleted writer unsealed or publish an independent stale-key writer; both-missing retargeted directory-alias deletion now selects the proved current owner without sealing the healthy historical owner.
+- Coordinated canonical JSONL publication with existing-file open/delete, including symlink aliases. Successful deletion now seals live writers without resurrecting headerless logs; failed deletions preserve usable handles and idle publication-queue records are reclaimed.
+- Reserved JSONL IDs by canonical session directory through create/fork publication, rejecting colliding cwd encodings, directory aliases, and occupied destinations without changing filenames or separate-directory namespaces.
+- Coordinated JSONL publication/deletion by canonical directory before file ownership, preventing native case-alias overwrites without folding IDs or rejecting valid distinct filenames. Verified parent identity now orders absent-target directory-alias deletion and missing-owner quarantine, including retargeted weak aliases while preserving healthy former owners and validated case aliases.
+- Quarantined known JSONL writers after missing-file reopen, retained historical reads and validated restoration, and kept verified dangling-file-alias deletion idempotent without masking existing-target resolution errors.
+- Settled published tool calls with honest not-executed error results when assistant `message_end` observers reject or accepted completion is followed by response-iterator cleanup failure, preserving the original failure without dispatching tools or hooks.
+- Omitted only undefined top-level optional details/usage keys from canonical tool-result messages so strict session persistence accepts them; defined values, including null/falsy details, and nested invalid-payload rejection are unchanged.
+- Tracked turn completion independently from run completion so rejecting `turn_end` observers cannot publish a second end for the same turn.
+- Released proxy stream reader locks without waiting for transport cancellation to settle, while observing cancellation rejection and preserving the terminal outcome.
+- Preserved actual tool results after start, update, completion, and result-message listener failures in sequential, parallel, and truncated batches; every requested call is answered before the observer error is surfaced.
+- Reopening a live JSONL session shares its writer queue, validates disk changes without racing appends, and preserves acknowledged writes during append recovery.
+- Kept `agent_end` final when its listeners reject, without publishing a second terminal event or synthetic transcript message.
+- Cancelled and released proxy response readers after terminal events, malformed frames, and aborts, including servers that leave the body open.
 - Malformed `usage` records in a session JSONL are rejected as schema errors instead of crashing session state with a `TypeError`.
 - Branch summarization no longer requests a fixed 2048 output tokens when the model caps less than that.
 

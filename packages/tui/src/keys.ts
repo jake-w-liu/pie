@@ -851,8 +851,10 @@ function formatKeyNameWithModifiers(keyName: string, modifier: number): string |
 function parseKeyId(
 	keyId: string,
 ): { key: string; ctrl: boolean; shift: boolean; alt: boolean; super: boolean } | null {
-	const parts = keyId.toLowerCase().split("+");
-	const key = parts[parts.length - 1];
+	const normalized = keyId.toLowerCase();
+	const literalPlus = normalized === "+" || normalized.endsWith("++");
+	const parts = literalPlus ? normalized.slice(0, -1).split("+") : normalized.split("+");
+	const key = literalPlus ? "+" : parts.pop();
 	if (!key) return null;
 	return {
 		key,

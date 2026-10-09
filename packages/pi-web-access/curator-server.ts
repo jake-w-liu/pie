@@ -38,12 +38,39 @@ export interface IndexedCuratorSearchEntry extends CuratorSearchEntry {
 	query: string;
 }
 
+/**
+ * Single authoritative allocator for curator result indices, shared by every
+ * producer: the initial streaming searches, browser-added searches, and
+ * multi-provider overflow entries all write the same result map, so independent
+ * counters starting at the original query count collide.
+ */
+export interface CuratorResultIndexAllocator {
+	/** Reserve a fresh result index. */
+	reserve(): number;
+	/** Absorb an externally supplied index into the exclusive bound. */
+	observe(index: number): void;
+	/** Exclusive upper bound over all issued and observed indices. */
+	bound(): number;
+}
+
+export function createCuratorResultIndexAllocator(initialBound: number): CuratorResultIndexAllocator {
+	let next = initialBound;
+	return {
+		reserve: () => next++,
+		observe: (index) => {
+			next = Math.max(next, index + 1);
+		},
+		bound: () => next,
+	};
+}
+
 export interface CuratorServerCallbacks {
 	onSubmit: (payload: { selectedQueryIndices: number[]; summary?: string; summaryMeta?: SummaryMeta; rawResults?: boolean }) => void;
 	onCancel: (reason: "user" | "timeout" | "stale") => void;
 	onProviderChange: (provider: string) => void;
 	onAddSearch: (query: string, provider?: string) => Promise<CuratorSearchEntry[]>;
 	onAddSearchResults: (entries: IndexedCuratorSearchEntry[]) => void;
+	indexAllocator: CuratorResultIndexAllocator;
 	onSummarize: (
 		selectedQueryIndices: number[],
 		signal: AbortSignal,
@@ -213,7 +240,7 @@ export function startCuratorServer(
 	let sseResponse: ServerResponse | null = null;
 	const streamedEventsByResultIndex = new Map<number, CuratorStoredEvent>();
 	let searchStreamDone = queries.length === 0;
-	let nextQueryIndex = queries.length;
+	const indexAllocator = callbacks.indexAllocator;
 	let summarizeAbortController: AbortController | null = null;
 	let summarizeRequestSeq = 0;
 
@@ -475,7 +502,7 @@ export function startCuratorServer(
 						return;
 					}
 				}
-				const qi = nextQueryIndex++;
+				const qi = indexAllocator.reserve();
 				const trimmedQuery = query.trim();
 				touchHeartbeat();
 				try {
@@ -483,7 +510,7 @@ export function startCuratorServer(
 					if (results.length === 0) throw new Error("Search returned no provider results");
 					const entries = results.map((result, index): IndexedCuratorSearchEntry => ({
 						...result,
-						queryIndex: index === 0 ? qi : nextQueryIndex++,
+						queryIndex: index === 0 ? qi : indexAllocator.reserve(),
 						query: trimmedQuery,
 					}));
 					callbacks.onAddSearchResults(entries);
@@ -515,7 +542,7 @@ export function startCuratorServer(
 
 				const parsed = normalizeSelectedIndices((body as { selected?: unknown }).selected, {
 					allowEmpty: false,
-					maxExclusive: nextQueryIndex,
+					maxExclusive: indexAllocator.bound(),
 				});
 				if ("error" in parsed) {
 					sendJson(res, 400, { ok: false, error: parsed.error });
@@ -600,7 +627,7 @@ export function startCuratorServer(
 
 				const parsed = normalizeSelectedIndices((body as { selected?: unknown }).selected, {
 					allowEmpty: true,
-					maxExclusive: nextQueryIndex,
+					maxExclusive: indexAllocator.bound(),
 				});
 				if ("error" in parsed) {
 					sendJson(res, 400, { ok: false, error: parsed.error });
@@ -721,14 +748,14 @@ export function startCuratorServer(
 				},
 				pushResult: (queryIndex, data) => {
 					if (completed) return;
-					nextQueryIndex = Math.max(nextQueryIndex, queryIndex + 1);
+					indexAllocator.observe(queryIndex);
 					const eventData: CuratorResultEventData = { ...data, queryIndex, query: data.query ?? queries[queryIndex] ?? "" };
 					retainStreamedEvent({ event: "result", data: eventData });
 					sendSSE("result", eventData);
 				},
 				pushError: (queryIndex, error, provider, meta) => {
 					if (completed) return;
-					nextQueryIndex = Math.max(nextQueryIndex, queryIndex + 1);
+					indexAllocator.observe(queryIndex);
 					const eventData: CuratorSearchErrorEventData = { queryIndex, query: meta?.query ?? queries[queryIndex] ?? "", error, provider, slotIndex: meta?.slotIndex };
 					retainStreamedEvent({ event: "search-error", data: eventData });
 					sendSSE("search-error", eventData);

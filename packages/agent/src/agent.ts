@@ -176,8 +176,10 @@ export class Agent {
 	private readonly listeners = new Set<(event: AgentEvent, signal: AbortSignal) => Promise<void> | void>();
 	private readonly steeringQueue: PendingMessageQueue;
 	private readonly followUpQueue: PendingMessageQueue;
-	/** True once the current run emitted `agent_start` (i.e. the loop actually began). */
+	/** True between publication of `agent_start` and the final `agent_end`. */
 	private _runStarted = false;
+	/** Turn publication is independent from the run's final event. */
+	private _turnStarted = false;
 
 	public convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	public transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
@@ -523,16 +525,12 @@ export class Agent {
 			errorMessage: formatThrownValue(error),
 			timestamp: Date.now(),
 		} satisfies AgentMessage;
+		this._state.errorMessage = failureMessage.errorMessage;
 
-		// If the loop never reached `agent_start` (e.g. a listener threw during the
-		// very first emission), the run has no lifecycle to close out. Emitting
-		// `turn_end`/`agent_end` (and pushing an empty assistant message) would desync
-		// the event sequence and pollute the transcript with a synthetic message for
-		// a turn that never began. In that case only surface the error via state.
-		if (!this._runStarted) {
-			this._state.errorMessage = failureMessage.errorMessage;
-			return;
-		}
+		// A run that never started, or already published its terminal event, has
+		// no lifecycle to close out. In particular a failing agent_end observer
+		// must not append a diagnostic message or publish a second terminal event.
+		if (!this._runStarted) return;
 
 		// Best-effort close-out: a listener that throws on one of these must not
 		// strand the run without its terminal event, and the original failure is
@@ -540,7 +538,9 @@ export class Agent {
 		const closeOut: Array<() => Promise<void>> = [
 			() => this.processEvents({ type: "message_start", message: failureMessage }, signal),
 			() => this.processEvents({ type: "message_end", message: failureMessage }, signal),
-			() => this.processEvents({ type: "turn_end", message: failureMessage, toolResults: [] }, signal),
+			...(this._turnStarted
+				? [() => this.processEvents({ type: "turn_end", message: failureMessage, toolResults: [] }, signal)]
+				: []),
 			() => this.processEvents({ type: "agent_end", messages: [failureMessage] }, signal),
 		];
 		for (const emit of closeOut) {
@@ -554,6 +554,7 @@ export class Agent {
 
 	private finishRun(): void {
 		this._runStarted = false;
+		this._turnStarted = false;
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
@@ -575,6 +576,10 @@ export class Agent {
 		switch (event.type) {
 			case "agent_start":
 				this._runStarted = true;
+				break;
+
+			case "turn_start":
+				this._turnStarted = true;
 				break;
 
 			case "message_start":
@@ -605,12 +610,15 @@ export class Agent {
 			}
 
 			case "turn_end":
+				this._turnStarted = false;
 				if (event.message.role === "assistant" && event.message.errorMessage) {
 					this._state.errorMessage = event.message.errorMessage;
 				}
 				break;
 
 			case "agent_end":
+				this._runStarted = false;
+				this._turnStarted = false;
 				this._state.streamingMessage = undefined;
 				break;
 		}
@@ -620,14 +628,14 @@ export class Agent {
 		// handleRunFailure, whose close-out sequence emits message_start first --
 		// so a listener throwing on message_start/message_end skipped agent_end
 		// entirely and left consumers that gate on the terminal event unsettled.
-		let firstError: unknown;
+		let failure: { error: unknown } | undefined;
 		for (const listener of this.listeners) {
 			try {
 				await listener(event, signal);
 			} catch (error) {
-				firstError ??= error;
+				failure ??= { error };
 			}
 		}
-		if (firstError !== undefined) throw firstError;
+		if (failure) throw failure.error;
 	}
 }

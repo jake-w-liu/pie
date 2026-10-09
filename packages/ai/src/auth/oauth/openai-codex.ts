@@ -18,6 +18,7 @@ if (typeof process !== "undefined" && (process.versions?.node || process.version
 }
 
 import { raceWithAbortSignal } from "../../utils/abort.ts";
+import { cancelResponseBody } from "../../utils/http-response.ts";
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { OAuthCallbackServerError } from "./callback-server.ts";
@@ -198,6 +199,7 @@ async function startOpenAICodexDeviceAuth(signal: AbortSignal): Promise<DeviceAu
 
 	if (!response.ok) {
 		if (response.status === 404) {
+			await cancelResponseBody(response);
 			throw new Error(
 				"OpenAI Codex device code login is not enabled for this server. Use browser login or verify the server URL.",
 			);
@@ -264,6 +266,7 @@ async function pollOpenAICodexDeviceAuth(device: DeviceAuthInfo, signal: AbortSi
 			}
 
 			if (response.status === 403 || response.status === 404) {
+				await cancelResponseBody(response);
 				return { status: "pending" };
 			}
 

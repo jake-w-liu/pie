@@ -56,6 +56,7 @@ import {
 	resolveJsonSchemaStrictSampling,
 } from "./constrained-sampling.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
+import { lazyStream } from "./lazy.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
 import { buildBaseOptions, clampThinkingBudgetToAnswerRoom, thinkingBudgetForLevel } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
@@ -731,22 +732,27 @@ export const streamSimple: StreamFunction<"openai-completions", SimpleStreamOpti
 	model: Model<"openai-completions">,
 	context: Context,
 	options?: SimpleStreamOptions,
-): AssistantMessageEventStream => {
-	getClientApiKey(model.provider, options?.apiKey, options?.headers);
+): AssistantMessageEventStream =>
+	lazyStream(
+		model,
+		async () => {
+			getClientApiKey(model.provider, options?.apiKey, options?.headers);
 
-	const base = {
-		...buildBaseOptions(model, context, options, options?.apiKey),
-		toolChoice: options?.toolChoice,
-	} satisfies OpenAICompletionsOptions;
-	const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
-	const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
+			const base = {
+				...buildBaseOptions(model, context, options, options?.apiKey),
+				toolChoice: options?.toolChoice,
+			} satisfies OpenAICompletionsOptions;
+			const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
+			const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
 
-	return stream(model, context, {
-		...base,
-		reasoningEffort,
-		thinkingBudgets: options?.thinkingBudgets,
-	} satisfies OpenAICompletionsOptions);
-};
+			return stream(model, context, {
+				...base,
+				reasoningEffort,
+				thinkingBudgets: options?.thinkingBudgets,
+			} satisfies OpenAICompletionsOptions);
+		},
+		options?.signal,
+	);
 
 function createClient(
 	model: Model<"openai-completions">,

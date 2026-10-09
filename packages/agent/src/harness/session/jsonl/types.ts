@@ -4,6 +4,7 @@ import type { JsonValue, SessionCreateOptions, SessionMetadata } from "../types.
 export type JsonlSessionRepoFileSystem = Pick<
 	FileSystem,
 	| "absolutePath"
+	| "canonicalPath"
 	| "joinPath"
 	| "readTextFile"
 	| "readTextLines"

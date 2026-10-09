@@ -5,7 +5,6 @@ import type {
 	ResponseInput,
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
-
 import { clampThinkingLevel } from "../models.ts";
 import { registerSessionResourceCleanup } from "../session-resources.ts";
 import type {
@@ -38,6 +37,7 @@ import { sleep as abortableSleep } from "../utils/sleep.ts";
 import { iterateSseMessages } from "../utils/sse.ts";
 import { uuidv7 } from "../utils/uuid.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
+import { lazyStream } from "./lazy.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
@@ -252,6 +252,8 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			timestamp: Date.now(),
 		};
 
+		let response: Response | undefined;
+		let activeStreamSignal: ReturnType<typeof combineAbortSignals> | undefined;
 		try {
 			const apiKey = options?.apiKey;
 			if (!apiKey) {
@@ -374,11 +376,8 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			const sseBody = compressedBody ?? bodyJson;
 
 			// Fetch with retry logic for rate limits and transient errors
-			let response: Response | undefined;
 			let lastError: Error | undefined;
 			const maxRetries = options?.maxRetries ?? DEFAULT_MAX_RETRIES;
-			// Held for the accepted response only; released once its body is consumed.
-			let activeStreamSignal: ReturnType<typeof combineAbortSignals> | undefined;
 
 			for (let attempt = 0; attempt <= maxRetries; attempt++) {
 				if (options?.signal?.aborted) {
@@ -392,6 +391,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					httpTimeoutMs !== undefined && httpTimeoutMs > 0 ? AbortSignal.timeout(httpTimeoutMs) : undefined;
 				const combinedSignal = combineAbortSignals([options?.signal, headerTimeoutSignal]);
 				activeStreamSignal = combinedSignal;
+				let terminalHttpError: Error | undefined;
 				try {
 					try {
 						response = await (options?.fetch ?? globalThis.fetch)(resolveCodexUrl(model.baseUrl), {
@@ -411,9 +411,9 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						break;
 					}
 
+					const errorText = await response.text();
 					combinedSignal.cleanup();
 					activeStreamSignal = undefined;
-					const errorText = await response.text();
 					if (attempt < maxRetries && isRetryableError(response.status, errorText)) {
 						const retryAfterDelayMs = getRetryAfterDelayMs(response.headers);
 						const delayMs =
@@ -431,12 +431,14 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						statusText: response.statusText,
 					});
 					const info = await parseErrorResponse(fakeResponse);
-					throw new Error(info.friendlyMessage || info.message);
+					terminalHttpError = new Error(info.friendlyMessage || info.message);
+					throw terminalHttpError;
 				} catch (error) {
 					combinedSignal.cleanup();
 					activeStreamSignal = undefined;
 					await cancelResponseBody(response);
 					response = undefined;
+					if (terminalHttpError !== undefined && error === terminalHttpError) throw error;
 					if (error instanceof Error) {
 						if (error.name === "AbortError" || error.message === "Request was aborted") {
 							throw new Error("Request was aborted");
@@ -469,13 +471,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			// loop like every other provider. A throwing observer must not resubmit a
 			// request the provider already accepted; the body is cancelled so the
 			// connection is not leaked on that path.
-			try {
-				await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
-			} catch (error) {
-				await cancelResponseBody(response);
-				response = undefined;
-				throw error;
-			}
+			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 
 			if (!startEmitted) {
 				startEmitted = true;
@@ -486,7 +482,6 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				// Keep `timeoutMs` effective for the body as well as the headers.
 				signal: activeStreamSignal?.signal ?? options?.signal,
 			});
-			activeStreamSignal?.cleanup();
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -505,6 +500,12 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			output.errorMessage = formatProviderError(normalizeProviderError(error));
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
+		} finally {
+			// Accepted/bodyless responses and observer/parser failures own the same
+			// signal subscription. Release it on every path, then abandon any body
+			// not already closed by its iterator without masking the real outcome.
+			activeStreamSignal?.cleanup();
+			await cancelResponseBody(response);
 		}
 	})();
 
@@ -515,24 +516,29 @@ export const streamSimple: StreamFunction<"openai-codex-responses", SimpleStream
 	model: Model<"openai-codex-responses">,
 	context: Context,
 	options?: SimpleStreamOptions,
-): AssistantMessageEventStream => {
-	const apiKey = options?.apiKey;
-	if (!apiKey) {
-		throw new Error(`No API key for provider: ${model.provider}`);
-	}
+): AssistantMessageEventStream =>
+	lazyStream(
+		model,
+		async () => {
+			const apiKey = options?.apiKey;
+			if (!apiKey) {
+				throw new Error(`No API key for provider: ${model.provider}`);
+			}
 
-	const base = {
-		...buildBaseOptions(model, context, options, apiKey),
-		toolChoice: options?.toolChoice,
-	} satisfies OpenAICodexResponsesOptions;
-	const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
-	const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
+			const base = {
+				...buildBaseOptions(model, context, options, apiKey),
+				toolChoice: options?.toolChoice,
+			} satisfies OpenAICodexResponsesOptions;
+			const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
+			const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
 
-	return stream(model, context, {
-		...base,
-		reasoningEffort,
-	} satisfies OpenAICodexResponsesOptions);
-};
+			return stream(model, context, {
+				...base,
+				reasoningEffort,
+			} satisfies OpenAICodexResponsesOptions);
+		},
+		options?.signal,
+	);
 
 // ============================================================================
 // Request Building
@@ -680,6 +686,7 @@ async function processStream(
 	options?: OpenAICodexResponsesOptions,
 ): Promise<void> {
 	await processResponsesStream(mapCodexEvents(parseSSE(response, options?.signal), output), output, stream, model, {
+		onResponseFailed: throwCodexResponseFailed,
 		serviceTier: options?.serviceTier,
 		grammarToolInputProperties,
 		resolveServiceTier: resolveCodexServiceTier,
@@ -736,6 +743,11 @@ function extractCodexEventError(event: Record<string, unknown>): { code?: string
 	};
 }
 
+function throwCodexResponseFailed(event: Extract<ResponseStreamEvent, { type: "response.failed" }>): never {
+	const error = event.response?.error;
+	throw new CodexApiError(error?.message || "Codex response failed", { code: error?.code, payload: { ...event } });
+}
+
 async function* mapCodexEvents(
 	events: AsyncIterable<Record<string, unknown>>,
 	output: AssistantMessage,
@@ -750,13 +762,6 @@ async function* mapCodexEvents(
 				code,
 				payload: event,
 			});
-		}
-
-		if (type === "response.failed") {
-			const response = (event as { response?: { error?: { code?: string; message?: string } } }).response;
-			const code = response?.error?.code;
-			const message = response?.error?.message;
-			throw new CodexApiError(message || "Codex response failed", { code, payload: event });
 		}
 
 		if (type === "response.done" || type === "response.completed" || type === "response.incomplete") {
@@ -1503,6 +1508,7 @@ async function processWebSocketStream(
 			stream,
 			model,
 			{
+				onResponseFailed: throwCodexResponseFailed,
 				serviceTier: options?.serviceTier,
 				grammarToolInputProperties,
 				resolveServiceTier: resolveCodexServiceTier,

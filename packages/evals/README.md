@@ -101,7 +101,9 @@ const harness = createPiCodingAgentHarness({
 ```
 
 Assert application behavior on `result.output`. Assert model and tool traces on `result.session`, using
-`vitest-evals` helpers such as `toolCalls(...)`.
+`vitest-evals` helpers such as `toolCalls(...)`. The normalized trace records completed messages across all prompt
+steps and reloads, including interactions later removed from the live context by compaction. Each prompt's response
+comes from its own completed assistant message, not a position in the compacted history.
 
 ### Writing comparative eval sets
 

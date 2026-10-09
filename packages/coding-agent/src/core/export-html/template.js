@@ -57,8 +57,9 @@
       // Labels are stored in 'label' entries that reference their target via targetId
       const labelMap = new Map();
       for (const entry of entries) {
-        if (entry.type === 'label' && entry.targetId && entry.label) {
-          labelMap.set(entry.targetId, entry.label);
+        if (entry.type === 'label' && entry.targetId) {
+          if (entry.label) labelMap.set(entry.targetId, entry.label);
+          else labelMap.delete(entry.targetId);
         }
       }
 
@@ -950,9 +951,15 @@
 
             let pathHtml = filePath === null ? invalidArg : escapeHtml(shortenPath(filePath || ''));
             if (filePath !== null && (offset !== undefined || limit !== undefined)) {
-              const startLine = offset ?? 1;
-              const endLine = limit !== undefined ? startLine + limit - 1 : '';
-              pathHtml += `<span class="line-numbers">:${startLine}${endLine ? '-' + endLine : ''}</span>`;
+              if ((offset !== undefined && (!Number.isSafeInteger(offset) || offset <= 0)) ||
+                  (limit !== undefined && (!Number.isSafeInteger(limit) || limit <= 0))) {
+                pathHtml += ` ${invalidArg}`;
+              } else {
+                const startLine = offset ?? 1;
+                const endLine = limit !== undefined ? startLine + (limit - 1) : '';
+                if (endLine !== '' && !Number.isSafeInteger(endLine)) pathHtml += ` ${invalidArg}`;
+                else pathHtml += `<span class="line-numbers">:${escapeHtml(startLine)}${endLine ? '-' + escapeHtml(endLine) : ''}</span>`;
+              }
             }
 
             html += `<div class="tool-header"><span class="tool-name">read</span> <span class="tool-path">${pathHtml}</span></div>`;
@@ -1278,7 +1285,7 @@
             if (msg.cancelled) {
               html += '<div style="color: var(--warning)">(cancelled)</div>';
             } else if (msg.exitCode !== 0 && msg.exitCode !== null) {
-              html += `<div style="color: var(--error)">(exit ${msg.exitCode})</div>`;
+              html += `<div style="color: var(--error)">(exit ${escapeHtml(msg.exitCode)})</div>`;
             }
             html += '</div>';
             return html;
@@ -1292,10 +1299,12 @@
         }
 
         if (entry.type === 'compaction') {
+          const tokensBefore = Number.isSafeInteger(entry.tokensBefore) && entry.tokensBefore >= 0
+            ? entry.tokensBefore.toLocaleString() : '[invalid token count]';
           return `<div class="compaction" id="${entryDomId}" onclick="if(window.getSelection().toString())return;this.classList.toggle('expanded')">
             <div class="compaction-label">[compaction]</div>
-            <div class="compaction-collapsed">Compacted from ${entry.tokensBefore.toLocaleString()} tokens</div>
-            <div class="compaction-content"><strong>Compacted from ${entry.tokensBefore.toLocaleString()} tokens</strong>\n\n${escapeHtml(entry.summary)}</div>
+            <div class="compaction-collapsed">Compacted from ${escapeHtml(tokensBefore)} tokens</div>
+            <div class="compaction-content"><strong>Compacted from ${escapeHtml(tokensBefore)} tokens</strong>\n\n${escapeHtml(entry.summary)}</div>
           </div>`;
         }
 

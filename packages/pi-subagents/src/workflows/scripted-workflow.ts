@@ -600,9 +600,11 @@ function installWorkflowApi(host) {
   function asContextError(error) {
     if (error instanceof Error) return error;
     const message = error && typeof error.message === "string" ? error.message : String(error);
-    // Deliberately not copying the host stack: it would disclose worker source
-    // offsets to a script the schema describes as isolated.
-    return new Error(message);
+    // Deliberately not copying the host stack or arbitrary host properties.
+    // Only the detached receipt's scalar classification crosses the boundary.
+    const contextError = new Error(message);
+    if (error && error.workflowErrorKind === "detached-child") contextError.workflowErrorKind = "detached-child";
+    return contextError;
   }
 
   // Invoke a host function and hand the result to toContextPromise.

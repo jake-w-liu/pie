@@ -25,6 +25,7 @@ import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
+import { lazyStream } from "./lazy.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
@@ -206,21 +207,26 @@ export const streamSimple: StreamFunction<"openai-responses", SimpleStreamOption
 	model: Model<"openai-responses">,
 	context: Context,
 	options?: SimpleStreamOptions,
-): AssistantMessageEventStream => {
-	getClientApiKey(model.provider, options?.apiKey, options?.headers);
+): AssistantMessageEventStream =>
+	lazyStream(
+		model,
+		async () => {
+			getClientApiKey(model.provider, options?.apiKey, options?.headers);
 
-	const base = {
-		...buildBaseOptions(model, context, options, options?.apiKey),
-		toolChoice: options?.toolChoice,
-	} satisfies OpenAIResponsesOptions;
-	const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
-	const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
+			const base = {
+				...buildBaseOptions(model, context, options, options?.apiKey),
+				toolChoice: options?.toolChoice,
+			} satisfies OpenAIResponsesOptions;
+			const clampedReasoning = options?.reasoning ? clampThinkingLevel(model, options.reasoning) : undefined;
+			const reasoningEffort = clampedReasoning === "off" ? undefined : clampedReasoning;
 
-	return stream(model, context, {
-		...base,
-		reasoningEffort,
-	} satisfies OpenAIResponsesOptions);
-};
+			return stream(model, context, {
+				...base,
+				reasoningEffort,
+			} satisfies OpenAIResponsesOptions);
+		},
+		options?.signal,
+	);
 
 function createClient(
 	model: Model<"openai-responses">,

@@ -1,3 +1,5 @@
+import { setImmediate } from "node:timers/promises";
+import { type AssistantMessage, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { Agent } from "../src/agent.ts";
 import type { AgentEvent } from "../src/types.ts";
@@ -37,6 +39,71 @@ function subscribeTwo(agent: Agent, failOn: AgentEvent["type"] | undefined, seen
 }
 
 describe("listener failures do not strand the run", () => {
+	it("publishes agent_end exactly once when a successful run's terminal listener rejects", async () => {
+		const events: AgentEvent[] = [];
+		let release = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let terminalStarted = () => {};
+		const entered = new Promise<void>((resolve) => {
+			terminalStarted = resolve;
+		});
+		const agent = new Agent({
+			initialState: { model: TEST_MODEL },
+			streamFn: () => {
+				const stream = createAssistantMessageEventStream();
+				const message: AssistantMessage = {
+					role: "assistant",
+					content: [{ type: "text", text: "success" }],
+					api: "test-api",
+					provider: "test",
+					model: "test-model",
+					stopReason: "stop",
+					timestamp: 1,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+				};
+				stream.push({ type: "done", reason: "stop", message });
+				return stream;
+			},
+		});
+		const unsubscribe = agent.subscribe(async (event) => {
+			events.push(event);
+			if (event.type === "agent_end") {
+				terminalStarted();
+				await gate;
+				throw new Error("terminal observer failed");
+			}
+		});
+		const running = agent.prompt("hello");
+		let idle = false;
+		const waiting = agent.waitForIdle().then(() => {
+			idle = true;
+		});
+		try {
+			await entered;
+			await setImmediate();
+			expect(idle).toBe(false);
+			expect(agent.state.isStreaming).toBe(true);
+		} finally {
+			release();
+			await Promise.all([running, waiting]);
+		}
+		expect(events.filter((event) => event.type === "agent_end")).toHaveLength(1);
+		expect(events.at(-1)?.type).toBe("agent_end");
+		expect(agent.state.messages.filter((message) => message.role === "assistant")).toHaveLength(1);
+		expect(agent.state.errorMessage).toBe("terminal observer failed");
+		unsubscribe();
+		await agent.prompt("again");
+		expect(agent.state.errorMessage).toBeUndefined();
+	});
 	for (const failOn of ["message_start", "message_end", "turn_end", "agent_end"] as const) {
 		it(`still delivers agent_end when a listener throws on ${failOn}`, async () => {
 			const seen: string[] = [];
@@ -77,5 +144,112 @@ describe("listener failures do not strand the run", () => {
 		await agent.prompt("second");
 		expect(seen).toContain("first:agent_start");
 		expect(seen).toContain("second:agent_end");
+	});
+});
+
+describe("turn publication is independent from run finality", () => {
+	function successfulAgent() {
+		return new Agent({
+			initialState: { model: TEST_MODEL },
+			streamFn: () => {
+				const stream = createAssistantMessageEventStream();
+				const message: AssistantMessage = {
+					role: "assistant",
+					content: [{ type: "text", text: "success" }],
+					api: "test-api",
+					provider: "test",
+					model: "test-model",
+					stopReason: "stop",
+					timestamp: 1,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+				};
+				stream.push({ type: "done", reason: "stop", message });
+				return stream;
+			},
+		});
+	}
+
+	it.each(["agent_start", "turn_start", "message_start", "message_end", "turn_end", "agent_end"] as const)(
+		"pairs only started turns after a %s observer failure",
+		async (phase) => {
+			const agent = successfulAgent();
+			const events: AgentEvent[] = [];
+			let failed = false;
+			agent.subscribe((event) => {
+				events.push(event);
+				if (!failed && event.type === phase) {
+					failed = true;
+					throw new Error(`${phase} rejected`);
+				}
+			});
+			await agent.prompt("hello");
+			await agent.waitForIdle();
+			expect(failed).toBe(true);
+			expect(events.filter((event) => event.type === "turn_start")).toHaveLength(phase === "agent_start" ? 0 : 1);
+			expect(events.filter((event) => event.type === "turn_end")).toHaveLength(phase === "agent_start" ? 0 : 1);
+			expect(events.filter((event) => event.type === "agent_end")).toHaveLength(1);
+			expect(events.at(-1)?.type).toBe("agent_end");
+			expect(agent.state.errorMessage).toBe(`${phase} rejected`);
+			expect(agent.state.isStreaming).toBe(false);
+		},
+	);
+
+	it("drains a rejecting turn-end observer without duplicate closure and remains reusable", async () => {
+		const agent = successfulAgent();
+		const events: AgentEvent[] = [];
+		let enter = () => {};
+		const entered = new Promise<void>((resolve) => {
+			enter = resolve;
+		});
+		let release = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const unsubscribe = agent.subscribe(async (event) => {
+			events.push(event);
+			if (event.type === "turn_end") {
+				enter();
+				await gate;
+				throw new Error("turn observer rejected");
+			}
+		});
+		const running = agent.prompt("hello");
+		let idle = false;
+		const waiting = agent.waitForIdle().then(() => {
+			idle = true;
+		});
+		try {
+			await entered;
+			await setImmediate();
+			expect(idle).toBe(false);
+			expect(agent.state.isStreaming).toBe(true);
+			expect(events.some((event) => event.type === "agent_end")).toBe(false);
+			await expect(agent.prompt("too early")).rejects.toThrow("already processing");
+		} finally {
+			release();
+			await Promise.all([running, waiting]);
+		}
+		expect(events.filter((event) => event.type === "turn_start")).toHaveLength(1);
+		expect(events.filter((event) => event.type === "turn_end")).toHaveLength(1);
+		expect(events.filter((event) => event.type === "agent_end")).toHaveLength(1);
+		expect(agent.state.errorMessage).toBe("turn observer rejected");
+		expect(agent.state.messages.filter((message) => message.role === "assistant")).toHaveLength(2);
+		unsubscribe();
+		const next: AgentEvent[] = [];
+		agent.subscribe((event) => {
+			next.push(event);
+		});
+		await agent.prompt("again");
+		expect(agent.state.errorMessage).toBeUndefined();
+		expect(next.filter((event) => event.type === "turn_start")).toHaveLength(1);
+		expect(next.filter((event) => event.type === "turn_end")).toHaveLength(1);
+		expect(next.at(-1)?.type).toBe("agent_end");
 	});
 });

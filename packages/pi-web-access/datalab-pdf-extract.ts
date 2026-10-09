@@ -237,6 +237,7 @@ export async function extractPDFViaDatalab(
 			apiKey,
 		);
 		if (!put.ok) {
+			await put.body?.cancel();
 			throw new Error(
 				`Datalab PDF upload failed: HTTP ${put.status} ${put.statusText}`,
 			);
@@ -373,7 +374,7 @@ async function deleteDatalabFile(
 	fileId: string,
 ): Promise<void> {
 	try {
-		await fetchDatalab(
+		const response = await fetchDatalab(
 			`${getDatalabApiBase()}/files/${encodeURIComponent(fileId)}`,
 			{
 				method: "DELETE",
@@ -382,6 +383,7 @@ async function deleteDatalabFile(
 			},
 			apiKey,
 		);
+		await response.body?.cancel();
 	} catch {
 		// Best-effort cleanup; a leftover file is not worth failing the conversion.
 	}

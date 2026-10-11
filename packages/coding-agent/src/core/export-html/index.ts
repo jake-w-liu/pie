@@ -183,17 +183,22 @@ function generateHtml(sessionData: SessionData, themeName?: string): string {
 
 	// Build the CSS with theme variables injected
 	const css = templateCss
-		.replace("{{THEME_VARS}}", themeVars)
-		.replace("{{BODY_BG}}", bodyBg)
-		.replace("{{CONTAINER_BG}}", containerBg)
-		.replace("{{INFO_BG}}", infoBg);
+		.replace("{{THEME_VARS}}", () => themeVars)
+		.replace("{{BODY_BG}}", () => bodyBg)
+		.replace("{{CONTAINER_BG}}", () => containerBg)
+		.replace("{{INFO_BG}}", () => infoBg);
 
+	// Replacer functions, not strings: a string replacement goes through
+	// GetSubstitution, so "$$", "$&" and "$`" inside the bundled template.js and
+	// highlight.js were rewritten to the matched placeholder and to the surrounding
+	// text, silently corrupting the export (a dropped "$" in the cost label and a
+	// broken operator regex in the highlighter).
 	return template
-		.replace("{{CSS}}", css)
-		.replace("{{JS}}", templateJs)
-		.replace("{{SESSION_DATA}}", sessionDataBase64)
-		.replace("{{MARKED_JS}}", markedJs)
-		.replace("{{HIGHLIGHT_JS}}", hljsJs);
+		.replace("{{CSS}}", () => css)
+		.replace("{{JS}}", () => templateJs)
+		.replace("{{SESSION_DATA}}", () => sessionDataBase64)
+		.replace("{{MARKED_JS}}", () => markedJs)
+		.replace("{{HIGHLIGHT_JS}}", () => hljsJs);
 }
 
 /** Tools rendered directly by the HTML template (not pre-rendered via TUI→ANSI→HTML pipeline) */

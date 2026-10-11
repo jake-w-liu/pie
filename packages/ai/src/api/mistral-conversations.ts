@@ -18,7 +18,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { cancelResponseBody } from "../utils/http-response.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
+import { parseStreamingJson, shouldReparseStreamingJson } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { iterateSseMessages } from "../utils/sse.ts";
@@ -650,12 +650,12 @@ async function consumeChatStream(
 					: deriveMistralToolCallId(`toolcall:${toolCall.index ?? 0}`, 0);
 			const key = toolCall.index ?? callId;
 			const existingIndex = toolBlocksByKey.get(key);
-			let block: (ToolCall & { partialArgs?: string }) | undefined;
+			let block: (ToolCall & { partialArgs?: string; parsedArgsLength?: number }) | undefined;
 
 			if (existingIndex !== undefined) {
 				const existing = output.content[existingIndex];
 				if (existing?.type === "toolCall") {
-					block = existing as ToolCall & { partialArgs?: string };
+					block = existing as ToolCall & { partialArgs?: string; parsedArgsLength?: number };
 				}
 			}
 
@@ -677,7 +677,10 @@ async function consumeChatStream(
 					? toolCall.function.arguments
 					: JSON.stringify(toolCall.function.arguments || {});
 			block.partialArgs = (block.partialArgs || "") + argsDelta;
-			block.arguments = parseStreamingJson<Record<string, unknown>>(block.partialArgs);
+			if (shouldReparseStreamingJson(block.parsedArgsLength ?? 0, block.partialArgs.length)) {
+				block.arguments = parseStreamingJson<Record<string, unknown>>(block.partialArgs);
+				block.parsedArgsLength = block.partialArgs.length;
+			}
 			stream.push({
 				type: "toolcall_delta",
 				contentIndex: toolBlocksByKey.get(key)!,
@@ -691,11 +694,12 @@ async function consumeChatStream(
 	for (const index of toolBlocksByKey.values()) {
 		const block = output.content[index];
 		if (block.type !== "toolCall") continue;
-		const toolBlock = block as ToolCall & { partialArgs?: string };
+		const toolBlock = block as ToolCall & { partialArgs?: string; parsedArgsLength?: number };
 		toolBlock.arguments = parseStreamingJson<Record<string, unknown>>(toolBlock.partialArgs);
 		// Finalize in-place and strip the scratch buffer so replay only
 		// carries parsed arguments.
 		delete toolBlock.partialArgs;
+		delete toolBlock.parsedArgsLength;
 		stream.push({
 			type: "toolcall_end",
 			contentIndex: index,

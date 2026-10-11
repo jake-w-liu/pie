@@ -148,6 +148,41 @@ describe("workflowScript admits a whole runs.all batch from one message", () => 
 		expect(result.emits).toEqual([{ refused: "Workflow child permit does not support runs.all." }]);
 		expect(admitted).toEqual([]);
 	}, 20_000);
+
+	it("keeps the setup-abort result instead of retrying a launch the one-use permit refuses", async () => {
+		// The setup-abort auto-resume re-launches the same key as a retained resume.
+		// A one-use permit covers exactly one native child launch and refuses
+		// retained resume, so the retry could only replace the real failure with a
+		// permit error that reads like a workflow policy decision.
+		const permit = createWorkflowChildPermit({
+			issuerPackage: "test",
+			workflowRunId: "wf",
+			childKey: "a",
+			agent: "w",
+			launchContractDigest: "digest",
+			context: "fresh",
+		} as never);
+		const launched: Array<Record<string, unknown>> = [];
+		const result = await runWorkflowScript({
+			script: 'try { const r = await runs.run("a", { agent: "w", task: "A" }); emit({ error: r.error }); } catch (error) { emit({ error: error.message }); }\nreturn 1;',
+			status: async () => okResult,
+			launch: async (key, params) => {
+				launched.push(params as Record<string, unknown>);
+				return {
+					key,
+					ok: false,
+					output: "",
+					error: "This operation was aborted",
+					runId: "run-1",
+					artifactPaths: [],
+					results: [{ index: 0, agent: "w", exitCode: 1, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+				} satisfies WorkflowScriptChildResult;
+			},
+			oneUsePermit: { claim: (key) => claimWorkflowChildPermit(permit, "wf", key) },
+		});
+		expect(launched).toHaveLength(1);
+		expect(result.emits).toEqual([{ error: "Run 'a' failed: This operation was aborted" }]);
+	}, 20_000);
 });
 
 describe("workflowScript teardown survives a throwing host", () => {

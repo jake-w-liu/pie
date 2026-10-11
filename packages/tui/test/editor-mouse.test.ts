@@ -2,6 +2,7 @@ import assert from "node:assert";
 import { describe, it } from "node:test";
 import { Editor } from "../src/components/editor.ts";
 import { Text } from "../src/components/text.ts";
+import { StdinBuffer } from "../src/stdin-buffer.ts";
 import {
 	Container,
 	isMouseDragMotion,
@@ -314,6 +315,58 @@ describe("Main-screen editor selection routing", () => {
 		assert.strictEqual(editor.hasSelection(), false);
 		assert.strictEqual(editor.getText(), "hello");
 
+		tui.stop();
+	});
+});
+
+describe("split mouse reports during a blocked render", () => {
+	it("keeps a wheel report split across reads out of the input line", async () => {
+		const terminal = new RecordingTerminal(80, 24);
+		const tui = new TuiMainScreen(terminal);
+		const editor = new Editor(tui, defaultEditorTheme);
+		editor.setText("hello");
+		tui.addChild(new Text("line1\nline2", 0, 0));
+		tui.addChild(editor);
+		tui.setFocus(editor);
+		tui.start();
+		await terminal.waitForRender();
+
+		// Wire the real stdin splitter in front of the screen input handler, the way
+		// ProcessTerminal does. Scrolling over the input window blocks the render,
+		// so the next read of the same wheel report lands after the sequence
+		// timeout and the report is delivered in two pieces.
+		const stdin = new StdinBuffer({ timeout: 10 });
+		stdin.on("data", (sequence) => {
+			if (sequence !== "") terminal.sendInput(sequence);
+		});
+		try {
+			stdin.process("\x1b[<64;58;");
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			stdin.process("23M");
+			await new Promise((resolve) => setTimeout(resolve, 30));
+
+			// Neither the abandoned prefix nor the remainder may reach the input line.
+			assert.strictEqual(editor.getText(), "hello");
+			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 5 });
+		} finally {
+			stdin.destroy();
+			tui.stop();
+		}
+	});
+
+	it("still scrolls on a wheel report that arrives in one piece", async () => {
+		const terminal = new RecordingTerminal(80, 24);
+		const tui = new TuiMainScreen(terminal);
+		const editor = new Editor(tui, defaultEditorTheme);
+		editor.setText("hello");
+		tui.addChild(new Text("line1\nline2", 0, 0));
+		tui.addChild(editor);
+		tui.setFocus(editor);
+		tui.start();
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<64;4;22M");
+		assert.strictEqual(editor.getText(), "hello");
 		tui.stop();
 	});
 });

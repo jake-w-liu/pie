@@ -22,6 +22,7 @@
 - Extended slash-command autocomplete to a whitespace-bounded `/` token anywhere on the first line, so `please run /` opens the same command menu as a line-start `/`; slashes inside words and paths with a second separator still complete as files.
 
 ### Fixed
+- Mouse reports split across reads no longer leak into the input line: a wheel event whose second half arrives after the sequence timeout (a scroll that blocks the render) is resynchronized instead of typed as text such as `23M` or `<65;58;23M`. Non-mouse CSI input is still replayed for the Kitty negotiation path, and bracketed paste and live keystrokes after an abandoned report are unaffected.
 - Real keyboard input and bracketed paste replace editor selections as one undoable edit, and selected-range deletion emits one change notification.
 - Cleared editor selections before text replacement, submission, history navigation, completion, and undo callbacks, preventing stale coordinates from corrupting the next buffer.
 - Input is decoded as a byte stream: a multi-byte character split across reads is decoded once complete, and the legacy single high-byte Meta conversion still applies to bytes that never complete a UTF-8 sequence.

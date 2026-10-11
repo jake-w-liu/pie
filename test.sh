@@ -76,4 +76,28 @@ for name in CI GITHUB_ACTIONS; do
 done
 
 echo "Running tests without API keys in isolated home: $test_root/home"
+
+# CLI-spawning tests start the CLI from TypeScript source, which imports sibling
+# workspace packages by name. Node resolves those through the node_modules
+# symlinks to each package's exports, which point at dist/; with no build present
+# the spawned CLI dies with ERR_MODULE_NOT_FOUND and every such test fails with a
+# stack trace that looks like a product bug. scripts/refresh-pie.sh removes dist/
+# on purpose, so build it back when it is missing.
+if [[ "${PI_SKIP_TEST_BUILD:-}" != "1" ]]; then
+	missing_build=false
+	for entry in packages/ai/dist/index.js packages/agent/dist/index.js packages/tui/dist/index.js packages/coding-agent/dist/index.js; do
+		[[ -f "$entry" ]] || missing_build=true
+	done
+	if [[ "$missing_build" == true ]]; then
+		echo "Workspace dist/ is missing or incomplete; building for tests..."
+		if ! npm run build:offline; then
+			printf '%s\n' \
+				"error: workspace build failed before the tests could run." \
+				"       A fresh clone has no generated model data (packages/ai/src/providers/data is gitignored)." \
+				"       Run 'npm run hydrate:model-data' once, then re-run ./test.sh." >&2
+			exit 1
+		fi
+	fi
+fi
+
 env -i "${test_env[@]}" npm test

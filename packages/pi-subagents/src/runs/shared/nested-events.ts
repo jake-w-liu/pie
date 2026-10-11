@@ -39,6 +39,12 @@ const MAX_EVENT_BYTES = 64 * 1024;
 const MAX_STEPS = 12;
 const MAX_CHILDREN = 16;
 const MAX_DEPTH = 3;
+/** A control result is awaited for at most 1s by the requester
+ * (`waitForNestedControlResult` in runs/foreground/subagent-executor.ts). A result
+ * older than this window can no longer be matched by an in-flight waiter, so it is
+ * safe to reclaim once the projection cursor has moved past it. The margin is
+ * 60x the wait so a slow poll loop cannot lose its result. */
+const CONTROL_RESULT_RETENTION_MS = 60_000;
 
 type NestedStatusEventType = "subagent.nested.started" | "subagent.nested.updated" | "subagent.nested.completed";
 type NestedControlResultEventType = "subagent.nested.control-result";
@@ -715,6 +721,10 @@ export function readNestedRegistry(route: NestedRoute): NestedRegistry {
 	}
 }
 
+function hasControlResultInContent(content: string, route: NestedRoute): boolean {
+	return content.split("\n").some((line) => line.trim() && parseControlResult(line.trim(), route));
+}
+
 export function projectNestedEvents(route: NestedRoute): NestedRegistry {
 	validateRouteShape(route);
 	let registry = readNestedRegistry(route);
@@ -739,7 +749,16 @@ export function projectNestedEvents(route: NestedRoute): NestedRegistry {
 			continue;
 		}
 		const records = parseNestedEventRecords(content, route);
-		if (records.length === 0) continue;
+		if (records.length === 0) {
+			// Control results share the status sink but carry no status event. They
+			// still have to advance the cursor: a file the projection never records
+			// is re-read and re-parsed on every status render, forever.
+			if (hasControlResultInContent(content, route)) {
+				seen.add(entry);
+				changed = true;
+			}
+			continue;
+		}
 		for (const event of records) {
 			registry = applyNestedEvent(registry, event);
 			changed = true;
@@ -768,10 +787,14 @@ export function projectNestedEvents(route: NestedRoute): NestedRegistry {
 				if (!stat.isFile() || stat.size > MAX_EVENT_BYTES) continue;
 				const content = fs.readFileSync(eventPath, "utf-8");
 				const hasStatusRecord = parseNestedEventRecords(content, route).length > 0;
-				const hasControlResult = content
-					.split("\n")
-					.some((line) => line.trim() && parseControlResult(line.trim(), route));
-				if (hasStatusRecord && !hasControlResult) fs.unlinkSync(eventPath);
+				const hasControlResult = hasControlResultInContent(content, route);
+				if (hasStatusRecord && !hasControlResult) {
+					fs.unlinkSync(eventPath);
+				} else if (!hasStatusRecord && hasControlResult && stat.mtimeMs < Date.now() - CONTROL_RESULT_RETENTION_MS) {
+					// Nobody waits on a control result this long, so reclaim it instead of
+					// letting the sink grow for the lifetime of the checkout.
+					fs.unlinkSync(eventPath);
+				}
 			} catch {
 				// A cleanup failure must not make a successfully projected status fail.
 			}

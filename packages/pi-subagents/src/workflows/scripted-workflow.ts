@@ -1997,6 +1997,11 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				const result = await options.launch(key, launchParams, childSignal, { admitted: true, batch: batch !== undefined });
 				const autoResumeParams = setupAbortResumeParams(params, result, childSignal);
 				if (!autoResumeParams) return result;
+				// A one-use permit covers exactly one native child launch, and the retry
+				// is a retained resume that the permit rejects. Launching it anyway
+				// replaces the real setup-abort result with a permit error that reads
+				// like a policy decision the workflow never made, so keep the result.
+				if (options.oneUsePermit) return result;
 				resolvedResumeLineage = [...new Set([...(resolvedResumeLineage ?? []), result.runId!])];
 				trace.push({ operation: "run", key, state: "started", ...workflowStringMetadata(autoResumeParams), phase: "auto-resume", runId: result.runId });
 				traceChanged();

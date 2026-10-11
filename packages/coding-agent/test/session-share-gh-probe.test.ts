@@ -1,8 +1,12 @@
 import type * as ChildProcess from "node:child_process";
 import { spawnSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../src/core/agent-session.ts";
 import { shareSession } from "../src/modes/interactive/session-share.ts";
+import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
 type ShareContext = Parameters<typeof shareSession>[0];
 
@@ -100,5 +104,63 @@ describe("shareSession gh auth probe", () => {
 
 		expect(errors).toHaveLength(1);
 		expect(errors[0]).toContain("not logged in");
+	});
+});
+
+/**
+ * Every share writes the session out to disk before uploading it. A fixed
+ * $TMPDIR name collides with any other share running at the same time (two
+ * processes overwrite each other's bytes, and the first to finish deletes the
+ * file the other is still uploading) and is predictable enough to be pre-created
+ * as a symlink by another local user. Each share gets its own private directory.
+ */
+describe("shareSession temp files", () => {
+	afterEach(() => {
+		vi.mocked(spawnSync).mockReset();
+		vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: "", stderr: "" } as never);
+	});
+
+	function makeContext(htmlPaths: string[]): ShareContext {
+		const session = {
+			sessionManager: {
+				getSessionId: () => "session-id",
+				getCwd: () => process.cwd(),
+				getBranch: () => [],
+			},
+			state: { systemPrompt: "system", tools: [] },
+			modelRuntime: { getProvider: () => undefined },
+			exportToHtml: async (target: string) => {
+				htmlPaths.push(target);
+				// Stop before the gist upload; this test is about the temp path.
+				throw new Error("stop after capture");
+			},
+		} as unknown as AgentSession;
+
+		return {
+			session,
+			ui: {} as never,
+			editorContainer: {} as never,
+			editor: {} as never,
+			showStatus: () => {},
+			showError: () => {},
+		};
+	}
+
+	it("exports each share into its own temporary directory and cleans it up", async () => {
+		initTheme("dark");
+		const htmlPaths: string[] = [];
+
+		await Promise.all([shareSession(makeContext(htmlPaths)), shareSession(makeContext(htmlPaths))]);
+
+		expect(htmlPaths).toHaveLength(2);
+		const directories = htmlPaths.map((file) => path.dirname(file));
+		expect(new Set(directories).size).toBe(2);
+		for (const directory of directories) {
+			expect(path.basename(directory)).toMatch(/^pi-share-/);
+			expect(path.dirname(directory)).toBe(os.tmpdir());
+		}
+		for (const directory of directories) {
+			expect(fs.existsSync(directory)).toBe(false);
+		}
 	});
 });

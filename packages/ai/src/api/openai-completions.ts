@@ -41,7 +41,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { cancelResponseBody } from "../utils/http-response.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
+import { parseStreamingJson, shouldReparseStreamingJson } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
@@ -377,6 +377,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 
 			interface StreamingToolCallBlock extends ToolCall {
 				partialArgs?: string;
+				parsedArgsLength?: number;
 				customInput?: {
 					property: string;
 					jsonBuffer: GrammarToolInputJsonBuffer;
@@ -458,6 +459,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 					// Finalize in-place and strip the scratch buffers so replay only
 					// carries parsed arguments.
 					delete block.partialArgs;
+					delete block.parsedArgsLength;
 					delete block.customInput;
 					delete block.streamIndex;
 					stream.push({
@@ -543,6 +545,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 						jsonBuffer: { input: "", started: false, closed: false },
 					};
 					delete block.partialArgs;
+					delete block.parsedArgsLength;
 				}
 				return block;
 			};
@@ -644,7 +647,10 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 							if (toolCall.function?.arguments) {
 								delta = toolCall.function.arguments;
 								block.partialArgs = (block.partialArgs ?? "") + toolCall.function.arguments;
-								block.arguments = parseStreamingJson(block.partialArgs);
+								if (shouldReparseStreamingJson(block.parsedArgsLength ?? 0, block.partialArgs.length)) {
+									block.arguments = parseStreamingJson(block.partialArgs);
+									block.parsedArgsLength = block.partialArgs.length;
+								}
 							} else if (toolCall.custom?.input) {
 								const nextInput = getCustomToolCallInput(block) + toolCall.custom.input;
 								delta = appendCustomToolCallInput(block, nextInput, false) ?? "";

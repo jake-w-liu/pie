@@ -85,6 +85,18 @@ function commandExists(cmd: string): boolean {
 	}
 }
 
+/**
+ * Resolved PATH fallbacks, keyed by tool.
+ *
+ * The system lookup forks a process (`rg --version`) and blocks the event loop
+ * while it answers, and grep/find call it on every invocation. A binary that is
+ * on PATH when the session starts does not move during the session, so remember
+ * the answer. Only successful lookups are cached: a tool that is absent now may
+ * be installed later, and caching that would keep sending it to the download
+ * path after the user installed it.
+ */
+const resolvedSystemTools = new Map<string, string>();
+
 // Get the path to a tool (system-wide or in our tools dir)
 export function getToolPath(tool: "fd" | "rg"): string | null {
 	const config = TOOLS[tool];
@@ -97,9 +109,12 @@ export function getToolPath(tool: "fd" | "rg"): string | null {
 	}
 
 	// Check system PATH - if found, just return the command name (it's in PATH)
+	const cached = resolvedSystemTools.get(tool);
+	if (cached !== undefined) return cached;
 	const systemBinaryNames = config.systemBinaryNames ?? [config.binaryName];
 	for (const systemBinaryName of systemBinaryNames) {
 		if (commandExists(systemBinaryName)) {
+			resolvedSystemTools.set(tool, systemBinaryName);
 			return systemBinaryName;
 		}
 	}

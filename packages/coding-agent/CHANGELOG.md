@@ -43,6 +43,13 @@
 - Raised the MLX provider local-model context ceiling from 32k to 128k so models with large native windows and a capable local server (e.g. 27B hybrid-attention 4-bit) are reported with up to 131072 tokens; models without a readable local config still default to 32k.
 
 ### Fixed
+- An extension dialog opened while another is still up disposes the superseded one, so its countdown interval cannot keep driving renders or later cancel whichever dialog is open by then.
+- `RpcClient.stop()` returns immediately when the agent process already exited instead of waiting out its one-second kill timeout after a crash or external kill.
+- `/share` exports each session into its own private temporary directory instead of a fixed, process-shared `$TMPDIR/session.jsonl` and `session.html`, so concurrent shares cannot overwrite each other's upload and another local user cannot pre-create the path as a symlink.
+- HTML export embeds `template.js`, `marked.min.js` and `highlight.min.js` verbatim; replacing them with a string replacement previously applied `$$`/`$&` substitution and silently corrupted the exported page (dropped `$` in the cost label, broken operator regex in the highlighter).
+- The trust store lock retry sleeps with `Atomics.wait` instead of spinning, matching the settings and credential lock retries.
+- Extension events build their context object only when an extension actually handles the event, so a streaming `message_update` delta no longer allocates a 25-closure context when nothing subscribes.
+- `grep`/`find` resolve the managed tool path once per session instead of spawning `fd --version`/`rg --version` synchronously on every call, which blocked the event loop for ~13-20 ms per tool invocation.
 - Project-local subagent schedules now require a project trust decision, including projects with no other protected resources.
 - Cross-project forks now migrate legacy session entries before writing the current-format header, preserving history and compaction links without modifying the source.
 - Session loading and forking reject invalid entry IDs, duplicate IDs, and parent cycles before rewriting or publishing candidates; failed switches retain the current session.

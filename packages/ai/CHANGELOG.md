@@ -10,6 +10,7 @@
 - NVIDIA and OpenRouter now refresh their model catalogs live from their own `/models` endpoints at runtime instead of relying only on the shipped static catalog, so new models appear in the `/model` picker without waiting for a release. NVIDIA keeps its curated static baseline and adds newly-available chat models (filtering out embeddings, safety guards, and code/vision-only endpoints); OpenRouter replaces baseline entries with current metadata (context window, pricing, reasoning, tool support).
 
 ### Fixed
+- Streaming tool-call arguments no longer re-parse the whole accumulated buffer on every delta. Large tool calls (a Write of a big file) cost Θ(n²) parse work on the stream loop, which blocked the process for ~7s at 128 KB and ~28s at 256 KB of arguments; large buffers now re-parse on a doubling byte budget while small ones keep per-delta updates and every adapter still re-parses exactly once at block end.
 - Terminal event pushes settle every pending stream consumer; indexed FIFOs clear consumed payload references and periodically reclaim backing storage instead of shifting a queued backlog on every event.
 - Image generation preserves the never-reject contract for asynchronous failures without configured auth, and image catalog refresh retries after synchronous callback failures while retaining concurrent deduplication and the last successful catalog.
 - Invalid proxy URL diagnostics no longer include credential-bearing configuration or parser details.

@@ -154,10 +154,10 @@ function acquireTrustLockSync(path: string): () => void {
 				throw error;
 			}
 			lastError = error;
-			const start = Date.now();
-			while (Date.now() - start < delayMs) {
-				// Sleep synchronously to avoid changing trust store callers to async.
-			}
+			// Block without busy-spinning the CPU, like the settings and credential
+			// lock retries. The event loop stays blocked for up to delayMs, which is
+			// inherent to the synchronous lock API.
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
 		}
 	}
 

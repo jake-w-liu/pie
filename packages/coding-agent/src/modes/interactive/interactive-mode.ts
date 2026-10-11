@@ -595,6 +595,7 @@ export class InteractiveMode {
 	 */
 	private readonly extensionCustomInvocations = new Set<() => void>();
 	private extensionInput: ExtensionInputComponent | undefined = undefined;
+	private extensionInputAbort?: { signal: AbortSignal; handler: () => void };
 	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
 	private extensionTerminalInputSubscriptions = new Set<{
 		handler: (data: string) => { consume?: boolean; data?: string } | undefined;
@@ -2616,6 +2617,9 @@ export class InteractiveMode {
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
 			this.extensionSelectorAbort = opts?.signal ? { signal: opts.signal, handler: onAbort } : undefined;
 
+			// A second selector supersedes the first; dispose it so its countdown
+			// interval cannot outlive the dialog and cancel a later one.
+			this.extensionSelector?.dispose();
 			this.extensionSelector = new ExtensionSelectorComponent(
 				title,
 				options,
@@ -2693,6 +2697,14 @@ export class InteractiveMode {
 				resolve(undefined);
 			};
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
+			// A dialog opened while another one is still up supersedes it. Dispose the
+			// previous component and detach its abort listener first: a superseded
+			// countdown interval would otherwise keep driving requestRender() for the
+			// rest of the session and later cancel whichever dialog is open by then.
+			this.extensionInputAbort?.signal.removeEventListener("abort", this.extensionInputAbort.handler);
+			this.extensionInputAbort = undefined;
+			this.extensionInput?.dispose();
+			this.extensionInputAbort = opts?.signal ? { signal: opts.signal, handler: onAbort } : undefined;
 
 			this.extensionInput = new ExtensionInputComponent(
 				title,
@@ -2722,6 +2734,8 @@ export class InteractiveMode {
 	 * Hide the extension input.
 	 */
 	private hideExtensionInput(): void {
+		this.extensionInputAbort?.signal.removeEventListener("abort", this.extensionInputAbort.handler);
+		this.extensionInputAbort = undefined;
 		this.extensionInput?.dispose();
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);

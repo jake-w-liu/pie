@@ -27,7 +27,7 @@ import { safeJsonStringify } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
 import { cancelResponseBody } from "../utils/http-response.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
+import { parseStreamingJson, shouldReparseStreamingJson } from "../utils/json-parse.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { iterateSseMessages } from "../utils/sse.ts";
 
@@ -178,6 +178,7 @@ function appendRewriteDiagnostic(message: AssistantMessage, rewrite: PiMessagesR
 
 function createEventConverter(partial: AssistantMessage) {
 	const toolJson = new Map<number, string>();
+	const toolParsedLength = new Map<number, number>();
 
 	return (event: PiMessagesEvent): AssistantMessageEvent => {
 		switch (event.type) {
@@ -233,17 +234,23 @@ function createEventConverter(partial: AssistantMessage) {
 					arguments: {},
 				};
 				toolJson.set(event.contentIndex, "");
+				toolParsedLength.set(event.contentIndex, 0);
 				break;
 			case "toolcall_delta": {
 				const json = `${toolJson.get(event.contentIndex) ?? ""}${event.delta}`;
 				toolJson.set(event.contentIndex, json);
-				(partial.content[event.contentIndex] as ToolCall).arguments =
-					parseStreamingJson<ToolCall["arguments"]>(json);
+				const lastParsedLength = toolParsedLength.get(event.contentIndex) ?? 0;
+				if (shouldReparseStreamingJson(lastParsedLength, json.length)) {
+					(partial.content[event.contentIndex] as ToolCall).arguments =
+						parseStreamingJson<ToolCall["arguments"]>(json);
+					toolParsedLength.set(event.contentIndex, json.length);
+				}
 				break;
 			}
 			case "toolcall_end":
 				Object.assign(partial.content[event.contentIndex]!, event.toolCall);
 				toolJson.delete(event.contentIndex);
+				toolParsedLength.delete(event.contentIndex);
 				return {
 					type: "toolcall_end",
 					contentIndex: event.contentIndex,

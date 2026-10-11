@@ -94,6 +94,30 @@ export function parseJsonWithRepair<T>(json: string): T {
 	}
 }
 
+/** Bytes below which a streaming tool-argument buffer is re-parsed on every delta. */
+const STREAMING_JSON_FULL_PARSE_BYTES = 2048;
+/** Smallest growth that justifies another parse of an already-large buffer. */
+const STREAMING_JSON_MIN_REPARSE_GROWTH = 1024;
+
+/**
+ * Whether a streaming tool-argument buffer grew enough to be worth re-parsing.
+ *
+ * Re-parsing the whole accumulated buffer on every delta made a large tool call
+ * (a Write of a big file, ~256 KB of arguments in small deltas) cost Θ(n²) parse
+ * work on the stream loop, which blocks the whole process: measured at ~27s of
+ * event-loop stall for 256 KB and minutes beyond that.
+ *
+ * Small buffers keep the exact previous behavior. Large ones re-parse on a
+ * doubling byte budget, so the total work stays amortized linear while the
+ * streaming preview still refreshes at a geometric granularity. Adapters always
+ * re-parse once more when the tool-call block ends, so the final arguments are
+ * exact regardless of what was skipped along the way.
+ */
+export function shouldReparseStreamingJson(lastParsedLength: number, currentLength: number): boolean {
+	if (currentLength <= STREAMING_JSON_FULL_PARSE_BYTES) return true;
+	return currentLength - lastParsedLength >= Math.max(STREAMING_JSON_MIN_REPARSE_GROWTH, lastParsedLength);
+}
+
 /**
  * Attempts to parse potentially incomplete JSON during streaming.
  * Always returns a valid object, even if the JSON is incomplete.

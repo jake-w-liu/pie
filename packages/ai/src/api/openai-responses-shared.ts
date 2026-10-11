@@ -30,7 +30,7 @@ import type {
 } from "../types.ts";
 import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
+import { parseStreamingJson, shouldReparseStreamingJson } from "../utils/json-parse.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import {
 	appendGrammarToolInputJsonDelta,
@@ -402,6 +402,7 @@ export function convertResponsesTools(tools: readonly Tool[], options?: ConvertR
 
 type StreamingToolCall = ToolCall & {
 	partialJson?: string;
+	parsedJsonLength?: number;
 	customInput?: {
 		property: string;
 		jsonBuffer: GrammarToolInputJsonBuffer;
@@ -657,7 +658,10 @@ export async function processResponsesStream<TApi extends Api>(
 			const slot = getSlot(event.output_index, "toolCall");
 			if (!slot || slot.block.partialJson === undefined) continue;
 			slot.block.partialJson += event.delta;
-			slot.block.arguments = parseStreamingJson(slot.block.partialJson);
+			if (shouldReparseStreamingJson(slot.block.parsedJsonLength ?? 0, slot.block.partialJson.length)) {
+				slot.block.arguments = parseStreamingJson(slot.block.partialJson);
+				slot.block.parsedJsonLength = slot.block.partialJson.length;
+			}
 			pushToolCallDelta(slot, event.delta);
 		} else if (event.type === "response.function_call_arguments.done") {
 			const slot = getSlot(event.output_index, "toolCall");
@@ -719,6 +723,7 @@ export async function processResponsesStream<TApi extends Api>(
 				// Finalize in-place and strip the scratch buffer so replay only
 				// carries parsed arguments.
 				delete slot.block.partialJson;
+				delete slot.block.parsedJsonLength;
 				stream.push({
 					type: "toolcall_end",
 					contentIndex: slot.contentIndex,

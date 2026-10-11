@@ -143,3 +143,18 @@ describe("ensureTool", () => {
 		});
 	});
 });
+
+describe("getToolPath PATH probe", () => {
+	it("probes PATH once per tool instead of forking a process on every call", () => {
+		// grep and find call this on every invocation, and the probe is a
+		// synchronous process spawn that blocks the event loop while it answers.
+		vi.mocked(spawnSync).mockReturnValue({ status: 0, stdout: "", stderr: "" } as never);
+
+		expect(getToolPath("rg")).toBe("rg");
+		expect(getToolPath("rg")).toBe("rg");
+		expect(getToolPath("rg")).toBe("rg");
+
+		const probes = vi.mocked(spawnSync).mock.calls.filter((call) => call[0] === "rg");
+		expect(probes).toHaveLength(1);
+	});
+});

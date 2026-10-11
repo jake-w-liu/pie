@@ -34,7 +34,7 @@ import { safeJsonStringify } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { cancelResponseBody } from "../utils/http-response.ts";
-import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.ts";
+import { parseJsonWithRepair, parseStreamingJson, shouldReparseStreamingJson } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
@@ -469,7 +469,13 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
-			type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
+			type Block = (
+				| ThinkingContent
+				| TextContent
+				| (ToolCall & { partialJson: string; parsedJsonLength?: number })
+			) & {
+				index: number;
+			};
 			const blocks = output.content as Block[];
 
 			for await (const event of iterateAnthropicEvents(response, options?.signal)) {
@@ -566,7 +572,13 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 						const block = blocks[index];
 						if (block && block.type === "toolCall") {
 							block.partialJson += event.delta.partial_json;
-							if (block.partialJson.trim().length > 0) block.arguments = parseStreamingJson(block.partialJson);
+							if (
+								block.partialJson.trim().length > 0 &&
+								shouldReparseStreamingJson(block.parsedJsonLength ?? 0, block.partialJson.length)
+							) {
+								block.arguments = parseStreamingJson(block.partialJson);
+								block.parsedJsonLength = block.partialJson.length;
+							}
 							stream.push({
 								type: "toolcall_delta",
 								contentIndex: index,
@@ -609,7 +621,8 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 							if (block.partialJson.trim().length > 0) block.arguments = parseStreamingJson(block.partialJson);
 							// Finalize in-place and strip the scratch buffer so replay only
 							// carries parsed arguments.
-							delete (block as { partialJson?: string }).partialJson;
+							delete (block as { partialJson?: string; parsedJsonLength?: number }).partialJson;
+							delete (block as { parsedJsonLength?: number }).parsedJsonLength;
 							stream.push({
 								type: "toolcall_end",
 								contentIndex: index,
@@ -688,7 +701,8 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			for (const block of output.content) {
 				delete (block as { index?: number }).index;
 				// partialJson is only a streaming scratch buffer; never persist it.
-				delete (block as { partialJson?: string }).partialJson;
+				delete (block as { partialJson?: string; parsedJsonLength?: number }).partialJson;
+				delete (block as { parsedJsonLength?: number }).parsedJsonLength;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = error instanceof Error ? error.message : safeJsonStringify(error);

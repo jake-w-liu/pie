@@ -30,6 +30,10 @@ const BRACKETED_PASTE_END = "\x1b[201~";
  * Pastes beyond the cap are truncated; the overflow is discarded while still
  * scanning for the terminator so the stream resynchronizes. */
 const MAX_BRACKETED_PASTE_CHARS = 1_000_000;
+/** Upper bound on bytes swallowed while resynchronizing after an abandoned CSI
+ * sequence. A truncated mouse report ends within a few bytes; the cap keeps a
+ * stream that never sends the terminator from swallowing real keystrokes. */
+const MAX_ABANDONED_SEQUENCE_SWALLOW = 32;
 
 /**
  * Check if a string is a complete escape sequence or needs more data
@@ -189,6 +193,30 @@ function isCompleteApcSequence(data: string): "complete" | "incomplete" {
 	}
 
 	return "incomplete";
+}
+
+/**
+ * A CSI parameter/intermediate byte (0x20-0x3F). These can only appear between
+ * the introducer and the final byte, so a stream of them belongs to the sequence
+ * being resynchronized rather than to the user's text.
+ */
+function isCsiParameterByte(code: number): boolean {
+	return code >= 0x20 && code <= 0x3f;
+}
+
+/** A CSI final byte (0x40-0x7E) terminates the sequence. */
+function isCsiFinalByte(code: number): boolean {
+	return code >= 0x40 && code <= 0x7e;
+}
+
+/** True for a CSI that is still in its parameter phase (no final byte yet). */
+function isCsiParameterPhase(sequence: string): boolean {
+	return /^\x1b\[[\x20-\x3f]*$/.test(sequence);
+}
+
+/** SGR mouse reports (`ESC[<Cb;Cx;CyM|m`) end in M/m; nothing else can. */
+function isSgrMouseParameterPhase(sequence: string): boolean {
+	return /^\x1b\[<\d*(?:;\d*)*;?$/.test(sequence);
 }
 
 /**
@@ -375,6 +403,15 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	/** Incomplete trailing UTF-8 sequence from a Buffer chunk boundary. */
 	private pendingBytes: Buffer = Buffer.alloc(0);
 	private pendingKittyPrintableCodepoint: number | undefined;
+	/**
+	 * Set when a CSI was abandoned by the sequence timeout. The bytes that
+	 * complete the abandoned sequence arrive after the timeout fired (a blocked
+	 * render thread delays the next read past the deadline), and they are
+	 * indistinguishable from typed text once the introducer is gone. Swallowing
+	 * them here keeps a split mouse report out of the input line instead of
+	 * typing "<65;58;23M" into the editor.
+	 */
+	private abandonedCsi: { final: "Mm" | undefined; budget: number; introducer: boolean } | undefined;
 
 	constructor(options: StdinBufferOptions = {}) {
 		super();
@@ -405,6 +442,8 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		} else {
 			str = data;
 		}
+
+		if (this.abandonedCsi) str = this.consumeAbandonedCsiRemainder(str);
 
 		if (str.length === 0 && this.buffer.length === 0 && this.pendingBytes.length === 0) {
 			this.emitDataSequence("");
@@ -534,6 +573,56 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	}
 
 	/**
+	 * Drop the tail of a CSI abandoned by the sequence timeout.
+	 *
+	 * Only the sequence's own bytes are consumed: parameters, then exactly one
+	 * final byte. A new escape starts a fresh sequence, and a final byte the
+	 * abandoned sequence could not have ended with is handed back as ordinary
+	 * input so real keystrokes are never swallowed.
+	 */
+	private consumeAbandonedCsiRemainder(text: string): string {
+		let index = 0;
+		while (index < text.length && this.abandonedCsi) {
+			const char = text[index]!;
+			if (char === ESC) {
+				// The abandoned sequence can never complete now that a new one
+				// started; resume normal parsing from here.
+				this.abandonedCsi = undefined;
+				break;
+			}
+			if (this.abandonedCsi.budget <= 0) {
+				this.abandonedCsi = undefined;
+				break;
+			}
+			// A sequence abandoned right after its ESC lost only the introducer;
+			// the CSI introducer is the one byte that can still arrive first.
+			if (this.abandonedCsi.introducer && char === "[") {
+				this.abandonedCsi.introducer = false;
+				index++;
+				continue;
+			}
+			this.abandonedCsi.budget--;
+			const code = char.charCodeAt(0);
+			if (isCsiParameterByte(code)) {
+				index++;
+				continue;
+			}
+			if (isCsiFinalByte(code)) {
+				const final = this.abandonedCsi.final;
+				this.abandonedCsi = undefined;
+				if (final === undefined || final.includes(char)) {
+					index++;
+					continue;
+				}
+			}
+			// Not a sequence byte: hand the rest back untouched.
+			this.abandonedCsi = undefined;
+			break;
+		}
+		return text.slice(index);
+	}
+
+	/**
 	 * Re-enter normal parsing after a bracketed paste has been emitted. Bytes
 	 * queued before the paste start are prepended so a sequence split across
 	 * the paste boundary is re-assembled instead of being dropped.
@@ -576,9 +665,31 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			return sequences;
 		}
 
-		sequences.push(this.buffer);
+		const held = this.buffer;
 		this.buffer = "";
 		this.pendingKittyPrintableCodepoint = undefined;
+
+		if (held === ESC) {
+			sequences.push(ESC);
+			// The peer may have split the sequence one byte later; keep resyncing
+			// so the remainder is not typed into the input line.
+			this.abandonedCsi = { final: undefined, budget: MAX_ABANDONED_SEQUENCE_SWALLOW, introducer: true };
+			return sequences;
+		}
+		if (isCsiParameterPhase(held)) {
+			// The rest of the abandoned sequence is swallowed either way; a mouse
+			// report is never text and must not be typed, while any other CSI is real
+			// key input (the host replays it when Kitty negotiation finishes).
+			if (!isSgrMouseParameterPhase(held)) sequences.push(held);
+			this.abandonedCsi = {
+				final: isSgrMouseParameterPhase(held) ? "Mm" : undefined,
+				budget: MAX_ABANDONED_SEQUENCE_SWALLOW,
+				introducer: false,
+			};
+			return sequences;
+		}
+
+		sequences.push(held);
 		return sequences;
 	}
 
@@ -594,6 +705,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.pasteOverflowTail = "";
 		this.pendingBytes = Buffer.alloc(0);
 		this.pendingKittyPrintableCodepoint = undefined;
+		this.abandonedCsi = undefined;
 	}
 
 	getBuffer(): string {

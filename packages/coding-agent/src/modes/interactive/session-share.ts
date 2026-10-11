@@ -52,7 +52,13 @@ export function exportSessionForShare(filePath: string, session: AgentSession): 
 
 /** Share the current session through Radius, falling back to a private gist. */
 export async function shareSession(context: SessionShareContext): Promise<void> {
-	const jsonlFile = path.join(os.tmpdir(), "session.jsonl");
+	// Every share gets its own private directory. A fixed $TMPDIR/session.jsonl is
+	// shared by every process on the machine: two concurrent shares overwrite each
+	// other's bytes and the first one to finish unlinks the file the other is still
+	// uploading, and on a world-writable /tmp a local user can pre-create the name
+	// as a symlink that the export would truncate and overwrite.
+	const shareDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-share-"));
+	const jsonlFile = path.join(shareDirectory, "session.jsonl");
 	let htmlFile: string | null = null;
 
 	try {
@@ -96,7 +102,7 @@ export async function shareSession(context: SessionShareContext): Promise<void> 
 		}
 
 		try {
-			htmlFile = path.join(os.tmpdir(), "session.html");
+			htmlFile = path.join(shareDirectory, "session.html");
 			await context.session.exportToHtml(htmlFile, { themeName: theme.name });
 		} catch (error: unknown) {
 			context.showError(`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`);
@@ -104,14 +110,11 @@ export async function shareSession(context: SessionShareContext): Promise<void> 
 		}
 		await shareViaGist(htmlFile, context);
 	} finally {
-		for (const tmpFile of [jsonlFile, htmlFile]) {
-			try {
-				if (tmpFile !== null) {
-					fs.unlinkSync(tmpFile);
-				}
-			} catch {
-				// Ignore cleanup errors
-			}
+		try {
+			// Only the directory created above is removed, never an unverified path.
+			fs.rmSync(shareDirectory, { recursive: true, force: true });
+		} catch {
+			// Ignore cleanup errors
 		}
 	}
 }

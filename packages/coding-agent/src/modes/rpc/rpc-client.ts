@@ -159,6 +159,14 @@ export class RpcClient {
 	async stop(): Promise<void> {
 		if (!this.process) return;
 
+		// An already-reaped child will never emit "exit" again, so the wait below
+		// would always run out its full second after a crash or an external kill.
+		if (this.process.exitCode !== null || this.process.signalCode !== null) {
+			this.process = null;
+			this.pendingRequests.clear();
+			return;
+		}
+
 		this.stopReadingStdout?.();
 		this.stopReadingStdout = null;
 		this.process.kill("SIGTERM");

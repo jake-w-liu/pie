@@ -53,7 +53,7 @@ import { normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { providerHeadersToRecord } from "../utils/headers.ts";
 import { cancelResponseBody } from "../utils/http-response.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
+import { parseStreamingJson, shouldReparseStreamingJson } from "../utils/json-parse.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
@@ -105,6 +105,7 @@ export interface BedrockOptions extends StreamOptions {
 type Block = (TextContent | ThinkingContent | ToolCall) & {
 	index?: number;
 	partialJson?: string;
+	parsedJsonLength?: number;
 	/** Scratch buffer for encrypted reasoning deltas, joined into `thinkingSignature`. */
 	redactedChunks?: Uint8Array[];
 };
@@ -646,7 +647,10 @@ function handleContentBlockDelta(
 		}
 	} else if (delta?.toolUse && block?.type === "toolCall") {
 		block.partialJson = (block.partialJson || "") + (delta.toolUse.input || "");
-		block.arguments = parseStreamingJson(block.partialJson);
+		if (shouldReparseStreamingJson(block.parsedJsonLength ?? 0, block.partialJson.length)) {
+			block.arguments = parseStreamingJson(block.partialJson);
+			block.parsedJsonLength = block.partialJson.length;
+		}
 		stream.push({ type: "toolcall_delta", contentIndex: index, delta: delta.toolUse.input || "", partial: output });
 	} else if (delta?.reasoningContent) {
 		let thinkingBlock = block;
@@ -761,6 +765,7 @@ function handleContentBlockStop(
 			// Finalize in-place and strip the scratch buffer so replay only
 			// carries parsed arguments.
 			delete (block as Block).partialJson;
+			delete (block as Block).parsedJsonLength;
 			stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: output });
 			break;
 	}

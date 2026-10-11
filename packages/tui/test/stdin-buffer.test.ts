@@ -34,6 +34,12 @@ describe("StdinBuffer", () => {
 		return new Promise((resolve) => setTimeout(resolve, ms));
 	}
 
+	// A fully swallowed chunk still emits the buffer's empty data event; it
+	// carries no input, so assertions about typed text ignore it.
+	function typed(): string[] {
+		return emittedSequences.filter((sequence) => sequence !== "");
+	}
+
 	describe("Regular Characters", () => {
 		it("should pass through regular characters immediately", () => {
 			processInput("a");
@@ -130,14 +136,62 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedSequences, ["\x1b[<35;20;5m"]);
 		});
 
-		it("should flush incomplete sequence after timeout", async () => {
+		it("should drop an incomplete sequence after timeout instead of typing it", async () => {
 			processInput("\x1b[<35");
 			assert.deepStrictEqual(emittedSequences, []);
 
 			// Wait for timeout
 			await wait(15);
 
-			assert.deepStrictEqual(emittedSequences, ["\x1b[<35"]);
+			// The fragment is never delivered as input: its bytes would otherwise be
+			// typed into the prompt and the rest of the report would follow as text.
+			assert.deepStrictEqual(typed(), []);
+		});
+
+		it("should swallow the remainder of a sequence abandoned by the timeout", async () => {
+			processInput("\x1b[<64;58;");
+			await wait(15);
+			assert.deepStrictEqual(typed(), []);
+
+			// The rest of the split wheel report arrives after the deadline (a
+			// render blocked past the timeout delays the next read).
+			processInput("23M");
+			await wait(15);
+
+			assert.deepStrictEqual(typed(), []);
+			assert.equal(buffer.getBuffer(), "");
+		});
+
+		it("should keep real keystrokes that follow an abandoned sequence", async () => {
+			processInput("\x1b[<64;58;");
+			await wait(15);
+			processInput("23M");
+			processInput("hello");
+			await wait(15);
+
+			assert.deepStrictEqual(typed(), ["h", "e", "l", "l", "o"]);
+		});
+
+		it("should recover a complete sequence that arrives after the timeout", async () => {
+			processInput("\x1b[<64;58;");
+			await wait(15);
+			processInput("23M");
+			processInput("\x1b[<65;58;23M");
+			await wait(15);
+
+			assert.deepStrictEqual(typed(), ["\x1b[<65;58;23M"]);
+		});
+
+		it("should not swallow a bracketed paste that follows an abandoned sequence", async () => {
+			const pastes: string[] = [];
+			buffer.on("paste", (data) => pastes.push(data));
+			processInput("\x1b[<64;58;");
+			await wait(15);
+			processInput("\x1b[200~pasted\x1b[201~");
+			await wait(15);
+
+			assert.deepStrictEqual(pastes, ["pasted"]);
+			assert.deepStrictEqual(typed(), []);
 		});
 
 		it("should flush a lone ESC as Escape when CR arrives after the timeout", async () => {
@@ -408,11 +462,24 @@ describe("StdinBuffer", () => {
 	});
 
 	describe("Flush", () => {
-		it("should flush incomplete sequences", () => {
+		it("should drop incomplete sequences", () => {
 			processInput("\x1b[<35");
 			const flushed = buffer.flush();
-			assert.deepStrictEqual(flushed, ["\x1b[<35"]);
+			assert.deepStrictEqual(flushed, []);
 			assert.strictEqual(buffer.getBuffer(), "");
+		});
+
+		it("should flush a lone ESC as Escape and resynchronize a split sequence", () => {
+			processInput("\x1b");
+			assert.deepStrictEqual(buffer.flush(), ["\x1b"]);
+
+			// A report split one byte later must not type its remainder.
+			const received: string[] = [];
+			buffer.on("data", (sequence) => {
+				if (sequence !== "") received.push(sequence);
+			});
+			processInput("[<64;58;23M");
+			assert.deepStrictEqual(received, []);
 		});
 
 		it("should return empty array if nothing to flush", () => {
@@ -420,14 +487,14 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(flushed, []);
 		});
 
-		it("should emit flushed data via timeout", async () => {
+		it("should emit nothing when the timeout abandons an incomplete sequence", async () => {
 			processInput("\x1b[<35");
 			assert.deepStrictEqual(emittedSequences, []);
 
-			// Wait for timeout to flush
+			// Wait for timeout to resolve the held sequence
 			await wait(15);
 
-			assert.deepStrictEqual(emittedSequences, ["\x1b[<35"]);
+			assert.deepStrictEqual(emittedSequences, []);
 		});
 	});
 

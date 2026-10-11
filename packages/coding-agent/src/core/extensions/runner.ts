@@ -849,13 +849,16 @@ export class ExtensionRunner {
 	}
 
 	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
-		const ctx = this.createContext();
+		// message_update fires once per streaming delta and usually has no subscriber,
+		// so build the context only once an extension actually handles the event.
+		let ctx: ExtensionContext | undefined;
 		let result: SessionBeforeEventResult | undefined;
 
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get(event.type);
 			if (!handlers || handlers.length === 0) continue;
 
+			ctx ??= this.createContext();
 			for (const handler of handlers) {
 				try {
 					const handlerResult = await handler(event, ctx);

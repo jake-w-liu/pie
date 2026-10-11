@@ -41,9 +41,9 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 }
 
 function configureSqliteDatabase(db: SqliteDatabase): void {
+	sql`PRAGMA busy_timeout=5000`.exec(db);
 	sql`PRAGMA journal_mode=WAL`.exec(db);
 	sql`PRAGMA synchronous=FULL`.exec(db);
-	sql`PRAGMA busy_timeout=5000`.exec(db);
 }
 
 export interface SqliteSessionSearchOptions {
@@ -98,6 +98,7 @@ export interface SqliteSessionSearchHit extends SessionSearchHit {
 class SqliteSessionSearch implements SessionSearch<SqliteSessionSearchHit> {
 	private readonly options: SqliteSessionSearchOptions;
 	private databasePath: string | undefined;
+	private initializationPromise: Promise<void> | undefined;
 
 	constructor(options: SqliteSessionSearchOptions) {
 		this.options = options;
@@ -113,7 +114,7 @@ class SqliteSessionSearch implements SessionSearch<SqliteSessionSearchHit> {
 		return this.databasePath;
 	}
 
-	private async openDatabase(): Promise<SqliteDatabase> {
+	private async initialize(): Promise<void> {
 		const path = await this.getDatabasePath();
 		const directory = getParentPath(path);
 		getFileSystemResultOrThrow(
@@ -125,9 +126,18 @@ class SqliteSessionSearch implements SessionSearch<SqliteSessionSearchHit> {
 			configureSqliteDatabase(db);
 			await applyMigrations(db);
 			ensureSearchSchema(db);
-			return db;
-		} catch (error) {
+		} finally {
 			db.close();
+		}
+	}
+
+	private async ensureInitialized(): Promise<void> {
+		this.initializationPromise ??= this.initialize();
+		const initialization = this.initializationPromise;
+		try {
+			await initialization;
+		} catch (error) {
+			if (this.initializationPromise === initialization) this.initializationPromise = undefined;
 			throw error;
 		}
 	}
@@ -137,8 +147,11 @@ class SqliteSessionSearch implements SessionSearch<SqliteSessionSearchHit> {
 		if (!queryText || (options.limit !== undefined && options.limit <= 0)) return;
 		if (options.entryTypes?.length === 0) return;
 		throwIfAborted(options.signal);
-		const db = await this.openDatabase();
+		await this.ensureInitialized();
+		throwIfAborted(options.signal);
+		const db = await this.options.sqlite.open(await this.getDatabasePath());
 		try {
+			sql`PRAGMA busy_timeout=5000`.exec(db);
 			const query = `"${queryText.replaceAll('"', '""')}"`;
 			const predicates = ["session_search_fts MATCH ?"];
 			const params: unknown[] = [query];

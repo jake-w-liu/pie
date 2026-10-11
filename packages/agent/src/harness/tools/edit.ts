@@ -2,12 +2,10 @@ import { type Static, Type } from "typebox";
 import type { AgentHarnessTool, FileError } from "../types.ts";
 import {
 	applyEditsToNormalizedContent,
-	detectLineEnding,
 	type Edit,
 	generateDiffString,
 	generateUnifiedPatch,
 	normalizeToLF,
-	restoreLineEndings,
 	stripBom,
 } from "./edit-diff.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
@@ -115,12 +113,11 @@ export function createEditTool<TContext extends ExecutionToolContext = Execution
 				if (signal?.aborted) throw new Error("Operation aborted");
 
 				const { bom, text: content } = stripBom(readResult.value);
-				const originalEnding = detectLineEnding(content);
 				const normalizedContent = normalizeToLF(content);
-				const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+				const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path, content);
 				if (signal?.aborted) throw new Error("Operation aborted");
 
-				const finalContent = bom + restoreLineEndings(newContent, originalEnding);
+				const finalContent = bom + newContent;
 				const writeResult = await env.writeFile(absolutePath, finalContent, signal);
 				if (!writeResult.ok) throw editAccessError(path, writeResult.error);
 				if (signal?.aborted) throw new Error("Operation aborted");

@@ -39,6 +39,7 @@ import {
 	type RpcSessionState,
 	type RpcSlashCommand,
 	rpcCommandSchema,
+	rpcExtensionUIResponseSchema,
 } from "./rpc-types.ts";
 
 // Re-export types for consumers
@@ -828,7 +829,13 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 		// UI responses must remain available while session_start is awaiting a dialog.
 		if (parsed.type === "extension_ui_response") {
-			const response = parsed as RpcExtensionUIResponse;
+			if (!Check(rpcExtensionUIResponseSchema, parsed)) {
+				const invalid = parsed as { id?: string; type: string };
+				output(error(invalid.id, invalid.type, "Invalid extension UI response"));
+				await waitForRawStdoutBackpressure();
+				return;
+			}
+			const response: RpcExtensionUIResponse = parsed;
 			const pending = pendingExtensionRequests.get(response.id);
 			if (pending) {
 				pendingExtensionRequests.delete(response.id);

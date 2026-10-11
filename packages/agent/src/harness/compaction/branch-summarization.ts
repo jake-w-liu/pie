@@ -11,8 +11,12 @@ import {
 import type { AgentMessage } from "../../types.ts";
 import { convertToLlm, createBranchSummaryMessage, createCompactionSummaryMessage } from "../messages.ts";
 import { type Entry, type Session, SessionError } from "../session/index.ts";
-import { BranchSummaryError, err, ok, type Result } from "../types.ts";
-import { completeSimpleWithRetries, SUMMARIZATION_SYSTEM_PROMPT } from "./compaction.ts";
+import { BranchSummaryError, err, ok, type Result, toError } from "../types.ts";
+import {
+	completeSimpleWithRetries,
+	estimateSummarizationInputTokens,
+	SUMMARIZATION_SYSTEM_PROMPT,
+} from "./compaction.ts";
 import {
 	computeFileLists,
 	createFileOps,
@@ -221,16 +225,41 @@ export async function generateBranchSummary(
 		callbacks,
 	} = options;
 	const contextWindow = model.contextWindow || 128000;
-	// The output reservation must fit the model: sending `maxTokens` above
-	// `model.maxTokens` either exceeds the model's cap or makes
-	// `completeSimpleWithRetries` reject an otherwise valid small-context request,
-	// because it validates input + the requested maxTokens against the context window.
+	if (!Number.isFinite(reserveTokens) || reserveTokens <= 0) {
+		return err(new BranchSummaryError("summarization_failed", "reserveTokens must be a positive number."));
+	}
+	if (reserveTokens >= contextWindow) {
+		return err(
+			new BranchSummaryError(
+				"summarization_failed",
+				"No input budget is available for branch summarization. Reduce reserveTokens or use a larger-context model.",
+			),
+		);
+	}
+	let instructions: string;
+	if (replaceInstructions && customInstructions) {
+		instructions = customInstructions;
+	} else if (customInstructions) {
+		instructions = `${BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: ${customInstructions}`;
+	} else {
+		instructions = BRANCH_SUMMARY_PROMPT;
+	}
+	// The public reserve covers the generated summary. Never request more output
+	// than was reserved, and subtract the fixed prompt envelope before selecting
+	// branch messages.
 	const maxOutputTokens = Math.max(
 		1,
-		Math.min(BRANCH_SUMMARY_MAX_OUTPUT_TOKENS, model.maxTokens || BRANCH_SUMMARY_MAX_OUTPUT_TOKENS),
+		Math.min(
+			BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
+			model.maxTokens || BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
+			Math.floor(reserveTokens),
+		),
 	);
-	const tokenBudget = contextWindow - reserveTokens;
-	if (!Number.isFinite(tokenBudget) || tokenBudget <= 0 || !Number.isFinite(reserveTokens) || reserveTokens < 0) {
+	const fixedEnvelope = Math.ceil(
+		(SUMMARIZATION_SYSTEM_PROMPT.length + instructions.length + "<conversation>\n\n</conversation>\n\n".length) / 4,
+	);
+	const tokenBudget = contextWindow - maxOutputTokens - fixedEnvelope;
+	if (!Number.isFinite(tokenBudget) || tokenBudget <= 0) {
 		return err(
 			new BranchSummaryError(
 				"summarization_failed",
@@ -253,14 +282,6 @@ export async function generateBranchSummary(
 	}
 	const llmMessages = convertToLlm(messages);
 	const conversationText = serializeConversation(llmMessages);
-	let instructions: string;
-	if (replaceInstructions && customInstructions) {
-		instructions = customInstructions;
-	} else if (customInstructions) {
-		instructions = `${BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: ${customInstructions}`;
-	} else {
-		instructions = BRANCH_SUMMARY_PROMPT;
-	}
 	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${instructions}`;
 
 	const summarizationMessages = [
@@ -270,14 +291,36 @@ export async function generateBranchSummary(
 			timestamp: Date.now(),
 		},
 	];
-	const response = await completeSimpleWithRetries(
-		models,
-		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		{ signal, maxTokens: maxOutputTokens },
-		retry,
-		callbacks,
-	);
+	const completionContext = { systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages };
+	if (estimateSummarizationInputTokens(completionContext) + maxOutputTokens > contextWindow) {
+		return err(
+			new BranchSummaryError(
+				"summarization_failed",
+				"Selected branch content does not fit the model context window.",
+			),
+		);
+	}
+	let response: Awaited<ReturnType<typeof completeSimpleWithRetries>>;
+	try {
+		response = await completeSimpleWithRetries(
+			models,
+			model,
+			completionContext,
+			{ signal, maxTokens: maxOutputTokens },
+			retry,
+			callbacks,
+		);
+	} catch (error) {
+		const cause = toError(error);
+		const aborted = signal.aborted || cause.name === "AbortError";
+		return err(
+			new BranchSummaryError(
+				aborted ? "aborted" : "summarization_failed",
+				aborted ? cause.message || "Branch summary aborted" : `Branch summary failed: ${cause.message}`,
+				cause,
+			),
+		);
+	}
 	if (response.stopReason === "aborted") {
 		return err(new BranchSummaryError("aborted", response.errorMessage || "Branch summary aborted"));
 	}

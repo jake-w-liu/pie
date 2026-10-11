@@ -36,6 +36,28 @@ process.stdin.resume();
 		await expect(client.getCommands()).rejects.toThrow(/Agent process exited \(code=43 signal=null\)/);
 	});
 
+	test.each(["waitForIdle", "collectEvents"] as const)(
+		"rejects %s promptly and removes its event listener when the child exits",
+		async (method) => {
+			const client = new RpcClient({
+				cliPath: writeChildScript(`
+setTimeout(() => process.exit(43), 150);
+process.stdin.resume();
+`),
+			});
+			await client.start();
+
+			const started = process.hrtime.bigint();
+			await expect(client[method](5_000)).rejects.toThrow(/Agent process exited \(code=43 signal=null\)/);
+			const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+
+			expect(elapsedMs).toBeLessThan(1_000);
+			expect((client as unknown as { eventListeners: unknown[] }).eventListeners).toHaveLength(0);
+			await client.stop();
+		},
+		10_000,
+	);
+
 	test("stop() returns immediately when the child already exited", async () => {
 		// The exit listener is registered after the kill, so a child that died
 		// earlier (crash, external kill) never fires it and stop() used to burn

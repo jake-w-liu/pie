@@ -1,7 +1,31 @@
 #!/bin/sh
 
-# Get list of staged files before running check
-STAGED_FILES=$(git diff --cached --name-only)
+STAGED_FILES=$(mktemp)
+trap 'rm -f "$STAGED_FILES"' EXIT HUP INT TERM
+git diff --cached --name-only -z > "$STAGED_FILES"
+
+# Refuse partially staged files: formatting the worktree and re-adding those files
+# would otherwise include unrelated unstaged edits in the commit.
+if ! node - "$STAGED_FILES" <<'NODE'
+const { readFileSync } = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const paths = readFileSync(process.argv[2]).toString().split("\0").filter(Boolean);
+let partial = false;
+for (const path of paths) {
+  const result = spawnSync("git", ["diff", "--quiet", "--", path]);
+  if (result.status === 1) {
+    console.error(`Refusing to format partially staged file: ${path}`);
+    partial = true;
+  } else if (result.status !== 0) {
+    process.exit(result.status ?? 1);
+  }
+}
+process.exit(partial ? 1 : 0);
+NODE
+then
+  echo "Stage or stash each file's remaining edits before committing."
+  exit 1
+fi
 
 node scripts/check-lockfile-commit.mjs
 if [ $? -ne 0 ]; then
@@ -16,17 +40,13 @@ if [ $? -ne 0 ]; then
   exit 1
 fi
 
-RUN_BROWSER_SMOKE=0
-for file in $STAGED_FILES; do
-  case "$file" in
-    packages/ai/*|packages/web-ui/*|package.json|package-lock.json)
-      RUN_BROWSER_SMOKE=1
-      break
-      ;;
-  esac
-done
+RUN_BROWSER_SMOKE=$(node -e '
+const { readFileSync } = require("node:fs");
+const paths = readFileSync(process.argv[1]).toString().split("\0").filter(Boolean);
+console.log(paths.some(path => /^(packages\/(ai|web-ui)\/|package(?:-lock)?\.json$)/.test(path)) ? "1" : "0");
+' "$STAGED_FILES")
 
-if [ $RUN_BROWSER_SMOKE -eq 1 ]; then
+if [ "$RUN_BROWSER_SMOKE" -eq 1 ]; then
   echo "Running browser smoke check..."
   npm run check:browser-smoke
   if [ $? -ne 0 ]; then
@@ -35,11 +55,12 @@ if [ $RUN_BROWSER_SMOKE -eq 1 ]; then
   fi
 fi
 
-# Restage files that were previously staged and may have been modified by formatting
-for file in $STAGED_FILES; do
-  if [ -f "$file" ]; then
-    git add "$file"
-  fi
-done
+# Only files that were staged before formatting are returned to the index.
+node - "$STAGED_FILES" <<'NODE'
+const { readFileSync } = require("node:fs");
+const { execFileSync } = require("node:child_process");
+const paths = readFileSync(process.argv[2]).toString().split("\0").filter(Boolean);
+if (paths.length > 0) execFileSync("git", ["add", "-A", "--", ...paths], { stdio: "inherit" });
+NODE
 
 echo "✅ All pre-commit checks passed!"

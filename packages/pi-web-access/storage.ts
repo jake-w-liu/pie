@@ -134,7 +134,9 @@ function isInlineFetchedUrl(value: unknown): value is ExtractedContent {
 		(url.error === null || typeof url.error === "string");
 }
 
-function isInlineFetchData(data: StoredSearchData): data is StoredSearchData & { urls: ExtractedContent[] } {
+function isInlineFetchData(
+	data: StoredSearchData,
+): data is StoredSearchData & { type: "fetch"; urls: ExtractedContent[] } {
 	return data.type === "fetch" && Array.isArray(data.urls) && data.urls.every(isInlineFetchedUrl);
 }
 
@@ -426,9 +428,16 @@ function readCachedFetchData(data: StoredSearchData, now = Date.now()): StoredSe
 	}
 }
 
+function pruneExpiredStoredResults(now: number): void {
+	for (const [id, data] of storedResults) {
+		if (data.type === "fetch" && now - data.timestamp >= CACHE_TTL_MS) storedResults.delete(id);
+	}
+}
+
 export function pruneExpiredFetchCache(now = Date.now(), requestedLimits?: Partial<FetchCacheLimits>): void {
 	const limits = cacheLimits(requestedLimits);
 	try { pruneFetchCache(now, limits); } catch {}
+	pruneExpiredStoredResults(now);
 }
 
 export function storeResult(id: string, data: StoredSearchData): void {
@@ -443,19 +452,22 @@ export function storeFetchedContentResult(id: string, data: StoredSearchData & {
 	} catch (err) {
 		cacheError = cacheWriteError(err);
 	}
-	storedResults.set(id, ref ? { ...data, fetchCache: ref, urlMetadata: metadataForUrls(data.urls) } : { ...data, fetchCacheError: cacheError });
+	storedResults.set(id, ref ? createFetchSessionData(data, ref) : { ...data, fetchCacheError: cacheError });
 	return createFetchSessionData(data, ref, cacheError);
 }
 
 export function getResult(id: string): StoredSearchData | null {
 	const data = storedResults.get(id);
 	if (!data) return null;
-	const loaded = readCachedFetchData(data);
-	if (loaded !== data) storedResults.set(id, loaded);
-	return loaded;
+	if (data.type === "fetch" && Date.now() - data.timestamp >= CACHE_TTL_MS) {
+		storedResults.delete(id);
+		return unavailableFetchData(data, "Cached fetched content is missing or expired");
+	}
+	return readCachedFetchData(data);
 }
 
 export function getAllResults(): StoredSearchData[] {
+	pruneExpiredStoredResults(Date.now());
 	return Array.from(storedResults.values());
 }
 
@@ -505,7 +517,15 @@ export function restoreFromSession(ctx: ExtensionContext): void {
 		if (entry.type === "custom" && entry.customType === "web-search-results") {
 			const data = entry.data;
 			if (isValidStoredData(data) && now - data.timestamp < CACHE_TTL_MS) {
-				storedResults.set(data.id, data);
+				if (isInlineFetchData(data)) {
+					// Legacy sessions embedded fetched bodies directly. Migrate them through
+					// the bounded disk cache, then retain only metadata in memory even when
+					// the cache write fails (for example, for an oversized legacy entry).
+					const migrated = storeFetchedContentResult(data.id, data);
+					storedResults.set(data.id, migrated);
+				} else {
+					storedResults.set(data.id, data);
+				}
 			}
 		}
 	}

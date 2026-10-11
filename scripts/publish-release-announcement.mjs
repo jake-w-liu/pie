@@ -130,6 +130,20 @@ function gitSourceCommit() {
 	return execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
 }
 
+export function gitCommitTimestamp(sourceCommit) {
+	const value = execFileSync("git", ["show", "-s", "--format=%cI", sourceCommit], { encoding: "utf8" }).trim();
+	const timestamp = new Date(value);
+	if (!value || Number.isNaN(timestamp.getTime())) {
+		throw new Error(`Unable to determine the commit timestamp for ${sourceCommit}`);
+	}
+	return timestamp.toISOString();
+}
+
+export function buildReleaseAnnouncement({ version, sourceCommit, packages }, commitTimestamp = gitCommitTimestamp) {
+	const publishedAt = commitTimestamp(sourceCommit);
+	return `${JSON.stringify({ schemaVersion: 1, version, sourceCommit, publishedAt, packages }, null, "\t")}\n`;
+}
+
 function runAws(args, { allowNotFound = false, allowPreconditionFailure = false } = {}) {
 	const result = spawnSync("aws", args, {
 		encoding: "utf8",
@@ -302,18 +316,16 @@ async function main() {
 	}
 
 	const publishedPackages = await verifyPackagesAreAvailable(packages);
-	const release = {
-		schemaVersion: 1,
+	const sourceCommit = options.sourceCommit ?? gitSourceCommit();
+	const releaseBody = buildReleaseAnnouncement({
 		version: options.version,
-		sourceCommit: options.sourceCommit ?? gitSourceCommit(),
-		publishedAt: new Date().toISOString(),
+		sourceCommit,
 		packages: publishedPackages,
-	};
+	});
 	const temporaryDirectory = mkdtempSync(join(tmpdir(), "pi-release-announcement-"));
 	try {
 		const releasePath = join(temporaryDirectory, "release.json");
 		const latestPath = join(temporaryDirectory, "latest.json");
-		const releaseBody = `${JSON.stringify(release, null, "\t")}\n`;
 		writeFileSync(releasePath, releaseBody);
 		const readRemoteObject = async (key) => {
 			const remotePath = join(temporaryDirectory, `remote-${key.replace(/[^a-zA-Z0-9.-]/g, "_")}`);

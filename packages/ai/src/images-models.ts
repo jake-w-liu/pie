@@ -2,7 +2,7 @@ import { defaultProviderAuthContext as defaultAuthContext } from "./auth/context
 import { InMemoryCredentialStore } from "./auth/credential-store.ts";
 import { type AuthResolutionOverrides, ModelsError, resolveProviderAuth } from "./auth/resolve.ts";
 import type { AuthContext, AuthResult, CredentialStore, ProviderAuth } from "./auth/types.ts";
-import type { CreateModelsOptions } from "./models.ts";
+import { type CreateModelsOptions, mergeHeaders } from "./models.ts";
 import type { AssistantImages, ImagesApi, ImagesContext, ImagesModel, ImagesOptions, ProviderImages } from "./types.ts";
 
 /**
@@ -205,7 +205,7 @@ class ImagesModelsImpl implements MutableImagesModels {
 
 			// Explicit request options win per-field; headers/env merge per key.
 			const apiKey = options?.apiKey ?? auth.apiKey;
-			const headers = auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined;
+			const headers = mergeHeaders(auth.headers, options?.headers);
 			const env =
 				resolution.env || options?.env ? { ...(resolution.env ?? {}), ...(options?.env ?? {}) } : undefined;
 

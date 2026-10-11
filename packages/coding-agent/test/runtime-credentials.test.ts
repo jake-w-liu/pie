@@ -16,6 +16,25 @@ describe("RuntimeCredentials", () => {
 		expect(await credentials.read("anthropic")).toEqual({ type: "api_key", key: "stored-key" });
 	});
 
+	test("runtime overrides retain stored provider-scoped environment", async () => {
+		const storage = AuthStorage.inMemory({
+			"cloudflare-ai-gateway": {
+				type: "api_key",
+				key: "stored-key",
+				env: { CLOUDFLARE_ACCOUNT_ID: "account", CLOUDFLARE_GATEWAY_ID: "gateway" },
+			},
+		});
+		const credentials = new RuntimeCredentials(storage);
+
+		credentials.setRuntimeApiKey("cloudflare-ai-gateway", "runtime-key");
+
+		expect(await credentials.read("cloudflare-ai-gateway")).toEqual({
+			type: "api_key",
+			key: "runtime-key",
+			env: { CLOUDFLARE_ACCOUNT_ID: "account", CLOUDFLARE_GATEWAY_ID: "gateway" },
+		});
+	});
+
 	test("enumeration merges overrides without exposing keys", async () => {
 		const storage = AuthStorage.inMemory({
 			anthropic: { type: "oauth", access: "access", refresh: "refresh", expires: Date.now() + 60_000 },

@@ -242,7 +242,7 @@ export interface CreateModelsOptions {
 	authContext?: AuthContext;
 }
 
-function mergeHeaders(
+export function mergeHeaders(
 	base: ProviderHeaders | undefined,
 	override: ProviderHeaders | undefined,
 ): ProviderHeaders | undefined {
@@ -969,13 +969,14 @@ export function isInPeakWindow(windows: ModelPeakWindow[] | undefined, now: Date
 	const utcMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
 	const dayInMinutes = 24 * 60;
 	return windows.some((window) => {
-		if (window.days && window.days.length > 0 && !window.days.includes(utcDay)) return false;
 		const start = ((window.startMinutes % dayInMinutes) + dayInMinutes) % dayInMinutes;
 		const end = ((window.endMinutes % dayInMinutes) + dayInMinutes) % dayInMinutes;
 		if (start === end) {
 			// A zero-length window applies only at the exact minute; treat it as never active.
 			return false;
 		}
+		const windowDay = start > end && utcMinutes < end ? (utcDay + 6) % 7 : utcDay;
+		if (window.days && window.days.length > 0 && !window.days.includes(windowDay)) return false;
 		if (start < end) return utcMinutes >= start && utcMinutes < end;
 		return utcMinutes >= start || utcMinutes < end;
 	});

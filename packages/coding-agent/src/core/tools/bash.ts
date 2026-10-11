@@ -2,7 +2,7 @@ import { constants } from "node:fs";
 import { access as fsAccess } from "node:fs/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Container, Text, truncateToWidth } from "@earendil-works/pi-tui";
-import { spawn } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import { type Static, Type } from "typebox";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
 import { truncateToVisualLines } from "../../modes/interactive/components/visual-truncate.ts";
@@ -24,6 +24,43 @@ import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from "./truncate.ts";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
+
+function killLocalProcessTree(pid: number): void {
+	if (process.platform !== "win32") {
+		try {
+			const listing = spawnSync("ps", ["-axo", "pid=,ppid="], { encoding: "utf8", timeout: 1_000 }).stdout;
+			const children = new Map<number, number[]>();
+			for (const line of listing.split("\n")) {
+				const [childText, parentText] = line.trim().split(/\s+/);
+				const child = Number(childText);
+				const parent = Number(parentText);
+				if (Number.isInteger(child) && Number.isInteger(parent)) {
+					const siblings = children.get(parent) ?? [];
+					siblings.push(child);
+					children.set(parent, siblings);
+				}
+			}
+			const descendants: number[] = [];
+			const visit = (parent: number) => {
+				for (const child of children.get(parent) ?? []) {
+					visit(child);
+					descendants.push(child);
+				}
+			};
+			visit(pid);
+			for (const descendant of descendants) {
+				try {
+					process.kill(descendant, "SIGKILL");
+				} catch {
+					// It exited between the process snapshot and the kill.
+				}
+			}
+		} catch {
+			// Process-group cleanup below remains the fallback.
+		}
+	}
+	killProcessTree(pid);
+}
 const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
 
 function resolveTimeoutMs(timeout: number | undefined): number | undefined {
@@ -66,13 +103,15 @@ export interface BashOperations {
 	 * @param command The command to execute
 	 * @param cwd Working directory
 	 * @param options Execution options
+	 * @remarks Every `onData` call must identify its source as `"stdout"` or `"stderr"`.
 	 * @returns Promise resolving to exit code (null if killed)
 	 */
 	exec: (
 		command: string,
 		cwd: string,
 		options: {
-			onData: (data: Buffer) => void;
+			onData: (data: Buffer, stream: "stdout" | "stderr") => boolean | undefined;
+			waitForDrain?: () => Promise<void>;
 			signal?: AbortSignal;
 			timeout?: number;
 			env?: NodeJS.ProcessEnv;
@@ -83,7 +122,7 @@ export interface BashOperations {
 /** Shared process execution used by the built-in shell tools. */
 export function createLocalShellOperations(shellName: string, resolveShellConfig: () => ShellConfig): BashOperations {
 	return {
-		exec: async (command, cwd, { onData, signal, timeout, env }) => {
+		exec: async (command, cwd, { onData, waitForDrain, signal, timeout, env }) => {
 			const timeoutMs = resolveTimeoutMs(timeout);
 			if (signal?.aborted) {
 				throw new Error("aborted");
@@ -111,7 +150,7 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 			let timedOut = false;
 			let timeoutHandle: NodeJS.Timeout | undefined;
 			const onAbort = () => {
-				if (child.pid) killProcessTree(child.pid);
+				if (child.pid) killLocalProcessTree(child.pid);
 			};
 
 			try {
@@ -119,12 +158,24 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 				if (timeoutMs !== undefined) {
 					timeoutHandle = setTimeout(() => {
 						timedOut = true;
-						if (child.pid) killProcessTree(child.pid);
+						if (child.pid) killLocalProcessTree(child.pid);
 					}, timeoutMs);
 				}
-				// Stream stdout and stderr.
-				child.stdout?.on("data", onData);
-				child.stderr?.on("data", onData);
+				// Stream stdout and stderr, pausing both pipes while the output spool drains.
+				let draining = false;
+				const handleData = (stream: "stdout" | "stderr") => (data: Buffer) => {
+					if (onData(data, stream) !== false || draining || !waitForDrain) return;
+					draining = true;
+					child.stdout?.pause();
+					child.stderr?.pause();
+					void waitForDrain().finally(() => {
+						draining = false;
+						child.stdout?.resume();
+						child.stderr?.resume();
+					});
+				};
+				child.stdout?.on("data", handleData("stdout"));
+				child.stderr?.on("data", handleData("stderr"));
 				// Handle abort signal by killing the entire process tree.
 				if (signal) {
 					if (signal.aborted) onAbort();
@@ -132,7 +183,7 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 				}
 				// Handle shell spawn errors and wait for the process to terminate without hanging
 				// on inherited stdio handles held by detached descendants.
-				const exitCode = await waitForChildProcess(child);
+				const exitCode = await waitForChildProcess(child, signal);
 				if (signal?.aborted) {
 					throw new Error("aborted");
 				}
@@ -416,10 +467,11 @@ export function createShellToolDefinition(
 				onUpdate({ content: [], details: undefined });
 			}
 
-			const handleData = (data: Buffer) => {
-				if (!acceptingOutput) return;
-				output.append(data);
+			const handleData = (data: Buffer): boolean => {
+				if (!acceptingOutput) return true;
+				const canContinue = output.append(data);
 				scheduleOutputUpdate();
+				return canContinue;
 			};
 
 			const finishOutput = async () => {
@@ -459,6 +511,7 @@ export function createShellToolDefinition(
 				try {
 					const result = await ops.exec(spawnContext.command, spawnContext.cwd, {
 						onData: handleData,
+						waitForDrain: () => output.waitForDrain(),
 						signal,
 						timeout,
 						env: spawnContext.env,
@@ -486,7 +539,10 @@ export function createShellToolDefinition(
 
 				const snapshot = await finishOutput();
 				const { text: outputText, details } = formatOutput(snapshot);
-				if (exitCode !== 0 && exitCode !== null) {
+				if (exitCode === null) {
+					throw new Error(appendStatus(outputText, "Command terminated by signal"));
+				}
+				if (exitCode !== 0) {
 					throw new Error(appendStatus(outputText, `Command exited with code ${exitCode}`));
 				}
 				return { content: [{ type: "text", text: outputText }], details };

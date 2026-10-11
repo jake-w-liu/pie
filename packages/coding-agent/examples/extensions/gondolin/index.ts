@@ -347,7 +347,7 @@ function createGondolinBashOps(vm: VM, localCwd: string, shellPath: string): Bas
 					stdout: "pipe",
 					stderr: "pipe",
 				});
-				for await (const chunk of proc.output()) onData(chunk.data);
+				for await (const chunk of proc.output()) onData(chunk.data, chunk.stream);
 				const result = await proc;
 				return { exitCode: result.exitCode };
 			} catch (error) {

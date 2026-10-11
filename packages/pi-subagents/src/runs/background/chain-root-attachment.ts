@@ -68,7 +68,6 @@ interface AsyncResultFile {
 }
 
 const TERMINAL_STATES = new Set(["complete", "failed", "paused", "stopped"]);
-const TERMINAL_STEP_STATUSES = new Set(["complete", "completed", "failed", "paused", "stopped"]);
 
 function readResultFile(resultPath: string): AsyncResultFile | undefined {
 	try {
@@ -85,11 +84,8 @@ function selectedStatusStep(status: AsyncStatus | null, index: number): NonNulla
 	return status?.steps?.[index];
 }
 
-function isTerminalStatus(status: AsyncStatus | null, index: number): boolean {
-	if (!status) return false;
-	const step = selectedStatusStep(status, index);
-	if (step && TERMINAL_STEP_STATUSES.has(step.status)) return true;
-	return TERMINAL_STATES.has(status.state);
+function isTerminalStatus(status: AsyncStatus | null): boolean {
+	return status !== null && TERMINAL_STATES.has(status.state);
 }
 
 function resultState(result: AsyncResultFile | undefined, child: NonNullable<AsyncResultFile["results"]>[number] | undefined): "complete" | "failed" | "paused" | "stopped" | undefined {
@@ -198,7 +194,7 @@ export async function waitForImportedAsyncRoot(
 		if (options.shouldAbort?.()) return outputFromTimeout(root, status, options.timeoutMessage ?? "Subagent timed out.");
 		const result = readResultFile(root.resultPath);
 		if (result) return buildImportedResult(root, status, result);
-		if (isTerminalStatus(status, root.index)) {
+		if (isTerminalStatus(status)) {
 			terminalSince ??= now();
 			if (now() - terminalSince >= terminalResultGraceMs) {
 				return outputFromTerminalStatus(root, status!, selectedStatusStep(status, root.index));

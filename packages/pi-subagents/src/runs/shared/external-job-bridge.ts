@@ -118,6 +118,90 @@ function responsePath(asyncDir: string, id: string): string {
 	return path.join(responseDir(asyncDir), `${id}.json`);
 }
 
+function nonDispatchCompletingPrefix(asyncDir: string, id: string): string {
+	return `${requestPath(asyncDir, id)}.completing-`;
+}
+
+function nonDispatchPendingResponsePrefix(asyncDir: string, id: string): string {
+	return `${responsePath(asyncDir, id)}.pending-`;
+}
+
+function removeNonDispatchPublicationArtifacts(asyncDir: string, id: string): void {
+	const pendingPrefix = path.basename(nonDispatchPendingResponsePrefix(asyncDir, id));
+	try {
+		for (const file of fs.readdirSync(responseDir(asyncDir))) {
+			if (file.startsWith(pendingPrefix)) fs.rmSync(path.join(responseDir(asyncDir), file), { force: true });
+		}
+	} catch (error) {
+		if (!isNotFoundError(error)) throw error;
+	}
+	fs.rmSync(responsePath(asyncDir, id), { force: true });
+}
+
+function cancelNonDispatchRequest(asyncDir: string, id: string): boolean {
+	const filePath = requestPath(asyncDir, id);
+	const canceledPath = `${filePath}.canceled-${randomUUID()}`;
+	try {
+		fs.renameSync(filePath, canceledPath);
+	} catch (error) {
+		if (!isNotFoundError(error)) throw error;
+		// A responder claims the canonical request only after staging its complete
+		// response. At the caller's deadline, taking that claim prevents an
+		// abandoned responder from extending timeoutMs indefinitely.
+		const completingPrefix = path.basename(nonDispatchCompletingPrefix(asyncDir, id));
+		let files: string[];
+		try {
+			files = fs.readdirSync(requestDir(asyncDir));
+		} catch (scanError) {
+			if (isNotFoundError(scanError)) return false;
+			throw scanError;
+		}
+		const completingFile = files.find((file) => file.startsWith(completingPrefix));
+		if (!completingFile) return false;
+		try {
+			fs.renameSync(path.join(requestDir(asyncDir), completingFile), canceledPath);
+		} catch (claimError) {
+			if (isNotFoundError(claimError)) return false;
+			throw claimError;
+		}
+	}
+	fs.rmSync(canceledPath, { force: true });
+	removeNonDispatchPublicationArtifacts(asyncDir, id);
+	return true;
+}
+
+function publishNonDispatchResponse(asyncDir: string, filePath: string, response: ExternalJobBridgeResponse): boolean {
+	const publicationId = randomUUID();
+	const completingPath = `${filePath}.completing-${publicationId}`;
+	const pendingPath = `${responsePath(asyncDir, response.id)}.pending-${publicationId}`;
+	// Stage the complete response before claiming the request. If timeout wins
+	// the request rename, no responder can publish after cancellation; if this
+	// process dies after the rename, the requester can retire both artifacts.
+	writeAtomicJson(pendingPath, response);
+	try {
+		fs.renameSync(filePath, completingPath);
+	} catch (error) {
+		fs.rmSync(pendingPath, { force: true });
+		if (isNotFoundError(error)) return false;
+		throw error;
+	}
+	try {
+		fs.renameSync(pendingPath, responsePath(asyncDir, response.id));
+		fs.rmSync(completingPath, { force: true });
+		return true;
+	} catch (error) {
+		fs.rmSync(pendingPath, { force: true });
+		try {
+			fs.renameSync(completingPath, filePath);
+		} catch (restoreError) {
+			// Timeout may have atomically taken and retired the completing claim.
+			if (isNotFoundError(restoreError)) return false;
+			throw restoreError;
+		}
+		throw error;
+	}
+}
+
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -362,14 +446,14 @@ export function serviceExternalJobBridgeRequestFile(asyncDir: string, file: stri
 	const claimedRequest = claimed.request;
 	inFlight.add(claimedRequest.id);
 	void executeBridgeRequest(claimedRequest, isDispatchOperation(claimedRequest.operation) ? claimed.filePath : undefined).then((response) => {
-		writeAtomicJson(responsePath(asyncDir, claimedRequest.id), response);
 		if (isDispatchOperation(claimedRequest.operation)) {
+			writeAtomicJson(responsePath(asyncDir, claimedRequest.id), response);
 			writeAtomicJson(dispatchClaimCompletedPath(claimed.filePath), { completedAt: Date.now() });
 		} else {
-			fs.rmSync(claimed.filePath, { recursive: true, force: true });
+			publishNonDispatchResponse(asyncDir, claimed.filePath, response);
 		}
 	}).catch((error) => {
-		writeAtomicJson(responsePath(asyncDir, claimedRequest.id), {
+		const response = {
 			id: claimedRequest.id,
 			ok: false,
 			operation: claimedRequest.operation,
@@ -377,8 +461,13 @@ export function serviceExternalJobBridgeRequestFile(asyncDir: string, file: stri
 			code: "bridge-error",
 			message: error instanceof Error ? error.message : String(error),
 			completedAt: Date.now(),
-		} satisfies ExternalJobBridgeResponse);
-		if (isDispatchOperation(claimedRequest.operation)) writeAtomicJson(dispatchClaimCompletedPath(claimed.filePath), { completedAt: Date.now() });
+		} satisfies ExternalJobBridgeResponse;
+		if (isDispatchOperation(claimedRequest.operation)) {
+			writeAtomicJson(responsePath(asyncDir, claimedRequest.id), response);
+			writeAtomicJson(dispatchClaimCompletedPath(claimed.filePath), { completedAt: Date.now() });
+		} else {
+			publishNonDispatchResponse(asyncDir, claimed.filePath, response);
+		}
 	}).finally(() => {
 		inFlight.delete(claimedRequest.id);
 	});
@@ -438,14 +527,20 @@ export async function requestExternalJobOperation<T extends ExternalJobHandle | 
 	while (!fs.existsSync(outPath)) {
 		const canceled = cancel?.();
 		if (canceled) {
-			if (isDispatchOperation(request.operation) && !cancelDispatchRequest(asyncDir, bridgeRequest)) {
+			const retired = isDispatchOperation(request.operation)
+				? cancelDispatchRequest(asyncDir, bridgeRequest)
+				: cancelNonDispatchRequest(asyncDir, id);
+			if (!retired) {
 				await sleep(POLL_INTERVAL_MS);
 				continue;
 			}
-			if (!isDispatchOperation(request.operation)) fs.rmSync(requestPath(asyncDir, id), { force: true });
 			throw canceled;
 		}
 		if (deadline !== undefined && Date.now() >= deadline) {
+			if (!cancelNonDispatchRequest(asyncDir, id)) {
+				await sleep(POLL_INTERVAL_MS);
+				continue;
+			}
 			throw new ExternalJobProviderError(
 				`External-job provider bridge did not respond to ${request.operation} for provider '${request.provider}' within ${timeoutMs}ms.`,
 				{ code: "bridge-timeout" },

@@ -7,6 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parseFrontmatter } from "./frontmatter.ts";
+import { findConfiguredProjectRoot } from "./agents.ts";
 import { getAgentDir, getProjectConfigDir } from "../shared/utils.ts";
 
 export type SkillSource =
@@ -627,10 +628,11 @@ export function resolveSkills(
 ): { resolved: ResolvedSkill[]; missing: string[] } {
 	const resolved: ResolvedSkill[] = [];
 	const missing: string[] = [];
+	const projectCwd = findConfiguredProjectRoot(cwd) ?? cwd;
 	const localByName = new Map<string, CachedSkillEntry>();
 	if (localSkillPaths?.length) {
 		const agentDir = getAgentDir();
-		const localEntries = collectFilesystemSkills(cwd, agentDir, localSkillPaths.map((entry) => ({
+		const localEntries = collectFilesystemSkills(projectCwd, agentDir, localSkillPaths.map((entry) => ({
 			path: path.resolve(localBaseDir ?? cwd, entry),
 			source: "unknown" as const,
 		})));
@@ -650,7 +652,7 @@ export function resolveSkills(
 		const local = localByName.get(trimmed);
 		let skill = local ? readSkill(trimmed, local.filePath, local.source) : undefined;
 		if (!skill) {
-			const location = resolveSkillPath(trimmed, cwd);
+			const location = resolveSkillPath(trimmed, projectCwd);
 			if (location) skill = readSkill(trimmed, location.path, location.source);
 		}
 		if (skill) resolved.push(skill);

@@ -69,15 +69,16 @@ export async function executeBashWithOperations(
 		}
 	};
 
-	const decoder = new TextDecoder();
+	const decoders = {
+		stdout: new TextDecoder(),
+		stderr: new TextDecoder(),
+	};
 	let acceptingOutput = true;
 
-	const onData = (data: Buffer) => {
-		if (!acceptingOutput) return;
-		totalBytes += data.length;
-
+	const appendDecodedText = (decoded: string): void => {
 		// Sanitize: strip ANSI, replace binary garbage, normalize newlines
-		const text = sanitizeBinaryOutput(stripAnsi(decoder.decode(data, { stream: true }))).replace(/\r/g, "");
+		const text = sanitizeBinaryOutput(stripAnsi(decoded)).replace(/\r/g, "");
+		if (text.length === 0) return;
 
 		// Start writing to temp file if exceeds threshold
 		if (totalBytes > DEFAULT_MAX_BYTES) {
@@ -100,12 +101,34 @@ export async function executeBashWithOperations(
 		}
 	};
 
+	const onData = (data: Buffer, stream: "stdout" | "stderr"): boolean | undefined => {
+		const decoder = decoders[stream];
+		if (!decoder) {
+			// A custom operation that reports chunks without labelling their stream would
+			// otherwise interleave stderr into stdout. Fail loudly instead of guessing.
+			throw new Error(
+				`Bash operations must label every chunk as "stdout" or "stderr"; received ${JSON.stringify(stream)}.`,
+			);
+		}
+		if (!acceptingOutput) return undefined;
+		totalBytes += data.length;
+		appendDecodedText(decoder.decode(data, { stream: true }));
+		return undefined;
+	};
+
+	const flushDecoders = () => {
+		appendDecodedText(decoders.stdout.decode());
+		appendDecodedText(decoders.stderr.decode());
+	};
+
 	let exitCode: number | null;
 	try {
 		const result = await operations.exec(command, cwd, { onData, signal: options?.signal });
+		flushDecoders();
 		acceptingOutput = false;
 		exitCode = result.exitCode;
 	} catch (err) {
+		flushDecoders();
 		acceptingOutput = false;
 		const fullOutput = outputChunks.join("");
 		const truncationResult = truncateTail(fullOutput);

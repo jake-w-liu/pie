@@ -62,6 +62,7 @@ export class RpcClient {
 	private requestId = 0;
 	private stderr = "";
 	private exitError: Error | null = null;
+	private terminationListeners = new Set<(error: Error) => void>();
 	private options: RpcClientOptions;
 
 	constructor(options: RpcClientOptions = {}) {
@@ -106,22 +107,15 @@ export class RpcClient {
 
 		childProcess.once("exit", (code, signal) => {
 			if (this.process !== childProcess) return;
-			const error = this.createProcessExitError(code, signal);
-			this.exitError = error;
-			this.rejectPendingRequests(error);
+			this.failProcess(this.createProcessExitError(code, signal));
 		});
 		childProcess.once("error", (error) => {
 			if (this.process !== childProcess) return;
-			const processError = new Error(`Agent process error: ${error.message}. Stderr: ${this.stderr}`);
-			this.exitError = processError;
-			this.rejectPendingRequests(processError);
+			this.failProcess(new Error(`Agent process error: ${error.message}. Stderr: ${this.stderr}`));
 		});
 		childProcess.stdin?.on("error", (error) => {
 			if (this.process !== childProcess) return;
-			const stdinError =
-				this.exitError ?? new Error(`Agent process stdin error: ${error.message}. Stderr: ${this.stderr}`);
-			this.exitError = stdinError;
-			this.rejectPendingRequests(stdinError);
+			this.failProcess(new Error(`Agent process stdin error: ${error.message}. Stderr: ${this.stderr}`));
 		});
 		// A stdout stream error (e.g. EPIPE, or the child dying mid-stream) would
 		// otherwise fire an unhandled EventEmitter 'error' (crashing this process)
@@ -129,10 +123,7 @@ export class RpcClient {
 		// timeout. Reject them here like the other stream error paths do.
 		childProcess.stdout?.on("error", (error) => {
 			if (this.process !== childProcess) return;
-			const stdoutError =
-				this.exitError ?? new Error(`Agent process stdout error: ${error.message}. Stderr: ${this.stderr}`);
-			this.exitError = stdoutError;
-			this.rejectPendingRequests(stdoutError);
+			this.failProcess(new Error(`Agent process stdout error: ${error.message}. Stderr: ${this.stderr}`));
 		});
 
 		// Set up strict JSONL reader for stdout.
@@ -484,18 +475,26 @@ export class RpcClient {
 	 * Resolves when agent_settled event is received.
 	 */
 	waitForIdle(timeout = 60000): Promise<void> {
+		if (this.exitError) return Promise.reject(this.exitError);
 		return new Promise((resolve, reject) => {
+			const cleanup = () => {
+				clearTimeout(timer);
+				unsubscribeEvent();
+				unsubscribeTermination();
+			};
 			const timer = setTimeout(() => {
-				unsubscribe();
+				cleanup();
 				reject(new Error(`Timeout waiting for agent to become idle. Stderr: ${this.stderr}`));
 			}, timeout);
-
-			const unsubscribe = this.onEvent((event) => {
+			const unsubscribeEvent = this.onEvent((event) => {
 				if (event.type === "agent_settled") {
-					clearTimeout(timer);
-					unsubscribe();
+					cleanup();
 					resolve();
 				}
+			});
+			const unsubscribeTermination = this.onTermination((error) => {
+				cleanup();
+				reject(error);
 			});
 		});
 	}
@@ -507,10 +506,15 @@ export class RpcClient {
 	collectEvents(timeout = 60000, signal?: AbortSignal): Promise<JsonAgentSessionEvent[]> {
 		return new Promise((resolve, reject) => {
 			signal?.throwIfAborted();
+			if (this.exitError) {
+				reject(this.exitError);
+				return;
+			}
 			const events: JsonAgentSessionEvent[] = [];
 			const cleanup = () => {
 				clearTimeout(timer);
-				unsubscribe();
+				unsubscribeEvent();
+				unsubscribeTermination();
 				signal?.removeEventListener("abort", onAbort);
 			};
 			const onAbort = () => {
@@ -522,12 +526,16 @@ export class RpcClient {
 				reject(new Error(`Timeout collecting events. Stderr: ${this.stderr}`));
 			}, timeout);
 
-			const unsubscribe = this.onEvent((event) => {
+			const unsubscribeEvent = this.onEvent((event) => {
 				events.push(event);
 				if (event.type === "agent_settled") {
 					cleanup();
 					resolve(events);
 				}
+			});
+			const unsubscribeTermination = this.onTermination((error) => {
+				cleanup();
+				reject(error);
 			});
 			signal?.addEventListener("abort", onAbort, { once: true });
 		});
@@ -596,6 +604,23 @@ export class RpcClient {
 			pending.reject(error);
 		}
 		this.pendingRequests.clear();
+	}
+
+	private failProcess(error: Error): void {
+		const exitError = this.exitError ?? error;
+		this.exitError = exitError;
+		this.rejectPendingRequests(exitError);
+		for (const listener of this.terminationListeners) listener(exitError);
+		this.terminationListeners.clear();
+	}
+
+	private onTermination(listener: (error: Error) => void): () => void {
+		if (this.exitError) {
+			listener(this.exitError);
+			return () => {};
+		}
+		this.terminationListeners.add(listener);
+		return () => this.terminationListeners.delete(listener);
 	}
 
 	private async send(command: RpcCommandBody): Promise<RpcResponse> {

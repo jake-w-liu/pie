@@ -92,6 +92,14 @@ const RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS = [
 
 type BuiltInKeyBindings = Partial<Record<KeyId, { keybinding: string; restrictOverride: boolean }>>;
 
+function canonicalShortcut(key: string): KeyId {
+	const parts = key.toLowerCase().split("+");
+	const base = parts.pop() ?? "";
+	const modifiers = new Set(parts);
+	const ordered = ["ctrl", "shift", "alt", "super"].filter((modifier) => modifiers.has(modifier));
+	return [...ordered, base].join("+") as KeyId;
+}
+
 const buildBuiltinKeybindings = (resolvedKeybindings: KeybindingsConfig): BuiltInKeyBindings => {
 	const builtinKeybindings = {} as BuiltInKeyBindings;
 	for (const [keybinding, keys] of Object.entries(resolvedKeybindings)) {
@@ -99,7 +107,7 @@ const buildBuiltinKeybindings = (resolvedKeybindings: KeybindingsConfig): BuiltI
 		const keyList = Array.isArray(keys) ? keys : [keys];
 		const restrictOverride = (RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS as readonly string[]).includes(keybinding);
 		for (const key of keyList) {
-			const normalizedKey = key.toLowerCase() as KeyId;
+			const normalizedKey = canonicalShortcut(key);
 			// If multiple actions bind the same key, the reserved action wins so extensions
 			// remain blocked by reserved shortcuts regardless of iteration order.
 			const existing = builtinKeybindings[normalizedKey];
@@ -555,7 +563,7 @@ export class ExtensionRunner {
 
 		for (const ext of this.extensions) {
 			for (const [key, shortcut] of ext.shortcuts) {
-				const normalizedKey = key.toLowerCase() as KeyId;
+				const normalizedKey = canonicalShortcut(key);
 
 				const builtInKeybinding = builtinKeybindings[normalizedKey];
 				if (builtInKeybinding?.restrictOverride === true) {
@@ -588,6 +596,10 @@ export class ExtensionRunner {
 
 	getShortcutDiagnostics(): ResourceDiagnostic[] {
 		return this.shortcutDiagnostics;
+	}
+
+	isActive(): boolean {
+		return !this.staleMessage;
 	}
 
 	invalidate(
@@ -725,6 +737,7 @@ export class ExtensionRunner {
 		const getModel = this.getModel;
 		const getScopedModels = this.getScopedModels;
 		return {
+			isActive: () => runner.isActive(),
 			get ui() {
 				runner.assertActive();
 				return runner.uiContext;

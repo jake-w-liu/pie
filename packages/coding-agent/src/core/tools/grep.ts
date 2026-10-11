@@ -1,4 +1,5 @@
 import { stat as fsStat } from "node:fs/promises";
+import { StringDecoder } from "node:string_decoder";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Text } from "@earendil-works/pi-tui";
 import { spawn } from "child_process";
@@ -54,6 +55,38 @@ export type GrepToolInput = Static<typeof grepSchema>;
 export type GrepOutputMode = "content" | "files_with_matches" | "count";
 
 const DEFAULT_LIMIT = 20;
+
+export function createUtf8LineDecoder(onLine: (line: string) => void): {
+	write: (chunk: Buffer) => void;
+	end: () => void;
+} {
+	const decoder = new StringDecoder("utf8");
+	let pending = "";
+	let ended = false;
+	const drainLines = () => {
+		let newlineIndex = pending.indexOf("\n");
+		while (newlineIndex >= 0) {
+			onLine(pending.slice(0, newlineIndex));
+			pending = pending.slice(newlineIndex + 1);
+			newlineIndex = pending.indexOf("\n");
+		}
+	};
+	return {
+		write(chunk) {
+			if (ended) return;
+			pending += decoder.write(chunk);
+			drainLines();
+		},
+		end() {
+			if (ended) return;
+			ended = true;
+			pending += decoder.end();
+			drainLines();
+			if (pending) onLine(pending);
+			pending = "";
+		},
+	};
+}
 
 export interface GrepToolDetails {
 	truncation?: TruncationResult;
@@ -252,7 +285,7 @@ export function createGrepToolDefinition(
 						// cache the old path kept for the whole run.
 						// --no-config keeps a user RIPGREP_CONFIG_PATH from injecting flags
 						// that break these assumptions.
-						const args: string[] = ["--no-config", "--color=never", "--hidden"];
+						const args: string[] = ["--no-config", "--color=never", "--hidden", "--glob", "!**/.git/**"];
 						if (ignoreCase) args.push("--ignore-case");
 						if (literal) args.push("--fixed-strings");
 						if (glob) args.push("--glob", glob);
@@ -273,6 +306,7 @@ export function createGrepToolDefinition(
 						let linesTruncated = false;
 						let aborted = false;
 						let killedDueToLimit = false;
+						let trailingContextRemaining = 0;
 						const outputLines: string[] = [];
 
 						// Paths seen in "-l" mode, in first-seen order.
@@ -364,7 +398,6 @@ export function createGrepToolDefinition(
 
 							// Content mode. "--json" is the only format that carries the path verbatim,
 							// which is what makes the path/line split unambiguous on Windows.
-							if (matchCount >= effectiveLimit) return;
 							let event: any;
 							try {
 								event = JSON.parse(line);
@@ -383,16 +416,27 @@ export function createGrepToolDefinition(
 							}
 							if (event.type === "end") {
 								flushBlock();
+								if (trailingContextRemaining > 0) stopChild(true);
 								return;
 							}
 							if (event.type === "context") {
+								if (matchLimitReached && trailingContextRemaining === 0) return;
 								const contextLine = event.data?.line_number;
 								if (typeof contextLine === "number" && blockLines) {
 									pushContentLine(relativePath, contextLine, event.data?.lines?.text ?? "", false);
+									if (trailingContextRemaining > 0 && --trailingContextRemaining === 0) stopChild(true);
 								}
 								return;
 							}
 							if (event.type !== "match") return;
+							if (matchCount >= effectiveLimit) {
+								const contextLine = event.data?.line_number;
+								if (trailingContextRemaining > 0 && typeof contextLine === "number" && blockLines) {
+									pushContentLine(relativePath, contextLine, event.data?.lines?.text ?? "", false);
+									if (--trailingContextRemaining === 0) stopChild(true);
+								}
+								return;
+							}
 
 							matchCount++;
 							const lineNumber = event.data?.line_number;
@@ -415,35 +459,21 @@ export function createGrepToolDefinition(
 
 							if (matchCount >= effectiveLimit) {
 								matchLimitReached = true;
-								if (stopAtLimit) stopChild(true);
+								if (stopAtLimit) {
+									if (contextValue > 0) trailingContextRemaining = contextValue;
+									else stopChild(true);
+								}
 							}
 						};
 
-						// Split stdout on newlines directly. readline allocates a reader and event
-						// plumbing per line, which is measurable at the 100k+ lines a context search
-						// over a monorepo produces.
-						// Split stdout on newlines directly. readline allocates a reader and event
-						// plumbing per line, which is measurable at the 100k+ lines a context search
-						// over a monorepo produces.
-						let pending = "";
-						child.stdout?.on("data", (chunk: Buffer) => {
-							pending += chunk.toString();
-							let newlineIndex = pending.indexOf("\n");
-							while (newlineIndex >= 0) {
-								const line = pending.slice(0, newlineIndex);
-								pending = pending.slice(newlineIndex + 1);
-								handleLine(line);
-								newlineIndex = pending.indexOf("\n");
-							}
-						});
+						// Split stdout on newlines without corrupting code points divided between chunks.
+						const lineDecoder = createUtf8LineDecoder(handleLine);
+						child.stdout?.on("data", lineDecoder.write);
 						// Drain whatever is still buffered and close any open block. Idempotent: the
 						// "end" handler already did this in the common case, and "close" calls it
 						// again for a child that was killed before stdout reported end.
 						const finishStreaming = (): void => {
-							if (pending.length > 0) {
-								handleLine(pending);
-								pending = "";
-							}
+							lineDecoder.end();
 							flushBlock();
 						};
 						child.stdout?.on("end", finishStreaming);

@@ -711,6 +711,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				delete (block as { index?: number }).index;
 				// Streaming scratch buffers are only used during parsing; never persist them.
 				delete (block as { partialArgs?: string }).partialArgs;
+				delete (block as { parsedArgsLength?: number }).parsedArgsLength;
 				delete (block as { customInput?: unknown }).customInput;
 				delete (block as { streamIndex?: number }).streamIndex;
 			}

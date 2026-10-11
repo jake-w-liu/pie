@@ -17,6 +17,9 @@ import { isCommandConfigValue, resolveConfigValue } from "./resolve-config-value
 
 type AuthStorageData = Record<string, Credential>;
 
+const AUTH_LOCK_STALE_MS = 30_000;
+const AUTH_LOCK_UPDATE_MS = 10_000;
+
 type LockResult<T> = {
 	result: T;
 	next?: string;
@@ -94,7 +97,11 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 
 		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 			try {
-				return lockfile.lockSync(path, { realpath: false });
+				return lockfile.lockSync(path, {
+					realpath: false,
+					stale: AUTH_LOCK_STALE_MS,
+					update: AUTH_LOCK_UPDATE_MS,
+				});
 			} catch (error) {
 				const code =
 					typeof error === "object" && error !== null && "code" in error
@@ -141,9 +148,8 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 		signal: AbortSignal | undefined,
 		onCompromised: (error: Error) => void,
 	): Promise<() => Promise<void>> {
-		const staleMs = 30_000;
 		const maxDelayMs = 2_000;
-		const deadline = Date.now() + staleMs;
+		const deadline = Date.now() + AUTH_LOCK_STALE_MS;
 		let retry = 0;
 		while (true) {
 			signal?.throwIfAborted();
@@ -152,7 +158,8 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 				release = await lockfile.lock(this.authPath, {
 					realpath: false,
 					retries: 0,
-					stale: staleMs,
+					stale: AUTH_LOCK_STALE_MS,
+					update: AUTH_LOCK_UPDATE_MS,
 					onCompromised,
 				});
 			} catch (error) {

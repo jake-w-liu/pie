@@ -65,6 +65,16 @@ describe("node HTTP proxy resolution", () => {
 		).toBe("http://scoped-proxy.example:8080/");
 	});
 
+	it.each(["https_proxy", "HTTPS_PROXY"])("lets an explicit empty scoped %s suppress ambient proxies", (key) => {
+		resetProxyEnv();
+		process.env.https_proxy = "http://process-lower.example:8080";
+		process.env.HTTPS_PROXY = "http://process-upper.example:8080";
+
+		expect(
+			resolveHttpProxyUrlForTarget("https://bedrock-runtime.us-east-1.amazonaws.com", { [key]: "" }),
+		).toBeUndefined();
+	});
+
 	it.each([
 		"http://audit-user:audit-secret@proxy.example:bad",
 		"http://audit-user:audit-secret@[broken",

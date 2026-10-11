@@ -19,7 +19,7 @@ export type OAuthDeviceCodePollOptions<T> = {
 	intervalSeconds?: number;
 	expiresInSeconds?: number;
 	waitBeforeFirstPoll?: boolean;
-	poll: () => Promise<OAuthDeviceCodePollResult<T>>;
+	poll: (signal: AbortSignal) => Promise<OAuthDeviceCodePollResult<T>>;
 	signal: AbortSignal;
 };
 
@@ -40,6 +40,52 @@ export function abortableSleep(ms: number, signal: AbortSignal, cancelMessage: s
 		}, ms);
 
 		signal.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+async function pollWithDeadline<T>(
+	poll: (signal: AbortSignal) => Promise<T>,
+	signal: AbortSignal,
+	remainingMs: number,
+	timeoutMessage: string,
+): Promise<T> {
+	return new Promise((resolve, reject) => {
+		const pollController = new AbortController();
+		let settled = false;
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+
+		const cleanup = () => {
+			if (timeout !== undefined) clearTimeout(timeout);
+			signal.removeEventListener("abort", onCancel);
+		};
+		const finish = (callback: () => void) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			callback();
+		};
+		const onCancel = () => {
+			pollController.abort();
+			finish(() => reject(new Error(CANCEL_MESSAGE)));
+		};
+		const onTimeout = () => {
+			pollController.abort();
+			finish(() => reject(new Error(timeoutMessage)));
+		};
+
+		if (signal.aborted) {
+			onCancel();
+			return;
+		}
+		signal.addEventListener("abort", onCancel, { once: true });
+		if (Number.isFinite(remainingMs)) timeout = setTimeout(onTimeout, Math.max(0, remainingMs));
+
+		Promise.resolve()
+			.then(() => poll(pollController.signal))
+			.then(
+				(value) => finish(() => resolve(value)),
+				(error: unknown) => finish(() => reject(error)),
+			);
 	});
 }
 
@@ -66,7 +112,10 @@ export async function pollOAuthDeviceCodeFlow<T>(options: OAuthDeviceCodePollOpt
 			throw new Error(CANCEL_MESSAGE);
 		}
 
-		const result = await options.poll();
+		const remainingPollMs = deadline - Date.now();
+		const timeoutMessage = slowDownResponses > 0 ? SLOW_DOWN_TIMEOUT_MESSAGE : TIMEOUT_MESSAGE;
+		const result = await pollWithDeadline(options.poll, options.signal, remainingPollMs, timeoutMessage);
+		if (Date.now() >= deadline) break;
 		if (result.status === "complete") {
 			return result.value;
 		}

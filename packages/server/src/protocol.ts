@@ -87,6 +87,7 @@ type _AiAssistantMessageFieldsAccountedFor = Assert<
 		| "provider"
 		| "model"
 		| "responseModel"
+		| "crossModelResponse"
 		| "responseId"
 		| "diagnostics"
 		| "usage"
@@ -142,7 +143,9 @@ function timestamp(value: number): number {
 export function toProtocolJsonValue(value: unknown, seen = new Set<object>()): JsonValue {
 	if (value === null || typeof value === "string" || typeof value === "boolean") return value;
 	if (typeof value === "number") {
-		if (!Number.isFinite(value)) throw new TypeError("Protocol JSON numbers must be finite");
+		if (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value))) {
+			throw new TypeError("Protocol JSON numbers must be finite and use safe integers");
+		}
 		return value;
 	}
 	if (typeof value !== "object") throw new TypeError(`Unsupported protocol JSON value: ${typeof value}`);
@@ -172,7 +175,11 @@ export function toProtocolJsonValue(value: unknown, seen = new Set<object>()): J
 /** Lossily sanitize diagnostic tool details that must not affect execution semantics. */
 export function sanitizeProtocolDetails(value: unknown, seen = new Set<object>()): JsonValue | undefined {
 	if (value === null || typeof value === "string" || typeof value === "boolean") return value;
-	if (typeof value === "number") return Number.isFinite(value) ? value : String(value);
+	if (typeof value === "number") {
+		return Number.isFinite(value) && (!Number.isInteger(value) || Number.isSafeInteger(value))
+			? value
+			: String(value);
+	}
 	if (typeof value === "bigint") return value.toString();
 	if (value === undefined || typeof value === "function" || typeof value === "symbol") return undefined;
 	if (value instanceof Date) return Number.isNaN(value.getTime()) ? "Invalid Date" : value.toISOString();
@@ -310,6 +317,7 @@ export function toProtocolAssistantMessage(
 		...(message.responseModel === undefined
 			? {}
 			: { responseModel: identifier(message.responseModel, "Assistant response model") }),
+		...(message.crossModelResponse === undefined ? {} : { crossModelResponse: message.crossModelResponse }),
 		...(usage ? { usage } : {}),
 		timestamp: timestamp(message.timestamp),
 	} as const;

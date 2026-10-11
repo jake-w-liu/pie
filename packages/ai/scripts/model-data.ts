@@ -17,6 +17,27 @@ export interface ModelDataManifest {
 const MODEL_DATA_IMPORT_PATTERN =
 	/^import \{ [A-Z][A-Z0-9_]*_MODELS \} from "\.\/providers\/([^"/]+)\.models\.ts";$/gm;
 
+/**
+ * models.dev encodes "the price depends on which upstream this router picks" as
+ * -1000000. The generator drops those models from the catalog, but they stay in
+ * the hydrated shard, so the shard validator has to accept the sentinel while
+ * still rejecting negative rates that would produce negative billed cost.
+ */
+export const UNKNOWN_PRICING_SENTINEL = -1000000;
+
+const COST_RATE_FIELDS = ["input", "output", "cacheRead", "cacheWrite"] as const;
+
+/** True when a flat cost rate carries the sentinel that the published catalog must not contain. */
+export function hasUnknownPricing(cost: unknown): boolean {
+	if (typeof cost !== "object" || cost === null || Array.isArray(cost)) return false;
+	const rates = cost as Record<string, unknown>;
+	return COST_RATE_FIELDS.some((field) => rates[field] === UNKNOWN_PRICING_SENTINEL);
+}
+
+function isValidRate(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && (value >= 0 || value === UNKNOWN_PRICING_SENTINEL);
+}
+
 function sha256(value: string): string {
 	return createHash("sha256").update(value).digest("hex");
 }
@@ -175,10 +196,43 @@ function validateModelValue(
 	if (!isRecord(value.cost)) {
 		errors.push(`${label} has invalid cost metadata`);
 	} else {
-		for (const field of ["input", "output", "cacheRead", "cacheWrite"] as const) {
-			const cost = value.cost[field];
-			if (typeof cost !== "number" || !Number.isFinite(cost)) {
-				errors.push(`${label} has invalid cost.${field}`);
+		const validateRates = (rates: Record<string, unknown>, path: string): void => {
+			for (const field of ["input", "output", "cacheRead", "cacheWrite"] as const) {
+				if (!isValidRate(rates[field])) {
+					errors.push(`${label} has invalid ${path}.${field}`);
+				}
+			}
+		};
+		validateRates(value.cost, "cost");
+		if (value.cost.tiers !== undefined) {
+			if (!Array.isArray(value.cost.tiers)) {
+				errors.push(`${label} has invalid cost.tiers`);
+			} else {
+				let previousThreshold = -1;
+				for (const [index, tier] of value.cost.tiers.entries()) {
+					if (!isRecord(tier)) {
+						errors.push(`${label} has invalid cost.tiers[${index}]`);
+						continue;
+					}
+					validateRates(tier, `cost.tiers[${index}]`);
+					if (
+						typeof tier.inputTokensAbove !== "number" ||
+						!Number.isFinite(tier.inputTokensAbove) ||
+						tier.inputTokensAbove < 0 ||
+						tier.inputTokensAbove <= previousThreshold
+					) {
+						errors.push(`${label} has invalid or unordered cost.tiers[${index}].inputTokensAbove`);
+					} else {
+						previousThreshold = tier.inputTokensAbove;
+					}
+				}
+			}
+		}
+		if (value.cost.peak !== undefined) {
+			if (!isRecord(value.cost.peak) || !isRecord(value.cost.peak.rates)) {
+				errors.push(`${label} has invalid cost.peak metadata`);
+			} else {
+				validateRates(value.cost.peak.rates, "cost.peak.rates");
 			}
 		}
 	}

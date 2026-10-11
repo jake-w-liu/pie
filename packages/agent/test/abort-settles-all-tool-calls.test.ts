@@ -57,6 +57,43 @@ function collect(executed: string[]): AgentTool<never> {
 }
 
 describe("aborting a tool batch still answers every tool call", () => {
+	it("does not start another provider turn after an aborted tool", async () => {
+		let providerCalls = 0;
+		const streamFn: StreamFn = () => {
+			providerCalls++;
+			if (providerCalls === 1) return streamToolCalls()({} as never, {} as never, {} as never);
+			const stream = createAssistantMessageEventStream();
+			const message: AssistantMessage = {
+				role: "assistant",
+				content: [],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "aborted",
+				timestamp: 1,
+			};
+			stream.push({ type: "error", reason: "aborted", error: message });
+			return stream;
+		};
+		const agent = new Agent({ initialState: { model, tools: [collect([])] }, streamFn });
+		agent.subscribe((event) => {
+			if (event.type === "tool_execution_start") agent.abort();
+		});
+
+		await agent.prompt("run tools");
+
+		expect(providerCalls).toBe(1);
+		expect(agent.state.messages.filter((message) => message.role === "toolResult")).toHaveLength(CALL_IDS.length);
+	});
+
 	it.each(["sequential", "parallel"] as const)(
 		"%s leaves no tool call unanswered after an abort mid-batch",
 		async (toolExecution) => {

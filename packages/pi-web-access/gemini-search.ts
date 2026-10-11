@@ -976,9 +976,8 @@ async function resolveGroundingChunks(
 ): Promise<SearchResult[]> {
 	if (!chunks?.length) return [];
 
-	const results: SearchResult[] = [];
-	for (const chunk of chunks) {
-		if (!chunk.web) continue;
+	const resolvedResults = await Promise.all(chunks.map(async (chunk): Promise<SearchResult | null> => {
+		if (!chunk.web) return null;
 		const title = chunk.web.title || "";
 		let url = chunk.web.uri || "";
 
@@ -987,9 +986,9 @@ async function resolveGroundingChunks(
 			if (resolved) url = resolved;
 		}
 
-		if (url) results.push({ title, url, snippet: "" });
-	}
-	return results;
+		return url ? { title, url, snippet: "" } : null;
+	}));
+	return resolvedResults.filter((result): result is SearchResult => result !== null);
 }
 
 async function resolveRedirect(proxyUrl: string, signal?: AbortSignal): Promise<string | null> {
@@ -1006,7 +1005,9 @@ async function resolveRedirect(proxyUrl: string, signal?: AbortSignal): Promise<
 			]),
 		});
 		return res.headers.get("location") || null;
-	} catch {
+	} catch (err) {
+		if (signal?.aborted) throw signal.reason ?? err;
+		if (err instanceof Error && err.name === "AbortError") throw err;
 		return null;
 	}
 }

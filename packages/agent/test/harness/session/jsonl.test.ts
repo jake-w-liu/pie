@@ -123,6 +123,17 @@ describe("JSONL v4 persistence", () => {
 		await expect(repository.open({ ...metadata, id: "wrong-id" })).rejects.toMatchObject({ code: "invalid_entry" });
 	});
 
+	it("requests a durable flush before acknowledging mutations", async () => {
+		const root = createTempDir();
+		const env = new NodeExecutionEnv({ cwd: root });
+		const append = vi.spyOn(env, "appendFile");
+		const session = await new JsonlSessionRepo({ fs: env, sessionsRoot: root }).create({ id: "durable", cwd: root });
+
+		await session.appendCustomEntry("durable");
+
+		expect(append).toHaveBeenLastCalledWith(expect.any(String), expect.any(String), undefined, { flush: true });
+	});
+
 	it("deduplicates concurrent initial opens before admitting writes", async () => {
 		const root = createTempDir();
 		const source = await createRepository(root).create({ id: "initial-opens", cwd: root });

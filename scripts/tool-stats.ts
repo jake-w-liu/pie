@@ -17,20 +17,22 @@ interface ToolCallInfo { toolName: string; bashCommand?: string }
 
 const BUCKETS = [0, 50, 100, 250, 500, 1000, 2000, 4000, 8000, 16000, 32000, Number.POSITIVE_INFINITY];
 
-function parseArgs(): { sessionsDir: string; output: string } {
+function parseArgs(): { sessionsDir: string; output: string; open: boolean } {
 	let sessionsDir = join(homedir(), ".pi", "agent", "sessions");
 	let output = join(tmpdir(), "pi-tool-stats.html");
+	let open = true;
 	const args = process.argv.slice(2);
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
 		if (arg === "--sessions-dir" && args[i + 1]) sessionsDir = resolve(args[++i]);
 		else if ((arg === "--output" || arg === "-o") && args[i + 1]) output = resolve(args[++i]);
+		else if (arg === "--no-open") open = false;
 		else if (arg === "--help" || arg === "-h") {
-			console.log(`Usage: scripts/tool-stats.ts [--sessions-dir <dir>] [--output <file.html>]`);
+			console.log(`Usage: scripts/tool-stats.ts [--sessions-dir <dir>] [--output <file.html>] [--no-open]`);
 			process.exit(0);
 		}
 	}
-	return { sessionsDir, output };
+	return { sessionsDir, output, open };
 }
 
 function jsonlFiles(dir: string): string[] {
@@ -104,7 +106,7 @@ function bucketLabels(): string[] {
 	});
 }
 
-const { sessionsDir, output } = parseArgs();
+const { sessionsDir, output, open } = parseArgs();
 if (!existsSync(sessionsDir)) throw new Error(`Sessions directory not found: ${sessionsDir}`);
 
 const tools = new Map<string, ToolStats>();
@@ -151,6 +153,8 @@ for (const file of files) {
 const toolRows = [...tools.entries()].map(([name, s]) => ({ name, ...s, avg: s.results ? s.estimatedTokens / s.results : 0, histogram: bucketCounts(s.samples) })).sort((a, b) => b.estimatedTokens - a.estimatedTokens);
 const bashRows = [...bashCommands.entries()].map(([name, s]) => ({ name, ...s, avg: s.samples.length ? s.estimatedTokens / s.samples.length : 0, histogram: bucketCounts(s.samples) })).sort((a, b) => b.estimatedTokens - a.estimatedTokens).slice(0, 50);
 const data = { generatedAt: new Date().toISOString(), sessionsDir, files: files.length, parseErrors, bucketLabels: bucketLabels(), tools: toolRows, bashCommands: bashRows };
+const escapeHtml = (value: string): string => value.replace(/[&<>"']/g, character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]!);
+const serializedData = JSON.stringify(data).replace(/</g, "\\u003c").replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
 
 const html = `<!doctype html>
 <html>
@@ -163,7 +167,7 @@ const html = `<!doctype html>
 <body class="bg-zinc-950 text-zinc-100 p-6">
 	<main class="max-w-7xl mx-auto space-y-6">
 		<h1 class="text-3xl font-bold">Pi Tool Stats</h1>
-		<p class="text-zinc-400">${data.files} session files from <code>${sessionsDir}</code>. Generated ${data.generatedAt}.</p>
+		<p class="text-zinc-400">${data.files} session files from <code>${escapeHtml(sessionsDir)}</code>. Generated ${data.generatedAt}.</p>
 		<section class="grid md:grid-cols-2 gap-6">
 			<div class="bg-zinc-900 rounded p-4"><h2 class="font-semibold mb-3">Estimated result tokens by tool</h2><canvas id="tokens"></canvas></div>
 			<div class="bg-zinc-900 rounded p-4"><h2 class="font-semibold mb-3">Tool calls</h2><canvas id="calls"></canvas></div>
@@ -192,8 +196,9 @@ const html = `<!doctype html>
 			<div id="bash" class="mt-4"></div>
 		</section>
 	</main>
+	<script type="application/json" id="report-data">${serializedData}</script>
 	<script>
-		const data=${JSON.stringify(data)};
+		const data=JSON.parse(document.getElementById('report-data').textContent);
 		function fmt(n){return Math.round(n).toLocaleString()}
 		function esc(s){return String(s).replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 		function table(rows,el){
@@ -229,4 +234,4 @@ const html = `<!doctype html>
 mkdirSync(resolve(output, ".."), { recursive: true });
 writeFileSync(output, html);
 console.log(`Wrote ${output}`);
-openBrowser(output);
+if (open) openBrowser(output);

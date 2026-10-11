@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import type { ExtractedContent, ExtractOptions } from "./extract.ts";
 import { checkGhAvailable, showGhHint } from "./github-api.ts";
 import { fetchRemoteUrl, loadFetchContentDomainPolicy, loadSsrfConfig } from "./ssrf-protection.ts";
-import { getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
+import { getWebSearchConfigPath, jsonParseDiagnostic, proxyChildEnv } from "./utils.ts";
 
 const CONFIG_PATH = getWebSearchConfigPath();
 const GH_TIMEOUT_MS = 10_000;
@@ -156,7 +156,7 @@ function runGh(args: string[], timeoutMs = GH_TIMEOUT_MS, signal?: AbortSignal):
 			timeout: timeoutMs,
 			maxBuffer: 10 * 1024 * 1024,
 			...(signal ? { signal } : {}),
-			env: { ...process.env, GH_PROMPT_DISABLED: "1", GIT_TERMINAL_PROMPT: "0" },
+			env: { ...proxyChildEnv(), GH_PROMPT_DISABLED: "1", GIT_TERMINAL_PROMPT: "0" },
 		}, (err, stdout, stderr) => {
 			const nodeErr = err as NodeJS.ErrnoException | null;
 			resolve({

@@ -691,8 +691,8 @@ function parseKittySequence(data: string): ParsedKittySequence | null {
 		}
 	}
 
-	// Function keys F1-F4: CSI 1;<mod>:<event> P/Q/R/S, or the unmodified CSI P/Q/R/S.
-	const functionKeyMatch = data.match(/^\x1b(?:\[1|O)?(?:;(\d+))?(?::(\d+))?([PQRS])$/);
+	// Function keys F1-F4: CSI 1;<mod>:<event> P/Q/R/S, or unmodified SS3 O P/Q/R/S.
+	const functionKeyMatch = data.match(/^\x1b(?:\[1|O)(?:;(\d+))?(?::(\d+))?([PQRS])$/);
 	if (functionKeyMatch) {
 		const codepoint = FUNCTION_KEY_CSI_FINAL[functionKeyMatch[3]!];
 		if (codepoint !== undefined) {

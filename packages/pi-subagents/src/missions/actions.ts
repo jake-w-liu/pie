@@ -250,10 +250,10 @@ function refreshLinkedRunStatus(location: MissionStoreLocation, record: MissionR
 	const states = merged.map((run) => run.status);
 	const status: MissionStatus = record.status === "completed" || record.status === "failed" || record.status === "cancelled"
 		? record.status
-		: record.goal && !states.some((state) => state === "queued" || state === "running" || state === "active")
-		? "active"
 		: states.some((state) => state === "queued" || state === "running" || state === "active")
 		? "active"
+		: record.goal
+			? record.status
 		: states.some((state) => state === "paused")
 			? "waiting"
 			: states.some((state) => state === "failed")

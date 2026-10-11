@@ -289,6 +289,8 @@ export interface LogOptions {
 
 export interface SessionStorage<TMetadata extends SessionMetadata = SessionMetadata> {
 	getMetadata(): Promise<TMetadata>;
+	/** Release backend resources such as an exclusive writer claim. Idempotent when implemented. */
+	close?(): Promise<void>;
 
 	// Lanes
 	getLanes(): Promise<{ lane: string; leafId: string | null }[]>;

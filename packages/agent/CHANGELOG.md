@@ -7,6 +7,10 @@
 - `JsonlSessionRepoFileSystem` now requires the existing `FileSystem.canonicalPath()` operation. Custom JSONL filesystems must implement symlink-aware canonical resolution and propagate resolution failures. Repository metadata file paths are canonical; header `cwd` spelling is unchanged.
 - Changed `prepareNextTurn` and `prepareNextTurnWithContext` to run only after `shouldStopAfterTurn` and queued-message checks determine that the agent loop will start another assistant turn. They no longer run after final or terminating turns; move end-of-run work to `agent_end` handling ([#6879](https://github.com/earendil-works/pi/issues/6879)).
 
+### Added
+
+- Added a cross-process writer lease for JSONL sessions: opening a session for writing claims a sibling lock directory, renews a heartbeat while it is held, and can take over a lease whose holder stopped renewing, so two processes can no longer interleave appends into one session file. Read-only opens hold no claim, never repair the file, and refuse mutations.
+
 ### Fixed
 - Revalidated JSONL identities at admission, redirecting only after releasing stale file/directory queues and failing bounded repeated churn. Case-only generation replacement cannot leave a deleted writer unsealed or publish an independent stale-key writer; both-missing retargeted directory-alias deletion now selects the proved current owner without sealing the healthy historical owner.
 - Coordinated canonical JSONL publication with existing-file open/delete, including symlink aliases. Successful deletion now seals live writers without resurrecting headerless logs; failed deletions preserve usable handles and idle publication-queue records are reclaimed.
@@ -41,6 +45,9 @@
 - Fixed harness branch summaries dropping tool results and cumulative file tracking from earlier compactions; large tool results are now budgeted at their bounded serialized size.
 - Fixed `prepareNextTurn` compaction deciding the run must stop (e.g. required compaction cancelled or context still overflowing) after the loop had already committed to the next provider request; the loop now re-checks the stop condition after preparation so no request is made.
 - Fixed Windows `NodeExecutionEnv` aborts crashing when `taskkill.exe` is unavailable on `PATH` ([#6596](https://github.com/earendil-works/pi/issues/6596)).
+- Fixed a crash between claiming the JSONL writer lease and publishing its owner record leaving a session permanently unwritable. A lease whose owner record is missing or unreadable is reclaimed once the lock directory itself is stale, while a concurrent acquisition is still reported as in progress.
+- Fixed the edit tool inserting a replacement at the start of the file when the matched text was only whitespace, which the fuzzy matcher treated as an empty pattern that "matched" at offset 0; such an edit now reports the text as not found and leaves the file untouched.
+- Fixed fuzzy edit matches being applied in normalized space, which rewrote untouched bytes and converted a file's original line endings. Matches are now mapped back to the original content, so every byte outside the matched ranges and the file's own line endings are preserved.
 
 ## [0.84.3] - 2026-08-24
 

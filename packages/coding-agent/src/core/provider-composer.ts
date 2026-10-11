@@ -258,16 +258,37 @@ function adaptOAuth(config: ExtensionOAuthConfig): OAuthAuth {
 	};
 }
 
-function withConfiguredAuth(
-	auth: ModelAuth,
-	headers: Record<string, string> | undefined,
-	authHeader: boolean,
-): ModelAuth {
-	let mergedHeaders: ProviderHeaders | undefined =
-		auth.headers || headers ? { ...auth.headers, ...headers } : undefined;
+function mergeHeadersCaseInsensitive(...sources: Array<ProviderHeaders | undefined>): ProviderHeaders | undefined {
+	const merged: ProviderHeaders = {};
+	for (const source of sources) {
+		for (const [name, value] of Object.entries(source ?? {})) {
+			const existing = Object.keys(merged).find((candidate) => candidate.toLowerCase() === name.toLowerCase());
+			if (existing !== undefined) delete merged[existing];
+			merged[name] = value;
+		}
+	}
+	return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+/**
+ * `ProviderHeaders` values may be null, which documents "this header is unset".
+ * Template resolution and request assembly work on concrete strings, so nulls are
+ * dropped here, matching how the ai package applies provider headers.
+ */
+function concreteHeaders(headers: ProviderHeaders | undefined): Record<string, string> | undefined {
+	if (!headers) return undefined;
+	const concrete: Record<string, string> = {};
+	for (const [name, value] of Object.entries(headers)) {
+		if (value !== null) concrete[name] = value;
+	}
+	return Object.keys(concrete).length > 0 ? concrete : undefined;
+}
+
+function withConfiguredAuth(auth: ModelAuth, headers: ProviderHeaders | undefined, authHeader: boolean): ModelAuth {
+	let mergedHeaders = mergeHeadersCaseInsensitive(auth.headers, headers);
 	if (authHeader) {
 		if (!auth.apiKey) throw new Error("authHeader requires a resolved API key");
-		mergedHeaders = { ...mergedHeaders, Authorization: `Bearer ${auth.apiKey}` };
+		mergedHeaders = mergeHeadersCaseInsensitive(mergedHeaders, { Authorization: `Bearer ${auth.apiKey}` });
 	}
 	return { ...auth, headers: mergedHeaders };
 }
@@ -282,9 +303,8 @@ function configuredApiKey(
 function configuredHeaders(
 	config: ModelsJsonProvider | undefined,
 	extension: ProviderConfigInput | undefined,
-): Record<string, string> | undefined {
-	if (!config?.headers && !extension?.headers) return undefined;
-	return { ...config?.headers, ...extension?.headers };
+): ProviderHeaders | undefined {
+	return mergeHeadersCaseInsensitive(config?.headers, extension?.headers);
 }
 
 async function configContextEnv(
@@ -360,8 +380,9 @@ function composeApiKeyAuth(
 			}
 			if (!result) return undefined;
 			const explicitEnv = { ...(input.credential?.env ?? {}), ...(result.env ?? {}) };
-			const headerEnv = await configContextEnv(Object.values(rawHeaders ?? {}), input.ctx, explicitEnv);
-			const headers = resolveHeadersOrThrow(rawHeaders, `provider "${providerId}"`, headerEnv);
+			const concrete = concreteHeaders(rawHeaders);
+			const headerEnv = await configContextEnv(Object.values(concrete ?? {}), input.ctx, explicitEnv);
+			const headers = resolveHeadersOrThrow(concrete, `provider "${providerId}"`, headerEnv);
 			return { ...result, auth: withConfiguredAuth(result.auth, headers, authHeader) };
 		},
 	};
@@ -383,7 +404,7 @@ function composeOAuthAuth(
 			const auth = await oauth.toAuth(credential);
 			const env = credential.env;
 			const headers = resolveHeadersOrThrow(
-				rawHeaders,
+				concreteHeaders(rawHeaders),
 				`provider "${providerId}"`,
 				typeof env === "object" && env !== null ? (env as Record<string, string>) : undefined,
 			);
@@ -396,15 +417,14 @@ function rawModelHeaders(
 	model: Model<Api>,
 	config: ModelsJsonProvider | undefined,
 	extension: ProviderConfigInput | undefined,
-): Record<string, string> | undefined {
+): ProviderHeaders | undefined {
 	const definition = config?.models?.find((entry) => entry.id === model.id);
 	const extensionModel = extension?.models?.find((entry) => entry.id === model.id);
-	const headers = {
-		...config?.modelOverrides?.[model.id]?.headers,
-		...definition?.headers,
-		...extensionModel?.headers,
-	};
-	return Object.keys(headers).length > 0 ? headers : undefined;
+	return mergeHeadersCaseInsensitive(
+		config?.modelOverrides?.[model.id]?.headers,
+		definition?.headers,
+		extensionModel?.headers,
+	);
 }
 
 export function validateExtensionProvider(
@@ -532,7 +552,7 @@ export function resolveConfiguredModelHeaders(
 	env?: Record<string, string>,
 ): Record<string, string> | undefined {
 	return resolveHeadersOrThrow(
-		rawModelHeaders(model, config, extension),
+		concreteHeaders(rawModelHeaders(model, config, extension)),
 		`model "${model.provider}/${model.id}"`,
 		env,
 	);
@@ -549,11 +569,14 @@ export function resolveCompatibilityRequestConfig(
 	extension: ProviderConfigInput | undefined,
 ): CompatibilityRequestConfig {
 	const configured = resolveHeadersOrThrow(
-		{ ...configuredHeaders(config, extension), ...rawModelHeaders(model, config, extension) },
+		{
+			...concreteHeaders(configuredHeaders(config, extension)),
+			...concreteHeaders(rawModelHeaders(model, config, extension)),
+		},
 		`model "${model.provider}/${model.id}"`,
 	);
 	return {
-		headers: model.headers || configured ? { ...model.headers, ...configured } : undefined,
+		headers: mergeHeadersCaseInsensitive(model.headers, configured),
 		authHeader: extension?.authHeader ?? config?.authHeader ?? false,
 	};
 }

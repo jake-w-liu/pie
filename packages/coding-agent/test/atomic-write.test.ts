@@ -1,4 +1,13 @@
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+	lstatSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -67,5 +76,18 @@ describe("atomic-write", () => {
 		const target = join(d, "secret.txt");
 		atomicWriteFileSync(target, "secret", { mode: 0o600 });
 		expect(statSync(target).mode & 0o777).toBe(0o600);
+	});
+
+	it("updates a symlink target without replacing the link or its mode", () => {
+		const d = freshDir();
+		const target = join(d, "settings.json");
+		const link = join(d, "settings-link.json");
+		writeFileSync(target, "old", { mode: 0o600 });
+		symlinkSync(target, link);
+		atomicWriteFileSync(link, "new");
+		expect(readFileSync(target, "utf8")).toBe("new");
+		expect(statSync(target).mode & 0o777).toBe(0o600);
+		expect(readFileSync(link, "utf8")).toBe("new");
+		expect(lstatSync(link).isSymbolicLink()).toBe(true);
 	});
 });

@@ -28,6 +28,7 @@ import {
 	PiServerError,
 } from "./errors.ts";
 import type { PiServerListener } from "./listener.ts";
+import { sanitizeProtocolDetails } from "./protocol.ts";
 import { LiveSessionManager } from "./sessions.ts";
 import { ServerSnapshotPublisher } from "./snapshots.ts";
 import type { PiServerOptions, PiServerService } from "./types.ts";
@@ -357,9 +358,10 @@ export class PiServer {
 			if (error.code === "not_implemented") {
 				return { code: "not_implemented", message: NOT_IMPLEMENTED_MESSAGE };
 			}
-			return error.details === undefined
+			const details = sanitizeProtocolDetails(error.details);
+			return details === undefined
 				? { code: error.code, message: error.message }
-				: { code: error.code, message: error.message, details: error.details };
+				: { code: error.code, message: error.message, details };
 		}
 		if (error instanceof ProtocolValidationError) {
 			return { code: "invalid_request", message: error.message };

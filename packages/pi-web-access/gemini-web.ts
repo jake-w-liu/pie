@@ -34,7 +34,8 @@ const REQUIRED_COOKIES = ["__Secure-1PSID", "__Secure-1PSIDTS"];
 // through a dedicated undici Agent with a larger header budget instead; fall
 // back to the ambient global fetch when undici is not resolvable (e.g.
 // standalone test environments).
-let geminiFetchImpl: typeof fetch | null = null;
+type ClosableGeminiFetch = typeof fetch & { close?: () => Promise<void> };
+let geminiFetchImpl: ClosableGeminiFetch | null = null;
 
 // Test-only hook: lets tests inject a simulated transport instead of patching
 // globalThis.fetch. Gemini Web deliberately bypasses the ambient global fetch
@@ -52,11 +53,12 @@ let geminiFetchOverride: typeof fetch | null = null;
 // Google's /app page exceeds undici's default 16 KiB maxHeaderSize when
 // served over HTTP/1.1, which is how pi's global dispatcher operates.
 export const GEMINI_MAX_HEADER_SIZE = 4 * 1024 * 1024;
+export const GEMINI_DISPATCHER_CACHE_SIZE = 16;
 
 // Build a fetch that routes through a dedicated undici Agent with a larger
 // header budget than the host agent's global dispatcher allows. Exported for
 // tests so the agent configuration can be asserted without network access.
-export function createGeminiFetch(undiciImpl: typeof import("undici")): typeof fetch {
+export function createGeminiFetch(undiciImpl: typeof import("undici")): ClosableGeminiFetch {
 	const baseOptions = {
 		allowH2: false,
 		connectTimeout: 30_000,
@@ -69,36 +71,57 @@ export function createGeminiFetch(undiciImpl: typeof import("undici")): typeof f
 	// routing decision so requests share connections.
 	type UndiciDispatcher = InstanceType<typeof undiciImpl.Dispatcher>;
 	const dispatchers = new Map<string, UndiciDispatcher>();
+	const closeDispatcher = async (dispatcher: UndiciDispatcher): Promise<void> => {
+		const close = (dispatcher as UndiciDispatcher & { close?: () => Promise<void> }).close;
+		if (typeof close === "function") await close.call(dispatcher);
+	};
+	const rememberDispatcher = (key: string, dispatcher: UndiciDispatcher): UndiciDispatcher => {
+		dispatchers.delete(key);
+		dispatchers.set(key, dispatcher);
+		if (dispatchers.size > GEMINI_DISPATCHER_CACHE_SIZE) {
+			const oldestKey = dispatchers.keys().next().value;
+			if (oldestKey !== undefined) {
+				const oldest = dispatchers.get(oldestKey);
+				dispatchers.delete(oldestKey);
+				if (oldest) void closeDispatcher(oldest).catch(() => undefined);
+			}
+		}
+		return dispatcher;
+	};
 	const dispatcherFor = (): UndiciDispatcher => {
 		if (!hasScopedProxyDecision()) {
-			let dispatcher = dispatchers.get("env");
-			if (!dispatcher) {
-				dispatcher = new undiciImpl.EnvHttpProxyAgent(baseOptions);
-				dispatchers.set("env", dispatcher);
-			}
-			return dispatcher;
+			const dispatcher = dispatchers.get("env") ?? new undiciImpl.EnvHttpProxyAgent(baseOptions);
+			return rememberDispatcher("env", dispatcher);
 		}
 		const proxy = getActiveProxy();
 		const key = proxy ?? "direct";
-		let dispatcher = dispatchers.get(key);
-		if (!dispatcher) {
-			dispatcher = proxy
-				? new undiciImpl.ProxyAgent({ ...baseOptions, uri: proxy })
-				: new undiciImpl.Agent(baseOptions);
-			dispatchers.set(key, dispatcher);
-		}
-		return dispatcher;
+		const dispatcher = dispatchers.get(key) ?? (proxy
+			? new undiciImpl.ProxyAgent({ ...baseOptions, uri: proxy })
+			: new undiciImpl.Agent(baseOptions));
+		return rememberDispatcher(key, dispatcher);
 	};
 	// undici 8 types its fetch request/response structurally differently from
 	// the DOM lib types (duplex/textStream on Request, Symbol.dispose on
 	// Headers); the shape this module uses (status, ok, headers.get, text) is
 	// identical, so bridge the two.
 	type UndiciFetch = typeof undiciImpl.fetch;
-	return (input, init) => fetchWithResponseErrors(dispatcherFor(), (dispatcher) =>
+	const geminiFetch: ClosableGeminiFetch = (input, init) => fetchWithResponseErrors(dispatcherFor(), (dispatcher) =>
 		undiciImpl.fetch(
 			input as unknown as Parameters<UndiciFetch>[0],
 			{ ...init, dispatcher } as unknown as Parameters<UndiciFetch>[1],
 		) as unknown as Promise<Response>, init?.signal);
+	geminiFetch.close = async () => {
+		const retained = [...dispatchers.values()];
+		dispatchers.clear();
+		await Promise.allSettled(retained.map(closeDispatcher));
+	};
+	return geminiFetch;
+}
+
+export async function closeGeminiFetch(): Promise<void> {
+	const fetchImpl = geminiFetchImpl;
+	geminiFetchImpl = null;
+	await fetchImpl?.close?.();
 }
 
 export async function resolveGeminiFetch(): Promise<typeof fetch> {

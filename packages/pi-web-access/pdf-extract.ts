@@ -7,8 +7,9 @@
  * `pdf.provider`.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { writeFile, mkdir } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { join, basename } from "node:path";
 import { tmpdir } from "node:os";
 import { CredentialResolutionError } from "./credential-source.ts";
@@ -61,8 +62,20 @@ export const DEFAULT_PDF_MAX_SIZE_MB = 20;
 export const MAX_PDF_MAX_SIZE_MB = 50;
 export const MAX_DATALAB_TIMEOUT_MS = 300_000;
 const DEFAULT_MAX_PAGES = 100;
-const DEFAULT_OUTPUT_DIR = join(tmpdir(), "pi-web-pdf");
+const PDF_OUTPUT_PREFIX = join(tmpdir(), "pi-web-pdf-");
 const CONFIG_PATH = getWebSearchConfigPath();
+let sessionOutputDir: string | null = null;
+
+function defaultOutputDir(): string {
+	sessionOutputDir ??= mkdtempSync(PDF_OUTPUT_PREFIX);
+	return sessionOutputDir;
+}
+
+export function clearPdfArtifacts(): void {
+	if (!sessionOutputDir) return;
+	try { rmSync(sessionOutputDir, { recursive: true, force: true }); } catch {}
+	sessionOutputDir = null;
+}
 const PAGE_MARKER_PATTERN = /^<!-- Page (\d+) -->$/gm;
 
 export function loadPDFConfig(): PDFConfig {
@@ -165,7 +178,7 @@ export async function extractPDFToMarkdown(
 ): Promise<PDFExtractResult> {
 	const {
 		maxPages,
-		outputDir = DEFAULT_OUTPUT_DIR,
+		outputDir = defaultOutputDir(),
 		filename,
 		signal,
 		geminiTimeoutMs,
@@ -370,8 +383,8 @@ async function writeMarkdownResult(options: {
 }
 
 async function writeUnique(dir: string, baseName: string, content: string): Promise<string> {
-	for (let i = 0; i < 100; i++) {
-		const outputPath = join(dir, i === 0 ? `${baseName}.md` : `${baseName}-${i}.md`);
+	for (let attempt = 0; attempt < 10; attempt++) {
+		const outputPath = join(dir, `${baseName}-${randomUUID()}.md`);
 		try {
 			await writeFile(outputPath, content, { encoding: "utf-8", flag: "wx" });
 			return outputPath;

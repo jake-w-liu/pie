@@ -139,6 +139,47 @@ describe("v4 branch summarization", () => {
 		expect(result.modifiedFiles).toEqual(["changed-before.ts"]);
 	});
 
+	it("returns aborted completions as BranchSummaryError Results", async () => {
+		const entries: Entry[] = [
+			{
+				type: "message",
+				id: "user",
+				parentId: null,
+				seq: 1,
+				timestamp: 1,
+				message: message("summarize"),
+			},
+		];
+		const models = createModels();
+		const faux = fauxProvider({ provider: "branch-abort", models: [{ id: "model" }] });
+		models.setProvider(faux.provider);
+		const controller = new AbortController();
+		controller.abort();
+
+		const result = await generateBranchSummary(entries, {
+			models,
+			model: faux.getModel(),
+			signal: controller.signal,
+		});
+
+		expect(result).toMatchObject({ ok: false, error: { name: "BranchSummaryError", code: "aborted" } });
+
+		faux.setResponses([
+			() => {
+				throw new Error("provider exploded");
+			},
+		]);
+		const providerFailure = await generateBranchSummary(entries, {
+			models,
+			model: faux.getModel(),
+			signal: new AbortController().signal,
+		});
+		expect(providerFailure).toMatchObject({
+			ok: false,
+			error: { name: "BranchSummaryError", code: "summarization_failed" },
+		});
+	});
+
 	it("rejects truncated, tool-only, and empty branch summaries", async () => {
 		const branchEntries: Entry[] = [
 			{

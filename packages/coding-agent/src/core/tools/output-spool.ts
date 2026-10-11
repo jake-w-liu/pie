@@ -8,8 +8,11 @@ export class OutputSpool {
 	private readonly completion: Promise<void>;
 	private failure: { error: unknown } | undefined;
 	private closing = false;
+	private drainPromise: Promise<void> | undefined;
+	private resolveDrain: (() => void) | undefined;
 	private readonly onError = (error: Error): void => {
 		this.failure ??= { error };
+		this.resolveDrain?.();
 	};
 
 	constructor(filePath: string) {
@@ -29,14 +32,30 @@ export class OutputSpool {
 		}
 	}
 
-	write(data: string | Buffer): void {
-		if (!this.stream || this.failure || this.closing) return;
+	write(data: string | Buffer): boolean {
+		if (!this.stream || this.failure || this.closing) return true;
 		try {
-			this.stream.write(data);
+			const canContinue = this.stream.write(data);
+			if (!canContinue && !this.drainPromise) {
+				this.drainPromise = new Promise<void>((resolve) => {
+					this.resolveDrain = () => {
+						this.drainPromise = undefined;
+						this.resolveDrain = undefined;
+						resolve();
+					};
+					this.stream?.once("drain", this.resolveDrain);
+				});
+			}
+			return canContinue;
 		} catch (error) {
 			this.failure ??= { error };
 			this.stream.destroy();
+			return true;
 		}
+	}
+
+	async waitForDrain(): Promise<void> {
+		await this.drainPromise;
 	}
 
 	getPath(): string | undefined {
@@ -46,6 +65,9 @@ export class OutputSpool {
 	async close(): Promise<void> {
 		if (!this.closing) {
 			this.closing = true;
+			// Ending the stream settles a pending backpressure wait: `drain` may never fire once the
+			// stream ends, so a consumer waiting on it would stay paused forever.
+			this.resolveDrain?.();
 			try {
 				this.stream?.end();
 			} catch (error) {

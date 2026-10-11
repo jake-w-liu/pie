@@ -10,6 +10,7 @@ import { MISSION_BINDING_FILE } from "../../missions/lifecycle.ts";
 import { ACTIVE_RUN_INDEX_DIR } from "./active-run-index.ts";
 import { encodeIndexSegment } from "./index-segment.ts";
 import { reconcileAsyncRun } from "./stale-run-reconciler.ts";
+import { removeTerminalRunIndex } from "./terminal-run-index.ts";
 
 export const ASYNC_RETENTION_DAYS = 30;
 export const ASYNC_RETENTION_BATCH_SIZE = 100;
@@ -910,6 +911,7 @@ export async function cleanupAsyncRetention(options: AsyncRetentionOptions): Pro
 					}
 					mutationStateChanged = true;
 					fs.rmSync(runDir, { recursive: true });
+					removeTerminalRunIndex(options.asyncDirRoot, status!);
 					removeRunTombstoneMarker(maintenanceRoot, status!.runId);
 					result.reapedTombstones += 1;
 					deletedIds.push(`run-tombstone:${status!.runId}`);
@@ -939,6 +941,7 @@ export async function cleanupAsyncRetention(options: AsyncRetentionOptions): Pro
 					continue;
 				}
 				fs.rmSync(tombstone, { recursive: true });
+				removeTerminalRunIndex(options.asyncDirRoot, status!);
 				removeRunTombstoneMarker(maintenanceRoot, status!.runId);
 				result.deletedRuns += 1;
 				deletedIds.push(`run:${status!.runId}`);

@@ -330,11 +330,8 @@ function buildInstructions(options: SearchOptions): string {
 function buildWebSearchTool(options: SearchOptions): Record<string, unknown> {
 	const tool: Record<string, unknown> = { type: "web_search" };
 	const filters = normalizeDomainFilters(options.domainFilter);
-	if (filters) {
-		tool.filters = {
-			...(filters.allowedDomains ? { allowed_domains: filters.allowedDomains } : {}),
-			...(filters.blockedDomains ? { blocked_domains: filters.blockedDomains } : {}),
-		};
+	if (filters?.allowedDomains) {
+		tool.filters = { allowed_domains: filters.allowedDomains };
 	}
 	return tool;
 }

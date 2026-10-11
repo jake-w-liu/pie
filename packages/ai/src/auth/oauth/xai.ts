@@ -164,7 +164,7 @@ async function pollForTokens(device: XaiDeviceCode, signal: AbortSignal): Promis
 		expiresInSeconds: device.expiresInSeconds,
 		waitBeforeFirstPoll: true,
 		signal,
-		poll: async () => {
+		poll: async (pollSignal) => {
 			const response = await postForm(
 				XAI_TOKEN_URL,
 				{
@@ -172,7 +172,7 @@ async function pollForTokens(device: XaiDeviceCode, signal: AbortSignal): Promis
 					client_id: XAI_CLIENT_ID,
 					device_code: device.deviceCode,
 				},
-				signal,
+				pollSignal,
 			);
 
 			if (response.ok) {

@@ -30,6 +30,20 @@ describe("edit-diff fuzzy matching", () => {
 
 	it("rejects ambiguous matches", () => {
 		expect(() => apply("const x = 1;\nconst x = 1;\n", "const x = 1;", "changed")).toThrow(/must be unique/i);
+		expect(() => apply("end\nend\nend\n", "end\nend", "changed")).toThrow(/must be unique/i);
+	});
+
+	it("preserves matched indentation when fuzzy matching trailing whitespace", () => {
+		expect(apply("def f():\n    x = 1   \n", " x = 1\n", " x = 2\n")).toBe("def f():\n    x = 2\n");
+	});
+
+	it("reports whitespace-only old text as not found instead of editing at offset 0", () => {
+		expect(() => apply("hello world\n", "\u00a0", "X")).toThrow(/not found/i);
+		expect(() => apply("hello world\n", "\t\t", "X")).toThrow(/not found/i);
+	});
+
+	it("rejects a pattern that overlaps itself", () => {
+		expect(() => apply("aaa", "aa", "b")).toThrow(/must be unique/i);
 	});
 
 	it("normalizeForFuzzyMatch collapses leading indentation and trailing whitespace", () => {

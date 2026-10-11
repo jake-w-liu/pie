@@ -34,7 +34,7 @@ class UserMessageList implements Component {
 		const lines: string[] = [];
 
 		if (this.messages.length === 0) {
-			lines.push(theme.fg("muted", "  No user messages found"));
+			lines.push(theme.fg("muted", truncateToWidth("  No user messages found", Math.max(0, width))));
 			return lines;
 		}
 
@@ -55,15 +55,15 @@ class UserMessageList implements Component {
 
 			// First line: cursor + message
 			const cursor = isSelected ? theme.fg("accent", "› ") : "  ";
-			const maxMsgWidth = width - 2; // Account for cursor (2 chars)
+			const maxMsgWidth = Math.max(0, width - 2); // Account for cursor (2 chars)
 			const truncatedMsg = truncateToWidth(normalizedMessage, maxMsgWidth);
 			const messageLine = cursor + (isSelected ? theme.bold(truncatedMsg) : truncatedMsg);
 
-			lines.push(messageLine);
+			lines.push(truncateToWidth(messageLine, Math.max(0, width)));
 
 			// Second line: metadata (position in history)
 			const position = i + 1;
-			const metadata = `  Message ${position} of ${this.messages.length}`;
+			const metadata = truncateToWidth(`  Message ${position} of ${this.messages.length}`, Math.max(0, width));
 			const metadataLine = theme.fg("muted", metadata);
 			lines.push(metadataLine);
 			lines.push(""); // Blank line between messages
@@ -71,7 +71,10 @@ class UserMessageList implements Component {
 
 		// Add scroll indicator if needed
 		if (startIndex > 0 || endIndex < this.messages.length) {
-			const scrollInfo = theme.fg("muted", `  (${this.selectedIndex + 1}/${this.messages.length})`);
+			const scrollInfo = theme.fg(
+				"muted",
+				truncateToWidth(`  (${this.selectedIndex + 1}/${this.messages.length})`, Math.max(0, width)),
+			);
 			lines.push(scrollInfo);
 		}
 

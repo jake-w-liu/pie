@@ -11,6 +11,7 @@ import { getExperimentalToolSampling } from "../experimental.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
 import {
 	applyEditsToNormalizedContent,
+	applyNormalizedChangesToOriginal,
 	computeEditsDiff,
 	detectLineEnding,
 	type Edit,
@@ -19,7 +20,6 @@ import {
 	generateDiffString,
 	generateUnifiedPatch,
 	normalizeToLF,
-	restoreLineEndings,
 } from "./edit-diff.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import { resolveToCwd } from "./path-utils.ts";
@@ -370,7 +370,8 @@ export function createEditToolDefinition(
 				const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
 				throwIfAborted();
 
-				const finalContent = bom + restoreLineEndings(newContent, originalEnding);
+				const finalContent =
+					bom + applyNormalizedChangesToOriginal(content, normalizedContent, newContent, originalEnding);
 				// From here the edit has already landed. An abort that arrives while the
 				// write is in flight must not turn a committed change into a failure:
 				// the model would read "Operation aborted" as "nothing happened" and

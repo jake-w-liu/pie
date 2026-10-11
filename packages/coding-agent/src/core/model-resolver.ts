@@ -293,12 +293,15 @@ export function resolveModelScopeFromModels(
 			const colonIdx = pattern.lastIndexOf(":");
 			let globPattern = pattern;
 			let thinkingLevel: ThinkingLevel | undefined;
+			let invalidThinkingSuffix: string | undefined;
 
 			if (colonIdx !== -1) {
 				const suffix = pattern.substring(colonIdx + 1);
 				if (isValidThinkingLevel(suffix)) {
 					thinkingLevel = suffix;
 					globPattern = pattern.substring(0, colonIdx);
+				} else {
+					invalidThinkingSuffix = suffix;
 				}
 			}
 
@@ -312,10 +315,23 @@ export function resolveModelScopeFromModels(
 
 			// Match against "provider/modelId" format OR just model ID
 			// This allows "*sonnet*" to match without requiring "anthropic/*sonnet*"
-			const matchingModels = availableModels.filter((m) => {
-				const fullId = `${m.provider}/${m.id}`;
-				return minimatch(fullId, globPattern, { nocase: true }) || minimatch(m.id, globPattern, { nocase: true });
-			});
+			const matchesGlob = (model: Model<Api>) => {
+				const fullId = `${model.provider}/${model.id}`;
+				return (
+					minimatch(fullId, globPattern, { nocase: true }) || minimatch(model.id, globPattern, { nocase: true })
+				);
+			};
+			let matchingModels = availableModels.filter(matchesGlob);
+			if (matchingModels.length === 0 && invalidThinkingSuffix !== undefined) {
+				globPattern = pattern.substring(0, colonIdx);
+				matchingModels = availableModels.filter(matchesGlob);
+				diagnostics.push({
+					type: "warning",
+					code: "invalid-thinking-level",
+					message: `Invalid thinking level "${invalidThinkingSuffix}" in pattern "${pattern}". Using default instead.`,
+					pattern,
+				});
+			}
 
 			if (matchingModels.length === 0) {
 				diagnostics.push({
@@ -389,6 +405,40 @@ export interface ResolveCliModelResult {
 	 * When set, model will be undefined.
 	 */
 	error: string | undefined;
+}
+
+function resolveExactCliMatches(
+	cliModel: string,
+	exactMatches: readonly Model<Api>[],
+	modelRuntime: ModelRuntime,
+): ResolveCliModelResult | undefined {
+	if (exactMatches.length === 0) return undefined;
+	if (exactMatches.length === 1) {
+		return { model: exactMatches[0], warning: undefined, thinkingLevel: undefined, error: undefined };
+	}
+	const authenticatedExactMatches = exactMatches.filter((model) => modelRuntime.hasConfiguredAuth(model.provider));
+	if (authenticatedExactMatches.length === 1) {
+		return {
+			model: authenticatedExactMatches[0],
+			warning: undefined,
+			thinkingLevel: undefined,
+			error: undefined,
+		};
+	}
+	const matches = exactMatches
+		.map((model) => `${model.provider}/${model.id}`)
+		.sort((a, b) => a.localeCompare(b))
+		.join(", ");
+	const authHint =
+		authenticatedExactMatches.length === 0
+			? "No matching provider is authenticated."
+			: "More than one matching provider is authenticated.";
+	return {
+		model: undefined,
+		warning: undefined,
+		thinkingLevel: undefined,
+		error: `Model "${cliModel}" is ambiguous across providers: ${matches}. ${authHint} Use --provider or provider/model.`,
+	};
 }
 
 /**
@@ -471,35 +521,8 @@ export function resolveCliModel(options: {
 		const exactMatches = availableModels.filter(
 			(m) => m.id.toLowerCase() === lower || `${m.provider}/${m.id}`.toLowerCase() === lower,
 		);
-		if (exactMatches.length === 1) {
-			return { model: exactMatches[0], warning: undefined, thinkingLevel: undefined, error: undefined };
-		}
-		if (exactMatches.length > 1) {
-			const authenticatedExactMatches = exactMatches.filter((m) => modelRuntime.hasConfiguredAuth(m.provider));
-			if (authenticatedExactMatches.length === 1) {
-				return {
-					model: authenticatedExactMatches[0],
-					warning: undefined,
-					thinkingLevel: undefined,
-					error: undefined,
-				};
-			}
-
-			const matches = exactMatches
-				.map((m) => `${m.provider}/${m.id}`)
-				.sort((a, b) => a.localeCompare(b))
-				.join(", ");
-			const authHint =
-				authenticatedExactMatches.length === 0
-					? "No matching provider is authenticated."
-					: "More than one matching provider is authenticated.";
-			return {
-				model: undefined,
-				warning: undefined,
-				thinkingLevel: undefined,
-				error: `Model "${cliModel}" is ambiguous across providers: ${matches}. ${authHint} Use --provider or provider/model.`,
-			};
-		}
+		const exactResult = resolveExactCliMatches(cliModel, exactMatches, modelRuntime);
+		if (exactResult) return exactResult;
 	}
 
 	if (cliProvider && provider) {
@@ -546,12 +569,11 @@ export function resolveCliModel(options: {
 	// looks like a provider but the full string is actually a model id on openrouter.
 	if (inferredProvider) {
 		const lower = cliModel.toLowerCase();
-		const exact = availableModels.find(
+		const exactMatches = availableModels.filter(
 			(m) => m.id.toLowerCase() === lower || `${m.provider}/${m.id}`.toLowerCase() === lower,
 		);
-		if (exact) {
-			return { model: exact, warning: undefined, thinkingLevel: undefined, error: undefined };
-		}
+		const exactResult = resolveExactCliMatches(cliModel, exactMatches, modelRuntime);
+		if (exactResult) return exactResult;
 		// Also try parseModelPattern on the full input against all models
 		const fallback = parseModelPattern(cliModel, availableModels, {
 			allowInvalidThinkingLevelFallback: false,

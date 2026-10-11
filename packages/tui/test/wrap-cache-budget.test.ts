@@ -30,6 +30,14 @@ describe("wrap cache budget accounts for keys (D1)", () => {
 		assert.ok(Object.isFrozen(seen[0]!));
 	});
 
+	it("retains a long frame instead of thrashing at 1,024 distinct lines", () => {
+		const entries = Array.from({ length: 1100 }, (_, i) => `stream-${i} ${"word ".repeat(20)}`);
+		const firstPass = entries.map((entry) => wrapTextWithAnsi(entry, 24));
+		const secondPass = entries.map((entry) => wrapTextWithAnsi(entry, 24));
+
+		assert.equal(secondPass.filter((result, index) => result === firstPass[index]).length, entries.length);
+	});
+
 	it("freezes cached arrays so mutation fails fast instead of corrupting frames", () => {
 		const cached = wrapTextWithAnsi("frozen-check payload", 8);
 		assert.ok(Object.isFrozen(cached));

@@ -35,6 +35,31 @@ Use this skill.
 		]);
 	});
 
+	it("parses a UTF-8 BOM before skill frontmatter", async () => {
+		const root = createTempDir();
+		const env = new NodeExecutionEnv({ cwd: root });
+		await env.createDir("skills/bom", { recursive: true });
+		await env.writeFile("skills/bom/SKILL.md", "\uFEFF---\nname: bom\ndescription: BOM skill\n---\nBody");
+
+		const result = await loadSkills(env, "skills");
+
+		expect(result.diagnostics).toEqual([]);
+		expect(result.skills).toMatchObject([{ name: "bom", description: "BOM skill", content: "Body" }]);
+	});
+
+	it("terminates symlink cycles and loads each physical skill once", async () => {
+		const root = createTempDir();
+		const env = new NodeExecutionEnv({ cwd: root });
+		await env.createDir("skills/good", { recursive: true });
+		await env.writeFile("skills/good/SKILL.md", "---\nname: good\ndescription: Good\n---\nBody");
+		await symlink(join(root, "skills"), join(root, "skills", "again"), "dir");
+
+		const result = await loadSkills(env, "skills");
+
+		expect(result.diagnostics).toEqual([]);
+		expect(result.skills.map((skill) => skill.name)).toEqual(["good"]);
+	});
+
 	it("loads skills through symlinked directories", async () => {
 		const root = createTempDir();
 		const env = new NodeExecutionEnv({ cwd: root });

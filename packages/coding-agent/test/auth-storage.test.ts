@@ -139,6 +139,18 @@ describe("AuthStorage", () => {
 		expect(release).toHaveBeenCalledTimes(1);
 	});
 
+	test("uses the same lease duration for synchronous and asynchronous locks", async () => {
+		const syncLock = vi.spyOn(lockfile, "lockSync");
+		const asyncLock = vi.spyOn(lockfile, "lock");
+		const backend = new FileAuthStorageBackend(authJsonPath);
+
+		backend.withLock(() => ({ result: undefined }));
+		await backend.withLockAsync(async () => ({ result: undefined }));
+
+		expect(syncLock.mock.calls.at(-1)?.[1]).toMatchObject({ stale: 30_000, update: 10_000 });
+		expect(asyncLock.mock.calls.at(-1)?.[1]).toMatchObject({ stale: 30_000, update: 10_000 });
+	});
+
 	test.skipIf(process.platform === "win32")("creates new auth files with owner-only permissions", () => {
 		AuthStorage.create(authJsonPath);
 

@@ -313,19 +313,32 @@ class ScheduleStore {
 		return value.runs as ScheduleRunRecord[];
 	}
 
+	private appendEventRecord(dir: string, record: object): void {
+		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+		const file = path.join(dir, "events.jsonl");
+		fs.appendFileSync(file, `${JSON.stringify(record)}\n`, { encoding: "utf-8", mode: 0o600 });
+		const lines = fs.readFileSync(file, "utf-8").trimEnd().split("\n");
+		if (lines.length <= MAX_HISTORY) return;
+		const replacement = `${file}.${randomUUID()}.tmp`;
+		try {
+			fs.writeFileSync(replacement, `${lines.slice(-MAX_HISTORY).join("\n")}\n`, { encoding: "utf-8", mode: 0o600 });
+			fs.renameSync(replacement, file);
+		} finally {
+			fs.rmSync(replacement, { force: true });
+		}
+	}
+
 	writeRun(schedule: ScheduleRecord, run: ScheduleRunRecord, event: string): void {
 		const dir = scheduleDir(this.root, schedule.id, true, this.projectCwd);
 		writePrivateAtomicJson(path.join(dir, "runs", `${run.id}.json`), run);
 		const runs = [run, ...this.history(schedule.id).filter((item) => item.id !== run.id)].slice(0, MAX_HISTORY);
 		writePrivateAtomicJson(path.join(dir, "history.json"), { schemaVersion: 1, runs });
-		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-		fs.appendFileSync(path.join(dir, "events.jsonl"), `${JSON.stringify({ schemaVersion: 1, timestamp: new Date().toISOString(), event, scheduleId: schedule.id, runId: run.id, state: run.state })}\n`, { encoding: "utf-8", mode: 0o600 });
+		this.appendEventRecord(dir, { schemaVersion: 1, timestamp: new Date().toISOString(), event, scheduleId: schedule.id, runId: run.id, state: run.state });
 	}
 
 	appendEvent(schedule: ScheduleRecord, event: string): void {
 		const dir = scheduleDir(this.root, schedule.id, true, this.projectCwd);
-		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-		fs.appendFileSync(path.join(dir, "events.jsonl"), `${JSON.stringify({ schemaVersion: 1, timestamp: new Date().toISOString(), event, scheduleId: schedule.id })}\n`, { encoding: "utf-8", mode: 0o600 });
+		this.appendEventRecord(dir, { schemaVersion: 1, timestamp: new Date().toISOString(), event, scheduleId: schedule.id });
 	}
 }
 

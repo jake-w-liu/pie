@@ -226,8 +226,9 @@ export function createLsToolDefinition(
 							details: Object.keys(details).length > 0 ? details : undefined,
 						});
 					} catch (e: any) {
-						signal?.removeEventListener("abort", onAbort);
 						reject(e);
+					} finally {
+						signal?.removeEventListener("abort", onAbort);
 					}
 				})();
 			});

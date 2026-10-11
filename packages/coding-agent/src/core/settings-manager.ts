@@ -192,6 +192,7 @@ export interface SettingsManagerCreateOptions {
 }
 
 export interface SettingsStorage {
+	read?(scope: SettingsScope): string | undefined;
 	/** fn may be retried with fresh content when a missing file needs initialization. */
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void;
 }
@@ -249,6 +250,11 @@ export class FileSettingsStorage implements SettingsStorage {
 		throw (lastError as Error) ?? new Error("Failed to acquire settings lock");
 	}
 
+	read(scope: SettingsScope): string | undefined {
+		const path = scope === "global" ? this.globalSettingsPath : this.projectSettingsPath;
+		return existsSync(path) ? readFileSync(path, "utf-8") : undefined;
+	}
+
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
 		const path = scope === "global" ? this.globalSettingsPath : this.projectSettingsPath;
 		const dir = dirname(path);
@@ -289,6 +295,10 @@ export class FileSettingsStorage implements SettingsStorage {
 export class InMemorySettingsStorage implements SettingsStorage {
 	private global: string | undefined;
 	private project: string | undefined;
+
+	read(scope: SettingsScope): string | undefined {
+		return scope === "global" ? this.global : this.project;
+	}
 
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
 		const current = scope === "global" ? this.global : this.project;
@@ -403,10 +413,14 @@ export class SettingsManager {
 		}
 
 		let content: string | undefined;
-		storage.withLock(scope, (current) => {
-			content = current;
-			return undefined;
-		});
+		if (storage.read) {
+			content = storage.read(scope);
+		} else {
+			storage.withLock(scope, (current) => {
+				content = current;
+				return undefined;
+			});
+		}
 
 		if (!content) {
 			return {};
@@ -808,18 +822,17 @@ export class SettingsManager {
 		if (!this.globalSettings.modelThinkingLevels) {
 			this.globalSettings.modelThinkingLevels = {};
 		}
-		this.globalSettings.modelThinkingLevels[`${provider}/${modelId}`] = level;
-		this.markModified("modelThinkingLevels");
+		const key = `${provider}/${modelId}`;
+		this.globalSettings.modelThinkingLevels[key] = level;
+		this.markModified("modelThinkingLevels", key);
 		this.save();
 	}
 
 	removeModelThinkingLevel(provider: string, modelId: string): void {
 		if (!this.globalSettings.modelThinkingLevels) return;
-		delete this.globalSettings.modelThinkingLevels[`${provider}/${modelId}`];
-		if (Object.keys(this.globalSettings.modelThinkingLevels).length === 0) {
-			delete this.globalSettings.modelThinkingLevels;
-		}
-		this.markModified("modelThinkingLevels");
+		const key = `${provider}/${modelId}`;
+		delete this.globalSettings.modelThinkingLevels[key];
+		this.markModified("modelThinkingLevels", key);
 		this.save();
 	}
 
@@ -1055,6 +1068,26 @@ export class SettingsManager {
 	setProjectPackages(packages: PackageSource[]): void {
 		this.updateProjectSettings("packages", (settings) => {
 			settings.packages = packages;
+		});
+	}
+
+	/** Apply a package-array mutation again under the persistence lock to avoid stale-snapshot lost updates. */
+	mutatePackages(scope: SettingsScope, update: (packages: PackageSource[]) => PackageSource[]): void {
+		if (scope === "project") this.assertProjectTrustedForWrite();
+		const scopedSettings = scope === "global" ? this.globalSettings : this.projectSettings;
+		scopedSettings.packages = update([...(scopedSettings.packages ?? [])]);
+		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+
+		const loadError = scope === "global" ? this.globalSettingsLoadError : this.projectSettingsLoadError;
+		if (loadError) return;
+		this.enqueueWrite(scope, () => {
+			this.storage.withLock(scope, (current) => {
+				const persisted = current
+					? SettingsManager.migrateSettings(JSON.parse(stripBom(current)) as Record<string, unknown>)
+					: {};
+				persisted.packages = update([...(persisted.packages ?? [])]);
+				return JSON.stringify(persisted, null, 2);
+			});
 		});
 	}
 

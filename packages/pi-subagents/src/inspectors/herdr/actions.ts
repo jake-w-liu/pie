@@ -207,6 +207,13 @@ export async function handleHerdrInspectorAction(action: HerdrInspectorAction, p
 			return result(`Herdr inspector error: ${formatHerdrError(live.error)}\nBinding kept for ${existing.paneId}: ${bindingPath(target.asyncDir, params.index)}`, true);
 		}
 	}
+	// Validate the local command before creating a pane. Startup failures after a
+	// successful split are cleaned up below, but a missing runner is knowable up
+	// front and must not leave an empty orphan pane behind.
+	const runnerPath = deps.runnerPath ?? defaultInspectorRunnerPath();
+	if (!fs.existsSync(runnerPath)) {
+		return result(`Herdr inspector error (RUNNER_MISSING): inspector runner '${runnerPath}' does not exist; the active Pie installation may have changed (e.g. refresh:pie). Restart pie and retry.`, true);
+	}
 	const splitArgs = ["pane", "split", "--current", "--direction", "right", "--cwd", status.cwd ?? deps.cwd];
 	splitArgs.push(params.focus === true ? "--focus" : "--no-focus");
 	const split = await client.run(splitArgs, { timeoutMs: 15_000, signal: deps.signal });
@@ -214,10 +221,6 @@ export async function handleHerdrInspectorAction(action: HerdrInspectorAction, p
 	const paneId = extractPaneId(split.data);
 	if (!paneId) return result("Herdr inspector error (PANE_GONE): pane split returned no pane id.", true);
 	const mission = missionForRun(target.asyncDir, deps.cwd, deps.missions, target.runId);
-	const runnerPath = deps.runnerPath ?? defaultInspectorRunnerPath();
-	if (!fs.existsSync(runnerPath)) {
-		return result(`Herdr inspector error (RUNNER_MISSING): inspector runner '${runnerPath}' does not exist; the active Pie installation may have changed (e.g. refresh:pie). Restart pie and retry.`, true);
-	}
 	const command = inspectorCommand({
 		runnerPath,
 		asyncDir: target.asyncDir,

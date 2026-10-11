@@ -19,8 +19,8 @@ const YOUTUBE_PROMPT = `Extract the complete content of this YouTube video. Incl
 
 Format as markdown.`;
 
-const YOUTUBE_REGEX =
-	/(?:(?:www\.|m\.)?youtube\.com\/(?:watch\?.*v=|shorts\/|live\/|embed\/|v\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/;
+const YOUTUBE_VIDEO_ID = /^[a-zA-Z0-9_-]{11}$/;
+const YOUTUBE_HOSTS = new Set(["youtube.com", "www.youtube.com", "m.youtube.com"]);
 
 function errorMessage(err: unknown): string {
 	return err instanceof Error ? err.message : String(err);
@@ -77,17 +77,28 @@ function loadYouTubeConfig(): YouTubeConfig {
 }
 
 export function isYouTubeURL(url: string): { isYouTube: boolean; videoId: string | null } {
+	let parsed: URL;
 	try {
-		const parsed = new URL(url);
-		if (parsed.pathname === "/playlist") {
-			return { isYouTube: false, videoId: null };
-		}
+		parsed = new URL(url);
 	} catch {
+		return { isYouTube: false, videoId: null };
 	}
 
-	const match = url.match(YOUTUBE_REGEX);
-	if (!match) return { isYouTube: false, videoId: null };
-	return { isYouTube: true, videoId: match[1] };
+	const host = parsed.hostname.toLowerCase();
+	let videoId: string | null = null;
+	if (host === "youtu.be") {
+		videoId = parsed.pathname.match(/^\/([^/]+)\/?$/)?.[1] ?? null;
+	} else if (YOUTUBE_HOSTS.has(host)) {
+		if (parsed.pathname === "/watch") {
+			videoId = parsed.searchParams.get("v");
+		} else {
+			const match = parsed.pathname.match(/^\/(?:shorts|live|embed|v)\/([^/]+)\/?$/);
+			videoId = match?.[1] ?? null;
+		}
+	}
+
+	if (!videoId || !YOUTUBE_VIDEO_ID.test(videoId)) return { isYouTube: false, videoId: null };
+	return { isYouTube: true, videoId };
 }
 
 export function isYouTubeEnabled(): boolean {

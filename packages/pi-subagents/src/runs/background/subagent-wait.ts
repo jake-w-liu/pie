@@ -472,7 +472,7 @@ async function waitForDetachedForegroundRun(
 				true,
 			);
 		}
-		await waitForWake(pollIntervalMs, signal, deps);
+		await waitForWake(Math.min(pollIntervalMs, Math.max(0, timeoutMs - (now() - startedAt))), signal, deps);
 	}
 }
 
@@ -589,7 +589,7 @@ export async function waitForSubagents(
 			);
 		}
 		try {
-			await waitForWake(pollIntervalMs, signal, deps);
+			await waitForWake(Math.min(pollIntervalMs, Math.max(0, timeoutMs - (now() - startedAt))), signal, deps);
 			if (deps.state.currentSessionId !== sessionId) {
 				return result(`Session identity changed while subagent_wait was tracking ${initialAsyncIds.size} async run(s) and ${initialProviderIds.size} provider item(s); terminal state for the original session cannot be confirmed.`, true);
 			}

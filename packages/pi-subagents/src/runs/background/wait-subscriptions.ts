@@ -5,7 +5,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { listAsyncRuns, type AsyncRunSummary } from "./async-status.ts";
 import { formatResumeFirstFailedRunDetail } from "./resume-guidance.ts";
 import { readCompletionReplay } from "./completion-replay.ts";
-import { writeAtomicJson } from "../../shared/atomic-json.ts";
+import { writeAtomicJson, writePrivateAtomicJson } from "../../shared/atomic-json.ts";
 import {
 	DIRS,
 	INTERCOM_DETACH_REQUEST_EVENT,
@@ -35,6 +35,13 @@ const FOREIGN_SWEEP_INTERVAL_MS = 60_000;
  * enough for an ordinary return and short enough to bound the directory.
  */
 const FOREIGN_SWEEP_GRACE_MS = 24 * 60 * 60 * 1000;
+const WAIT_DELIVERY_REPLAY_DIR = path.join("completion-replay", "wait-deliveries");
+/**
+ * A crashed claimant is retried after this lease rather than orphaning the wake.
+ * Transport is intentionally at-least-once; the owning session's durable receipt
+ * turns an ordinary stale-claim redelivery into a no-op.
+ */
+const CLAIM_LEASE_MS = 5 * 60_000;
 
 export interface ArmWaitSubscriptionInput {
 	targetKind: "async" | "foreground";
@@ -86,6 +93,74 @@ function subscriptionFile(dir: string, token: string): string {
 	return path.join(dir, `${token}.json`);
 }
 
+function subscriptionClaimFile(dir: string, token: string, claimedAt: number): string {
+	return path.join(dir, `${token}.claim-${Math.floor(claimedAt)}-${randomUUID()}.json`);
+}
+
+interface WaitDeliveryReplay {
+	version: 1;
+	token: string;
+	sessionId: string;
+	deliveredAt: number;
+	expiresAt: number;
+}
+
+function waitDeliveryReplayPath(resultsDir: string, token: string): string {
+	return path.join(resultsDir, WAIT_DELIVERY_REPLAY_DIR, `${token}.json`);
+}
+
+function removeBestEffort(filePath: string): void {
+	try { fs.rmSync(filePath, { force: true }); } catch { /* replay cleanup only */ }
+}
+
+function readWaitDeliveryReplay(resultsDir: string, record: WaitSubscriptionRecord, readAt: number): WaitDeliveryReplay | undefined {
+	const replayPath = waitDeliveryReplayPath(resultsDir, record.token);
+	let value: unknown;
+	try {
+		value = JSON.parse(fs.readFileSync(replayPath, "utf-8"));
+	} catch (error) {
+		if (isNotFound(error)) return undefined;
+		console.error(`Failed to read wait delivery replay '${record.token}':`, error);
+		return undefined;
+	}
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		removeBestEffort(replayPath);
+		return undefined;
+	}
+	const replay = value as Partial<WaitDeliveryReplay>;
+	if (replay.version !== 1
+		|| replay.token !== record.token
+		|| replay.sessionId !== record.sessionId
+		|| typeof replay.deliveredAt !== "number"
+		|| typeof replay.expiresAt !== "number") {
+		removeBestEffort(replayPath);
+		return undefined;
+	}
+	if (replay.expiresAt <= readAt) {
+		removeBestEffort(replayPath);
+		return undefined;
+	}
+	return replay as WaitDeliveryReplay;
+}
+
+function writeWaitDeliveryReplay(resultsDir: string, record: WaitSubscriptionRecord, deliveredAt: number): void {
+	writePrivateAtomicJson(waitDeliveryReplayPath(resultsDir, record.token), {
+		version: 1,
+		token: record.token,
+		sessionId: record.sessionId,
+		deliveredAt,
+		// Keep the receipt past both subscription expiry and stale-claim recovery.
+		expiresAt: Math.max(record.expiresAt, deliveredAt) + FOREIGN_SWEEP_GRACE_MS + CLAIM_LEASE_MS,
+	} satisfies WaitDeliveryReplay);
+}
+
+function parseSubscriptionClaimName(file: string): { token: string; claimedAt: number } | undefined {
+	const match = file.match(/^([0-9a-f-]{36})\.claim-(\d+)-[0-9a-f-]{36}\.json$/i);
+	if (!match) return undefined;
+	const claimedAt = Number(match[2]);
+	return Number.isSafeInteger(claimedAt) ? { token: match[1]!, claimedAt } : undefined;
+}
+
 export function formatWaitSubscriptions(state: Pick<SubagentState, "waitSubscriptions">, now = Date.now()): string | undefined {
 	const subscriptions = [...(state.waitSubscriptions?.values() ?? [])].sort((left, right) => left.createdAt - right.createdAt);
 	if (subscriptions.length === 0) return undefined;
@@ -110,6 +185,39 @@ export function createWaitSubscriptionManager(
 	const unresolvedRestoredForegroundTokens = new Set<string>();
 	let disposed = false;
 	let lastForeignSweepAt = 0;
+	let lastClaimRecoveryAt = 0;
+
+	const recoverStaleClaims = (force = false) => {
+		const recoveredAt = now();
+		if (!force && recoveredAt - lastClaimRecoveryAt < FOREIGN_SWEEP_INTERVAL_MS) return;
+		lastClaimRecoveryAt = recoveredAt;
+		let files: string[];
+		try {
+			files = fs.readdirSync(subscriptionsDir);
+		} catch (error) {
+			if (!isNotFound(error)) console.error(`Failed to scan wait subscription claims in '${subscriptionsDir}':`, error);
+			return;
+		}
+		for (const file of files) {
+			const claim = parseSubscriptionClaimName(file);
+			if (!claim || recoveredAt - claim.claimedAt <= CLAIM_LEASE_MS) continue;
+			const claimPath = path.join(subscriptionsDir, file);
+			const originalPath = subscriptionFile(subscriptionsDir, claim.token);
+			try {
+				// Linking recreates the canonical record without overwriting a retry
+				// restored concurrently by the original claimant.
+				fs.linkSync(claimPath, originalPath);
+				fs.unlinkSync(claimPath);
+			} catch (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				if (code === "EEXIST") {
+					try { fs.unlinkSync(claimPath); } catch (unlinkError) { if (!isNotFound(unlinkError)) console.error(`Failed to remove superseded wait subscription claim '${claimPath}':`, unlinkError); }
+				} else if (!isNotFound(error)) {
+					console.error(`Failed to recover wait subscription claim '${claimPath}':`, error);
+				}
+			}
+		}
+	};
 
 	/**
 	 * Remove expired records armed by another session.
@@ -167,22 +275,53 @@ export function createWaitSubscriptionManager(
 		}
 	};
 
-	const remove = (record: WaitSubscriptionRecord) => {
-		try {
-			fs.unlinkSync(subscriptionFile(subscriptionsDir, record.token));
-		} catch (error) {
-			if (!isNotFound(error)) throw error;
-		}
-		subscriptions.delete(record.token);
-		unresolvedRestoredForegroundTokens.delete(record.token);
-	};
-
 	const settle = (record: WaitSubscriptionRecord, outcome: string, detail: string, completion?: WaitCompletion) => {
 		if (disposed || state.currentSessionId !== record.sessionId) return;
-		// Deliver before clearing: the record is the durable retry state for this
-		// wake, so removing it first and only then sending would lose the wake for
-		// good if `sendMessage` threw. A failed delivery leaves the subscription
-		// armed and reconciliation retries it.
+		const originalPath = subscriptionFile(subscriptionsDir, record.token);
+		const claimPath = subscriptionClaimFile(subscriptionsDir, record.token, now());
+		try {
+			// Renaming is the cross-process lease: only its current claimant may
+			// deliver now. Transport remains at-least-once: stale claims are retried,
+			// while the durable session receipt makes repeat deliveries no-ops.
+			// A crash after sendMessage succeeds but before that receipt is durable
+			// can still duplicate one wake; that is deliberate rather than risking a
+			// lost wake by recording delivery before the send.
+			fs.renameSync(originalPath, claimPath);
+		} catch (error) {
+			if (!isNotFound(error)) console.error(`Failed to claim wait subscription '${record.token}':`, error);
+			else {
+				let claimExists = false;
+				try {
+					claimExists = fs.readdirSync(subscriptionsDir).some((file) => parseSubscriptionClaimName(file)?.token === record.token);
+				} catch (scanError) {
+					if (!isNotFound(scanError)) console.error(`Failed to inspect wait subscription claims in '${subscriptionsDir}':`, scanError);
+				}
+				if (!claimExists) {
+					subscriptions.delete(record.token);
+					unresolvedRestoredForegroundTokens.delete(record.token);
+				}
+			}
+			return;
+		}
+		const replayPath = waitDeliveryReplayPath(resultsDir, record.token);
+		const finishSettlement = (alreadyDelivered: boolean) => {
+			try {
+				fs.unlinkSync(claimPath);
+			} catch (error) {
+				if (!isNotFound(error)) {
+					const phase = alreadyDelivered ? "after recognizing its prior delivery" : "after delivering it";
+					console.error(`Failed to clear wait subscription claim '${record.token}' ${phase}; it will be deduplicated after the claim lease:`, error);
+					return;
+				}
+			}
+			subscriptions.delete(record.token);
+			unresolvedRestoredForegroundTokens.delete(record.token);
+			removeBestEffort(replayPath);
+		};
+		if (readWaitDeliveryReplay(resultsDir, record, now())) {
+			finishSettlement(true);
+			return;
+		}
 		try {
 			pi.sendMessage({
 				customType: "subagent-wait-subscription",
@@ -196,14 +335,22 @@ export function createWaitSubscriptionManager(
 				},
 			}, { triggerTurn: true });
 		} catch (error) {
+			try {
+				fs.renameSync(claimPath, originalPath);
+			} catch (restoreError) {
+				console.error(`Failed to restore wait subscription '${record.token}' after delivery failed:`, restoreError);
+			}
 			console.error(`Failed to deliver wait subscription '${record.token}'; it remains armed:`, error);
 			return;
 		}
 		try {
-			remove(record);
+			writeWaitDeliveryReplay(resultsDir, record, now());
 		} catch (error) {
-			console.error(`Failed to clear wait subscription '${record.token}' after delivering it; it may fire again:`, error);
+			// Sending already succeeded. Continue claim cleanup; if that also fails,
+			// stale-claim recovery may redeliver rather than risk losing the wake.
+			console.error(`Failed to persist wait delivery replay '${record.token}':`, error);
 		}
+		finishSettlement(false);
 	};
 
 	const reconcileRecord = (record: WaitSubscriptionRecord) => {
@@ -264,6 +411,7 @@ export function createWaitSubscriptionManager(
 
 	const reconcile = () => {
 		if (disposed) return;
+		recoverStaleClaims();
 		// Before the session check: with no current session every record is
 		// foreign, and expired ones should still be cleaned up.
 		sweepExpiredForeignSubscriptions();
@@ -314,7 +462,8 @@ export function createWaitSubscriptionManager(
 			subscriptions.clear();
 			unresolvedRestoredForegroundTokens.clear();
 			// Unconditional: a process that starts without a session identity should
-			// still clear records nobody can act on.
+			// still recover abandoned claims and clear records nobody can act on.
+			recoverStaleClaims(true);
 			sweepExpiredForeignSubscriptions(true);
 			if (!state.currentSessionId) return;
 			let files: string[];

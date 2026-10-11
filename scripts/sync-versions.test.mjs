@@ -44,6 +44,8 @@ test("synchronizes private dependencies without touching registry aliases, gener
 				"@earendil-works/pi-coding-agent": "^1.0.0",
 				"@mariozechner/pi-ai": "npm:@earendil-works/pi-ai@1.0.0",
 			},
+			peerDependencies: { "@earendil-works/pi-ai": "^1.0.0" },
+			optionalDependencies: { "@earendil-works/pi-coding-agent": "^1.0.0" },
 		});
 		await writeManifest(root, "packages/coding-agent/install-lock", {
 			name: "generated-install-lock",
@@ -60,6 +62,8 @@ test("synchronizes private dependencies without touching registry aliases, gener
 		const evalsManifest = await readManifest(root, "packages/evals");
 		assert.equal(evalsManifest.dependencies["@earendil-works/pi-coding-agent"], "^2.0.0");
 		assert.equal(evalsManifest.dependencies["@mariozechner/pi-ai"], "npm:@earendil-works/pi-ai@1.0.0");
+		assert.equal(evalsManifest.peerDependencies["@earendil-works/pi-ai"], "^2.0.0");
+		assert.equal(evalsManifest.optionalDependencies["@earendil-works/pi-coding-agent"], "^2.0.0");
 		const generatedManifest = await readManifest(root, "packages/coding-agent/install-lock");
 		assert.equal(generatedManifest.dependencies["@earendil-works/pi-coding-agent"], "^1.0.0");
 

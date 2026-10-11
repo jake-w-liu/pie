@@ -202,7 +202,10 @@ function parseFrontmatter<T extends Record<string, unknown>>(
 	content: string,
 ): Result<{ frontmatter: T; body: string }, Error> {
 	try {
-		const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+		const normalized = content
+			.replace(/^\uFEFF/, "")
+			.replace(/\r\n/g, "\n")
+			.replace(/\r/g, "\n");
 		if (!normalized.startsWith("---")) return { ok: true, value: { frontmatter: {} as T, body: normalized } };
 		const endIndex = normalized.indexOf("\n---", 3);
 		if (endIndex === -1) return { ok: true, value: { frontmatter: {} as T, body: normalized } };

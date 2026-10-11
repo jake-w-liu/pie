@@ -53,6 +53,8 @@
 - Fixed model catalog refreshes dropping the Kimi For Coding provider after models.dev renamed its provider key to `kimi-code-plan-global`.
 - Fixed Anthropic turns whose signed thinking blocks went stale after history rewrites (compaction, branch switches) failing with a 400: first-party API requests now drop stale blocks via the thinking-binding-controls beta, and other Anthropic-compatible endpoints retry once with signed thinking removed.
 - Fixed a provider rejecting an OAuth token with HTTP 401 before its stored expiry now triggering one token refresh and retry instead of failing every request until re-login.
+- Fixed replaying a turn whose response came from a configured fallback model keeping that model's signed thinking block when the replaying model no longer listed the fallback. The API rejects a signature produced by another model, so the cross-model verdict is now recorded with the response (`AssistantMessage.crossModelResponse`) instead of being re-derived at replay time.
+- Fixed model-catalog publication rejecting valid catalogs: deployment-scoped providers such as Azure OpenAI publish an empty `baseUrl` that is resolved at call time, and models whose price depends on the routed upstream are now dropped from the published catalog by models.dev's unknown-pricing sentinel while remaining available in the runtime model data.
 
 ## [0.84.3] - 2026-08-24
 

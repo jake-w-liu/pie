@@ -11,3 +11,5 @@
 - Schedule activation checks the captured project's current trust decision on restore, actions, timers, and immediately before launch. Inert inspection and pause/delete remain available without trust, and already-launched work keeps its ownership.
 - Persisted schedule triggers validate positive, consistent intervals and valid dates; recurrence advancement is bounded and checks overflow. Invalid records are reported individually during restoration.
 - Detached workflow child errors retain their whitelisted scalar classification across the sandbox boundary, so async status, results, and receipts correctly record a pause. Automatic JavaScript continuation remains unsupported.
+- Prompt frontmatter parsing accepts an empty or comment-only block as an empty mapping again, an empty block no longer leaks its `---` delimiters into the prompt body, and one malformed prompt file no longer disables every prompt workflow in the directory.
+- A corrupt model-exclusions store no longer blocks persistence of new exclusions; the store is rewritten from the in-memory state.

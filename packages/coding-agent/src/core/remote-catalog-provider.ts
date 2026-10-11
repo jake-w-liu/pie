@@ -1,6 +1,6 @@
 import type { Api, Model, ModelsStoreEntry, Provider } from "@earendil-works/pi-ai";
 import { VERSION } from "../config.ts";
-import { fetchWithRetry } from "../utils/management-http.ts";
+import { fetchWithRetryAndConsume } from "../utils/management-http.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 
 const DEFAULT_CATALOG_BASE_URL = "https://pi.dev";
@@ -79,7 +79,7 @@ export function withRemoteCatalog(
 			// leave the overlay empty.
 			const validator = stored?.models.length ? stored.etag : undefined;
 			const url = new URL(`/api/models/providers/${encodeURIComponent(provider.id)}`, catalogBaseUrl);
-			const response = await fetchWithRetry(
+			const { response, body } = await fetchWithRetryAndConsume(
 				url,
 				{
 					headers: {
@@ -90,6 +90,7 @@ export function withRemoteCatalog(
 					signal: context.signal,
 				},
 				{ attemptTimeoutMs: REMOTE_CATALOG_ATTEMPT_TIMEOUT_MS },
+				async (response) => ({ response, body: response.ok ? await response.json() : undefined }),
 			);
 			if (context.signal.aborted) return;
 			const checkedAt = Date.now();
@@ -122,7 +123,7 @@ export function withRemoteCatalog(
 				// interval after a single failed revalidation.
 				throw new Error(`Model catalog request failed for ${provider.id}: ${response.status}`);
 			}
-			const refreshed = parseCatalog(provider.id, await response.json());
+			const refreshed = parseCatalog(provider.id, body);
 			const lastModified = Date.parse(response.headers.get("last-modified") ?? "");
 			if (context.signal.aborted) return;
 			const entry = {

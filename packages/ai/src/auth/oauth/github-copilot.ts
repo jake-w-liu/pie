@@ -277,7 +277,7 @@ async function pollForGitHubAccessToken(
 		expiresInSeconds: device.expires_in,
 		waitBeforeFirstPoll: true,
 		signal,
-		poll: async () => {
+		poll: async (pollSignal) => {
 			const raw = await fetchJson(urls.accessTokenUrl, {
 				method: "POST",
 				headers: {
@@ -290,7 +290,7 @@ async function pollForGitHubAccessToken(
 					device_code: device.device_code,
 					grant_type: "urn:ietf:params:oauth:grant-type:device_code",
 				}),
-				signal,
+				signal: pollSignal,
 			});
 
 			if (raw && typeof raw === "object" && typeof (raw as DeviceTokenSuccessResponse).access_token === "string") {

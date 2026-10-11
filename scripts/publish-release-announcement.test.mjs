@@ -1,6 +1,41 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import test from "node:test";
-import { advanceLatestRelease, compareReleaseVersions, putImmutableObject } from "./publish-release-announcement.mjs";
+import {
+	advanceLatestRelease,
+	buildReleaseAnnouncement,
+	compareReleaseVersions,
+	putImmutableObject,
+} from "./publish-release-announcement.mjs";
+
+test("builds retry-stable immutable release announcements", async () => {
+	const sourceCommit = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+	const input = {
+		version: "1.2.3",
+		sourceCommit,
+		packages: [{ name: "@earendil-works/pi-ai", version: "1.2.3" }],
+	};
+	const firstWallClock = Date.now();
+	const firstBody = buildReleaseAnnouncement(input);
+	while (Date.now() === firstWallClock) await new Promise((resolve) => setTimeout(resolve, 1));
+	const secondBody = buildReleaseAnnouncement(input);
+	assert.equal(secondBody, firstBody);
+
+	const announcement = JSON.parse(firstBody);
+	const commitTimestamp = execFileSync("git", ["show", "-s", "--format=%cI", sourceCommit], {
+		encoding: "utf8",
+	}).trim();
+	assert.equal(announcement.publishedAt, new Date(commitTimestamp).toISOString());
+	assert.equal(
+		await putImmutableObject({
+			write: async () => false,
+			readRemote: async () => Buffer.from(firstBody),
+			key: "releases/v1/releases/1.2.3.json",
+			body: Buffer.from(secondBody),
+		}),
+		false,
+	);
+});
 
 test("compares stable release versions numerically", () => {
 	assert.ok(compareReleaseVersions("0.85.0", "0.84.9") > 0);

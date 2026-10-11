@@ -4,7 +4,7 @@
 # Mirrors .github/workflows/build-binaries.yml
 #
 # Usage:
-#   ./scripts/build-binaries.sh [--skip-install] [--skip-deps] [--skip-build] [--offline-model-data] [--platform <platform>] [--out <dir>]
+#   ./scripts/build-binaries.sh [--skip-install] [--skip-deps] [--skip-build] [--offline-model-data] [--platform <platform>] [--out <dir>] [--force]
 #
 # Options:
 #   --skip-install       Skip npm ci
@@ -13,6 +13,7 @@
 #   --offline-model-data Build with bundled model data instead of refreshing it
 #   --platform <name>    Build only for specified platform (darwin-arm64, darwin-x64, linux-x64, linux-arm64, windows-x64, windows-arm64)
 #   --out <dir>          Output directory (default: packages/coding-agent/binaries)
+#   --force              Replace an existing output directory not created by this script
 #
 # Output:
 #   packages/coding-agent/binaries/
@@ -33,6 +34,8 @@ SKIP_BUILD=false
 OFFLINE_MODEL_DATA=false
 PLATFORM=""
 OUTPUT_DIR=""
+FORCE_OUTPUT=false
+OUTPUT_MARKER=".pi-binaries-output"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -60,6 +63,10 @@ while [[ $# -gt 0 ]]; do
             OUTPUT_DIR="$2"
             shift 2
             ;;
+        --force)
+            FORCE_OUTPUT=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -83,8 +90,21 @@ fi
 if [[ -z "$OUTPUT_DIR" ]]; then
     OUTPUT_DIR="packages/coding-agent/binaries"
 fi
-if [[ "$OUTPUT_DIR" != /* ]]; then
-    OUTPUT_DIR="$(pwd)/$OUTPUT_DIR"
+OUTPUT_DIR="$(node -e 'const fs=require("node:fs"),p=require("node:path"); const value=p.resolve(process.argv[1]); console.log(fs.existsSync(value) ? fs.realpathSync(value) : value)' "$OUTPUT_DIR")"
+REPOSITORY_ROOT="$(pwd -P)"
+case "$REPOSITORY_ROOT/" in
+    "$OUTPUT_DIR/"*)
+        echo "Refusing output directory that contains the repository: $OUTPUT_DIR" >&2
+        exit 1
+        ;;
+esac
+# Only an output directory created by this script carries the ownership marker. Any other existing
+# path, including a regular file, is refused rather than erased by the clean below.
+if [[ -e "$OUTPUT_DIR" && "$FORCE_OUTPUT" == "false" ]]; then
+    if [[ ! -d "$OUTPUT_DIR" || ! -f "$OUTPUT_DIR/$OUTPUT_MARKER" ]]; then
+        echo "Refusing to replace unowned output path: $OUTPUT_DIR (pass --force to replace it)" >&2
+        exit 1
+    fi
 fi
 
 if [[ "$SKIP_INSTALL" == "false" ]]; then
@@ -151,6 +171,7 @@ cd packages/coding-agent
 # Clean previous builds
 rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"/{darwin-arm64,darwin-x64,linux-x64,linux-arm64,windows-x64,windows-arm64}
+printf 'created by scripts/build-binaries.sh\n' > "$OUTPUT_DIR/$OUTPUT_MARKER"
 
 # Determine which platforms to build
 if [[ -n "$PLATFORM" ]]; then

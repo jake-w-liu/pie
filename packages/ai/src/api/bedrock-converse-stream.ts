@@ -51,6 +51,7 @@ import type {
 import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
+import { shortHash } from "../utils/hash.ts";
 import { providerHeadersToRecord } from "../utils/headers.ts";
 import { cancelResponseBody } from "../utils/http-response.ts";
 import { parseStreamingJson, shouldReparseStreamingJson } from "../utils/json-parse.ts";
@@ -719,8 +720,12 @@ function flushRedactedContent(block: Block): void {
  */
 function finalizeStreamingBlock(block: Block): void {
 	delete block.index;
-	// partialJson is only a streaming scratch buffer; never persist it.
+	if (block.type === "toolCall" && block.partialJson !== undefined) {
+		block.arguments = parseStreamingJson(block.partialJson);
+	}
+	// Streaming parse state must never reach a persisted message.
 	delete block.partialJson;
+	delete block.parsedJsonLength;
 	flushRedactedContent(block);
 }
 
@@ -734,6 +739,11 @@ function handleMetadata(
 		output.usage.output = event.usage.outputTokens || 0;
 		output.usage.cacheRead = event.usage.cacheReadInputTokens || 0;
 		output.usage.cacheWrite = event.usage.cacheWriteInputTokens || 0;
+		output.usage.cacheWrite1h =
+			event.usage.cacheDetails?.reduce(
+				(total, detail) => total + (detail.ttl === CacheTTL.ONE_HOUR ? (detail.inputTokens ?? 0) : 0),
+				0,
+			) ?? 0;
 		output.usage.totalTokens =
 			event.usage.totalTokens ||
 			output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
@@ -761,11 +771,7 @@ function handleContentBlockStop(
 			stream.push({ type: "thinking_end", contentIndex: index, content: block.thinking, partial: output });
 			break;
 		case "toolCall":
-			block.arguments = parseStreamingJson(block.partialJson);
-			// Finalize in-place and strip the scratch buffer so replay only
-			// carries parsed arguments.
-			delete (block as Block).partialJson;
-			delete (block as Block).parsedJsonLength;
+			finalizeStreamingBlock(block);
 			stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: output });
 			break;
 	}
@@ -928,9 +934,26 @@ function buildSystemPrompt(
 	return blocks;
 }
 
-function normalizeToolCallId(id: string): string {
-	const sanitized = id.replace(/[^a-zA-Z0-9_-]/g, "_");
-	return sanitized.length > 64 ? sanitized.slice(0, 64) : sanitized;
+function createToolCallIdNormalizer(): (id: string) => string {
+	const idMap = new Map<string, string>();
+	const reverseMap = new Map<string, string>();
+
+	return (id: string): string => {
+		const existing = idMap.get(id);
+		if (existing) return existing;
+
+		const sanitized = id.replace(/[^a-zA-Z0-9_-]/g, "_") || "_";
+		for (let attempt = 0; ; attempt++) {
+			const suffix = attempt === 0 ? "" : `_${shortHash(`${id}:${attempt}`).slice(0, 10)}`;
+			const candidate = `${sanitized.slice(0, 64 - suffix.length)}${suffix}`;
+			const owner = reverseMap.get(candidate);
+			if (!owner || owner === id) {
+				idMap.set(id, candidate);
+				reverseMap.set(candidate, id);
+				return candidate;
+			}
+		}
+	};
 }
 
 function createNonBlankTextBlock(text: string): ContentBlock.TextMember | undefined {
@@ -977,7 +1000,8 @@ function convertMessages(
 	env?: ProviderEnv,
 ): Message[] {
 	const result: Message[] = [];
-	const transformedMessages = transformMessages(context.messages, model, normalizeToolCallId);
+	const normalizeToolCallId = createToolCallIdNormalizer();
+	const transformedMessages = transformMessages(context.messages, model, (id) => normalizeToolCallId(id));
 
 	for (let i = 0; i < transformedMessages.length; i++) {
 		const m = transformedMessages[i];
@@ -1041,19 +1065,13 @@ function convertMessages(
 								}
 								continue;
 							}
-							// Skip empty thinking blocks
 							const thinking = sanitizeSurrogates(c.thinking);
-							if (thinking.trim().length === 0) continue;
 							// Only Anthropic models support the signature field in reasoningText.
 							// For other models, we omit the signature to avoid errors like:
 							// "This model doesn't support the reasoningContent.reasoningText.signature field"
 							if (supportsThinkingSignature(model)) {
-								// Signatures arrive after thinking deltas. If a partial or externally
-								// persisted message lacks a signature, Bedrock rejects the replayed
-								// reasoning block. Fall back to plain text, matching Anthropic.
-								if (!c.thinkingSignature || c.thinkingSignature.trim().length === 0) {
-									contentBlocks.push({ text: thinking });
-								} else {
+								// A signature-only block is still required for signed tool continuation.
+								if (c.thinkingSignature && c.thinkingSignature.trim().length > 0) {
 									contentBlocks.push({
 										reasoningContent: {
 											reasoningText: {
@@ -1062,8 +1080,11 @@ function convertMessages(
 											},
 										},
 									});
+								} else if (thinking.trim().length > 0) {
+									// Bedrock rejects an unsigned reasoning block, so fall back to plain text.
+									contentBlocks.push({ text: thinking });
 								}
-							} else {
+							} else if (thinking.trim().length > 0) {
 								contentBlocks.push({
 									reasoningContent: {
 										reasoningText: { text: thinking },

@@ -103,7 +103,13 @@ function loadPromptWorkflow(filePath: string): PromptWorkflow | undefined {
 export function discoverPromptWorkflows(cwd: string): PromptWorkflow[] {
 	const workflows = new Map<string, PromptWorkflow>();
 	for (const file of readPromptFiles(cwd)) {
-		const workflow = loadPromptWorkflow(file);
+		let workflow: PromptWorkflow | undefined;
+		try {
+			workflow = loadPromptWorkflow(file);
+		} catch {
+			// One unreadable prompt file must not remove every prompt workflow in the directory.
+			continue;
+		}
 		if (workflow) workflows.set(workflow.name, workflow);
 	}
 	return [...workflows.values()].sort((a, b) => a.name.localeCompare(b.name));
@@ -146,13 +152,16 @@ function shellWords(input: string): string[] {
 	return words;
 }
 
-function substituteArgs(template: string, args: string[]): string {
+export function substituteArgs(template: string, args: string[]): string {
 	const all = args.join(" ");
-	return template
-		.replace(/\$ARGUMENTS/g, all)
-		.replace(/\$@/g, all)
-		.replace(/\$\{(\d+):-([^}]*)\}/g, (_match, index: string, fallback: string) => args[Number(index) - 1] || fallback)
-		.replace(/\$(\d+)/g, (_match, index: string) => args[Number(index) - 1] ?? "");
+	return template.replace(
+		/\$\{(\d+):-([^}]*)\}|\$(ARGUMENTS|@|\d+)/g,
+		(_match, defaultIndex: string | undefined, fallback: string | undefined, simple: string | undefined) => {
+			if (defaultIndex !== undefined) return args[Number(defaultIndex) - 1] || fallback || "";
+			if (simple === "ARGUMENTS" || simple === "@") return all;
+			return args[Number(simple) - 1] ?? "";
+		},
+	);
 }
 
 function parseRuntimeOptions(words: string[]): { args: string[]; agentOverride?: string; fork?: boolean; fresh?: boolean; bg?: boolean } {

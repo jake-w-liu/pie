@@ -46,6 +46,31 @@ describe("path-utils", () => {
 			expect(resolveToCwd("~draft.md", cwd)).toBe(resolve(cwd, "~draft.md"));
 			expect(resolveToCwd("@~draft.md", cwd)).toBe(resolve(cwd, "~draft.md"));
 		});
+
+		it("prefers an existing literal path before normalizing Unicode spaces or a leading @", () => {
+			const cwd = mkdtempSync(join(tmpdir(), "pi-path-utils-literal-"));
+			try {
+				for (const fileName of ["ideographic\u3000space.txt", "narrow\u202fspace.txt", "@scope.txt"]) {
+					writeFileSync(join(cwd, fileName), "literal");
+					expect(resolveToCwd(fileName, cwd)).toBe(join(cwd, fileName));
+				}
+			} finally {
+				for (const file of readdirSync(cwd)) unlinkSync(join(cwd, file));
+				rmdirSync(cwd);
+			}
+		});
+
+		it("normalizes a path when no literal file exists, including for creation", () => {
+			const cwd = mkdtempSync(join(tmpdir(), "pi-path-utils-normalized-"));
+			try {
+				writeFileSync(join(cwd, "existing space.txt"), "normalized");
+				expect(resolveToCwd("existing\u3000space.txt", cwd)).toBe(join(cwd, "existing space.txt"));
+				expect(resolveToCwd("@out\u202ffile.txt", cwd)).toBe(join(cwd, "out file.txt"));
+			} finally {
+				for (const file of readdirSync(cwd)) unlinkSync(join(cwd, file));
+				rmdirSync(cwd);
+			}
+		});
 	});
 
 	describe("resolveReadPath", () => {

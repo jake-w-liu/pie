@@ -134,7 +134,7 @@ import { acceptanceFailureMessage, aggregateAcceptanceReport, buildSkippedAccept
 import { attachContractProjections, isAgentContractV1 } from "../shared/agent-contract.ts";
 import { waitForImportedAsyncRoot } from "./chain-root-attachment.ts";
 import { normalizeExtensionBindings } from "../shared/extension-bindings.ts";
-import { appendRunnerStepsToStatus, consumeChainAppendRequests, countPendingChainAppendRequests, statusStepDescription } from "./chain-append.ts";
+import { appendRunnerStepsToStatus, closeChainAppendInbox, consumeChainAppendRequests, countPendingChainAppendRequests, statusStepDescription } from "./chain-append.ts";
 import { asyncStatusChildIdentity } from "../shared/child-identity.ts";
 import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudgetState, turnBudgetDecision, turnBudgetDeferredNote, turnBudgetDeferredState, turnBudgetExceededMessage, turnBudgetSoftNote, turnBudgetState } from "../shared/turn-budget.ts";
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
@@ -417,14 +417,18 @@ function costSummaryFromAttempts(attempts: ModelAttempt[] | undefined): CostSumm
 	if (!attempts || attempts.length === 0) return undefined;
 	let inputTokens = 0;
 	let outputTokens = 0;
+	let cacheReadTokens = 0;
+	let cacheWriteTokens = 0;
 	let costUsd = 0;
 	for (const attempt of attempts) {
 		inputTokens += attempt.usage?.input ?? 0;
 		outputTokens += attempt.usage?.output ?? 0;
+		cacheReadTokens += attempt.usage?.cacheRead ?? 0;
+		cacheWriteTokens += attempt.usage?.cacheWrite ?? 0;
 		costUsd += attempt.usage?.cost ?? 0;
 	}
-	return inputTokens > 0 || outputTokens > 0 || costUsd > 0
-		? { inputTokens, outputTokens, costUsd }
+	return inputTokens > 0 || outputTokens > 0 || cacheReadTokens > 0 || cacheWriteTokens > 0 || costUsd > 0
+		? { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, costUsd }
 		: undefined;
 }
 
@@ -2740,7 +2744,7 @@ async function runSubagent(
 	}
 	runPersistence.write(statusPath, statusPayload);
 
-	let pendingParallelUsageCost: CostSummary = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
+	let pendingParallelUsageCost: CostSummary = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0 };
 	const currentUsageTotals = (): CostSummary => {
 		const cost = results.reduce<CostSummary>((sum, result) => ({
 			inputTokens: sum.inputTokens + (result.totalCost?.inputTokens ?? result.usage?.input ?? 0),
@@ -2748,7 +2752,7 @@ async function runSubagent(
 			costUsd: sum.costUsd + (result.totalCost?.costUsd ?? result.usage?.cost ?? 0),
 			cacheReadTokens: (sum.cacheReadTokens ?? 0) + (result.totalCost?.cacheReadTokens ?? result.usage?.cacheRead ?? 0),
 			cacheWriteTokens: (sum.cacheWriteTokens ?? 0) + (result.totalCost?.cacheWriteTokens ?? result.usage?.cacheWrite ?? 0),
-		}), { inputTokens: pendingParallelUsageCost.inputTokens, outputTokens: pendingParallelUsageCost.outputTokens, costUsd: pendingParallelUsageCost.costUsd });
+		}), { ...pendingParallelUsageCost });
 		return {
 			inputTokens: Math.max(cost.inputTokens, statusPayload.totalTokens?.input ?? 0),
 			outputTokens: Math.max(cost.outputTokens, statusPayload.totalTokens?.output ?? 0),
@@ -3159,6 +3163,10 @@ async function runSubagent(
 		});
 		mutatingFailureStates.push(...Array.from({ length: added.addedFlatSteps }, () => createMutatingFailureState()));
 		pendingToolResults.push(...Array.from({ length: added.addedFlatSteps }, () => undefined));
+		flatSteps.push(...flattenSteps(appendedSteps));
+		activeToolCalls.push(...Array.from({ length: added.addedFlatSteps }, () => new Map<string, ActiveToolCall>()));
+		activeToolKeysByName.push(...Array.from({ length: added.addedFlatSteps }, () => new Map<string, string[]>()));
+		activeToolSequences.push(...Array.from({ length: added.addedFlatSteps }, () => 0));
 		if (config.childIntercomTargets) {
 			config.childIntercomTargets = statusPayload.steps.map((statusStep, index) => resolveSubagentIntercomTarget(id, statusStep.agent, index));
 		}
@@ -3953,7 +3961,14 @@ async function runSubagent(
 	while (true) {
 		if (interrupted || timedOut || stopped || turnBudgetExceeded) break;
 		consumePendingAppendRequests();
-		if (stepCursor >= steps.length) break;
+		if (stepCursor >= steps.length) {
+			// Closing first gives enqueuers a durable admission boundary. Requests
+			// committed before this marker are claimed by the final sweep; requests
+			// committed afterward remove themselves and report rejection.
+			closeChainAppendInbox(asyncDir);
+			consumePendingAppendRequests();
+			if (stepCursor >= steps.length) break;
+		}
 		refreshUsageBudget();
 		if (statusPayload.usageBudget?.exhausted) {
 			usageBudgetExceeded = true;
@@ -4080,6 +4095,15 @@ async function runSubagent(
 					results.push(omitUndefinedProperties({ agent: step.parallel.agent, context: step.parallel.context, output: errorMessage, error: errorMessage, success: false, exitCode: 1, timedOut: groupTimedOut ? true : undefined, stopped: groupStopped ? true : undefined, acceptance: effectiveGroupAcceptance }));
 					break;
 				}
+				results.push(omitUndefinedProperties({
+					agent: step.parallel.agent,
+					context: step.parallel.context,
+					output: previousOutput,
+					success: true,
+					exitCode: 0,
+					structuredOutput: collection,
+					acceptance: effectiveGroupAcceptance,
+				}));
 				flatIndex++;
 				statusPayload.lastUpdate = now;
 				markDynamicGraphGroup(stepIndex, "completed", undefined, effectiveGroupAcceptance);
@@ -4332,6 +4356,8 @@ async function runSubagent(
 					pendingParallelUsageCost = {
 						inputTokens: pendingParallelUsageCost.inputTokens + singleResult.totalCost.inputTokens,
 						outputTokens: pendingParallelUsageCost.outputTokens + singleResult.totalCost.outputTokens,
+						cacheReadTokens: (pendingParallelUsageCost.cacheReadTokens ?? 0) + (singleResult.totalCost.cacheReadTokens ?? 0),
+						cacheWriteTokens: (pendingParallelUsageCost.cacheWriteTokens ?? 0) + (singleResult.totalCost.cacheWriteTokens ?? 0),
 						costUsd: pendingParallelUsageCost.costUsd + singleResult.totalCost.costUsd,
 					};
 					refreshUsageBudget();
@@ -4418,7 +4444,7 @@ async function runSubagent(
 					writerAttemptCount: pr.writerAttemptCount,
 				}));
 			}
-			pendingParallelUsageCost = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
+			pendingParallelUsageCost = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0 };
 			refreshUsageBudget();
 			const collection = collectDynamicResults(step as Parameters<typeof collectDynamicResults>[0], materialized.items, parallelResults);
 			const failures = parallelResults.filter((result) => result.exitCode !== 0 && result.exitCode !== -1);
@@ -4736,6 +4762,8 @@ async function runSubagent(
 							pendingParallelUsageCost = {
 								inputTokens: pendingParallelUsageCost.inputTokens + singleResult.totalCost.inputTokens,
 								outputTokens: pendingParallelUsageCost.outputTokens + singleResult.totalCost.outputTokens,
+								cacheReadTokens: (pendingParallelUsageCost.cacheReadTokens ?? 0) + (singleResult.totalCost.cacheReadTokens ?? 0),
+								cacheWriteTokens: (pendingParallelUsageCost.cacheWriteTokens ?? 0) + (singleResult.totalCost.cacheWriteTokens ?? 0),
 								costUsd: pendingParallelUsageCost.costUsd + singleResult.totalCost.costUsd,
 							};
 							refreshUsageBudget();
@@ -4862,7 +4890,7 @@ async function runSubagent(
 						writerAttemptCount: pr.writerAttemptCount,
 					}));
 				}
-				pendingParallelUsageCost = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
+				pendingParallelUsageCost = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0 };
 				refreshUsageBudget();
 				for (let t = 0; t < group.parallel.length; t++) {
 					const outputName = group.parallel[t]?.outputName;
@@ -5304,9 +5332,11 @@ async function runSubagent(
 	const totalCost = results.reduce<CostSummary>((sum, result) => ({
 		inputTokens: sum.inputTokens + (result.totalCost?.inputTokens ?? 0),
 		outputTokens: sum.outputTokens + (result.totalCost?.outputTokens ?? 0),
+		cacheReadTokens: (sum.cacheReadTokens ?? 0) + (result.totalCost?.cacheReadTokens ?? 0),
+		cacheWriteTokens: (sum.cacheWriteTokens ?? 0) + (result.totalCost?.cacheWriteTokens ?? 0),
 		costUsd: sum.costUsd + (result.totalCost?.costUsd ?? 0),
-	}), { inputTokens: 0, outputTokens: 0, costUsd: 0 });
-	const finalTotalCost = totalCost.inputTokens > 0 || totalCost.outputTokens > 0 || totalCost.costUsd > 0 ? totalCost : undefined;
+	}), { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, costUsd: 0 });
+	const finalTotalCost = totalCost.inputTokens > 0 || totalCost.outputTokens > 0 || (totalCost.cacheReadTokens ?? 0) > 0 || (totalCost.cacheWriteTokens ?? 0) > 0 || totalCost.costUsd > 0 ? totalCost : undefined;
 	const finalFlatAgents = statusPayload.steps.map((step) => step.agent);
 	const agentName = finalFlatAgents.length === 1
 		? finalFlatAgents[0]!

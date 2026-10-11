@@ -304,6 +304,21 @@ describe("protocol validation", () => {
 		expect(() => parseServerMessage(message)).toThrow(ProtocolValidationError);
 	});
 
+	test("rejects JSON numbers outside the CBOR transportable safe range", () => {
+		expect(() =>
+			parseServerMessage({
+				type: "response",
+				id: "request-1",
+				ok: false,
+				error: {
+					code: "invalid_request",
+					message: "invalid",
+					details: { unsafe: Number.MAX_SAFE_INTEGER + 1 },
+				},
+			}),
+		).toThrow(ProtocolValidationError);
+	});
+
 	test("validation errors do not retain rejected payloads", () => {
 		let thrown: unknown;
 		try {

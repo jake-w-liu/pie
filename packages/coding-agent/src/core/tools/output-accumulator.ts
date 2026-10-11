@@ -60,7 +60,7 @@ export class OutputAccumulator {
 		this.tempFilePrefix = options.tempFilePrefix ?? "pi-output";
 	}
 
-	append(data: Buffer): void {
+	append(data: Buffer): boolean {
 		if (this.finished) {
 			throw new Error("Cannot append to a finished output accumulator");
 		}
@@ -70,10 +70,14 @@ export class OutputAccumulator {
 
 		if (this.spool || this.shouldUseTempFile()) {
 			this.ensureTempFile();
-			this.spool?.write(data);
-		} else if (data.length > 0) {
-			this.rawChunks.push(data);
+			return this.spool?.write(data) ?? true;
 		}
+		if (data.length > 0) this.rawChunks.push(data);
+		return true;
+	}
+
+	async waitForDrain(): Promise<void> {
+		await this.spool?.waitForDrain();
 	}
 
 	finish(): void {

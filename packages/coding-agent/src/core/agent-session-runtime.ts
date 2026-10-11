@@ -443,6 +443,10 @@ export class AgentSessionRuntime {
 		// Join the replacement queue so an in-flight replacement finishes applying
 		// before teardown, and a queued replacement still runs before disposal.
 		await this.runExclusiveReplacement(async () => {
+			// Match replacement teardown: settle agent and standalone Bash work before
+			// shutdown handlers invalidate resources used by their completion paths.
+			await this.session.abort();
+			await this.session.abortBashAndWait();
 			await emitSessionShutdownEvent(this.session.extensionRunner, {
 				type: "session_shutdown",
 				reason: "quit",

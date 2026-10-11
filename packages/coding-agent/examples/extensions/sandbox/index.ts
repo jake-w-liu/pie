@@ -161,8 +161,8 @@ function createSandboxedBashOps(): BashOperations {
 					}, timeout * 1000);
 				}
 
-				child.stdout?.on("data", onData);
-				child.stderr?.on("data", onData);
+				child.stdout?.on("data", (data: Buffer) => onData(data, "stdout"));
+				child.stderr?.on("data", (data: Buffer) => onData(data, "stderr"));
 
 				child.on("error", (err) => {
 					if (timeoutHandle) clearTimeout(timeoutHandle);

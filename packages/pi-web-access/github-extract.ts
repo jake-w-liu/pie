@@ -187,6 +187,47 @@ export function parseGitHubUrl(url: string): GitHubUrlInfo | null {
 	};
 }
 
+export async function resolveGitHubUrlInfo(url: string, info: GitHubUrlInfo, timeoutMs: number, signal?: AbortSignal): Promise<GitHubUrlInfo> {
+	if (info.type === "root" || info.refIsFullSha) return info;
+	let tail: string[];
+	try {
+		tail = new URL(url).pathname.split("/").filter(Boolean).slice(3).map(segment => decodeURIComponent(segment));
+	} catch {
+		return info;
+	}
+	if (tail.length < 2) return info;
+
+	const candidates = Array.from({ length: tail.length - 1 }, (_, index) => tail.slice(0, index + 2).join("/"));
+	const patterns = candidates.flatMap(candidate => [`refs/heads/${candidate}`, `refs/tags/${candidate}`]);
+	const remote = `https://github.com/${info.owner}/${info.repo}.git`;
+	const refs = await new Promise<Set<string> | null>((resolve) => {
+		execFile("git", ["ls-remote", "--heads", "--tags", remote, ...patterns], {
+			timeout: timeoutMs,
+			maxBuffer: 2 * 1024 * 1024,
+			env: proxyChildEnv(),
+			...(signal ? { signal } : {}),
+		}, (err, stdout) => {
+			if (err) {
+				resolve(null);
+				return;
+			}
+			resolve(new Set(stdout.split("\n").flatMap(line => {
+				const ref = line.split("\t")[1];
+				if (!ref || ref.endsWith("^{}")) return [];
+				return [ref.replace(/^refs\/(?:heads|tags)\//, "")];
+			})));
+		});
+	});
+	if (!refs) return info;
+	for (let length = tail.length; length >= 2; length--) {
+		const ref = tail.slice(0, length).join("/");
+		if (refs.has(ref)) {
+			return { ...info, ref, path: tail.slice(length).join("/"), refIsFullSha: false };
+		}
+	}
+	return info;
+}
+
 function cacheKey(owner: string, repo: string, ref?: string): string {
 	return ref ? `${owner}/${repo}@${ref}` : `${owner}/${repo}`;
 }
@@ -632,13 +673,15 @@ export async function extractGitHub(
 	signal?: AbortSignal,
 	forceClone?: boolean,
 ): Promise<ExtractedContent | null> {
-	const info = parseGitHubUrl(url);
-	if (!info) return null;
+	const parsedInfo = parseGitHubUrl(url);
+	if (!parsedInfo) return null;
 
 	if (signal?.aborted) return null;
 
 	const config = loadGitHubConfig();
 	if (!config.enabled) return null;
+	const info = await resolveGitHubUrlInfo(url, parsedInfo, Math.min(config.cloneTimeoutSeconds * 1000, 10_000), signal);
+	if (signal?.aborted) return null;
 	const generation = cloneGeneration;
 
 	const { owner, repo } = info;

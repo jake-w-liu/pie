@@ -38,14 +38,19 @@ export async function pathExists(filePath: string): Promise<boolean> {
 }
 
 export function expandPath(filePath: string): string {
+	const literal = normalizePath(filePath);
+	if (fileExists(literal)) return literal;
 	return normalizePath(filePath, { normalizeUnicodeSpaces: true, stripAtPrefix: true });
 }
 
 /**
- * Resolve a path relative to the given cwd.
- * Handles ~ expansion and absolute paths.
+ * Resolve a path relative to the given cwd, including ~ expansion and absolute paths.
+ * Existing literal filenames take precedence over Unicode-space normalization and leading-@ stripping.
+ * Nonexistent paths, including targets being created, keep the documented normalization behavior.
  */
 export function resolveToCwd(filePath: string, cwd: string): string {
+	const literal = resolvePath(filePath, cwd);
+	if (fileExists(literal)) return literal;
 	return resolvePath(filePath, cwd, { normalizeUnicodeSpaces: true, stripAtPrefix: true });
 }
 

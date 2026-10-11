@@ -11,11 +11,12 @@
 		"LICENSE",
 		"SECURITY.md"
 	],
-	"scripts": {
-		"clean": "shx rm -rf dist",
-		"build": "tsgo -p tsconfig.build.json",
-		"typecheck": "tsgo -p tsconfig.build.json"
-	},
+  "scripts": {
+    "clean": "shx rm -rf dist",
+    "build": "tsgo -p tsconfig.build.json",
+    "typecheck": "tsgo -p tsconfig.build.json",
+    "test": "vitest --run"
+  },
 	"license": "MIT",
 	"dependencies": {
 		"@mozilla/readability": "0.6.0",

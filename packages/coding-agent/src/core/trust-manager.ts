@@ -186,25 +186,27 @@ function withTrustFileLock<T>(path: string, fn: () => T): T {
 export function hasTrustRequiringProjectResources(cwd: string): boolean {
 	const homeDir = canonicalizePath(resolvePath(process.env.HOME || homedir()));
 	const userAgentsSkillsDir = join(homeDir, ".agents", "skills");
-	let currentDir = canonicalizePath(resolvePath(cwd));
+	const lexicalCwd = resolvePath(cwd);
+	const canonicalCwd = canonicalizePath(lexicalCwd);
 
-	const configDir = join(currentDir, CONFIG_DIR_NAME);
-	if (TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES.some((entry) => existsSync(join(configDir, entry)))) {
-		return true;
-	}
-
-	while (true) {
-		const agentsSkillsDir = join(currentDir, ".agents", "skills");
-		if (agentsSkillsDir !== userAgentsSkillsDir && existsSync(agentsSkillsDir)) {
+	for (const projectDir of new Set([lexicalCwd, canonicalCwd])) {
+		const configDir = join(projectDir, CONFIG_DIR_NAME);
+		if (TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES.some((entry) => existsSync(join(configDir, entry)))) {
 			return true;
 		}
 
-		const parentDir = dirname(currentDir);
-		if (parentDir === currentDir) {
-			return false;
+		let currentDir = projectDir;
+		while (true) {
+			const agentsSkillsDir = join(currentDir, ".agents", "skills");
+			if (canonicalizePath(agentsSkillsDir) !== userAgentsSkillsDir && existsSync(agentsSkillsDir)) {
+				return true;
+			}
+			const parentDir = dirname(currentDir);
+			if (parentDir === currentDir) break;
+			currentDir = parentDir;
 		}
-		currentDir = parentDir;
 	}
+	return false;
 }
 
 export class ProjectTrustStore {

@@ -160,11 +160,22 @@ export function applyReplacementsPreservingUnchangedLines(
 
 		const groupStartOffset = baseLines[group.startLine].start;
 		const groupEndOffset = baseLines[group.endLine - 1].end;
-		result += applyReplacements(
+		let changedBlock = applyReplacements(
 			baseContent.slice(groupStartOffset, groupEndOffset),
 			group.replacements,
 			groupStartOffset,
 		);
+		const changedLines = splitLinesWithEndings(changedBlock);
+		const originalGroupLines = originalLines.slice(group.startLine, group.endLine);
+		if (changedLines.length === originalGroupLines.length) {
+			changedBlock = changedLines
+				.map((line, index) => {
+					const originalIndent = originalGroupLines[index].match(/^[ \t]*/)?.[0] ?? "";
+					return originalIndent + line.replace(/^[ \t]*/, "");
+				})
+				.join("");
+		}
+		result += changedBlock;
 		originalLineIndex = group.endLine;
 	}
 	result += originalLines.slice(originalLineIndex).join("");
@@ -196,6 +207,59 @@ export interface Edit {
 export interface AppliedEditsResult {
 	baseContent: string;
 	newContent: string;
+}
+
+/** Apply changes computed in LF-normalized space back to the original text. */
+export function applyNormalizedChangesToOriginal(
+	originalContent: string,
+	normalizedContent: string,
+	newNormalizedContent: string,
+	newLineEnding: "\r\n" | "\n",
+): string {
+	const boundaryMap: number[] = [0];
+	let normalizedOffset = 0;
+	for (let rawOffset = 0; rawOffset < originalContent.length; rawOffset++) {
+		if (originalContent[rawOffset] === "\r") {
+			if (originalContent[rawOffset + 1] === "\n") rawOffset++;
+			normalizedOffset++;
+			boundaryMap[normalizedOffset] = rawOffset + 1;
+		} else {
+			normalizedOffset++;
+			boundaryMap[normalizedOffset] = rawOffset + 1;
+		}
+	}
+
+	let oldOffset = 0;
+	const replacements: Array<{ start: number; end: number; text: string }> = [];
+	let pending: { start: number; end: number; text: string } | undefined;
+	for (const part of Diff.diffChars(normalizedContent, newNormalizedContent)) {
+		if (!part.added && !part.removed) {
+			if (pending) {
+				replacements.push(pending);
+				pending = undefined;
+			}
+			oldOffset += part.value.length;
+			continue;
+		}
+		pending ??= { start: oldOffset, end: oldOffset, text: "" };
+		if (part.removed) {
+			oldOffset += part.value.length;
+			pending.end = oldOffset;
+		} else {
+			pending.text += restoreLineEndings(part.value, newLineEnding);
+		}
+	}
+	if (pending) replacements.push(pending);
+
+	let result = originalContent;
+	for (let i = replacements.length - 1; i >= 0; i--) {
+		const replacement = replacements[i];
+		result =
+			result.slice(0, boundaryMap[replacement.start]) +
+			replacement.text +
+			result.slice(boundaryMap[replacement.end]);
+	}
+	return result;
 }
 
 /**
@@ -247,7 +311,19 @@ export function fuzzyFindText(content: string, oldText: string): FuzzyMatchResul
 function countOccurrences(content: string, oldText: string): number {
 	const fuzzyContent = normalizeForFuzzyMatch(content);
 	const fuzzyOldText = normalizeForFuzzyMatch(oldText);
-	return fuzzyContent.split(fuzzyOldText).length - 1;
+	// A pattern with no characters has no occurrences, and stepping the scan by its length must advance.
+	if (fuzzyOldText.length === 0) return 0;
+	let count = 0;
+	// Overlapping occurrences count separately: a pattern that repeats inside its own match
+	// anchors at more than one offset, so the edit is ambiguous there.
+	for (
+		let index = fuzzyContent.indexOf(fuzzyOldText);
+		index !== -1;
+		index = fuzzyContent.indexOf(fuzzyOldText, index + 1)
+	) {
+		count++;
+	}
+	return count;
 }
 
 function getNotFoundError(path: string, editIndex: number, totalEdits: number): Error {
@@ -320,6 +396,11 @@ export function applyEditsToNormalizedContent(
 		const edit = normalizedEdits[i];
 		const matchResult = fuzzyFindText(replacementBaseContent, edit.oldText);
 		if (!matchResult.found) {
+			throw getNotFoundError(path, i, normalizedEdits.length);
+		}
+		// Whitespace-only old text normalizes to an empty pattern, which "matches" at offset 0
+		// without anchoring to any character. Report it as not found instead of editing there.
+		if (matchResult.matchLength === 0) {
 			throw getNotFoundError(path, i, normalizedEdits.length);
 		}
 

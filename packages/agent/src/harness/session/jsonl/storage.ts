@@ -18,6 +18,7 @@ import {
 } from "../types.ts";
 import { encodeHeader, encodeMutation, metadataFromHeader, parseHeader, parseMutation } from "./codec.ts";
 import { fileResult, invalidFile, JsonlDecodeError } from "./errors.ts";
+import { acquireJsonlWriterLease, type JsonlWriterLease, readOnlyJsonlWriterLease } from "./lease.ts";
 import type { JsonlSessionMetadata, JsonlSessionRepoFileSystem, JsonlV4Header } from "./types.ts";
 
 /**
@@ -45,6 +46,24 @@ async function publishFileAtomically(
 	}
 }
 
+function byteLength(value: string): number {
+	return new TextEncoder().encode(value).byteLength;
+}
+
+function setMutationSequence(mutation: SessionMutation, seq: number): void {
+	switch (mutation.kind) {
+		case "entry":
+			mutation.entry.seq = seq;
+			break;
+		case "record":
+			mutation.record.seq = seq;
+			break;
+		case "lane":
+		case "fact":
+			mutation.seq = seq;
+	}
+}
+
 export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata> {
 	private readonly fs: JsonlSessionRepoFileSystem;
 	private readonly metadata: JsonlSessionMetadata;
@@ -53,39 +72,83 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 	private acknowledgedContent: string;
 	private recoveryError: SessionError | undefined;
 	private deleted = false;
+	private closed = false;
+	private closePromise: Promise<void> | undefined;
+	private readonly lease: JsonlWriterLease;
 
-	private constructor(fs: JsonlSessionRepoFileSystem, metadata: JsonlSessionMetadata, content: string) {
+	private constructor(
+		fs: JsonlSessionRepoFileSystem,
+		metadata: JsonlSessionMetadata,
+		content: string,
+		lease: JsonlWriterLease,
+	) {
 		this.fs = fs;
 		this.metadata = structuredClone(metadata);
 		this.acknowledgedContent = content;
+		this.lease = lease;
 	}
 
 	static async create(
 		fs: JsonlSessionRepoFileSystem,
 		path: string,
 		header: JsonlV4Header,
+		lease?: JsonlWriterLease,
 	): Promise<JsonlSessionStorage> {
-		const content = encodeHeader(header);
-		fileResult(await fs.writeFile(path, content), `Failed to initialize session ${path}`);
-		const fileInfo = fileResult(await fs.fileInfo(path), `Failed to read session metadata ${path}`);
-		return new JsonlSessionStorage(fs, metadataFromHeader(header, path, fileInfo.mtimeMs), content);
+		const ownedLease = lease ?? (await acquireJsonlWriterLease(fs, path));
+		try {
+			const content = encodeHeader(header);
+			fileResult(await fs.writeFile(path, content), `Failed to initialize session ${path}`);
+			const fileInfo = fileResult(await fs.fileInfo(path), `Failed to read session metadata ${path}`);
+			return new JsonlSessionStorage(fs, metadataFromHeader(header, path, fileInfo.mtimeMs), content, ownedLease);
+		} catch (error) {
+			if (!lease) await ownedLease.close();
+			throw error;
+		}
 	}
 
+	/** Open an existing session for writing. Claims the exclusive writer lease unless one is supplied. */
 	static async load(
 		fs: JsonlSessionRepoFileSystem,
 		path: string,
 		acknowledgedPrefix?: string,
+		lease?: JsonlWriterLease,
 	): Promise<JsonlSessionStorage> {
+		const ownedLease = lease ?? (await acquireJsonlWriterLease(fs, path));
+		try {
+			return await JsonlSessionStorage.parse(fs, path, { lease: ownedLease, acknowledgedPrefix, repair: true });
+		} catch (error) {
+			if (!lease) await ownedLease.close();
+			throw error;
+		}
+	}
+
+	/**
+	 * Open an existing session for reading. The handle holds no writer claim and never repairs the file, so
+	 * any number of readers can observe a session while one writer holds its lease.
+	 */
+	static async read(fs: JsonlSessionRepoFileSystem, path: string): Promise<JsonlSessionStorage> {
+		return await JsonlSessionStorage.parse(fs, path, { lease: readOnlyJsonlWriterLease(path), repair: false });
+	}
+
+	/**
+	 * `repair` distinguishes a writer, which may truncate an unacknowledged torn tail and terminate an
+	 * unterminated tail, from a reader, which must ignore both without writing.
+	 */
+	private static async parse(
+		fs: JsonlSessionRepoFileSystem,
+		path: string,
+		options: { lease: JsonlWriterLease; acknowledgedPrefix?: string; repair: boolean },
+	): Promise<JsonlSessionStorage> {
+		const { acknowledgedPrefix, repair } = options;
 		const content = fileResult(await fs.readTextFile(path), `Failed to read session ${path}`);
 		// Never repair or import a replacement that removed an acknowledged write.
 		// A missing final newline is the only allowed change to the accepted prefix.
-		if (
+		// Decode first so a complete corrupt replacement retains the precise invalid-line
+		// diagnostic, but do not repair or adopt anything while the prefix differs.
+		const acknowledgedPrefixChanged =
 			acknowledgedPrefix !== undefined &&
 			!content.startsWith(acknowledgedPrefix) &&
-			content !== acknowledgedPrefix.slice(0, -1)
-		) {
-			throw new SessionError("invalid_entry", `Acknowledged session prefix changed: ${path}`);
-		}
+			content !== acknowledgedPrefix.slice(0, -1);
 		const physicalLines = content.split("\n");
 		if (physicalLines.at(-1) === "") physicalLines.pop();
 		if (physicalLines.length === 0 || !physicalLines[0]) {
@@ -98,6 +161,7 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 			fs,
 			metadataFromHeader(headerResult.value, path, fileInfo.mtimeMs),
 			content,
+			options.lease,
 		);
 		for (let index = 1; index < physicalLines.length; index++) {
 			const line = physicalLines[index]!;
@@ -105,11 +169,16 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 			if (!mutationResult.ok) {
 				const isTornTail = index === physicalLines.length - 1 && mutationResult.error.kind === "syntax";
 				if (isTornTail) {
-					// Drop the unacknowledged partial append by atomically publishing the valid prefix.
+					if (acknowledgedPrefixChanged) {
+						throw new SessionError("invalid_entry", `Acknowledged session prefix changed: ${path}`);
+					}
 					const validPrefix = `${physicalLines.slice(0, index).join("\n")}\n`;
-					await publishFileAtomically(fs, path, async (tempPath) => {
-						fileResult(await fs.writeFile(tempPath, validPrefix), `Failed to stage torn-tail repair ${path}`);
-					});
+					if (repair) {
+						// Drop the unacknowledged partial append by atomically publishing the valid prefix.
+						await publishFileAtomically(fs, path, async (tempPath) => {
+							fileResult(await fs.writeFile(tempPath, validPrefix), `Failed to stage torn-tail repair ${path}`);
+						});
+					}
 					storage.acknowledgedContent = validPrefix;
 					return storage;
 				}
@@ -124,7 +193,10 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 				throw error;
 			}
 		}
-		if (!content.endsWith("\n")) {
+		if (acknowledgedPrefixChanged) {
+			throw new SessionError("invalid_entry", `Acknowledged session prefix changed: ${path}`);
+		}
+		if (repair && !content.endsWith("\n")) {
 			fileResult(await fs.appendFile(path, "\n"), `Failed to repair unterminated session tail ${path}`);
 			storage.acknowledgedContent += "\n";
 		}
@@ -132,10 +204,10 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 	}
 
 	/** Validate/replay disk under the writer queue without creating a second writer. */
-	reopen(): Promise<void> {
+	reopen(fs: JsonlSessionRepoFileSystem = this.fs): Promise<void> {
 		return this.enqueue(async () => {
 			try {
-				const loaded = await JsonlSessionStorage.load(this.fs, this.metadata.path, this.acknowledgedContent);
+				const loaded = await JsonlSessionStorage.load(fs, this.metadata.path, this.acknowledgedContent, this.lease);
 				this.state = loaded.state;
 				Object.assign(this.metadata, loaded.metadata);
 				this.acknowledgedContent = loaded.acknowledgedContent;
@@ -158,14 +230,20 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 	async fork(path: string, header: JsonlV4Header, options: ForkOptions): Promise<JsonlSessionStorage> {
 		// Snapshot under the same queue as appends; never replay/repair a live writer's file.
 		const mutations = await this.enqueue(async () => this.state.createForkMutations(options));
-		await publishFileAtomically(this.fs, path, async (tempPath) => {
-			const targetStorage = await JsonlSessionStorage.create(this.fs, tempPath, header);
-			for (const mutation of mutations) {
-				await targetStorage.appendMutation(mutation);
-				targetStorage.applyMutation(mutation);
-			}
-		});
-		return JsonlSessionStorage.load(this.fs, path);
+		const destinationLease = await acquireJsonlWriterLease(this.fs, path);
+		try {
+			await publishFileAtomically(this.fs, path, async (tempPath) => {
+				const targetStorage = await JsonlSessionStorage.create(this.fs, tempPath, header, destinationLease);
+				for (const mutation of mutations) {
+					await targetStorage.appendMutation(mutation);
+					targetStorage.applyMutation(mutation);
+				}
+			});
+			return await JsonlSessionStorage.load(this.fs, path, undefined, destinationLease);
+		} catch (error) {
+			await destinationLease.close();
+			throw error;
+		}
 	}
 
 	/** Remove under the writer queue, then seal mutations while retaining readable history. */
@@ -176,7 +254,27 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 				`Failed to delete session ${this.metadata.path}`,
 			);
 			this.deleted = true;
+			await this.lease.close();
 		}, true);
+	}
+
+	close(): Promise<void> {
+		if (this.closePromise) return this.closePromise;
+		const result = this.tail.then(async () => {
+			if (this.closed) return;
+			this.closed = true;
+			await this.lease.close();
+		});
+		this.closePromise = result;
+		this.tail = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	}
+
+	isClosed(): boolean {
+		return this.closed || this.closePromise !== undefined;
 	}
 
 	async drain(): Promise<void> {
@@ -318,6 +416,8 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 	private enqueue<T>(operation: () => Promise<T>, reopening = false): Promise<T> {
 		const result = this.tail.then(() => {
 			if (this.deleted) throw new SessionError("not_found", `Session was deleted: ${this.metadata.id}`);
+			if (this.closed) throw new SessionError("storage", `Session is closed: ${this.metadata.id}`);
+			this.lease.assertUsable();
 			if (this.recoveryError && !reopening) throw this.recoveryError;
 			return operation();
 		});
@@ -329,26 +429,58 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 	}
 
 	private async appendMutation(mutation: SessionMutation): Promise<void> {
+		const path = this.metadata.path;
+		await this.adoptExternalGrowth(mutation);
+
 		const encoded = encodeMutation(mutation);
+		await this.appendEncoded(encoded);
+		if (!(await this.appendHasExpectedSize(encoded))) {
+			this.recoveryError = new SessionError(
+				"storage",
+				`Session size changed during append; refusing whole-file repair: ${path}`,
+			);
+			throw this.recoveryError;
+		}
+		this.acknowledgedContent += encoded;
+	}
+
+	private async adoptExternalGrowth(mutation: SessionMutation): Promise<void> {
+		const path = this.metadata.path;
+		const info = fileResult(await this.fs.fileInfo(path), `Failed to inspect session ${path}`);
+		const acknowledgedSize = byteLength(this.acknowledgedContent);
+		if (info.size === acknowledgedSize) {
+			const content = fileResult(await this.fs.readTextFile(path), `Failed to verify session prefix ${path}`);
+			if (content !== this.acknowledgedContent) {
+				throw new SessionError("invalid_entry", `Acknowledged session prefix changed: ${path}`);
+			}
+			return;
+		}
+		const loaded = await JsonlSessionStorage.load(this.fs, path, this.acknowledgedContent, this.lease);
+		this.adopt(loaded);
+		this.rebaseMutation(mutation);
+	}
+
+	private rebaseMutation(mutation: SessionMutation): void {
+		setMutationSequence(mutation, this.state.nextSequence);
+		if (mutation.kind === "entry") {
+			this.state.validateUnusedId(mutation.entry.id);
+			if (mutation.lane !== undefined) mutation.entry.parentId = this.state.requireLane(mutation.lane);
+		} else if (mutation.kind === "record") {
+			this.state.validateUnusedId(mutation.record.id);
+			this.state.requireLane(mutation.record.lane);
+		}
+	}
+
+	private async appendEncoded(encoded: string): Promise<void> {
 		const path = this.metadata.path;
 		try {
-			fileResult(await this.fs.appendFile(path, encoded), `Failed to append session ${path}`);
+			fileResult(
+				await this.fs.appendFile(path, encoded, undefined, { flush: true }),
+				`Failed to append session ${path}`,
+			);
 		} catch (error) {
-			// An I/O error may follow a partial or even complete write. Neither is acknowledged:
-			// restore the exact accepted prefix before admitting another mutation, without replay.
 			try {
-				const content = fileResult(await this.fs.readTextFile(path), `Failed to inspect failed append ${path}`);
-				if (!content.startsWith(this.acknowledgedContent)) {
-					throw new SessionError("invalid_entry", `Acknowledged session prefix changed: ${path}`);
-				}
-				if (content !== this.acknowledgedContent) {
-					await publishFileAtomically(this.fs, path, async (tempPath) => {
-						fileResult(
-							await this.fs.writeFile(tempPath, this.acknowledgedContent),
-							`Failed to stage append recovery ${path}`,
-						);
-					});
-				}
+				await this.recoverFailedAppend(encoded);
 			} catch (recoveryError) {
 				this.recoveryError = new SessionError(
 					"storage",
@@ -358,7 +490,60 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 			}
 			throw error;
 		}
-		this.acknowledgedContent += encoded;
+	}
+
+	private async appendHasExpectedSize(encoded: string): Promise<boolean> {
+		const path = this.metadata.path;
+		const info = fileResult(await this.fs.fileInfo(path), `Failed to verify session append ${path}`);
+		return info.size === byteLength(this.acknowledgedContent + encoded);
+	}
+
+	private async recoverFailedAppend(encoded: string): Promise<void> {
+		const path = this.metadata.path;
+		const content = fileResult(await this.fs.readTextFile(path), `Failed to inspect failed append ${path}`);
+		if (!content.startsWith(this.acknowledgedContent)) {
+			throw new SessionError("invalid_entry", `Acknowledged session prefix changed: ${path}`);
+		}
+		const suffix = content.slice(this.acknowledgedContent.length);
+		if (suffix.length === 0) return;
+
+		// A prefix (including all) of our encoded line is an unacknowledged write and
+		// retains the established rollback behavior. Anything else may be a complete
+		// external append and is only adopted through the validated loader.
+		if (encoded.startsWith(suffix)) {
+			await this.publishAcknowledgedContent(content);
+			return;
+		}
+		this.adopt(await JsonlSessionStorage.load(this.fs, path, this.acknowledgedContent, this.lease));
+	}
+
+	private publishAcknowledgedContent(observedContent: string): Promise<void> {
+		return this.publishContent(this.acknowledgedContent, "append recovery", observedContent);
+	}
+
+	private async publishContent(content: string, operation: string, expectedCurrent?: string): Promise<void> {
+		const path = this.metadata.path;
+		const tempPath = `${path}.tmp`;
+		try {
+			fileResult(await this.fs.writeFile(tempPath, content), `Failed to stage ${operation} ${path}`);
+			if (expectedCurrent !== undefined) {
+				const current = fileResult(await this.fs.readTextFile(path), `Failed to reverify ${operation} ${path}`);
+				if (current !== expectedCurrent) {
+					throw new SessionError("storage", `Session changed during ${operation}; refusing replacement: ${path}`);
+				}
+			}
+			fileResult(await this.fs.renameFile(tempPath, path), `Failed to publish staged file ${path}`);
+		} catch (error) {
+			await this.fs.remove(tempPath, { force: true });
+			throw error;
+		}
+	}
+
+	private adopt(loaded: JsonlSessionStorage): void {
+		this.state = loaded.state;
+		Object.assign(this.metadata, loaded.metadata);
+		this.acknowledgedContent = loaded.acknowledgedContent;
+		this.recoveryError = undefined;
 	}
 
 	private applyMutation(mutation: SessionMutation): void {

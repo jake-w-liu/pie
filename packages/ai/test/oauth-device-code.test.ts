@@ -128,6 +128,25 @@ describe("OAuth device-code polling", () => {
 		expect(pollTimes).toEqual([startTime, startTime + 30000]);
 	});
 
+	it("times out and aborts an in-flight poll at the device deadline", async () => {
+		vi.useFakeTimers();
+		let pollSignal: AbortSignal | undefined;
+		const resultPromise = pollOAuthDeviceCodeFlow({
+			expiresInSeconds: 0.02,
+			poll: async (signal) => {
+				pollSignal = signal;
+				return new Promise<never>(() => {});
+			},
+			signal: neverAbortedSignal,
+		});
+		const expectation = expect(resultPromise).rejects.toThrow("Device flow timed out");
+
+		await vi.advanceTimersByTimeAsync(20);
+
+		await expectation;
+		expect(pollSignal?.aborted).toBe(true);
+	});
+
 	it("cancels an in-flight wait", async () => {
 		vi.useFakeTimers();
 		const controller = new AbortController();

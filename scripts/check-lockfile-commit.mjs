@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from "node:child_process";
+import { matchesGlob } from "node:path";
 
 const allowValue = process.env.PI_ALLOW_LOCKFILE_CHANGE;
 const allowed = allowValue === "1" || allowValue === "true" || allowValue === "yes";
@@ -14,6 +15,15 @@ function readJsonFromGit(ref) {
 		return JSON.parse(git(["show", ref]));
 	} catch {
 		return undefined;
+	}
+}
+
+function pathExistsInIndex(path) {
+	try {
+		git(["cat-file", "-e", `:${path}`]);
+		return true;
+	} catch {
+		return false;
 	}
 }
 
@@ -44,15 +54,30 @@ function getLockfilePackageChanges() {
 			changes.push({ lockPath, oldEntry, newEntry });
 		}
 	}
-	return changes;
+	const packageJson = readJsonFromGit(":package.json");
+	const declaredWorkspaces = Array.isArray(packageJson?.workspaces)
+		? packageJson.workspaces
+		: packageJson?.workspaces?.packages;
+	const workspacePatterns = Array.isArray(declaredWorkspaces)
+		? declaredWorkspaces.filter((pattern) => typeof pattern === "string")
+		: [];
+	return { changes, workspacePatterns };
 }
 
-function isWorkspacePackagePath(lockPath) {
-	return lockPath.startsWith("packages/");
+function isWorkspacePackagePath(lockPath, workspacePatterns) {
+	return (
+		lockPath.length > 0 &&
+		!lockPath.includes("node_modules/") &&
+		pathExistsInIndex(`${lockPath}/package.json`) &&
+		workspacePatterns.some((pattern) => matchesGlob(lockPath, pattern))
+	);
 }
 
-function hasOnlyWorkspacePackageChanges(changes) {
-	return changes.length > 0 && changes.every((change) => isWorkspacePackagePath(change.lockPath));
+function hasOnlyWorkspacePackageChanges(changes, workspacePatterns) {
+	return (
+		changes.length > 0 &&
+		changes.every((change) => isWorkspacePackagePath(change.lockPath, workspacePatterns))
+	);
 }
 
 function summarizeLockfileChange(changes) {
@@ -88,8 +113,9 @@ if (allowed) {
 	process.exit(0);
 }
 
-const changes = getLockfilePackageChanges();
-if (changes && hasOnlyWorkspacePackageChanges(changes)) {
+const lockfileChange = getLockfilePackageChanges();
+const changes = lockfileChange?.changes;
+if (changes && hasOnlyWorkspacePackageChanges(changes, lockfileChange.workspacePatterns)) {
 	console.error("package-lock.json only updates workspace package metadata; allowing commit.");
 	process.exit(0);
 }

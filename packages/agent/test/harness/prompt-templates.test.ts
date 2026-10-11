@@ -28,6 +28,18 @@ describe("loadPromptTemplates", () => {
 		]);
 	});
 
+	it("parses a UTF-8 BOM before prompt frontmatter", async () => {
+		const root = createTempDir();
+		const env = new NodeExecutionEnv({ cwd: root });
+		await env.createDir("prompts", { recursive: true });
+		await env.writeFile("prompts/bom.md", "\uFEFF---\ndescription: BOM prompt\n---\nBOM body");
+
+		const result = await loadPromptTemplates(env, "prompts");
+
+		expect(result.diagnostics).toEqual([]);
+		expect(result.promptTemplates).toEqual([{ name: "bom", description: "BOM prompt", content: "BOM body" }]);
+	});
+
 	it("preserves source info for sourced prompt templates", async () => {
 		const root = createTempDir();
 		const env = new NodeExecutionEnv({ cwd: root });

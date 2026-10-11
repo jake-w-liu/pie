@@ -172,6 +172,8 @@ const ModelDefinitionSchema = Type.Object({
 	compat: Type.Optional(ProviderCompatSchema),
 });
 
+const PositiveNumberSchema = Type.Number({ exclusiveMinimum: 0 });
+
 const ModelOverrideSchema = Type.Object({
 	name: Type.Optional(Type.String({ minLength: 1 })),
 	reasoning: Type.Optional(Type.Boolean()),
@@ -186,8 +188,8 @@ const ModelOverrideSchema = Type.Object({
 			tiers: Type.Optional(Type.Array(ModelCostTierSchema)),
 		}),
 	),
-	contextWindow: Type.Optional(Type.Number()),
-	maxTokens: Type.Optional(Type.Number()),
+	contextWindow: Type.Optional(PositiveNumberSchema),
+	maxTokens: Type.Optional(PositiveNumberSchema),
 	samplingParams: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 	headers: Type.Optional(Type.Record(Type.String(), Type.String())),
 	compat: Type.Optional(ProviderCompatSchema),

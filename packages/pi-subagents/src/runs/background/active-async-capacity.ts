@@ -237,7 +237,6 @@ function abandonedRunnerReleaseVerdict(owner: ActiveAsyncCapacityOwnerV1, status
 	const proofReason = `process-terminal proof is ${proofState}`;
 	const thresholdMs = resolveAbandonedSlotReleaseAfterMs(options.abandonedSlotReleaseAfterMs);
 	if (thresholdMs === false) return { state: "retained", reason: `${proofReason}; abandoned-timeout policy is disabled` };
-	if (status.state !== "failed") return { state: "retained", reason: `${proofReason}; abandoned-timeout policy requires a failed run, not ${status.state}` };
 	if (typeof status.pid !== "number" || !Number.isInteger(status.pid) || status.pid < 1) return { state: "retained", reason: `${proofReason}; runner PID is missing or invalid` };
 	const liveness = (options.pidLiveness ?? checkPidLiveness)(status.pid);
 	if (liveness !== "dead") return { state: "retained", reason: `${proofReason}; runner PID liveness is ${liveness}` };

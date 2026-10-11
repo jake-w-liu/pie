@@ -23,8 +23,18 @@ function normalizeWhitespaceLower(text: string): string {
 	return text.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
+const normalizedSessionTextCache = new WeakMap<SessionInfo, string>();
+
 function getSessionSearchText(session: SessionInfo): string {
 	return `${session.id} ${session.name ?? ""} ${session.allMessagesText} ${session.cwd}`;
+}
+
+function getNormalizedSessionSearchText(session: SessionInfo): string {
+	const cached = normalizedSessionTextCache.get(session);
+	if (cached !== undefined) return cached;
+	const normalized = normalizeWhitespaceLower(getSessionSearchText(session));
+	normalizedSessionTextCache.set(session, normalized);
+	return normalized;
 }
 
 export function hasSessionName(session: SessionInfo): boolean {
@@ -114,13 +124,17 @@ export function parseSearchQuery(query: string): ParsedSearchQuery {
 }
 
 export function matchSession(session: SessionInfo, parsed: ParsedSearchQuery): MatchResult {
-	const text = getSessionSearchText(session);
+	let text: string | undefined;
+	const getText = (): string => {
+		text ??= getSessionSearchText(session);
+		return text;
+	};
 
 	if (parsed.mode === "regex") {
 		if (!parsed.regex) {
 			return { matches: false, score: 0 };
 		}
-		const idx = text.search(parsed.regex);
+		const idx = getText().search(parsed.regex);
 		if (idx < 0) return { matches: false, score: 0 };
 		return { matches: true, score: idx * 0.1 };
 	}
@@ -135,7 +149,7 @@ export function matchSession(session: SessionInfo, parsed: ParsedSearchQuery): M
 	for (const token of parsed.tokens) {
 		if (token.kind === "phrase") {
 			if (normalizedText === null) {
-				normalizedText = normalizeWhitespaceLower(text);
+				normalizedText = getNormalizedSessionSearchText(session);
 			}
 			const phrase = normalizeWhitespaceLower(token.value);
 			if (!phrase) continue;
@@ -145,7 +159,7 @@ export function matchSession(session: SessionInfo, parsed: ParsedSearchQuery): M
 			continue;
 		}
 
-		const m = fuzzyMatch(token.value, text);
+		const m = fuzzyMatch(token.value, getText());
 		if (!m.matches) return { matches: false, score: 0 };
 		totalScore += m.score;
 	}

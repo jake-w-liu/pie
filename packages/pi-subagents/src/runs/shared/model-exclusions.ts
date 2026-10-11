@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { DEFAULT_FILE_SYSTEM_RETRY_DELAYS_MS, waitForFileSystemRetry } from "../../shared/file-system-retry.ts";
 import { splitKnownThinkingSuffix } from "../../shared/model-info.ts";
 import { TEMP_ROOT_DIR } from "../../shared/types.ts";
 
@@ -29,6 +31,55 @@ let defaultTTLMs = DEFAULT_MODEL_EXCLUSION_TTL_MS;
 let loadedTTLCeilingMs: number | undefined;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let persistSeq = 0;
+const PERSIST_LOCK_STALE_MS = 30_000;
+
+function withPersistLock<T>(file: string, operation: () => T): T {
+	const lockPath = `${file}.lock`;
+	for (let attempt = 0; ; attempt++) {
+		try {
+			fs.mkdirSync(lockPath, { mode: 0o700 });
+			break;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			try {
+				if (Date.now() - fs.statSync(lockPath).mtimeMs > PERSIST_LOCK_STALE_MS) {
+					const stalePath = `${lockPath}.stale-${randomUUID()}`;
+					fs.renameSync(lockPath, stalePath);
+					fs.rmSync(stalePath, { recursive: true, force: true });
+					continue;
+				}
+			} catch (staleError) {
+				if ((staleError as NodeJS.ErrnoException).code !== "ENOENT") throw staleError;
+				continue;
+			}
+			const delay = DEFAULT_FILE_SYSTEM_RETRY_DELAYS_MS[attempt];
+			if (delay === undefined) throw new Error(`Timed out acquiring model exclusions lock at '${lockPath}'.`);
+			waitForFileSystemRetry(delay);
+		}
+	}
+	try { return operation(); }
+	finally { fs.rmSync(lockPath, { recursive: true, force: true }); }
+}
+
+function readPersistedExclusions(file: string): ModelExclusion[] {
+	try {
+		const data = JSON.parse(fs.readFileSync(file, "utf-8")) as { version?: unknown; exclusions?: unknown };
+		if (data.version !== 1 || !Array.isArray(data.exclusions)) return [];
+		return data.exclusions.filter((entry): entry is ModelExclusion => {
+			if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+			const item = entry as Partial<ModelExclusion>;
+			return typeof item.recordedAt === "number" && Number.isFinite(item.recordedAt)
+				&& typeof item.expiresAt === "number" && Number.isFinite(item.expiresAt)
+				&& (typeof item.modelId === "string" || typeof item.provider === "string");
+		});
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		// Unparseable content has nothing to merge, and rethrowing it would leave the store corrupt
+		// forever because every later flush would fail the same way before it could overwrite it.
+		if (error instanceof SyntaxError) return [];
+		throw error;
+	}
+}
 
 /**
  * Override the default TTL applied to newly recorded model exclusions.
@@ -66,12 +117,20 @@ export function flushPersist(): void {
 	const file = getExclusionsFilePath();
 	try {
 		fs.mkdirSync(path.dirname(file), { recursive: true });
-		const tmpPath = `${file}.${process.pid}.${persistSeq++}.tmp`;
-		fs.writeFileSync(tmpPath, JSON.stringify({
-			version: 1,
-			exclusions: deduplicate(exclusions),
-		}, null, 2), "utf-8");
-		fs.renameSync(tmpPath, file);
+		withPersistLock(file, () => {
+			exclusions = deduplicate([...exclusions, ...readPersistedExclusions(file)]);
+			prune(exclusions, Date.now());
+			exclusions.sort((left, right) => right.recordedAt - left.recordedAt);
+			if (exclusions.length > 200) exclusions.length = 200;
+			const tmpPath = `${file}.${process.pid}.${persistSeq++}.tmp`;
+			try {
+				fs.writeFileSync(tmpPath, JSON.stringify({ version: 1, exclusions }, null, 2), "utf-8");
+				fs.renameSync(tmpPath, file);
+			} catch (error) {
+				fs.rmSync(tmpPath, { force: true });
+				throw error;
+			}
+		});
 	} catch (error) {
 		console.error(`[model-exclusions] Failed to persist exclusions to ${file}:`, error);
 	}
@@ -156,6 +215,7 @@ export function recordModelFailure(options: RecordModelFailureOptions): void {
 	};
 	exclusions.unshift(exclusion);
 	exclusions = deduplicate(exclusions);
+	exclusions.sort((left, right) => right.recordedAt - left.recordedAt);
 	if (exclusions.length > 200) exclusions.length = 200;
 	flushPersist();
 }

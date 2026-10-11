@@ -327,7 +327,18 @@ export type RpcExtensionUIRequest =
 // ============================================================================
 
 /** Response to an extension UI request */
-export type RpcExtensionUIResponse =
-	| { type: "extension_ui_response"; id: string; value: string }
-	| { type: "extension_ui_response"; id: string; confirmed: boolean }
-	| { type: "extension_ui_response"; id: string; cancelled: true };
+export const rpcExtensionUIResponseSchema = Type.Union([
+	Type.Object(
+		{ type: Type.Literal("extension_ui_response"), id: Type.String(), value: Type.String() },
+		{ additionalProperties: false },
+	),
+	Type.Object(
+		{ type: Type.Literal("extension_ui_response"), id: Type.String(), confirmed: Type.Boolean() },
+		{ additionalProperties: false },
+	),
+	Type.Object(
+		{ type: Type.Literal("extension_ui_response"), id: Type.String(), cancelled: Type.Literal(true) },
+		{ additionalProperties: false },
+	),
+]);
+export type RpcExtensionUIResponse = Static<typeof rpcExtensionUIResponseSchema>;

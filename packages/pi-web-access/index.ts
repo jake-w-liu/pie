@@ -9,6 +9,7 @@ import { findContent, type FindMode } from "./content-find.ts";
 import { answerFromPage } from "./page-query.ts";
 import { rewriteSearchQuery } from "./query-rewrite.ts";
 import { clearCloneCache } from "./github-extract.ts";
+import { clearPdfArtifacts } from "./pdf-extract.ts";
 import { ALL_SEARCH_PROVIDERS, getConfiguredSearchRouting, normalizeSearchProviderSelection, RESOLVED_SEARCH_PROVIDERS, SEARCH_PROVIDERS, search, type AttributedSearchResponse, type ProviderAvailability, type SearchProvider, type SearchProviderSelection, type ResolvedSearchProvider } from "./gemini-search.ts";
 export type { ProviderAvailability } from "./gemini-search.ts";
 import type { SearchResult } from "./perplexity.ts";
@@ -43,7 +44,7 @@ import { join } from "node:path";
 import { isPerplexityAvailable } from "./perplexity.ts";
 import { isExaAvailable } from "./exa.ts";
 import { isGeminiApiAvailable } from "./gemini-api.ts";
-import { getActiveGoogleEmail, getGeminiWebAvailabilityDiagnostic, getGeminiWebAvailabilityDiagnosticDetails, isGeminiWebAvailable } from "./gemini-web.ts";
+import { closeGeminiFetch, getActiveGoogleEmail, getGeminiWebAvailabilityDiagnostic, getGeminiWebAvailabilityDiagnosticDetails, isGeminiWebAvailable } from "./gemini-web.ts";
 import { isBrowserCookieAccessAllowed } from "./gemini-web-config.ts";
 import { isBraveAvailable } from "./brave.ts";
 import { isCurrentModelHostedSearchEligible, isOpenAISearchAvailable } from "./openai-search.ts";
@@ -108,7 +109,7 @@ function withRegisteredFetchOptions(
 }
 
 function isAbortError(err: unknown): boolean {
-	return (err instanceof Error ? err.message : String(err)).toLowerCase().includes("abort");
+	return err instanceof Error && err.name === "AbortError";
 }
 
 /** Shared collapsed/expanded renderer for an error/cancel plan produced by
@@ -1023,6 +1024,7 @@ function handleSessionChange(ctx: ExtensionContext): void {
 	abortPendingFetches();
 	closeCurator();
 	clearCloneCache();
+	clearPdfArtifacts();
 	sessionActive = true;
 	restoreFromSession(ctx);
 	// Unsubscribe before clear() to avoid callback with stale ctx
@@ -1590,7 +1592,7 @@ export default function (pi: ExtensionAPI) {
 						pc.defaultProvider = normalized;
 						pc.searchProvider = normalized;
 						try {
-							saveConfig({ provider: normalized });
+							saveConfig({ searchProvider: normalized });
 						} catch (err) {
 							const message = err instanceof Error ? err.message : String(err);
 							console.error(`Failed to persist default provider: ${message}`);
@@ -1713,6 +1715,10 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("Opening curator — remaining searches will stream in", "info");
 				return;
 			}
+			if (pc.curatorUrl) {
+				await openInBrowser(pi, pc.curatorUrl);
+				ctx.ui.notify("Reopened search curator", "info");
+			}
 		},
 	});
 
@@ -1737,8 +1743,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		sessionActive = false;
 		abortPendingFetches();
+		void closeGeminiFetch();
 		closeCurator();
 		clearCloneCache();
+		clearPdfArtifacts();
 		clearResults();
 		// Unsubscribe before clear() to avoid callback with stale ctx
 		widgetUnsubscribe?.();
@@ -3242,7 +3250,7 @@ export default function (pi: ExtensionAPI) {
 							currentProvider = normalized;
 							currentSearchProvider = normalized;
 							try {
-								saveConfig({ provider: normalized });
+								saveConfig({ searchProvider: normalized });
 							} catch (err) {
 								const message = err instanceof Error ? err.message : String(err);
 								console.error(`Failed to persist default provider: ${message}`);

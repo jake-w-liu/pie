@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSy
 import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
 import { getEffortThinkingLevelMap, type ModelsDevReasoningOption } from "./models-dev-reasoning-options.ts";
+import { markModelCatalogOutput, replaceModelCatalogOutput } from "./owned-output-directory.ts";
 import {
 	getOpenRouterThinkingLevelMap,
 	type OpenRouterReasoningMetadata,
@@ -27,6 +28,7 @@ import type {
 import {
 	assertExactModelIds,
 	createModelDataManifest,
+	hasUnknownPricing,
 	type ModelDataStructure,
 	MODEL_DATA_MANIFEST_FILE,
 	readModelDataProviderIds,
@@ -44,12 +46,14 @@ function readGeneratorOptions(args: string[]): {
 	jsonOnly: boolean;
 	jsonOutputDir: string | undefined;
 	pretty: boolean;
+	forceJsonOutput: boolean;
 } {
 	let strict = false;
 	let dataOnly = false;
 	let jsonOnly = false;
 	let jsonOutputDir: string | undefined;
 	let pretty = false;
+	let forceJsonOutput = false;
 
 	for (let index = 0; index < args.length; index++) {
 		const arg = args[index];
@@ -75,12 +79,16 @@ function readGeneratorOptions(args: string[]): {
 			jsonOutputDir = resolve(value);
 			continue;
 		}
+		if (arg === "--force-json-output") {
+			forceJsonOutput = true;
+			continue;
+		}
 		throw new Error(`Unknown argument: ${arg}`);
 	}
 
 	if (jsonOnly && !jsonOutputDir) throw new Error("--json-only requires --json-output");
 	if (dataOnly && (jsonOnly || jsonOutputDir)) throw new Error("--data-only cannot be combined with JSON catalog output");
-	return { strict, dataOnly, jsonOnly, jsonOutputDir, pretty };
+	return { strict, dataOnly, jsonOnly, jsonOutputDir, pretty, forceJsonOutput };
 }
 
 const generatorOptions = readGeneratorOptions(process.argv.slice(2));
@@ -3196,15 +3204,36 @@ async function generateModels() {
 	}
 
 	if (generatorOptions.jsonOutputDir) {
-		const providerOutputDir = join(generatorOptions.jsonOutputDir, "providers");
-		rmSync(generatorOptions.jsonOutputDir, { recursive: true, force: true });
-		mkdirSync(providerOutputDir, { recursive: true });
-		writeJson(join(generatorOptions.jsonOutputDir, "models.json"), jsonProviders);
-		writeJson(join(generatorOptions.jsonOutputDir, "providers.json"), sortedProviderIds);
-		for (const providerId of sortedProviderIds) {
-			writeJson(join(providerOutputDir, `${providerId}.json`), jsonProviders[providerId]);
+		mkdirSync(dirname(generatorOptions.jsonOutputDir), { recursive: true });
+		const stagingRoot = mkdtempSync(join(dirname(generatorOptions.jsonOutputDir), ".pi-model-catalog-"));
+		try {
+			const providerOutputDir = join(stagingRoot, "providers");
+			mkdirSync(providerOutputDir, { recursive: true });
+			// models.dev reports router-dependent prices as the unknown-pricing sentinel, which the published
+			// catalog rejects. Those models stay in the generated runtime data, where they remain selectable.
+			const catalogProviders: Record<string, Record<string, Model<any>>> = {};
+			let unknownPricedModelCount = 0;
+			for (const providerId of sortedProviderIds) {
+				const catalogModels = Object.entries(jsonProviders[providerId]).filter(
+					([, model]) => !hasUnknownPricing(model.cost),
+				);
+				unknownPricedModelCount += Object.keys(jsonProviders[providerId]).length - catalogModels.length;
+				catalogProviders[providerId] = Object.fromEntries(catalogModels);
+			}
+			writeJson(join(stagingRoot, "models.json"), catalogProviders);
+			writeJson(join(stagingRoot, "providers.json"), sortedProviderIds);
+			for (const providerId of sortedProviderIds) {
+				writeJson(join(providerOutputDir, `${providerId}.json`), catalogProviders[providerId]);
+			}
+			markModelCatalogOutput(stagingRoot);
+			replaceModelCatalogOutput(generatorOptions.jsonOutputDir, stagingRoot, generatorOptions.forceJsonOutput);
+			if (unknownPricedModelCount > 0) {
+				console.log(`Dropped ${unknownPricedModelCount} model(s) with unknown pricing from the JSON model catalog`);
+			}
+			console.log(`Generated JSON model catalog under ${generatorOptions.jsonOutputDir}`);
+		} finally {
+			rmSync(stagingRoot, { recursive: true, force: true });
 		}
-		console.log(`Generated JSON model catalog under ${generatorOptions.jsonOutputDir}`);
 	}
 
 	// Print statistics

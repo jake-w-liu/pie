@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createImagesModels, createImagesProvider, type ImagesProvider } from "../src/images-models.ts";
-import type { AssistantImages, ImagesApi, ImagesModel } from "../src/types.ts";
+import type { AssistantImages, ImagesApi, ImagesModel, ProviderImagesOptions } from "../src/types.ts";
 
 const model: ImagesModel<"openrouter-images"> = {
 	id: "offline",
@@ -72,12 +72,52 @@ describe("offline image runtime failure contracts", () => {
 
 	it("retains successful result identity and no-auth options", async () => {
 		const images = createImagesModels({ authContext });
-		const generateImages = vi.fn(async () => success);
+		const generateImages = vi.fn(
+			async (_model: ImagesModel<"openrouter-images">, _context: unknown, _options?: ProviderImagesOptions) =>
+				success,
+		);
 		images.setProvider(createImagesProvider({ id: "offline", auth, models: [model], api: { generateImages } }));
 		const context = { input: [] };
 		const options = { metadata: { fixture: "unchanged" } };
 		expect(await images.generateImages(model, context, options)).toBe(success);
 		expect(generateImages).toHaveBeenCalledWith(model, context, options);
+	});
+
+	it("merges auth and request headers case-insensitively with request headers winning", async () => {
+		const images = createImagesModels({ authContext });
+		const generateImages = vi.fn(
+			async (_model: ImagesModel<"openrouter-images">, _context: unknown, _options?: ProviderImagesOptions) =>
+				success,
+		);
+		images.setProvider(
+			createImagesProvider({
+				id: "offline",
+				models: [model],
+				api: { generateImages },
+				auth: {
+					apiKey: {
+						name: "Offline",
+						resolve: async () => ({
+							auth: { headers: { Authorization: "Bearer stored-secret", "X-Test": "auth" } },
+						}),
+					},
+				},
+			}),
+		);
+
+		await images.generateImages(
+			model,
+			{ input: [] },
+			{
+				headers: { authorization: "Bearer explicit", "x-test": "caller" },
+			},
+		);
+
+		expect(generateImages).toHaveBeenCalledOnce();
+		expect(generateImages.mock.calls[0]?.[2]?.headers).toEqual({
+			authorization: "Bearer explicit",
+			"x-test": "caller",
+		});
 	});
 
 	it("preserves the baseline and retries after a synchronous refresh callback failure", async () => {

@@ -1043,6 +1043,14 @@ function parseBuiltinOverrideEntry(
 	return Object.keys(override).length > 0 ? override : undefined;
 }
 
+/** Validate profile/settings overrides with the same parser discovery uses. */
+export function validateSubagentAgentOverrides(value: unknown, filePath: string): void {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error(`Subagent overrides in '${filePath}' must be an object.`);
+	}
+	for (const [name, override] of Object.entries(value)) parseBuiltinOverrideEntry(name, override, filePath);
+}
+
 function readSubagentSettings(filePath: string | null): SubagentSettings {
 	if (!filePath) return EMPTY_SUBAGENT_SETTINGS;
 	const settings = readSettingsFileStrict(filePath);
@@ -1984,7 +1992,14 @@ function loadAgentsFromDefinitionFiles(files: AgentDefinitionFile[], source: Age
 			if (!KNOWN_FIELDS.has(key)) extraFields[key] = value;
 		}
 
-		const parsedMaxSubagentDepth = Number(frontmatter.maxSubagentDepth);
+		let maxSubagentDepth: number | undefined;
+		if (frontmatter.maxSubagentDepth !== undefined) {
+			const parsed = Number(frontmatter.maxSubagentDepth);
+			if (!Number.isInteger(parsed) || parsed < 0) {
+				throw new Error(`Agent '${localName}' has invalid maxSubagentDepth frontmatter; expected an integer >= 0.`);
+			}
+			maxSubagentDepth = parsed;
+		}
 		if (frontmatter.permission !== undefined && frontmatter.permissions !== undefined) {
 			throw new Error(`Agent '${localName}' cannot declare both permission and permissions frontmatter.`);
 		}
@@ -2006,9 +2021,6 @@ function loadAgentsFromDefinitionFiles(files: AgentDefinitionFile[], source: Age
 				? true
 				: undefined;
 
-		const maxSubagentDepth = Number.isInteger(parsedMaxSubagentDepth) && parsedMaxSubagentDepth >= 0
-			? parsedMaxSubagentDepth
-			: undefined;
 		const memory = parseMemoryFrontmatter(frontmatter.memory);
 		const agent: AgentConfig = {
 			name: runtimeName,
@@ -2320,9 +2332,11 @@ export function discoverAgentsAll(cwd: string): {
 	);
 	const packageMap = new Map<string, AgentConfig>();
 	const packageAgentDiagnostics: AgentDiscoveryDiagnostic[] = [];
+	const packageLoadedAgents: AgentConfig[] = [];
 	for (const [index, entry] of packageSubagentPaths.agents.entries()) {
 		const loaded = loadAgentsFromDir(entry.dir, "package", packageSubagentPaths.agents.length - index, entry);
 		packageAgentDiagnostics.push(...loaded.diagnostics);
+		packageLoadedAgents.push(...loaded.agents);
 		for (const agent of loaded.agents) {
 			if (!packageMap.has(agent.name)) packageMap.set(agent.name, agent);
 		}
@@ -2336,9 +2350,11 @@ export function discoverAgentsAll(cwd: string): {
 	);
 	const projectMap = new Map<string, AgentConfig>();
 	const projectAgentDiagnostics: AgentDiscoveryDiagnostic[] = [];
+	const projectLoadedAgents: AgentConfig[] = [];
 	for (const dir of projectDirs) {
 		const loaded = loadAgentsFromDir(dir, "project", dir === projectDir ? 1 : 0);
 		projectAgentDiagnostics.push(...loaded.diagnostics);
+		projectLoadedAgents.push(...loaded.agents);
 		for (const agent of loaded.agents) {
 			projectMap.set(agent.name, agent);
 		}
@@ -2353,8 +2369,8 @@ export function discoverAgentsAll(cwd: string): {
 
 	const duplicateAgentDiagnostics = collectDuplicateAgentDiagnostics([
 		{ source: "user", agents: userLoaded.flatMap((loaded) => loaded.agents) },
-		{ source: "package", agents: Array.from(packageMap.values()) },
-		{ source: "project", agents: Array.from(projectMap.values()) },
+		{ source: "package", agents: packageLoadedAgents },
+		{ source: "project", agents: projectLoadedAgents },
 	]);
 
 	const chainMap = new Map<string, ChainConfig>();

@@ -518,26 +518,43 @@ function mergeChildInto(existing: NestedRunSummary[] | undefined, event: NestedE
 }
 
 function attachChild(children: NestedRunSummary[], event: NestedEventRecord): NestedRunSummary[] {
-	let updated = false;
-	const walk = (items: NestedRunSummary[]): NestedRunSummary[] => items.map((item) => {
-		if (item.id === event.parentRunId) {
-			// `steps` is positional: its array index is the step index.
-			const stepIndex = event.child.parentStepIndex;
-			if (stepIndex !== undefined && stepIndex >= 0 && stepIndex < (item.steps?.length ?? 0)) {
-				const nextChildren = mergeChildInto(item.steps![stepIndex]!.children, event).slice(0, MAX_CHILDREN);
-				updated = true;
-				const nextSteps = item.steps!.map((step, index) => index === stepIndex ? { ...step, children: nextChildren } : step);
-				return { ...item, steps: nextSteps, lastUpdate: Math.max(item.lastUpdate ?? 0, event.ts) };
+	const walk = (items: NestedRunSummary[]): { items: NestedRunSummary[]; found: boolean } => {
+		for (let index = 0; index < items.length; index++) {
+			const item = items[index]!;
+			if (item.id === event.parentRunId) {
+				// `steps` is positional: its array index is the step index.
+				const stepIndex = event.child.parentStepIndex;
+				const nextItem = stepIndex !== undefined && stepIndex >= 0 && stepIndex < (item.steps?.length ?? 0)
+					? {
+						...item,
+						steps: item.steps!.map((step, currentIndex) => currentIndex === stepIndex
+							? { ...step, children: mergeChildInto(step.children, event).slice(0, MAX_CHILDREN) }
+							: step),
+						lastUpdate: Math.max(item.lastUpdate ?? 0, event.ts),
+					}
+					: {
+						...item,
+						children: mergeChildInto(item.children, event).slice(0, MAX_CHILDREN),
+						lastUpdate: Math.max(item.lastUpdate ?? 0, event.ts),
+					};
+				return { items: items.map((entry, currentIndex) => currentIndex === index ? nextItem : entry), found: true };
 			}
-			const nextChildren = mergeChildInto(item.children, event).slice(0, MAX_CHILDREN);
-			updated = true;
-			return { ...item, children: nextChildren, lastUpdate: Math.max(item.lastUpdate ?? 0, event.ts) };
+			if (item.children?.length) {
+				const nested = walk(item.children);
+				if (nested.found) return { items: items.map((entry, currentIndex) => currentIndex === index ? { ...item, children: nested.items } : entry), found: true };
+			}
+			for (let stepIndex = 0; stepIndex < (item.steps?.length ?? 0); stepIndex++) {
+				const step = item.steps![stepIndex]!;
+				if (!step.children?.length) continue;
+				const nested = walk(step.children);
+				if (!nested.found) continue;
+				const nextSteps = item.steps!.map((entry, currentIndex) => currentIndex === stepIndex ? { ...step, children: nested.items } : entry);
+				return { items: items.map((entry, currentIndex) => currentIndex === index ? { ...item, steps: nextSteps } : entry), found: true };
+			}
 		}
-		if (!item.children?.length) return item;
-		const nextChildren = walk(item.children);
-		return nextChildren === item.children ? item : { ...item, children: nextChildren };
-	});
-	const next = walk(children);
+		return { items, found: false };
+	};
+	const { items: next, found: updated } = walk(children);
 	if (updated) return next;
 	const childIndex = next.findIndex((child) => child.id === event.child.id);
 	const nextChild = mergeSummary(childIndex >= 0 ? next[childIndex] : undefined, event);

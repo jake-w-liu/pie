@@ -55,17 +55,29 @@ function editDistanceWithin(left: string, right: string, maximum: number): boole
  * the same place in the original text and slicing the original with it returned
  * unrelated snippets. Folding per code point keeps `map` exact.
  */
-function foldWithOffsets(text: string): { folded: string; starts: number[]; ends: number[] } {
+interface FoldedText {
+	folded: string;
+	starts: number[] | null;
+	ends: number[] | null;
+}
+
+function foldWithOffsets(text: string): FoldedText {
 	let folded = "";
-	const starts: number[] = [];
-	const ends: number[] = [];
+	let starts: number[] | null = null;
+	let ends: number[] | null = null;
 	let originalIndex = 0;
 	for (const char of text) {
 		// Final and ordinary sigma have the same case-insensitive identity.
 		const lowered = char.toLocaleLowerCase().replace(/ς/g, "σ");
-		for (let unit = 0; unit < lowered.length; unit++) {
-			starts.push(originalIndex);
-			ends.push(originalIndex + char.length);
+		if (lowered.length !== char.length && starts === null) {
+			starts = Array.from({ length: folded.length }, (_, index) => index);
+			ends = Array.from({ length: folded.length }, (_, index) => index + 1);
+		}
+		if (starts && ends) {
+			for (let unit = 0; unit < lowered.length; unit++) {
+				starts.push(originalIndex);
+				ends.push(originalIndex + char.length);
+			}
 		}
 		folded += lowered;
 		originalIndex += char.length;
@@ -73,13 +85,17 @@ function foldWithOffsets(text: string): { folded: string; starts: number[]; ends
 	return { folded, starts, ends };
 }
 
-function literalMatches(text: string, query: string, caseInsensitive: boolean): Match[] {
+function literalMatches(text: string, query: string, caseInsensitive: boolean, foldedText?: FoldedText): Match[] {
 	if (caseInsensitive) {
-		const { folded, starts, ends } = foldWithOffsets(text);
+		const { folded, starts, ends } = foldedText ?? foldWithOffsets(text);
 		const needle = foldWithOffsets(query).folded;
 		const matches: Match[] = [];
 		for (let start = folded.indexOf(needle); start >= 0; start = folded.indexOf(needle, start + Math.max(needle.length, 1))) {
-			matches.push({ query, start: starts[start] ?? text.length, end: ends[start + needle.length - 1] ?? text.length });
+			matches.push({
+				query,
+				start: starts?.[start] ?? start,
+				end: ends?.[start + needle.length - 1] ?? start + needle.length,
+			});
 		}
 		return matches;
 	}
@@ -140,9 +156,10 @@ export function findContent(
 	mode: FindMode,
 ): { text: string; matchCount: number; returnedMatches: number; queryResults: Array<{ query: string; matchCount: number }> } {
 	const normalizedQueries = [...new Set(queries.map(query => query.trim()).filter(Boolean))];
+	const foldedText = mode === "case-insensitive" ? foldWithOffsets(text) : undefined;
 	const matches = normalizedQueries.flatMap(query => mode === "fuzzy"
 		? fuzzyMatches(text, query)
-		: literalMatches(text, query, mode === "case-insensitive"));
+		: literalMatches(text, query, mode === "case-insensitive", foldedText));
 	const queryResults = normalizedQueries.map(query => ({
 		query,
 		matchCount: matches.filter(match => match.query === query).length,

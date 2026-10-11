@@ -128,10 +128,28 @@ export interface AgentHarnessStreamOptionsPatch
 /** Kind of filesystem object as addressed by a {@link FileSystem}. Symlinks are not followed automatically. */
 export type FileKind = "file" | "directory" | "symlink";
 
+/**
+ * Identity and liveness of the process that owns an execution environment.
+ *
+ * Cross-process coordination must separate "the other holder is alive but stalled" from "the other holder
+ * died". Environments without real process identity, such as a browser tab, must still supply an identity so
+ * that the choice is explicit: a fabricated identity only ever looks foreign, which limits staleness recovery
+ * to the heartbeat recorded by the other holder.
+ */
+export interface HostIdentity {
+	/** Host name. Processes that can inspect each other's pids must report the same value. */
+	hostname: string;
+	/** Positive process id of the environment's own process. */
+	pid: number;
+	/** Return true when the environment can see a running process with this pid. */
+	isProcessAlive(pid: number): boolean;
+}
+
 /** Stable, backend-independent file error codes returned by {@link FileSystem} file operations. */
 export type FileErrorCode =
 	| "aborted"
 	| "not_found"
+	| "already_exists"
 	| "permission_denied"
 	| "not_directory"
 	| "is_directory"
@@ -248,7 +266,12 @@ export interface FileSystem {
 	/** Create or overwrite a file, creating parent directories when supported. */
 	writeFile(path: string, content: string | Uint8Array, abortSignal?: AbortSignal): Promise<Result<void, FileError>>;
 	/** Create or append to a file, creating parent directories when supported. */
-	appendFile(path: string, content: string | Uint8Array, abortSignal?: AbortSignal): Promise<Result<void, FileError>>;
+	appendFile(
+		path: string,
+		content: string | Uint8Array,
+		abortSignal?: AbortSignal,
+		options?: { flush?: boolean },
+	): Promise<Result<void, FileError>>;
 	/** Atomically rename a file, replacing the destination when it exists. Does not copy across filesystems. */
 	renameFile(sourcePath: string, destinationPath: string, abortSignal?: AbortSignal): Promise<Result<void, FileError>>;
 	/** Return metadata for the addressed path without following symlinks. */
@@ -259,7 +282,7 @@ export interface FileSystem {
 	canonicalPath(path: string, abortSignal?: AbortSignal): Promise<Result<string, FileError>>;
 	/** Return false for missing paths. Other errors, such as permission failures, return a {@link FileError}. */
 	exists(path: string, abortSignal?: AbortSignal): Promise<Result<boolean, FileError>>;
-	/** Create a directory. Defaults: `recursive: true`, no abort signal. */
+	/** Create a directory. Defaults: `recursive: true`, no abort signal. A non-recursive existing target returns `already_exists`. */
 	createDir(
 		path: string,
 		options?: { recursive?: boolean; abortSignal?: AbortSignal },

@@ -177,9 +177,9 @@ function getParentPath(path: string): string {
 }
 
 function configureSqliteDatabase(db: SqliteDatabase): void {
+	sql`PRAGMA busy_timeout=5000`.exec(db);
 	sql`PRAGMA journal_mode=WAL`.exec(db);
 	sql`PRAGMA synchronous=FULL`.exec(db);
-	sql`PRAGMA busy_timeout=5000`.exec(db);
 }
 
 function entryRowFromCached(row: CachedBranchEntryRow): EntryRow {
@@ -366,19 +366,26 @@ class SqliteSessionStorage implements SessionStorage<SqliteSessionMetadata> {
 
 	async release(): Promise<void> {
 		this.releasePromise ??= this.finishRelease();
-		await this.releasePromise;
+		const release = this.releasePromise;
+		try {
+			await release;
+		} catch (error) {
+			if (this.releasePromise === release) {
+				this.releasePromise = undefined;
+				this.closing = false;
+				this.scheduleHeartbeat();
+			}
+			throw error;
+		}
 	}
 
 	private async finishRelease(): Promise<void> {
 		this.closing = true;
 		if (this.heartbeatTimer !== undefined) clearTimeout(this.heartbeatTimer);
-		try {
-			await this.operations.enqueue(() =>
-				this.db.transaction(() => releaseWriterLease(this.db, this.metadata.id, this.lease)),
-			);
-		} finally {
-			this.onRelease();
-		}
+		await this.operations.enqueue(() =>
+			this.db.transaction(() => releaseWriterLease(this.db, this.metadata.id, this.lease)),
+		);
+		this.onRelease();
 	}
 
 	private enqueueWrite<T>(operation: () => T): Promise<T> {
@@ -895,7 +902,7 @@ export class SqliteSessionRepository
 					if (options.scope === "tree") {
 						for (const lane of lanes) insertLane(db, id, allocateSeq(), lane.lane, lane.leafId);
 					} else {
-						createInitialLane(db, id, "main", branchForkTargetId);
+						insertLane(db, id, allocateSeq(), "main", branchForkTargetId);
 					}
 
 					if (latestName?.value !== undefined && latestName.value !== null) {
@@ -936,7 +943,16 @@ export class SqliteSessionRepository
 			this.database = undefined;
 			this.databasePromise = undefined;
 		})();
-		await this.closePromise;
+		const close = this.closePromise;
+		try {
+			await close;
+		} catch (error) {
+			if (this.closePromise === close) {
+				this.closePromise = undefined;
+				this.closing = false;
+			}
+			throw error;
+		}
 	}
 
 	async [Symbol.asyncDispose](): Promise<void> {
@@ -957,9 +973,15 @@ export class SqliteSessionRepository
 
 	private async getDatabase(): Promise<SqliteDatabase> {
 		this.assertOpen();
-		if (!this.databasePromise) this.databasePromise = this.openDatabase();
-		this.database = await this.databasePromise;
-		return this.database;
+		this.databasePromise ??= this.openDatabase();
+		const database = this.databasePromise;
+		try {
+			this.database = await database;
+			return this.database;
+		} catch (error) {
+			if (this.databasePromise === database) this.databasePromise = undefined;
+			throw error;
+		}
 	}
 
 	private async openDatabase(): Promise<SqliteDatabase> {

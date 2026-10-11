@@ -112,6 +112,11 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> implem
 		return this.storage.getMetadata();
 	}
 
+	/** Release backend resources, including any writer claim. */
+	async close(): Promise<void> {
+		await this.storage.close?.();
+	}
+
 	view(lane: string): SessionTree {
 		if (lane === "main") return this;
 		return {

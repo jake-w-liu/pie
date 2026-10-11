@@ -407,8 +407,16 @@ export class Editor implements Component, Focusable {
 	// to.
 	private snappedFromCursorCol: number | null = null;
 
-	// Undo support
-	private undoStack = new UndoStack<EditorSnapshot>();
+	// Undo support. Paste payload strings are immutable, so snapshots only need
+	// detached containers; deep-cloning them once per edit multiplies large pastes.
+	private undoStack = new UndoStack<EditorSnapshot>(
+		(snapshot) => ({
+			state: { ...snapshot.state, lines: [...snapshot.state.lines] },
+			pastes: new Map(snapshot.pastes),
+			pasteCounter: snapshot.pasteCounter,
+		}),
+		200,
+	);
 
 	public onSubmit?: (text: string) => void;
 	public onChange?: (text: string) => void;
@@ -1221,12 +1229,20 @@ export class Editor implements Component, Focusable {
 	 *    first marker for an id is the editor's. Later look-alikes stay literal
 	 *    instead of duplicating the paste into the submitted prompt.
 	 */
-	private expandPasteMarkers(text: string): string {
+	private expandPasteMarkers(text: string, precedingText = ""): string {
 		if (this.pastes.size === 0 || !text.includes("[paste #")) {
 			return text;
 		}
 
+		// A kill expands only markers the deleted range actually owns. Seed the
+		// claimed IDs from text before that range so a typed duplicate later in
+		// the buffer remains literal when killed and yanked.
 		const expanded = new Set<number>();
+		for (const match of precedingText.matchAll(PASTE_MARKER_REGEX)) {
+			const id = Number(match[1]);
+			const content = this.pastes.get(id);
+			if (content !== undefined && match[0] === expectedPasteMarker(id, content)) expanded.add(id);
+		}
 		return text.replace(PASTE_MARKER_REGEX, (match, idGroup: string) => {
 			const id = Number(idGroup);
 			if (expanded.has(id)) return match;
@@ -1236,6 +1252,10 @@ export class Editor implements Component, Focusable {
 			expanded.add(id);
 			return content;
 		});
+	}
+
+	private textBeforePosition(line: number, col: number): string {
+		return [...this.state.lines.slice(0, line), (this.state.lines[line] ?? "").slice(0, col)].join("\n");
 	}
 
 	/**
@@ -2082,12 +2102,17 @@ export class Editor implements Component, Focusable {
 
 			// Calculate text to be deleted and save to kill ring (backward deletion = prepend)
 			const deletedText = currentLine.slice(0, this.state.cursorCol);
-			this.killRing.push(deletedText, { prepend: true, accumulate: this.lastAction === "kill" });
+			const precedingText = this.textBeforePosition(this.state.cursorLine, 0);
+			this.killRing.push(this.expandPasteMarkers(deletedText, precedingText), {
+				prepend: true,
+				accumulate: this.lastAction === "kill",
+			});
 			this.lastAction = "kill";
 
 			// Delete from start of line up to cursor
 			this.state.lines[this.state.cursorLine] = currentLine.slice(this.state.cursorCol);
 			this.setCursorCol(0);
+			this.prunePasteRegistry();
 		} else if (this.state.cursorLine > 0) {
 			this.pushUndoSnapshot();
 
@@ -2117,11 +2142,16 @@ export class Editor implements Component, Focusable {
 
 			// Calculate text to be deleted and save to kill ring (forward deletion = append)
 			const deletedText = currentLine.slice(this.state.cursorCol);
-			this.killRing.push(deletedText, { prepend: false, accumulate: this.lastAction === "kill" });
+			const precedingText = this.textBeforePosition(this.state.cursorLine, this.state.cursorCol);
+			this.killRing.push(this.expandPasteMarkers(deletedText, precedingText), {
+				prepend: false,
+				accumulate: this.lastAction === "kill",
+			});
 			this.lastAction = "kill";
 
 			// Delete from cursor to end of line
 			this.state.lines[this.state.cursorLine] = currentLine.slice(0, this.state.cursorCol);
+			this.prunePasteRegistry();
 		} else if (this.state.cursorLine < this.state.lines.length - 1) {
 			this.pushUndoSnapshot();
 
@@ -2171,12 +2201,17 @@ export class Editor implements Component, Focusable {
 			this.setCursorCol(oldCursorCol);
 
 			const deletedText = currentLine.slice(deleteFrom, this.state.cursorCol);
-			this.killRing.push(deletedText, { prepend: true, accumulate: wasKill });
+			const precedingText = this.textBeforePosition(this.state.cursorLine, deleteFrom);
+			this.killRing.push(this.expandPasteMarkers(deletedText, precedingText), {
+				prepend: true,
+				accumulate: wasKill,
+			});
 			this.lastAction = "kill";
 
 			this.state.lines[this.state.cursorLine] =
 				currentLine.slice(0, deleteFrom) + currentLine.slice(this.state.cursorCol);
 			this.setCursorCol(deleteFrom);
+			this.prunePasteRegistry();
 		}
 
 		if (this.onChange) {
@@ -2214,11 +2249,16 @@ export class Editor implements Component, Focusable {
 			this.setCursorCol(oldCursorCol);
 
 			const deletedText = currentLine.slice(this.state.cursorCol, deleteTo);
-			this.killRing.push(deletedText, { prepend: false, accumulate: wasKill });
+			const precedingText = this.textBeforePosition(this.state.cursorLine, this.state.cursorCol);
+			this.killRing.push(this.expandPasteMarkers(deletedText, precedingText), {
+				prepend: false,
+				accumulate: wasKill,
+			});
 			this.lastAction = "kill";
 
 			this.state.lines[this.state.cursorLine] =
 				currentLine.slice(0, this.state.cursorCol) + currentLine.slice(deleteTo);
+			this.prunePasteRegistry();
 		}
 
 		if (this.onChange) {

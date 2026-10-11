@@ -299,6 +299,7 @@ function snapshotPartial(partial: AssistantMessage): AssistantMessage {
 			if (block.type === "toolCall" && "partialJson" in block) {
 				const copy = { ...block } as unknown as Record<string, unknown>;
 				delete copy.partialJson;
+				delete copy.parsedJsonLength;
 				return copy as unknown as (typeof partial.content)[number];
 			}
 			return { ...block };
@@ -320,6 +321,11 @@ function processProxyEvent(
 /**
  * Process a proxy event and update the partial message.
  */
+function shouldReparseToolArguments(lastParsedLength: number, currentLength: number): boolean {
+	if (currentLength <= 2048) return true;
+	return currentLength - lastParsedLength >= Math.max(1024, lastParsedLength);
+}
+
 function processProxyEventInner(
 	proxyEvent: ProxyAssistantMessageEvent,
 	partial: AssistantMessage,
@@ -399,14 +405,19 @@ function processProxyEventInner(
 				name: proxyEvent.toolName,
 				arguments: {},
 				partialJson: "",
-			} satisfies ToolCall & { partialJson: string } as ToolCall;
+				parsedJsonLength: 0,
+			} satisfies ToolCall & { partialJson: string; parsedJsonLength: number } as ToolCall;
 			return { type: "toolcall_start", contentIndex: proxyEvent.contentIndex, partial };
 
 		case "toolcall_delta": {
 			const content = partial.content[proxyEvent.contentIndex];
 			if (content?.type === "toolCall") {
-				(content as any).partialJson += proxyEvent.delta;
-				content.arguments = parseStreamingJson((content as any).partialJson) || {};
+				const staging = content as ToolCall & { partialJson: string; parsedJsonLength: number };
+				staging.partialJson += proxyEvent.delta;
+				if (shouldReparseToolArguments(staging.parsedJsonLength, staging.partialJson.length)) {
+					content.arguments = parseStreamingJson(staging.partialJson) || {};
+					staging.parsedJsonLength = staging.partialJson.length;
+				}
 				partial.content[proxyEvent.contentIndex] = { ...content }; // Trigger reactivity
 				return {
 					type: "toolcall_delta",
@@ -423,6 +434,7 @@ function processProxyEventInner(
 			if (content?.type === "toolCall") {
 				Object.assign(content, proxyEvent.toolCall);
 				delete (content as any).partialJson;
+				delete (content as any).parsedJsonLength;
 				return {
 					type: "toolcall_end",
 					contentIndex: proxyEvent.contentIndex,

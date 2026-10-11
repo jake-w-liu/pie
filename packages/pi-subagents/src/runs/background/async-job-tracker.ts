@@ -702,7 +702,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			return;
 		}
 		for (const run of runs) {
+			const existing = state.asyncJobs.get(run.id);
 			const job = summaryToJob(run);
+			if (existing) job.controlEventCursor = existing.controlEventCursor;
 			state.asyncJobs.set(run.id, job);
 			if (job.status === "running") runningJobIds.add(job.asyncId);
 			rememberFleetJob(state, job);

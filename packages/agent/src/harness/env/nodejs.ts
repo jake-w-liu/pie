@@ -14,7 +14,7 @@ import {
 	rm,
 	writeFile,
 } from "node:fs/promises";
-import { homedir, constants as osConstants, tmpdir } from "node:os";
+import { homedir, hostname, constants as osConstants, tmpdir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -25,6 +25,7 @@ import {
 	FileError,
 	type FileInfo,
 	type FileKind,
+	type HostIdentity,
 	ok,
 	type Result,
 	type ShellExecOptions,
@@ -122,6 +123,9 @@ function toFileError(error: unknown, fallbackPath?: string): FileError {
 				return new FileError("aborted", message, path, cause);
 			case "ENOENT":
 				return new FileError("not_found", message, path, cause);
+			case "EEXIST":
+			case "ENOTEMPTY":
+				return new FileError("already_exists", message, path, cause);
 			case "EACCES":
 			case "EPERM":
 				return new FileError("permission_denied", message, path, cause);
@@ -266,6 +270,16 @@ function getShellEnv(
 	};
 }
 
+/** A pid that only this process may not signal is still alive; every other failure means it is gone. */
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return isNodeError(error) && error.code === "EPERM";
+	}
+}
+
 function killProcessTree(pid: number): void {
 	if (process.platform === "win32") {
 		try {
@@ -374,11 +388,13 @@ export class NodeExecutionEnv implements ExecutionEnv {
 	private shellEnv?: NodeJS.ProcessEnv;
 	private activeChildPids = new Set<number>();
 	private tempDirs = new Set<string>();
+	readonly hostIdentity: HostIdentity;
 
 	constructor(options: { cwd: string; shellPath?: string; shellEnv?: NodeJS.ProcessEnv }) {
 		this.cwd = options.cwd;
 		this.shellPath = options.shellPath;
 		this.shellEnv = options.shellEnv;
+		this.hostIdentity = { hostname: hostname(), pid: process.pid, isProcessAlive };
 	}
 
 	async absolutePath(path: string): Promise<Result<string, FileError>> {
@@ -602,11 +618,18 @@ export class NodeExecutionEnv implements ExecutionEnv {
 		}
 	}
 
-	async appendFile(path: string, content: string | Uint8Array): Promise<Result<void, FileError>> {
+	async appendFile(
+		path: string,
+		content: string | Uint8Array,
+		abortSignal?: AbortSignal,
+		options?: { flush?: boolean },
+	): Promise<Result<void, FileError>> {
 		const resolved = resolvePath(this.cwd, path);
+		const aborted = abortResult<void>(abortSignal, resolved);
+		if (aborted) return aborted;
 		try {
 			await mkdir(resolve(resolved, ".."), { recursive: true });
-			await appendFile(resolved, content);
+			await appendFile(resolved, content, { flush: options?.flush });
 			return ok(undefined);
 		} catch (error) {
 			return err(toFileError(error, resolved));
@@ -679,12 +702,23 @@ export class NodeExecutionEnv implements ExecutionEnv {
 		return err(result.error);
 	}
 
-	async createDir(path: string, options?: { recursive?: boolean }): Promise<Result<void, FileError>> {
+	async createDir(
+		path: string,
+		options?: { recursive?: boolean; abortSignal?: AbortSignal },
+	): Promise<Result<void, FileError>> {
 		const resolved = resolvePath(this.cwd, path);
+		const aborted = abortResult<void>(options?.abortSignal, resolved);
+		if (aborted) return aborted;
 		try {
 			await mkdir(resolved, { recursive: options?.recursive ?? true });
 			return ok(undefined);
 		} catch (error) {
+			// Windows can report EPERM instead of EEXIST when mkdir targets an
+			// existing directory. Preserve a real permission failure otherwise.
+			if (isNodeError(error) && error.code === "EPERM" && (await pathExists(resolved))) {
+				const cause = toError(error);
+				return err(new FileError("already_exists", cause.message, resolved, cause));
+			}
 			return err(toFileError(error, resolved));
 		}
 	}

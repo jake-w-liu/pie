@@ -379,8 +379,8 @@ export async function generateSummaryDraft(
 					: completeFn(model, { messages: [userMessage] }, completionOptions);
 
 				const response = await raceSummaryOperation(Promise.resolve(completion));
-				if (response.stopReason === "aborted") {
-					throw new Error("Aborted");
+				if (!(["stop", "length", "toolUse"] as const).includes(response.stopReason as "stop" | "length" | "toolUse")) {
+					throw new Error(response.stopReason === "aborted" ? "Aborted" : `Summary generation failed (${response.stopReason})`);
 				}
 
 				const contentParts = Array.isArray(response.content) ? response.content : [];

@@ -86,6 +86,18 @@ describe("owned native output spools", () => {
 		fs.unlinkSync(path!);
 		expect(streams[0].listenerCount("error")).toBe(0);
 	});
+
+	it("settles a pending backpressure wait when the stream is closed first", async () => {
+		const spool = new OutputSpool(join(harness.tempDir, "backpressure.log"));
+		vi.spyOn(streams[0], "write").mockReturnValue(false);
+		expect(spool.write("data")).toBe(false);
+		await spool.close();
+		// `drain` never fires once the stream ends, so closing must release the pending wait instead of
+		// leaving the paused consumer waiting forever.
+		await expect(
+			Promise.race([spool.waitForDrain(), setImmediate().then(() => "pending" as const)]),
+		).resolves.toBeUndefined();
+	});
 });
 
 describe("spool failure propagation through both Bash callers", () => {
@@ -99,7 +111,7 @@ describe("spool failure propagation through both Bash callers", () => {
 			});
 			const operations: BashOperations = {
 				exec: async (_command, _cwd, { onData }) => {
-					onData(Buffer.from("x".repeat(60000)));
+					onData(Buffer.from("x".repeat(60000)), "stdout");
 					streams[0].destroy(failure);
 					await gate;
 					return { exitCode: 0 };
@@ -123,7 +135,7 @@ describe("spool failure propagation through both Bash callers", () => {
 		const spoolError = new Error("synthetic ENOSPC");
 		const operations: BashOperations = {
 			exec: async (_command, _cwd, { onData }) => {
-				onData(Buffer.from("x".repeat(60000)));
+				onData(Buffer.from("x".repeat(60000)), "stdout");
 				streams[0].destroy(spoolError);
 				controller.abort();
 				throw commandError;
@@ -149,7 +161,7 @@ describe("spool failure propagation through both Bash callers", () => {
 				harness.tempDir,
 				{
 					exec: async (_command, _cwd, { onData }) => {
-						onData(Buffer.from("x".repeat(60000)));
+						onData(Buffer.from("x".repeat(60000)), "stdout");
 						streams[0].destroy(failure);
 						controller.abort();
 						return { exitCode: 0 };
@@ -175,7 +187,7 @@ describe("spool failure propagation through both Bash callers", () => {
 			harness.tempDir,
 			{
 				exec: async (_command, _cwd, { onData }) => {
-					onData(Buffer.from("kept output\n"));
+					onData(Buffer.from("kept output\n"), "stdout");
 					controller.abort();
 					throw new Error("aborted");
 				},
@@ -192,12 +204,12 @@ describe("custom user-Bash output admission lifetime", () => {
 		async (mode) => {
 			const controller = new AbortController();
 			const failure = new Error("command rejected");
-			let callback: ((data: Buffer) => void) | undefined;
+			let callback: Parameters<BashOperations["exec"]>[2]["onData"] | undefined;
 			const chunks: string[] = [];
 			const operations: BashOperations = {
 				async exec(_command, _cwd, { onData }) {
 					callback = onData;
-					onData(Buffer.from("before\n"));
+					onData(Buffer.from("before\n"), "stdout");
 					if (mode === "cancelled") controller.abort();
 					if (mode !== "success") throw failure;
 					return { exitCode: 0 };
@@ -211,7 +223,7 @@ describe("custom user-Bash output admission lifetime", () => {
 			else expect(await running).toMatchObject({ output: "before\n", cancelled: mode === "cancelled" });
 			if (!callback) throw new Error("Missing actual executor callback");
 			try {
-				callback(Buffer.from("x".repeat(60000)));
+				callback(Buffer.from("x".repeat(60000)), "stdout");
 				expect(streams).toHaveLength(0);
 				expect(chunks).toEqual(["before\n"]);
 			} finally {
@@ -248,13 +260,13 @@ describe("custom user-Bash output admission lifetime", () => {
 			});
 			const controller = new AbortController();
 			const failure = new Error("command rejected");
-			let callback: ((data: Buffer) => void) | undefined;
+			let callback: Parameters<BashOperations["exec"]>[2]["onData"] | undefined;
 			const chunks: string[] = [];
 			const before = `before\n${"x".repeat(60000)}`;
 			const operations: BashOperations = {
 				async exec(_command, _cwd, { onData }) {
 					callback = onData;
-					onData(Buffer.from(before));
+					onData(Buffer.from(before), "stdout");
 					if (mode === "cancelled") controller.abort();
 					if (mode !== "success") throw failure;
 					return { exitCode: 0 };
@@ -270,7 +282,7 @@ describe("custom user-Bash output admission lifetime", () => {
 			try {
 				await entered;
 				if (!callback) throw new Error("Missing actual executor callback");
-				callback(Buffer.from("late output"));
+				callback(Buffer.from("late output"), "stderr");
 				expect(chunks).toEqual([before]);
 			} finally {
 				release();

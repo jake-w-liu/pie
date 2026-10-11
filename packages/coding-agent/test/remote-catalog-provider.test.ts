@@ -72,6 +72,37 @@ async function refreshProvider(
 afterEach(() => vi.restoreAllMocks());
 
 describe("remote catalog provider", () => {
+	it("retries when an attempt times out while reading the response body", async () => {
+		let timeoutAttempt = 0;
+		vi.spyOn(AbortSignal, "timeout").mockImplementation(() => {
+			const controller = new AbortController();
+			if (timeoutAttempt++ === 0) queueMicrotask(() => controller.abort());
+			return controller.signal;
+		});
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+			if (fetchSpy.mock.calls.length > 1) return Response.json({ retried: model("retried") });
+			const signal = init?.signal;
+			return {
+				ok: true,
+				status: 200,
+				headers: new Headers(),
+				json: async () => {
+					await new Promise<void>((_resolve, reject) => {
+						if (signal?.aborted) reject(signal.reason);
+						else signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+					});
+				},
+			} as Response;
+		});
+		const provider = testProvider();
+		const store = new InMemoryModelsStore();
+
+		await refreshProvider(provider, store);
+
+		expect(fetchSpy).toHaveBeenCalledTimes(2);
+		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "retried"]);
+	});
+
 	it("parses keyed catalogs, sends version headers, observes the refresh TTL, and supports forced refreshes", async () => {
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
 			async () =>

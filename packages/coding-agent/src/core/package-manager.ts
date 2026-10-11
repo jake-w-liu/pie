@@ -43,6 +43,7 @@ import { isOfflineModeEnabled } from "../utils/env.ts";
 import { type GitSource, parseGitUrl } from "../utils/git.ts";
 import { canonicalizePath, isLocalPath, markPathIgnoredByCloudSync, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
+import { addIgnoreRules, type IgnoreMatcher } from "./ignore-rules.ts";
 import { isStdoutTakenOver } from "./output-guard.ts";
 import { type PiManifest, readPiManifest } from "./pi-manifest.ts";
 import type { PackageSource, SettingsManager } from "./settings-manager.ts";
@@ -215,10 +216,6 @@ const FILE_PATTERNS: Record<ResourceType, RegExp> = {
 	themes: /\.json$/,
 };
 
-const IGNORE_FILE_NAMES = [".gitignore", ".ignore", ".fdignore"];
-
-type IgnoreMatcher = ReturnType<typeof ignore>;
-
 function toPosixPath(p: string): string {
 	return p.split(sep).join("/");
 }
@@ -232,49 +229,6 @@ export function getExtensionTempFolder(agentDir: string): string {
 	mkdirSync(tempFolder, { recursive: true, mode: 0o700 });
 	chmodSync(tempFolder, 0o700);
 	return tempFolder;
-}
-
-function prefixIgnorePattern(line: string, prefix: string): string | null {
-	const trimmed = line.trim();
-	if (!trimmed) return null;
-	if (trimmed.startsWith("#") && !trimmed.startsWith("\\#")) return null;
-
-	let pattern = line;
-	let negated = false;
-
-	if (pattern.startsWith("!")) {
-		negated = true;
-		pattern = pattern.slice(1);
-	} else if (pattern.startsWith("\\!")) {
-		pattern = pattern.slice(1);
-	}
-
-	if (pattern.startsWith("/")) {
-		pattern = pattern.slice(1);
-	}
-
-	const prefixed = prefix ? `${prefix}${pattern}` : pattern;
-	return negated ? `!${prefixed}` : prefixed;
-}
-
-function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string): void {
-	const relativeDir = relative(rootDir, dir);
-	const prefix = relativeDir ? `${toPosixPath(relativeDir)}/` : "";
-
-	for (const filename of IGNORE_FILE_NAMES) {
-		const ignorePath = join(dir, filename);
-		if (!existsSync(ignorePath)) continue;
-		try {
-			const content = readFileSync(ignorePath, "utf-8");
-			const patterns = content
-				.split(/\r?\n/)
-				.map((line) => prefixIgnorePattern(line, prefix))
-				.filter((line): line is string => Boolean(line));
-			if (patterns.length > 0) {
-				ig.add(patterns);
-			}
-		} catch {}
-	}
 }
 
 function isPattern(s: string): boolean {
@@ -579,13 +533,20 @@ function resolveExtensionEntries(dir: string): string[] | null {
 	if (existsSync(packageJsonPath)) {
 		const manifest = readPiManifest(packageJsonPath);
 		if (manifest?.extensions?.length) {
-			const entries: string[] = [];
-			for (const extPath of manifest.extensions) {
-				const resolvedExtPath = resolve(dir, extPath);
-				if (isWithinRoot(dir, resolvedExtPath) && existsSync(resolvedExtPath)) {
-					entries.push(resolvedExtPath);
-				}
-			}
+			const sourceEntries = manifest.extensions.filter((entry) => !isOverridePattern(entry));
+			const candidates = sourceEntries.flatMap((entry) => {
+				const paths = hasGlobPattern(entry) ? expandPackageGlob(entry, dir) : [resolve(dir, entry)];
+				return paths
+					.filter((path) => isWithinRoot(dir, path))
+					.flatMap((path) => {
+						try {
+							return statSync(path).isFile() ? [path] : collectResourceFiles(path, "extensions");
+						} catch {
+							return [];
+						}
+					});
+			});
+			const entries = [...applyPatterns(candidates, manifest.extensions.filter(isOverridePattern), dir)];
 			if (entries.length > 0) {
 				return entries;
 			}
@@ -845,49 +806,33 @@ export class DefaultPackageManager implements PackageManager {
 		const scope: SourceScope = options?.local ? "project" : "user";
 		const currentSettings =
 			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
-		const currentPackages = currentSettings.packages ?? [];
 		const normalizedSource = this.normalizePackageSourceForSettings(source, scope);
-		const matchIndex = currentPackages.findIndex((existing) => this.packageSourcesMatch(existing, source, scope));
-		if (matchIndex !== -1) {
-			const existing = currentPackages[matchIndex];
-			if (this.getPackageSourceString(existing) === normalizedSource) {
-				return false;
-			}
-			const nextPackages = [...currentPackages];
+		const update = (packages: PackageSource[]): PackageSource[] => {
+			const matchIndex = packages.findIndex((existing) => this.packageSourcesMatch(existing, source, scope));
+			if (matchIndex === -1) return [...packages, normalizedSource];
+			const existing = packages[matchIndex];
+			if (this.getPackageSourceString(existing) === normalizedSource) return packages;
+			const nextPackages = [...packages];
 			nextPackages[matchIndex] =
 				typeof existing === "string" ? normalizedSource : { ...existing, source: normalizedSource };
-			if (scope === "project") {
-				this.settingsManager.setProjectPackages(nextPackages);
-			} else {
-				this.settingsManager.setPackages(nextPackages);
-			}
-			return true;
-		}
-		const nextPackages = [...currentPackages, normalizedSource];
-		if (scope === "project") {
-			this.settingsManager.setProjectPackages(nextPackages);
-		} else {
-			this.settingsManager.setPackages(nextPackages);
-		}
-		return true;
+			return nextPackages;
+		};
+		const currentPackages = currentSettings.packages ?? [];
+		const changed = update(currentPackages) !== currentPackages;
+		if (changed) this.settingsManager.mutatePackages(scope === "project" ? "project" : "global", update);
+		return changed;
 	}
 
 	removeSourceFromSettings(source: string, options?: { local?: boolean }): boolean {
 		const scope: SourceScope = options?.local ? "project" : "user";
 		const currentSettings =
 			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
+		const update = (packages: PackageSource[]): PackageSource[] =>
+			packages.filter((existing) => !this.packageSourcesMatch(existing, source, scope));
 		const currentPackages = currentSettings.packages ?? [];
-		const nextPackages = currentPackages.filter((existing) => !this.packageSourcesMatch(existing, source, scope));
-		const changed = nextPackages.length !== currentPackages.length;
-		if (!changed) {
-			return false;
-		}
-		if (scope === "project") {
-			this.settingsManager.setProjectPackages(nextPackages);
-		} else {
-			this.settingsManager.setPackages(nextPackages);
-		}
-		return true;
+		const changed = update(currentPackages).length !== currentPackages.length;
+		if (changed) this.settingsManager.mutatePackages(scope === "project" ? "project" : "global", update);
+		return changed;
 	}
 
 	getInstalledPath(source: string, scope: "user" | "project"): string | undefined {
@@ -2366,10 +2311,13 @@ export class DefaultPackageManager implements PackageManager {
 	): void {
 		if (entries.length === 0) return;
 
-		// Collect all files from plain entries (non-pattern entries)
+		// Positive globs are both discovery sources and inclusion filters.
 		const { plain, patterns } = splitPatterns(entries);
 		const resolvedPlain = plain.map((p) => this.resolvePathFromBase(p, baseDir));
-		const allFiles = this.collectFilesFromPaths(resolvedPlain, resourceType);
+		const resolvedGlobs = patterns
+			.filter((pattern) => hasGlobPattern(pattern) && !isOverridePattern(pattern))
+			.flatMap((pattern) => expandPackageGlob(pattern, baseDir));
+		const allFiles = this.collectFilesFromPaths([...resolvedPlain, ...resolvedGlobs], resourceType);
 
 		// Determine which files are enabled based on patterns
 		const enabledPaths = applyPatterns(allFiles, patterns, baseDir);
@@ -2590,7 +2538,10 @@ export class DefaultPackageManager implements PackageManager {
 		enabled: boolean,
 	): void {
 		if (!path) return;
-		if (!map.has(path)) {
+		const existing = map.get(path);
+		// Package resources are collected first; explicit top-level settings have precedence.
+		// At the same rank, preserve the first declaration for deterministic behavior.
+		if (!existing || (existing.metadata.origin === "package" && metadata.origin === "top-level")) {
 			map.set(path, { metadata, enabled });
 		}
 	}

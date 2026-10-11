@@ -60,7 +60,7 @@ import { applyIntercomBridgeToAgent, INTERCOM_BRIDGE_MARKER, resolveIntercomBrid
 import { formatControlIntercomMessage, formatControlNoticeMessage, resolveControlConfig, shouldNotifyControlEvent } from "../shared/subagent-control.ts";
 import { resolveTurnBudgetConfig } from "../shared/turn-budget.ts";
 import { formatSpawnBudget, getSpawnBudgetSnapshot, grantSpawnBudget, preflightSpawnBudget, preflightSpawnBudgetGrant, reserveSpawnBudget } from "../shared/spawn-budget.ts";
-import { claimRunFanoutBatch, claimRunFanoutBatchWithCommit, createRunFanoutBudget, decodeRunFanoutBudgetDescriptor, formatRunFanoutBudget, getRunFanoutBudgetSnapshot, readRunFanoutBudgetDescriptor, releaseRunFanoutBatch, RunFanoutLimitError, RUN_FANOUT_BUDGET_ENV, writeRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
+import { claimRunFanoutBatch, claimRunFanoutBatchWithCommit, claimRunFanoutBatchWithReceipt, createRunFanoutBudget, decodeRunFanoutBudgetDescriptor, formatRunFanoutBudget, getRunFanoutBudgetSnapshot, readRunFanoutBudgetDescriptor, releaseRunFanoutBatch, RunFanoutLimitError, RUN_FANOUT_BUDGET_ENV, writeRunFanoutBudgetDescriptor, type RunFanoutBatchReceipt } from "../shared/run-fanout-budget.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
 import { usageBudgetExceededMessage, usageBudgetState, validateUsageBudgetConfig } from "../shared/usage-budget.ts";
 import { intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
@@ -6042,12 +6042,13 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		}
 
 		let runFanoutBudget: RunFanoutBudgetDescriptor;
+		let claimedStaticFanout: RunFanoutBatchReceipt | undefined;
 		try {
 			const inheritedRunFanoutBudget = effectiveParams.runFanoutBudget ? undefined : decodeRunFanoutBudgetDescriptor(process.env[RUN_FANOUT_BUDGET_ENV]);
 			runFanoutBudget = effectiveParams.runFanoutBudget
 				?? (inheritedRunFanoutBudget ? { ...inheritedRunFanoutBudget, parentPath: `${inheritedRunFanoutBudget.parentPath ? `${inheritedRunFanoutBudget.parentPath}/` : ""}${runId}` } : undefined)
 				?? createRunFanoutBudget(runId, resolveMaxSubagentSpawnsPerRun(deps.config.maxSubagentSpawnsPerRun));
-			if (!effectiveParams.runFanoutAdmitted) claimRunFanoutBatch(runFanoutBudget, staticRunFanoutPaths(effectiveParams));
+			if (!effectiveParams.runFanoutAdmitted) claimedStaticFanout = claimRunFanoutBatchWithReceipt(runFanoutBudget, staticRunFanoutPaths(effectiveParams));
 		} catch (error) {
 			activeAsyncCapacity?.rollback();
 			if (error instanceof RunFanoutLimitError) return runFanoutErrorResult(error, foregroundMode);
@@ -6056,9 +6057,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		// Slots claimed above belong to this launch attempt only. Every early return
 		// below (before children actually launch) must release them so a rejected
 		// launch does not permanently consume shared fan-out budget.
-		const claimedStaticFanoutPaths = effectiveParams.runFanoutAdmitted ? [] : staticRunFanoutPaths(effectiveParams);
 		const releaseClaimedFanout = (): void => {
-			releaseRunFanoutBatch(runFanoutBudget, claimedStaticFanoutPaths);
+			if (claimedStaticFanout) releaseRunFanoutBatch(runFanoutBudget, claimedStaticFanout);
 		};
 		const nestedRoute = inheritedNestedRoute ?? createNestedRoute(runId);
 

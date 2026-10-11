@@ -1579,6 +1579,31 @@ describe("Editor component", () => {
 	});
 
 	describe("Undo", () => {
+		it("snapshots a large paste without invoking structuredClone", () => {
+			const originalStructuredClone = globalThis.structuredClone;
+			let structuredCloneCalls = 0;
+			globalThis.structuredClone = ((value: unknown, options?: StructuredSerializeOptions) => {
+				structuredCloneCalls++;
+				return originalStructuredClone(value, options);
+			}) as typeof structuredClone;
+
+			try {
+				const editor = new Editor(createTestTUI(), defaultEditorTheme);
+				const paste = "x".repeat(1_000_000);
+				editor.handleInput(`\x1b[200~${paste}\x1b[201~`);
+
+				for (let word = 0; word < 200; word++) {
+					for (const char of " word") editor.handleInput(char);
+				}
+				for (let i = 0; i < 200; i++) editor.handleInput("\x1f");
+
+				assert.strictEqual(editor.getExpandedText(), paste);
+				assert.strictEqual(structuredCloneCalls, 0);
+			} finally {
+				globalThis.structuredClone = originalStructuredClone;
+			}
+		});
+
 		it("does nothing when undo stack is empty", () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
 
@@ -3896,6 +3921,66 @@ describe("Editor component", () => {
 			// Undo
 			editor.handleInput("\x1b[45;5u");
 			assert.strictEqual(editor.getText(), textBefore);
+		});
+
+		it("preserves a killed paste payload across registry pruning and yank", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const paste = "x".repeat(1200);
+			editor.handleInput(`\x1b[200~${paste}\x1b[201~`);
+
+			editor.handleInput("\x15"); // Ctrl+U: kill and prune the paste marker
+			editor.handleInput("\x19"); // Ctrl+Y
+
+			assert.strictEqual(editor.getExpandedText(), paste);
+		});
+
+		it("kills and yanks a typed duplicate paste marker as literal text", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const paste = "x".repeat(1200);
+			editor.handleInput(`\x1b[200~${paste}\x1b[201~`);
+			const marker = editor.getText();
+			for (const char of marker) editor.handleInput(char);
+
+			editor.handleInput("\x01"); // Ctrl+A
+			editor.handleInput("\x1b[C"); // move past the owning marker
+			editor.handleInput("\x0b"); // Ctrl+K: kill the typed duplicate
+			editor.handleInput("\x19"); // Ctrl+Y
+
+			assert.strictEqual(editor.getText(), marker + marker);
+			assert.strictEqual(editor.getExpandedText(), paste + marker);
+
+			// Killing both copies must expand only the owning marker into the kill
+			// ring. The typed duplicate remains literal after the registry is pruned.
+			const both = new Editor(createTestTUI(), defaultEditorTheme);
+			both.handleInput(`\x1b[200~${paste}\x1b[201~`);
+			for (const char of marker) both.handleInput(char);
+			both.handleInput("\x15"); // Ctrl+U
+			both.handleInput("\x19"); // Ctrl+Y
+			assert.strictEqual(both.getText(), paste + marker);
+			assert.strictEqual(both.getExpandedText(), paste + marker);
+		});
+
+		it("prunes paste ownership after every kill operation", () => {
+			const cases = [
+				{ name: "Ctrl+U", prepare: "", kill: "\x15" },
+				{ name: "Ctrl+K", prepare: "\x01", kill: "\x0b" },
+				{ name: "Ctrl+W", prepare: "", kill: "\x17" },
+				{ name: "Alt+D", prepare: "\x01", kill: "\x1bd" },
+			];
+
+			for (const { name, prepare, kill } of cases) {
+				const editor = new Editor(createTestTUI(), defaultEditorTheme);
+				const paste = "x".repeat(1200);
+				editor.handleInput(`\x1b[200~${paste}\x1b[201~`);
+				const marker = editor.getText();
+				if (prepare) editor.handleInput(prepare);
+				editor.handleInput(kill);
+				assert.ok(!editor.getText().includes(marker), `${name} must remove or damage the owning marker`);
+
+				const remainder = editor.getText();
+				for (const char of marker) editor.handleInput(char);
+				assert.strictEqual(editor.getExpandedText(), remainder + marker, `${name} left stale paste ownership`);
+			}
 		});
 
 		it("undo after paste marker deletion restores the paste registry", () => {

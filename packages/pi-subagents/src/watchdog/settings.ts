@@ -1,5 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { withStateFileLock } from "../missions/workflow-state.ts";
+import { writeAtomicJson } from "../shared/atomic-json.ts";
 import { THINKING_LEVELS, type ThinkingLevel } from "../shared/model-info.ts";
 import { getAgentDir, getProjectConfigDir } from "../shared/utils.ts";
 import {
@@ -500,32 +502,35 @@ function targetSettingsObject(watchdog: Record<string, unknown>, target: Watchdo
 }
 
 function writeSettingsFile(settingsPath: string, settings: Record<string, unknown>): string {
-	fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
-	fs.writeFileSync(settingsPath, `${JSON.stringify(settings, null, 2)}\n`, "utf-8");
+	writeAtomicJson(settingsPath, settings);
 	return settingsPath;
 }
 
 export function writeUserWatchdogEnabled(enabled: boolean): string {
 	const settingsPath = getUserSettingsPath();
-	const meta: ParseMeta = { scope: "user", path: settingsPath };
-	const settings = readSettingsFileStrict(settingsPath);
-	const watchdog = ensureWatchdogSettings(settings, meta);
-	watchdog.enabled = enabled;
-	targetSettingsObject(watchdog, { kind: "main" }, meta).enabled = enabled;
-	return writeSettingsFile(settingsPath, settings);
+	return withStateFileLock(settingsPath, () => {
+		const meta: ParseMeta = { scope: "user", path: settingsPath };
+		const settings = readSettingsFileStrict(settingsPath);
+		const watchdog = ensureWatchdogSettings(settings, meta);
+		watchdog.enabled = enabled;
+		targetSettingsObject(watchdog, { kind: "main" }, meta).enabled = enabled;
+		return writeSettingsFile(settingsPath, settings);
+	});
 }
 
 export function writeWatchdogModelSettings(input: WatchdogModelSettingsWrite): string {
 	const settingsPath = settingsPathForWrite(input.scope, input.cwd);
-	const meta: ParseMeta = { scope: input.scope, path: settingsPath };
-	const settings = readSettingsFileStrict(settingsPath);
-	const watchdog = ensureWatchdogSettings(settings, meta);
-	const target = targetSettingsObject(watchdog, input.target, meta);
-	if (input.model === null) delete target.model;
-	else if (input.model !== undefined) target.model = input.model;
-	if (input.thinking === null) delete target.thinking;
-	else if (input.thinking !== undefined) target.thinking = input.thinking;
-	return writeSettingsFile(settingsPath, settings);
+	return withStateFileLock(settingsPath, () => {
+		const meta: ParseMeta = { scope: input.scope, path: settingsPath };
+		const settings = readSettingsFileStrict(settingsPath);
+		const watchdog = ensureWatchdogSettings(settings, meta);
+		const target = targetSettingsObject(watchdog, input.target, meta);
+		if (input.model === null) delete target.model;
+		else if (input.model !== undefined) target.model = input.model;
+		if (input.thinking === null) delete target.thinking;
+		else if (input.thinking !== undefined) target.thinking = input.thinking;
+		return writeSettingsFile(settingsPath, settings);
+	});
 }
 
 export function resolveWatchdogConfig(cwd: string, options: { session?: Record<string, unknown> } = {}): WatchdogSettingsResult {

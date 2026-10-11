@@ -330,12 +330,23 @@ function createAbortedMessage(partial: AssistantMessage): AssistantMessage {
 	};
 }
 
-function scheduleChunk(chunk: string, tokensPerSecond: number | undefined): Promise<void> {
+function scheduleChunk(chunk: string, tokensPerSecond: number | undefined, signal?: AbortSignal): Promise<void> {
 	if (!tokensPerSecond || tokensPerSecond <= 0) {
 		return new Promise((resolve) => queueMicrotask(resolve));
 	}
+	if (signal?.aborted) return Promise.resolve();
 	const delayMs = (estimateTokens(chunk) / tokensPerSecond) * 1000;
-	return new Promise((resolve) => setTimeout(resolve, delayMs));
+	return new Promise((resolve) => {
+		const onAbort = () => {
+			clearTimeout(timeout);
+			resolve();
+		};
+		const timeout = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, delayMs);
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
 }
 
 async function streamWithDeltas(
@@ -370,7 +381,7 @@ async function streamWithDeltas(
 			partial.content = [...partial.content, { type: "thinking", thinking: "" }];
 			stream.push({ type: "thinking_start", contentIndex: index, partial: { ...partial } });
 			for (const chunk of splitStringByTokenSize(block.thinking, minTokenSize, maxTokenSize)) {
-				await scheduleChunk(chunk, tokensPerSecond);
+				await scheduleChunk(chunk, tokensPerSecond, signal);
 				if (signal?.aborted) {
 					const aborted = createAbortedMessage(partial);
 					stream.push({ type: "error", reason: "aborted", error: aborted });
@@ -393,7 +404,7 @@ async function streamWithDeltas(
 			partial.content = [...partial.content, { type: "text", text: "" }];
 			stream.push({ type: "text_start", contentIndex: index, partial: { ...partial } });
 			for (const chunk of splitStringByTokenSize(block.text, minTokenSize, maxTokenSize)) {
-				await scheduleChunk(chunk, tokensPerSecond);
+				await scheduleChunk(chunk, tokensPerSecond, signal);
 				if (signal?.aborted) {
 					const aborted = createAbortedMessage(partial);
 					stream.push({ type: "error", reason: "aborted", error: aborted });
@@ -410,7 +421,7 @@ async function streamWithDeltas(
 		partial.content = [...partial.content, { type: "toolCall", id: block.id, name: block.name, arguments: {} }];
 		stream.push({ type: "toolcall_start", contentIndex: index, partial: { ...partial } });
 		for (const chunk of splitStringByTokenSize(JSON.stringify(block.arguments), minTokenSize, maxTokenSize)) {
-			await scheduleChunk(chunk, tokensPerSecond);
+			await scheduleChunk(chunk, tokensPerSecond, signal);
 			if (signal?.aborted) {
 				const aborted = createAbortedMessage(partial);
 				stream.push({ type: "error", reason: "aborted", error: aborted });

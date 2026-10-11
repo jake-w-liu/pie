@@ -67,8 +67,10 @@ function findWebpTiffOffset(bytes: Uint8Array): number {
 	while (offset + 8 <= bytes.length) {
 		const chunkId = String.fromCharCode(bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]);
 		const chunkSize =
-			bytes[offset + 4] | (bytes[offset + 5] << 8) | (bytes[offset + 6] << 16) | (bytes[offset + 7] << 24);
+			(bytes[offset + 4] | (bytes[offset + 5] << 8) | (bytes[offset + 6] << 16) | (bytes[offset + 7] << 24)) >>> 0;
 		const dataStart = offset + 8;
+		const nextOffset = dataStart + chunkSize + (chunkSize % 2);
+		if (nextOffset <= offset || nextOffset > bytes.length) return -1;
 
 		if (chunkId === "EXIF") {
 			if (dataStart + chunkSize > bytes.length) return -1;
@@ -77,8 +79,8 @@ function findWebpTiffOffset(bytes: Uint8Array): number {
 			return tiffStart;
 		}
 
-		// RIFF chunks are padded to even size
-		offset = dataStart + chunkSize + (chunkSize % 2);
+		// RIFF chunks are padded to even size.
+		offset = nextOffset;
 	}
 
 	return -1;

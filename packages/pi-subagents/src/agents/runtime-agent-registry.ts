@@ -139,6 +139,12 @@ function validatePositiveInteger(value: unknown, field: string): number | undefi
 	return value as number;
 }
 
+function validateNonnegativeInteger(value: unknown, field: string): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Number.isInteger(value) || (value as number) < 0) throw new Error(`${field} must be an integer >= 0 when provided.`);
+	return value as number;
+}
+
 function validateBoolean(value: unknown, field: string): boolean | undefined {
 	if (value === undefined) return undefined;
 	if (typeof value !== "boolean") throw new Error(`${field} must be a boolean when provided.`);
@@ -246,7 +252,7 @@ function validateDefinition(value: unknown): RuntimeAgentDefinition {
 	const defaultReads = validateStringList(definition.defaultReads, "Runtime agent definition defaultReads");
 	const defaultProgress = validateBoolean(definition.defaultProgress, "Runtime agent definition defaultProgress");
 	const interactive = validateBoolean(definition.interactive, "Runtime agent definition interactive");
-	const maxSubagentDepth = validatePositiveInteger(definition.maxSubagentDepth, "Runtime agent definition maxSubagentDepth");
+	const maxSubagentDepth = validateNonnegativeInteger(definition.maxSubagentDepth, "Runtime agent definition maxSubagentDepth");
 	const completionGuard = validateBoolean(definition.completionGuard, "Runtime agent definition completionGuard");
 	const toolBudget = validateToolBudget(definition.toolBudget);
 	const permissions = validatePermissionRules(definition.permissions, "Runtime agent definition permissions");

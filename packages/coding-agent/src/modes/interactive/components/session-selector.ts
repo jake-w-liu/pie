@@ -383,7 +383,7 @@ class SessionList implements Component, Focusable {
 				ancestorContinues: [],
 			}));
 		}
-		this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredSessions.length - 1));
+		this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, Math.max(0, this.filteredSessions.length - 1)));
 	}
 
 	private setConfirmingDeletePath(path: string | null): void {
@@ -602,18 +602,22 @@ class SessionList implements Component, Focusable {
 
 		// Up arrow
 		if (kb.matches(keyData, "tui.select.up")) {
+			if (this.filteredSessions.length === 0) return;
 			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
 		}
 		// Down arrow
 		else if (kb.matches(keyData, "tui.select.down")) {
+			if (this.filteredSessions.length === 0) return;
 			this.selectedIndex = Math.min(this.filteredSessions.length - 1, this.selectedIndex + 1);
 		}
 		// Page up - jump up by maxVisible items
 		else if (kb.matches(keyData, "tui.select.pageUp")) {
+			if (this.filteredSessions.length === 0) return;
 			this.selectedIndex = Math.max(0, this.selectedIndex - this.maxVisible);
 		}
 		// Page down - jump down by maxVisible items
 		else if (kb.matches(keyData, "tui.select.pageDown")) {
+			if (this.filteredSessions.length === 0) return;
 			this.selectedIndex = Math.min(this.filteredSessions.length - 1, this.selectedIndex + this.maxVisible);
 		}
 		// Enter
@@ -969,11 +973,10 @@ export class SessionSelectorComponent extends Container implements Focusable {
 				? this.currentSessionsLoader(onProgress)
 				: this.allSessionsLoader(onProgress));
 
-			if (scope !== this.scope) return;
 			if (isStale()) return;
 
-			// Cache the result only after the staleness guard, so a superseded
-			// response cannot leave the cached list holding stale entries.
+			// Cache completed loads even when the user switched scope while they
+			// were in flight. Only the visible list/header are scope-specific.
 			if (scope === "current") {
 				this.currentSessions = sessions;
 				this.currentLoading = false;
@@ -982,11 +985,11 @@ export class SessionSelectorComponent extends Container implements Focusable {
 				this.allLoading = false;
 			}
 
+			if (scope !== this.scope) return;
 			this.header.setLoading(false);
 			this.sessionList.setSessions(sessions, showCwd);
 			this.requestRender();
 		} catch (err) {
-			if (scope !== this.scope) return;
 			if (isStale()) return;
 
 			if (scope === "current") {
@@ -995,6 +998,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 				this.allLoading = false;
 			}
 
+			if (scope !== this.scope) return;
 			const message = err instanceof Error ? err.message : String(err);
 			this.header.setLoading(false);
 			this.header.setStatusMessage({ type: "error", message: `Failed to load sessions: ${message}` }, 4000);

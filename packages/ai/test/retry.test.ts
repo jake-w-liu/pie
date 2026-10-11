@@ -87,6 +87,22 @@ describe("provider retry classification", () => {
 		).toBe(true);
 		expect(isRetryableAssistantError(fauxAssistantMessage("not an error"))).toBe(false);
 	});
+
+	it.each([
+		"400 invalid max_tokens: 65000 > 64000",
+		"validation failed with code 15003",
+		"unexpected application status 4500",
+		"field must not contain 500 characters",
+	])("does not mistake digits inside deterministic errors for HTTP status codes: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
+	});
+
+	it.each(["500 Internal Server Error", "API error: 503 unavailable", "request failed with status 502"])(
+		"retains structured transient HTTP status matching: %s",
+		(errorMessage) => {
+			expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+		},
+	);
 });
 
 describe("retryAssistantCall", () => {

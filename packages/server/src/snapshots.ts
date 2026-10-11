@@ -64,6 +64,8 @@ export class ServerSnapshotPublisher {
 		const current = await this.get(models);
 		const snapshot: ServerSnapshot = { ...current, revision };
 		const envelope: EventEnvelope = { type: "event", event: { type: "server_snapshot", snapshot } };
-		for (const connection of readyConnections) await this.options.sendMessage(connection, envelope);
+		for (const connection of readyConnections) {
+			void this.options.sendMessage(connection, envelope).catch((error: unknown) => this.options.reportError(error));
+		}
 	}
 }

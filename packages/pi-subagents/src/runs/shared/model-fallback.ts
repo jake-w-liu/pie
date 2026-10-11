@@ -156,14 +156,13 @@ export function fuzzyResolveModel(
 ): string | undefined {
 	const { queryProvider, queryIdRaw } = splitQualifiedModelQuery(baseModel, availableModels);
 	const queryId = normalizeModelSegment(queryIdRaw);
+	const providerMatches = availableModels.filter((entry) =>
+		queryProvider === undefined || normalizeModelSegment(entry.provider) === queryProvider);
+	const normalizedExact = providerMatches.filter((entry) => normalizeModelSegment(entry.id) === queryId);
 	const queryIdNoDate = stripTrailingDateStamp(queryId);
-
-	const candidates = availableModels.filter((entry) => {
-		const entryId = normalizeModelSegment(entry.id);
-		if (entryId !== queryId && stripTrailingDateStamp(entryId) !== queryIdNoDate) return false;
-		if (queryProvider !== undefined && normalizeModelSegment(entry.provider) !== queryProvider) return false;
-		return true;
-	});
+	const candidates = normalizedExact.length > 0
+		? normalizedExact
+		: providerMatches.filter((entry) => stripTrailingDateStamp(normalizeModelSegment(entry.id)) === queryIdNoDate);
 	if (candidates.length === 0) return undefined;
 	if (preferredProvider) {
 		const preferredProviderNorm = normalizeModelSegment(preferredProvider);

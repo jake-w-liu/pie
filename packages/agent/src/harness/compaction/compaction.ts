@@ -18,7 +18,7 @@ import type { AgentMessage, ThinkingLevel } from "../../types.ts";
 import { convertToLlm, createBranchSummaryMessage, createCompactionSummaryMessage } from "../messages.ts";
 import { buildSessionContext } from "../session/context.ts";
 import type { CompactionEntry, Entry } from "../session/types.ts";
-import { CompactionError, err, ok, type Result } from "../types.ts";
+import { CompactionError, err, ok, type Result, toError } from "../types.ts";
 import {
 	computeFileLists,
 	createFileOps,
@@ -102,7 +102,7 @@ export interface CompactResult<T = unknown> {
 	details?: T;
 }
 
-function estimateSummarizationInputTokens(context: Context): number {
+export function estimateSummarizationInputTokens(context: Context): number {
 	return (
 		context.messages.reduce((total, message) => total + estimateTokens(message), 0) +
 		Math.ceil((context.systemPrompt?.length ?? 0) / 4) +
@@ -225,6 +225,25 @@ export function getSummarizationFailure(
 		return `${label} failed: response contained no summary text`;
 	}
 	return undefined;
+}
+
+async function settleCompactionCompletion(
+	completion: Promise<AssistantMessage>,
+	signal: AbortSignal | undefined,
+): Promise<Result<AssistantMessage, CompactionError>> {
+	try {
+		return ok(await completion);
+	} catch (error) {
+		const cause = toError(error);
+		const aborted = signal?.aborted || cause.name === "AbortError";
+		return err(
+			new CompactionError(
+				aborted ? "aborted" : "summarization_failed",
+				aborted ? cause.message || "Summarization aborted" : `Summarization failed: ${cause.message}`,
+				cause,
+			),
+		);
+	}
 }
 
 function extractSummaryText(response: AssistantMessage, label: string): Result<string, CompactionError> {
@@ -529,16 +548,27 @@ export function findCutPoint(
 		}
 		cutIndex--;
 	}
-	const cutEntry = entries[cutIndex];
+	let contextEntryIndex = cutIndex;
+	while (
+		contextEntryIndex < endIndex &&
+		entries[contextEntryIndex].type !== "message" &&
+		entries[contextEntryIndex].type !== "branch_summary" &&
+		entries[contextEntryIndex].type !== "compaction"
+	) {
+		contextEntryIndex++;
+	}
+	const contextEntry = entries[contextEntryIndex];
 	const startsTurn =
-		cutEntry.type === "branch_summary" ||
-		(cutEntry.type === "message" &&
-			(cutEntry.message.role === "user" ||
-				cutEntry.message.role === "bashExecution" ||
-				cutEntry.message.role === "custom" ||
-				cutEntry.message.role === "branchSummary" ||
-				cutEntry.message.role === "compactionSummary"));
-	const turnStartIndex = startsTurn ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
+		contextEntry === undefined ||
+		contextEntry.type === "branch_summary" ||
+		contextEntry.type === "compaction" ||
+		(contextEntry.type === "message" &&
+			(contextEntry.message.role === "user" ||
+				contextEntry.message.role === "bashExecution" ||
+				contextEntry.message.role === "custom" ||
+				contextEntry.message.role === "branchSummary" ||
+				contextEntry.message.role === "compactionSummary"));
+	const turnStartIndex = startsTurn ? -1 : findTurnStartIndex(entries, contextEntryIndex, startIndex);
 
 	return {
 		firstKeptEntryIndex: cutIndex,
@@ -794,20 +824,25 @@ export async function generateSummaryWithUsage(
 			model.reasoning && thinkingLevel && thinkingLevel !== "off"
 				? { maxTokens, signal, reasoning: thinkingLevel }
 				: { maxTokens, signal };
-		const response = await completeSimpleWithRetries(
-			models,
-			model,
-			buildCacheReusingSummarizationContext(
-				cacheReuse.systemPrompt,
-				cacheReuse.tools,
-				instruction,
-				llmMessages,
-				model.contextWindow > 0 ? model.contextWindow - maxTokens : Number.POSITIVE_INFINITY,
+		const completion = await settleCompactionCompletion(
+			completeSimpleWithRetries(
+				models,
+				model,
+				buildCacheReusingSummarizationContext(
+					cacheReuse.systemPrompt,
+					cacheReuse.tools,
+					instruction,
+					llmMessages,
+					model.contextWindow > 0 ? model.contextWindow - maxTokens : Number.POSITIVE_INFINITY,
+				),
+				completionOptions,
+				retry,
+				callbacks,
 			),
-			completionOptions,
-			retry,
-			callbacks,
+			signal,
 		);
+		if (!completion.ok) return err(completion.error);
+		const response = completion.value;
 		const text = extractSummaryText(response, "Summarization");
 		return text.ok ? ok({ text: text.value, usage: response.usage }) : err(text.error);
 	}
@@ -828,14 +863,19 @@ export async function generateSummaryWithUsage(
 			? { maxTokens, signal, reasoning: thinkingLevel }
 			: { maxTokens, signal };
 
-	const response = await completeSimpleWithRetries(
-		models,
-		model,
-		buildSummarizationContext(promptText),
-		completionOptions,
-		retry,
-		callbacks,
+	const completion = await settleCompactionCompletion(
+		completeSimpleWithRetries(
+			models,
+			model,
+			buildSummarizationContext(promptText),
+			completionOptions,
+			retry,
+			callbacks,
+		),
+		signal,
 	);
+	if (!completion.ok) return err(completion.error);
+	const response = completion.value;
 	const text = extractSummaryText(response, "Summarization");
 	return text.ok ? ok({ text: text.value, usage: response.usage }) : err(text.error);
 }
@@ -1094,14 +1134,19 @@ async function generateTurnPrefixSummary(
 		model.reasoning && thinkingLevel && thinkingLevel !== "off"
 			? { maxTokens, signal, reasoning: thinkingLevel }
 			: { maxTokens, signal };
-	const response = await completeSimpleWithRetries(
-		models,
-		model,
-		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-		completionOptions,
-		retry,
-		callbacks,
+	const completion = await settleCompactionCompletion(
+		completeSimpleWithRetries(
+			models,
+			model,
+			{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
+			completionOptions,
+			retry,
+			callbacks,
+		),
+		signal,
 	);
+	if (!completion.ok) return err(completion.error);
+	const response = completion.value;
 	const text = extractSummaryText(response, "Turn prefix summarization");
 	return text.ok ? ok({ text: text.value, usage: response.usage }) : err(text.error);
 }

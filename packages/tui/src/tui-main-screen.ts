@@ -313,6 +313,9 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	override routeMousePress(x: number, y: number): void {
+		// A new press always supersedes a component-owned gesture, even if its
+		// release was lost while focus or terminal geometry changed.
+		if (this.componentMouseGesture) this.cancelSelectionGestureForRerender();
 		// Click coordinates are stale across a resize until the re-render lands.
 		// Cancel a half-open gesture and request a fresh frame rather than
 		// interpreting the new press against stale geometry.
@@ -383,11 +386,6 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const gesture = this.componentMouseGesture;
 		if (gesture) {
 			this.componentMouseGesture = undefined;
-			if (!isPrimaryMouseRelease({ button, x, y, press: false })) return true;
-			if (this.hasOverlay() || this.hasStalePointerFrame()) {
-				this.requestRender();
-				return true;
-			}
 			gesture.component.handleMouseRelease?.();
 			this.requestRender();
 			return true;
@@ -421,13 +419,13 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const gesture = this.componentMouseGesture;
 		if (gesture) {
 			if (this.hasOverlay() || this.hasStalePointerFrame()) {
-				this.componentMouseGesture = undefined;
+				this.cancelSelectionGestureForRerender();
 				this.requestRender();
 				return true;
 			}
 			const total = this.previousLines.length;
 			if (total === 0) {
-				this.componentMouseGesture = undefined;
+				this.cancelSelectionGestureForRerender();
 				return true;
 			}
 			const absoluteRow = this.previousViewportTop + y;
@@ -476,7 +474,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	protected override routeTerminalFocusChange(focused: boolean): void {
-		if (focused || !this.pendingDrag) return;
+		if (focused || (!this.pendingDrag && !this.componentMouseGesture)) return;
 		this.logMouse("focus-out");
 		this.cancelSelectionGestureForRerender();
 	}
@@ -495,10 +493,15 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	private cancelSelectionGestureForRerender(): void {
-		if (!this.pendingDrag) return;
-		this.pendingDrag = undefined;
-		this.lastClick = undefined;
-		this.clearSelection();
+		const componentGesture = this.componentMouseGesture;
+		this.componentMouseGesture = undefined;
+		componentGesture?.component.handleMouseRelease?.();
+		if (!this.pendingDrag && !componentGesture) return;
+		if (this.pendingDrag) {
+			this.pendingDrag = undefined;
+			this.lastClick = undefined;
+			this.clearSelection();
+		}
 		this.requestRender();
 	}
 

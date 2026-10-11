@@ -200,6 +200,20 @@ describe("remote transcript projection", () => {
 		});
 	});
 
+	test("an equal-revision snapshot preserves transient progress", () => {
+		let state = createTranscriptState(snapshot(7, "saved"));
+		state = applyTranscriptProgress(state, {
+			type: "assistant_delta",
+			messageId: "assistant-1",
+			contentIndex: 0,
+			kind: "text",
+			delta: " progress",
+		});
+		state = applyTranscriptSnapshot(state, snapshot(7, "duplicate"));
+
+		expect(selectTranscript(state)[0]).toMatchObject({ content: [{ text: "saved progress" }] });
+	});
+
 	test("a newer snapshot is authoritative and stale snapshots are ignored", () => {
 		let state = createTranscriptState(snapshot(3, "new"));
 		state = applyTranscriptProgress(state, {

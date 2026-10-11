@@ -41,6 +41,7 @@ import {
 	retryGoogleRequest,
 	supportsGoogleStrictToolSampling,
 } from "./google-shared.ts";
+import { lazyStream } from "./lazy.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
 export interface GoogleVertexOptions extends StreamOptions {
@@ -120,11 +121,12 @@ export const stream: StreamFunction<"google-vertex", GoogleVertexOptions> = (
 				output.responseId ||= chunk.responseId;
 				const candidate = chunk.candidates?.[0];
 				if (candidate?.content?.parts) {
-					for (const part of candidate.content.parts) {
+					for (const [partIndex, part] of candidate.content.parts.entries()) {
 						if (part.text !== undefined) {
 							const isThinking = isThinkingPart(part);
 							if (
 								!currentBlock ||
+								partIndex > 0 ||
 								(isThinking && currentBlock.type !== "thinking") ||
 								(!isThinking && currentBlock.type !== "text")
 							) {
@@ -237,6 +239,10 @@ export const stream: StreamFunction<"google-vertex", GoogleVertexOptions> = (
 						output.stopReason = "toolUse";
 					}
 				}
+				if (chunk.promptFeedback?.blockReason) {
+					output.rawStopReason = chunk.promptFeedback.blockReason;
+					output.stopReason = "error";
+				}
 
 				if (chunk.usageMetadata) {
 					output.usage = {
@@ -315,40 +321,45 @@ export const streamSimple: StreamFunction<"google-vertex", SimpleStreamOptions> 
 	model: Model<"google-vertex">,
 	context: Context,
 	options?: SimpleStreamOptions,
-): AssistantMessageEventStream => {
-	const base = {
-		...buildBaseOptions(model, context, options, undefined),
-		toolChoice: options?.toolChoice,
-	} satisfies GoogleVertexOptions;
-	if (!options?.reasoning) {
-		return stream(model, context, {
-			...base,
-			thinking: { enabled: false },
-		} satisfies GoogleVertexOptions);
-	}
+): AssistantMessageEventStream =>
+	lazyStream(
+		model,
+		async () => {
+			const base = {
+				...buildBaseOptions(model, context, options, undefined),
+				toolChoice: options?.toolChoice,
+			} satisfies GoogleVertexOptions;
+			if (!options?.reasoning) {
+				return stream(model, context, {
+					...base,
+					thinking: { enabled: false },
+				} satisfies GoogleVertexOptions);
+			}
 
-	const clampedReasoning = clampThinkingLevel(model, options.reasoning);
-	const resolvedLevel = resolveGoogleThinkingLevel(model, clampedReasoning);
-	const geminiModel = model as unknown as Model<"google-generative-ai">;
+			const clampedReasoning = clampThinkingLevel(model, options.reasoning);
+			const resolvedLevel = resolveGoogleThinkingLevel(model, clampedReasoning);
+			const geminiModel = model as unknown as Model<"google-generative-ai">;
 
-	if (isGemini3ProModel(geminiModel) || isGemini3FlashModel(geminiModel)) {
-		return stream(model, context, {
-			...base,
-			thinking: {
-				enabled: true,
-				level: getGemini3ThinkingLevel(resolvedLevel, geminiModel),
-			},
-		} satisfies GoogleVertexOptions);
-	}
+			if (isGemini3ProModel(geminiModel) || isGemini3FlashModel(geminiModel)) {
+				return stream(model, context, {
+					...base,
+					thinking: {
+						enabled: true,
+						level: getGemini3ThinkingLevel(resolvedLevel, geminiModel),
+					},
+				} satisfies GoogleVertexOptions);
+			}
 
-	return stream(model, context, {
-		...base,
-		thinking: {
-			enabled: true,
-			budgetTokens: getGoogleBudget(geminiModel, resolvedLevel, options.thinkingBudgets),
+			return stream(model, context, {
+				...base,
+				thinking: {
+					enabled: true,
+					budgetTokens: getGoogleBudget(geminiModel, resolvedLevel, options.thinkingBudgets),
+				},
+			} satisfies GoogleVertexOptions);
 		},
-	} satisfies GoogleVertexOptions);
-};
+		options?.signal,
+	);
 
 function createClient(
 	model: Model<"google-vertex">,

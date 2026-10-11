@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { DEFAULT_FILE_SYSTEM_RETRY_DELAYS_MS, waitForFileSystemRetry } from "../../shared/file-system-retry.ts";
 import { getAgentDir } from "../../shared/utils.ts";
 import { isUnexplainedProcessSignal } from "./process-signal.ts";
 
@@ -22,6 +23,7 @@ const ROTATE_KEEP = 1000;
 const PRIVATE_DIR_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const REDACTED_TASK = "[redacted]";
+const HISTORY_LOCK_STALE_MS = 30_000;
 
 type HistoryFileState = { mtimeMs: number; ctimeMs: number; size: number; ino: number; lineCount: number };
 
@@ -166,6 +168,34 @@ function appendPrivateHistoryLine(historyPath: string, line: string): void {
 	}
 }
 
+function withHistoryLock<T>(historyPath: string, operation: () => T): T {
+	const lockPath = `${historyPath}.lock`;
+	for (let attempt = 0; ; attempt++) {
+		try {
+			fs.mkdirSync(lockPath, { mode: PRIVATE_DIR_MODE });
+			break;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			try {
+				if (Date.now() - fs.statSync(lockPath).mtimeMs > HISTORY_LOCK_STALE_MS) {
+					const stalePath = `${lockPath}.stale-${randomUUID()}`;
+					fs.renameSync(lockPath, stalePath);
+					fs.rmSync(stalePath, { recursive: true, force: true });
+					continue;
+				}
+			} catch (staleError) {
+				if ((staleError as NodeJS.ErrnoException).code !== "ENOENT") throw staleError;
+				continue;
+			}
+			const delay = DEFAULT_FILE_SYSTEM_RETRY_DELAYS_MS[attempt];
+			if (delay === undefined) throw new Error(`Timed out acquiring run history lock at '${lockPath}'.`);
+			waitForFileSystemRetry(delay);
+		}
+	}
+	try { return operation(); }
+	finally { fs.rmSync(lockPath, { recursive: true, force: true }); }
+}
+
 export function recordRun(
 	agent: string,
 	task: string,
@@ -195,11 +225,13 @@ export function recordRun(
 		};
 		const historyPath = getHistoryPath();
 		hardenHistoryStorage(historyPath);
-		let lineCount: number | undefined;
-		try { lineCount = sanitizeHistoryFile(historyPath); } catch {}
-		appendPrivateHistoryLine(historyPath, JSON.stringify(entry));
-		if (lineCount === undefined) historyFileStates.delete(historyPath);
-		else rememberHistoryFile(historyPath, lineCount + 1);
+		withHistoryLock(historyPath, () => {
+			let lineCount: number | undefined;
+			try { lineCount = sanitizeHistoryFile(historyPath); } catch {}
+			appendPrivateHistoryLine(historyPath, JSON.stringify(entry));
+			if (lineCount === undefined) historyFileStates.delete(historyPath);
+			else rememberHistoryFile(historyPath, lineCount + 1);
+		});
 	} catch {
 		// Best-effort — never crash the execution flow for history recording
 	}

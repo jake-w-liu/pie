@@ -15,6 +15,12 @@ import type {
 
 const SESSION_ID_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 
+// A canonical session path has one in-process writer, regardless of which repo opened it.
+// Admission queues must be shared with the weak registry so concurrent opens cannot both
+// observe an empty slot and construct independent writers.
+const sharedLiveStorages = new Map<string, WeakRef<JsonlSessionStorage>>();
+const sharedStorageAccessTails = new Map<string, Promise<void>>();
+
 type JsonlPathIdentity = { path: string; directory?: string };
 type JsonlStorageAdmission =
 	| { kind: "ready"; storage: JsonlSessionStorage }
@@ -92,6 +98,10 @@ export async function listJsonlSessionMetadata(
 	return metadata.sort((left, right) => right.modifiedAt - left.modifiedAt);
 }
 
+/**
+ * Read one session without claiming its writer lease. Readers therefore never observe or repair a writer's
+ * unacknowledged tail, and stay available while another process owns the session.
+ */
 export async function loadJsonlSessionStorage(
 	options: JsonlSessionRepoOptions,
 	metadata: JsonlSessionMetadata,
@@ -99,7 +109,7 @@ export async function loadJsonlSessionStorage(
 	if (!fileResult(await options.fs.exists(metadata.path), `Failed to check session ${metadata.path}`)) {
 		throw new SessionError("not_found", `Session not found: ${metadata.id}`);
 	}
-	const storage = await JsonlSessionStorage.load(options.fs, metadata.path);
+	const storage = await JsonlSessionStorage.read(options.fs, metadata.path);
 	const loadedMetadata = await storage.getMetadata();
 	if (loadedMetadata.id !== metadata.id) {
 		throw new SessionError("invalid_entry", `Session id does not match header: ${metadata.id}`);
@@ -118,8 +128,10 @@ export class JsonlSessionRepo
 	private readonly fs: JsonlSessionRepoFileSystem;
 	private readonly sessionsRootInput: string;
 	private readonly activeCreateDestinations = new Set<string>();
+	// Retained as a per-repo view for lifecycle diagnostics; ownership lives in the
+	// module-scoped registry used by every admission path.
 	private readonly liveStorages = new Map<string, WeakRef<JsonlSessionStorage>>();
-	private readonly storageAccessTails = new Map<string, Promise<void>>();
+	private readonly storageAccessTails = sharedStorageAccessTails;
 	private rootPromise: Promise<string> | undefined;
 
 	constructor(options: JsonlSessionRepoOptions) {
@@ -135,7 +147,7 @@ export class JsonlSessionRepo
 				return this.serializeStorageAccess(path, async () => {
 					await this.requireUnoccupiedDestination(path, header.id);
 					const storage = await JsonlSessionStorage.create(this.fs, path, header);
-					this.liveStorages.set(path, new WeakRef(storage));
+					this.rememberStorage(path, storage);
 					return new Session(storage);
 				});
 			}),
@@ -176,7 +188,7 @@ export class JsonlSessionRepo
 							await this.fs.remove(current.path, { force: true }),
 							`Failed to delete session ${current.path}`,
 						);
-						this.liveStorages.delete(current.path);
+						this.forgetStoragePath(current.path);
 					}
 				});
 			};
@@ -210,7 +222,7 @@ export class JsonlSessionRepo
 						path = ownedPath;
 					} else {
 						// An absent retarget never authorizes deleting a healthy old owner.
-						this.liveStorages.delete(addressedPath);
+						this.forgetStoragePath(addressedPath);
 						known = undefined;
 						if (missing === "dangling") return;
 					}
@@ -243,7 +255,7 @@ export class JsonlSessionRepo
 				return this.serializeStorageAccess(path, async () => {
 					await this.requireUnoccupiedDestination(path, header.id);
 					const storage = await sourceStorage.fork(path, header, options);
-					this.liveStorages.set(path, new WeakRef(storage));
+					this.rememberStorage(path, storage);
 					return new Session(storage);
 				});
 			}),
@@ -268,23 +280,22 @@ export class JsonlSessionRepo
 				if (!current.ok || current.value !== path) return { kind: "redirect", canonical: current };
 				let storage = this.getLiveStorage(path);
 				if (storage && (await storage.getMetadata()).path !== path) {
-					this.liveStorages.delete(path);
+					this.forgetStoragePath(path);
 					storage = undefined;
 				}
 				if (storage) {
 					if ((await storage.getMetadata()).id !== metadata.id) {
 						throw new SessionError("invalid_entry", `Session id does not match header: ${metadata.id}`);
 					}
-					if (reopenLive) await storage.reopen();
+					if (reopenLive) await storage.reopen(this.fs);
 				} else {
 					storage = await JsonlSessionStorage.load(this.fs, path);
 				}
 				if ((await storage.getMetadata()).id !== metadata.id) {
 					throw new SessionError("invalid_entry", `Session id does not match header: ${metadata.id}`);
 				}
-				const owner = new WeakRef(storage);
-				this.liveStorages.set(path, owner);
-				this.liveStorages.set(addressedPath, owner);
+				this.rememberStorage(path, storage);
+				this.rememberStorage(addressedPath, storage);
 				return { kind: "ready", storage };
 			});
 			if (admission.kind === "ready") return admission.storage;
@@ -311,8 +322,8 @@ export class JsonlSessionRepo
 				throw new SessionError("invalid_entry", `Session id does not match header: ${metadata.id}`);
 			}
 			// Existing storage alone owns quarantine/recovery of a proved writer.
-			await storage.reopen();
-			if (addressedPath !== owned.path) this.liveStorages.delete(addressedPath);
+			await storage.reopen(this.fs);
+			if (addressedPath !== owned.path) this.forgetStoragePath(addressedPath);
 		});
 	}
 
@@ -332,7 +343,7 @@ export class JsonlSessionRepo
 				// Only independently differing physical parents prove retargeting.
 				// Same/unknown parent retains validated leaf-case uncertainty.
 				if (reference.directory && reference.directory !== identity.directory) {
-					this.liveStorages.delete(addressedPath);
+					this.forgetStoragePath(addressedPath);
 					storage = undefined;
 				}
 			}
@@ -386,13 +397,32 @@ export class JsonlSessionRepo
 	}
 
 	private getLiveStorage(path: string): JsonlSessionStorage | undefined {
-		const reference = this.liveStorages.get(path);
+		const reference = sharedLiveStorages.get(path);
 		const storage = reference?.deref();
-		if (reference && !storage) this.liveStorages.delete(path);
+		if (reference && (!storage || storage.isClosed())) {
+			sharedLiveStorages.delete(path);
+			this.liveStorages.delete(path);
+			return undefined;
+		}
 		return storage;
 	}
 
+	private rememberStorage(path: string, storage: JsonlSessionStorage): void {
+		const reference = new WeakRef(storage);
+		sharedLiveStorages.set(path, reference);
+		this.liveStorages.set(path, reference);
+	}
+
+	private forgetStoragePath(path: string): void {
+		sharedLiveStorages.delete(path);
+		this.liveStorages.delete(path);
+	}
+
 	private forgetStorage(storage: JsonlSessionStorage): void {
+		for (const [path, reference] of sharedLiveStorages) {
+			const owner = reference.deref();
+			if (!owner || owner === storage) sharedLiveStorages.delete(path);
+		}
 		for (const [path, reference] of this.liveStorages) {
 			const owner = reference.deref();
 			if (!owner || owner === storage) this.liveStorages.delete(path);

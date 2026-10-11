@@ -15,7 +15,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir, getProjectConfigDir } from "../shared/utils.ts";
-import { findNearestProjectRoot, type AgentConfig, type AgentMemoryConfig } from "./agents.ts";
+import { findConfiguredProjectRoot, type AgentConfig, type AgentMemoryConfig } from "./agents.ts";
 
 export const AGENT_MEMORY_DIR_NAME = "agent-memory";
 export const AGENT_MEMORY_FILE = "MEMORY.md";
@@ -198,7 +198,7 @@ export function buildAgentMemoryInjection(agent: AgentConfig, cwd: string): stri
 	if (memory.scope === "user") {
 		rootDir = path.join(getAgentDir(), AGENT_MEMORY_DIR_NAME);
 	} else {
-		const projectRoot = findNearestProjectRoot(cwd);
+		const projectRoot = findConfiguredProjectRoot(cwd);
 		if (!projectRoot) return "";
 		rootDir = path.join(getProjectConfigDir(projectRoot), AGENT_MEMORY_DIR_NAME);
 	}

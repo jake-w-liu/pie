@@ -239,7 +239,7 @@ async function pollOpenAICodexDeviceAuth(device: DeviceAuthInfo, signal: AbortSi
 		intervalSeconds: device.intervalSeconds,
 		expiresInSeconds: DEVICE_CODE_TIMEOUT_SECONDS,
 		signal,
-		poll: async () => {
+		poll: async (pollSignal) => {
 			const response = await fetchWithLoginCancellation(DEVICE_TOKEN_URL, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
@@ -247,7 +247,7 @@ async function pollOpenAICodexDeviceAuth(device: DeviceAuthInfo, signal: AbortSi
 					device_auth_id: device.deviceAuthId,
 					user_code: device.userCode,
 				}),
-				signal,
+				signal: pollSignal,
 			});
 
 			if (response.ok) {

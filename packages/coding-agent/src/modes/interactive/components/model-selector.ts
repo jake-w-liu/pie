@@ -206,8 +206,18 @@ export class ModelSelectorComponent extends Container implements Focusable {
 					this.refreshStatusSuccess = true;
 				}
 			}
+			const highlighted = this.filteredModels[this.selectedIndex];
 			this.loadModelsFromSnapshot();
 			this.filterModels(this.searchInput.getValue());
+			if (highlighted) {
+				const highlightedIndex = this.filteredModels.findIndex(
+					(item) => item.provider === highlighted.provider && item.id === highlighted.id,
+				);
+				if (highlightedIndex >= 0) {
+					this.selectedIndex = highlightedIndex;
+					this.updateList();
+				}
+			}
 			this.tui.requestRender();
 		} catch (error) {
 			if (this.closed) return;

@@ -51,9 +51,11 @@ export async function extractWithUrlContext(
 		const data = await res.json() as UrlContextResponse;
 		activityMonitor.logComplete(activityId, res.status);
 
-		const metadata = data.candidates?.[0]?.url_context_metadata;
-		if (metadata?.url_metadata?.length) {
-			const status = metadata.url_metadata[0].url_retrieval_status;
+		const candidate = data.candidates?.[0];
+		const metadata = candidate?.urlContextMetadata ?? candidate?.url_context_metadata;
+		const urlMetadata = metadata?.urlMetadata ?? metadata?.url_metadata;
+		if (urlMetadata?.length) {
+			const status = urlMetadata[0].urlRetrievalStatus ?? urlMetadata[0].url_retrieval_status;
 			if (status === "URL_RETRIEVAL_STATUS_UNSAFE" || status === "URL_RETRIEVAL_STATUS_ERROR") {
 				return null;
 			}
@@ -115,14 +117,22 @@ function extractTitleFromContent(text: string, url: string): string {
 	return extractHeadingTitle(text) ?? (new URL(url).pathname.split("/").pop() || url);
 }
 
+interface UrlMetadata {
+	retrievedUrl?: string;
+	urlRetrievalStatus?: string;
+	retrieved_url?: string;
+	url_retrieval_status?: string;
+}
+
+interface UrlContextMetadata {
+	urlMetadata?: UrlMetadata[];
+	url_metadata?: UrlMetadata[];
+}
+
 interface UrlContextResponse {
 	candidates?: Array<{
 		content?: { parts?: Array<{ text?: string }> };
-		url_context_metadata?: {
-			url_metadata?: Array<{
-				retrieved_url?: string;
-				url_retrieval_status?: string;
-			}>;
-		};
+		urlContextMetadata?: UrlContextMetadata;
+		url_context_metadata?: UrlContextMetadata;
 	}>;
 }

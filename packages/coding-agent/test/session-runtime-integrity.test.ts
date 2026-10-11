@@ -5,6 +5,7 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/compat
 import { Type } from "typebox";
 import { afterEach, expect, it } from "vitest";
 import { SessionManager } from "../src/core/session-manager.ts";
+import type { BashOperations } from "../src/core/tools/bash.ts";
 import { createSessionRuntimeFixture } from "./session-runtime-fixture.ts";
 
 const dirs: string[] = [];
@@ -208,6 +209,67 @@ it("settles an active tool into the outgoing history before an in-memory fork", 
 	expect(shutdownHistory).toContain('"role":"toolResult"');
 	expect(JSON.stringify(manager.getEntries())).not.toContain("waiting_tool");
 	expect(JSON.stringify(manager.getEntries())).not.toContain("late-tool-result");
+});
+
+it("quit disposal waits for active agent and Bash operations to settle", async () => {
+	const f = await createSessionRuntimeFixture();
+	fixtures.push(f);
+	let agentStarted = false;
+	let bashStarted = false;
+	let bashAborted = false;
+	let releaseAgent!: () => void;
+	let releaseBash!: () => void;
+	const agentGate = new Promise<void>((resolve) => {
+		releaseAgent = resolve;
+	});
+	const bashGate = new Promise<void>((resolve) => {
+		releaseBash = resolve;
+	});
+	f.harness.setResponses([
+		async (_context, options) => {
+			agentStarted = true;
+			await new Promise<void>((resolve) => {
+				if (options?.signal?.aborted) resolve();
+				else options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+			});
+			await agentGate;
+			return fauxAssistantMessage("aborted answer", { stopReason: "aborted" });
+		},
+	]);
+	const operations: BashOperations = {
+		exec: async (_command, _cwd, { signal }) => {
+			bashStarted = true;
+			await new Promise<void>((resolve) => {
+				if (signal?.aborted) resolve();
+				else signal?.addEventListener("abort", () => resolve(), { once: true });
+			});
+			bashAborted = true;
+			await bashGate;
+			throw new Error("aborted");
+		},
+	};
+	const prompting = f.runtime.session.prompt("active turn");
+	const bashing = f.runtime.session.executeBash("held command", undefined, { operations });
+	await expect.poll(() => agentStarted && bashStarted).toBe(true);
+
+	let disposed = false;
+	const disposing = f.runtime.dispose().then(() => {
+		disposed = true;
+	});
+	await Promise.resolve();
+	await Promise.resolve();
+	expect(disposed).toBe(false);
+
+	releaseAgent();
+	await expect.poll(() => bashAborted).toBe(true);
+	expect(disposed).toBe(false);
+	releaseBash();
+	await Promise.all([prompting, bashing, disposing]);
+	expect(disposed).toBe(true);
+	const persisted = JSON.stringify(f.runtime.session.sessionManager.getEntries());
+	expect(persisted).toContain("active turn");
+	expect(persisted).toContain('"stopReason":"aborted"');
+	expect(persisted).toContain("held command");
 });
 
 it("exclusive import creation cannot overwrite a destination created during the switch hook", async () => {

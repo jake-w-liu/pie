@@ -581,13 +581,14 @@ export class InteractiveMode {
 
 	// Messages queued while compaction is running
 	private compactionQueuedMessages: CompactionQueuedMessage[] = [];
+	private manualCompactionStartCount = 0;
 
 	// Shutdown state
 	private shutdownRequested = false;
 
 	// Extension UI state
 	private extensionSelector: ExtensionSelectorComponent | undefined = undefined;
-	private extensionSelectorAbort?: { signal: AbortSignal; handler: () => void };
+	private extensionSelectorCancel?: () => void;
 	/**
 	 * Cancel functions for in-flight showExtensionCustom invocations. Reset must
 	 * retire every owned invocation: hideOverlay() only removes the top overlay,
@@ -595,8 +596,9 @@ export class InteractiveMode {
 	 */
 	private readonly extensionCustomInvocations = new Set<() => void>();
 	private extensionInput: ExtensionInputComponent | undefined = undefined;
-	private extensionInputAbort?: { signal: AbortSignal; handler: () => void };
+	private extensionInputCancel?: () => void;
 	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
+	private extensionEditorCancel?: () => void;
 	private extensionTerminalInputSubscriptions = new Set<{
 		handler: (data: string) => { consume?: boolean; data?: string } | undefined;
 		unsubscribe: () => void;
@@ -2172,6 +2174,7 @@ export class InteractiveMode {
 
 		// Create a context for shortcut handlers
 		const createContext = (): ExtensionContext => ({
+			isActive: () => extensionRunner.isActive(),
 			ui: this.createExtensionUIContext(),
 			mode: "tui",
 			hasUI: true,
@@ -2352,15 +2355,9 @@ export class InteractiveMode {
 	}
 
 	private resetExtensionUI(): void {
-		if (this.extensionSelector) {
-			this.hideExtensionSelector();
-		}
-		if (this.extensionInput) {
-			this.hideExtensionInput();
-		}
-		if (this.extensionEditor) {
-			this.hideExtensionEditor();
-		}
+		this.extensionSelectorCancel?.();
+		this.extensionInputCancel?.();
+		this.extensionEditorCancel?.();
 		for (const cancel of [...this.extensionCustomInvocations]) {
 			cancel();
 		}
@@ -2597,49 +2594,42 @@ export class InteractiveMode {
 		options: string[],
 		opts?: ExtensionUIDialogOptions,
 	): Promise<string | undefined> {
+		this.extensionSelectorCancel?.();
 		return new Promise((resolve) => {
-			// A previously shown extension dialog may still have an active abort
-			// listener on its own signal. Remove it so an abort of the OLD signal can
-			// no longer hide a newer selector or resolve the old promise.
-			this.extensionSelectorAbort?.signal.removeEventListener("abort", this.extensionSelectorAbort.handler);
-			this.extensionSelectorAbort = undefined;
-
 			if (opts?.signal?.aborted) {
 				resolve(undefined);
 				return;
 			}
 
-			const onAbort = () => {
-				this.extensionSelectorAbort = undefined;
-				this.hideExtensionSelector();
-				resolve(undefined);
+			let settled = false;
+			let component: ExtensionSelectorComponent;
+			const settle = (value: string | undefined) => {
+				if (settled) return;
+				settled = true;
+				opts?.signal?.removeEventListener("abort", cancel);
+				if (this.extensionSelectorCancel === cancel) {
+					this.extensionSelectorCancel = undefined;
+				}
+				if (this.extensionSelector === component) {
+					this.hideExtensionSelector();
+				}
+				resolve(value);
 			};
-			opts?.signal?.addEventListener("abort", onAbort, { once: true });
-			this.extensionSelectorAbort = opts?.signal ? { signal: opts.signal, handler: onAbort } : undefined;
+			const cancel = () => settle(undefined);
+			opts?.signal?.addEventListener("abort", cancel, { once: true });
+			this.extensionSelectorCancel = cancel;
 
-			// A second selector supersedes the first; dispose it so its countdown
-			// interval cannot outlive the dialog and cancel a later one.
-			this.extensionSelector?.dispose();
-			this.extensionSelector = new ExtensionSelectorComponent(
-				title,
-				options,
-				(option) => {
-					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionSelector();
-					resolve(option);
-				},
-				() => {
-					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionSelector();
-					resolve(undefined);
-				},
-				{ tui: this.ui, timeout: opts?.timeout, onToggleToolsExpanded: () => this.toggleToolOutputExpansion() },
-			);
+			component = new ExtensionSelectorComponent(title, options, (option) => settle(option), cancel, {
+				tui: this.ui,
+				timeout: opts?.timeout,
+				onToggleToolsExpanded: () => this.toggleToolOutputExpansion(),
+			});
+			this.extensionSelector = component;
 
 			this.disposeActiveSelector();
 			this.editorContainer.clear();
-			this.editorContainer.addChild(this.extensionSelector);
-			this.ui.setFocus(this.extensionSelector);
+			this.editorContainer.addChild(component);
+			this.ui.setFocus(component);
 			this.ui.requestRender();
 		});
 	}
@@ -2648,8 +2638,6 @@ export class InteractiveMode {
 	 * Hide the extension selector.
 	 */
 	private hideExtensionSelector(): void {
-		this.extensionSelectorAbort?.signal.removeEventListener("abort", this.extensionSelectorAbort.handler);
-		this.extensionSelectorAbort = undefined;
 		this.extensionSelector?.dispose();
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);
@@ -2686,46 +2674,41 @@ export class InteractiveMode {
 		placeholder?: string,
 		opts?: ExtensionUIDialogOptions,
 	): Promise<string | undefined> {
+		this.extensionInputCancel?.();
 		return new Promise((resolve) => {
 			if (opts?.signal?.aborted) {
 				resolve(undefined);
 				return;
 			}
 
-			const onAbort = () => {
-				this.hideExtensionInput();
-				resolve(undefined);
+			let settled = false;
+			let component: ExtensionInputComponent;
+			const settle = (value: string | undefined) => {
+				if (settled) return;
+				settled = true;
+				opts?.signal?.removeEventListener("abort", cancel);
+				if (this.extensionInputCancel === cancel) {
+					this.extensionInputCancel = undefined;
+				}
+				if (this.extensionInput === component) {
+					this.hideExtensionInput();
+				}
+				resolve(value);
 			};
-			opts?.signal?.addEventListener("abort", onAbort, { once: true });
-			// A dialog opened while another one is still up supersedes it. Dispose the
-			// previous component and detach its abort listener first: a superseded
-			// countdown interval would otherwise keep driving requestRender() for the
-			// rest of the session and later cancel whichever dialog is open by then.
-			this.extensionInputAbort?.signal.removeEventListener("abort", this.extensionInputAbort.handler);
-			this.extensionInputAbort = undefined;
-			this.extensionInput?.dispose();
-			this.extensionInputAbort = opts?.signal ? { signal: opts.signal, handler: onAbort } : undefined;
+			const cancel = () => settle(undefined);
+			opts?.signal?.addEventListener("abort", cancel, { once: true });
+			this.extensionInputCancel = cancel;
 
-			this.extensionInput = new ExtensionInputComponent(
-				title,
-				placeholder,
-				(value) => {
-					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionInput();
-					resolve(value);
-				},
-				() => {
-					opts?.signal?.removeEventListener("abort", onAbort);
-					this.hideExtensionInput();
-					resolve(undefined);
-				},
-				{ tui: this.ui, timeout: opts?.timeout },
-			);
+			component = new ExtensionInputComponent(title, placeholder, (value) => settle(value), cancel, {
+				tui: this.ui,
+				timeout: opts?.timeout,
+			});
+			this.extensionInput = component;
 
 			this.disposeActiveSelector();
 			this.editorContainer.clear();
-			this.editorContainer.addChild(this.extensionInput);
-			this.ui.setFocus(this.extensionInput);
+			this.editorContainer.addChild(component);
+			this.ui.setFocus(component);
 			this.ui.requestRender();
 		});
 	}
@@ -2734,8 +2717,6 @@ export class InteractiveMode {
 	 * Hide the extension input.
 	 */
 	private hideExtensionInput(): void {
-		this.extensionInputAbort?.signal.removeEventListener("abort", this.extensionInputAbort.handler);
-		this.extensionInputAbort = undefined;
 		this.extensionInput?.dispose();
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);
@@ -2748,28 +2729,40 @@ export class InteractiveMode {
 	 * Show a multi-line editor for extensions (with Ctrl+G support).
 	 */
 	private showExtensionEditor(title: string, prefill?: string): Promise<string | undefined> {
+		this.extensionEditorCancel?.();
 		return new Promise((resolve) => {
-			this.extensionEditor = new ExtensionEditorComponent(
+			let settled = false;
+			let component: ExtensionEditorComponent;
+			const settle = (value: string | undefined) => {
+				if (settled) return;
+				settled = true;
+				if (this.extensionEditorCancel === cancel) {
+					this.extensionEditorCancel = undefined;
+				}
+				if (this.extensionEditor === component) {
+					this.hideExtensionEditor();
+				}
+				resolve(value);
+			};
+			const cancel = () => settle(undefined);
+			this.extensionEditorCancel = cancel;
+
+			component = new ExtensionEditorComponent(
 				this.ui,
 				this.keybindings,
 				title,
 				prefill,
-				(value) => {
-					this.hideExtensionEditor();
-					resolve(value);
-				},
-				() => {
-					this.hideExtensionEditor();
-					resolve(undefined);
-				},
+				(value) => settle(value),
+				cancel,
 				undefined,
 				this.settingsManager.getExternalEditorCommand(),
 			);
+			this.extensionEditor = component;
 
 			this.disposeActiveSelector();
 			this.editorContainer.clear();
-			this.editorContainer.addChild(this.extensionEditor);
-			this.ui.setFocus(this.extensionEditor);
+			this.editorContainer.addChild(component);
+			this.ui.setFocus(component);
 			this.ui.requestRender();
 		});
 	}
@@ -3604,6 +3597,9 @@ export class InteractiveMode {
 				break;
 
 			case "compaction_start": {
+				if (event.reason === "manual") {
+					this.manualCompactionStartCount++;
+				}
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(true);
 				}
@@ -4603,7 +4599,7 @@ export class InteractiveMode {
 		if (allQueued.length === 0) {
 			this.updatePendingMessagesDisplay();
 			if (options?.abort) {
-				this.agent.abort();
+				void this.session.abort();
 			}
 			return 0;
 		}
@@ -4613,7 +4609,7 @@ export class InteractiveMode {
 		this.editor.setText(combinedText);
 		this.updatePendingMessagesDisplay();
 		if (options?.abort) {
-			this.agent.abort();
+			void this.session.abort();
 		}
 		return allQueued.length;
 	}
@@ -6815,13 +6811,14 @@ export class InteractiveMode {
 
 	private async handleCompactCommand(customInstructions?: string): Promise<void> {
 		this.clearStatusIndicator();
+		const startCount = this.manualCompactionStartCount;
 
 		try {
 			await this.session.compact(customInstructions);
 		} catch (error: unknown) {
-			// Async failures surface via compaction_end; only synchronous
-			// rejections (nothing will emit) need direct feedback.
-			if (!this.session.isCompacting) {
+			// Failures after compaction_start surface via compaction_end. Only a
+			// rejection before that event needs direct feedback.
+			if (this.manualCompactionStartCount === startCount) {
 				this.showError(error instanceof Error ? error.message : String(error));
 			}
 		}

@@ -225,25 +225,26 @@ function qualifyRunFanoutPaths(descriptor: RunFanoutBudgetDescriptor, paths: str
 	return paths.map((item) => prefix ? `${prefix}/${item}` : item);
 }
 
-function commitRunFanoutBatch<T>(descriptor: RunFanoutBudgetDescriptor, paths: string[], commit: (snapshot: RunFanoutBudgetSnapshot) => T): T {
+function commitRunFanoutBatch<T>(descriptor: RunFanoutBudgetDescriptor, paths: string[], commit: (snapshot: RunFanoutBudgetSnapshot, claimIds: string[]) => T): T {
 	const valid = validateRunFanoutBudgetDescriptor(descriptor);
-	if (paths.length === 0) return commit(getRunFanoutBudgetSnapshot(valid));
+	if (paths.length === 0) return commit(getRunFanoutBudgetSnapshot(valid), []);
 	const qualified = qualifyRunFanoutPaths(valid, paths);
 	return withAdmissionLock(valid.directory, () => {
 		const before = getRunFanoutBudgetSnapshot(valid);
 		if (qualified.length > before.remaining) {
 			throw new RunFanoutLimitError({ code: "RUN_FANOUT_LIMIT", path: qualified[before.remaining] ?? qualified[0]!, requested: qualified.length, ...before });
 		}
-		const created: string[] = [];
+		const created: Array<{ slotPath: string; claimId: string }> = [];
 		try {
 			for (const claimPath of qualified) {
 				for (let slot = 0; slot < valid.limit; slot++) {
 					const slotPath = path.join(valid.directory, "claims", `${String(slot).padStart(6, "0")}.json`);
 					try {
 						const fd = fs.openSync(slotPath, "wx", 0o600);
-						created.push(slotPath);
+						const claimId = randomUUID();
+						created.push({ slotPath, claimId });
 						try {
-							const claim: ClaimV1 = { version: 1, claimId: randomUUID(), path: claimPath, claimedAt: Date.now() };
+							const claim: ClaimV1 = { version: 1, claimId, path: claimPath, claimedAt: Date.now() };
 							fs.writeFileSync(fd, `${JSON.stringify(claim)}\n`, "utf-8");
 						} finally { fs.closeSync(fd); }
 						break;
@@ -253,9 +254,9 @@ function commitRunFanoutBatch<T>(descriptor: RunFanoutBudgetDescriptor, paths: s
 					}
 				}
 			}
-			return commit(getRunFanoutBudgetSnapshot(valid));
+			return commit(getRunFanoutBudgetSnapshot(valid), created.map(({ claimId }) => claimId));
 		} catch (error) {
-			for (const slotPath of created) {
+			for (const { slotPath } of created) {
 				try { fs.unlinkSync(slotPath); } catch {}
 			}
 			throw error;
@@ -267,23 +268,29 @@ export function claimRunFanoutBatch(descriptor: RunFanoutBudgetDescriptor, paths
 	return commitRunFanoutBatch(descriptor, paths, (snapshot) => snapshot);
 }
 
+export interface RunFanoutBatchReceipt {
+	claimIds: string[];
+}
+
+export function claimRunFanoutBatchWithReceipt(descriptor: RunFanoutBudgetDescriptor, paths: string[]): RunFanoutBatchReceipt {
+	return commitRunFanoutBatch(descriptor, paths, (_snapshot, claimIds) => ({ claimIds }));
+}
+
 /**
- * Best-effort release of claim slots previously taken by {@link claimRunFanoutBatch}
- * for the same logical admission batch. Used when a launch is rejected *after*
- * its fan-out claim was committed (e.g. spawn-budget reservation failure) so the
- * shared budget does not permanently lose slots to a run that never started.
- * Matching is by qualified claim path; callers must pass the same paths object
- * they claimed with.
+ * Best-effort release of the exact claim slots identified by an admission receipt.
+ * Used when a launch is rejected *after* its fan-out claim was committed (e.g.
+ * spawn-budget reservation failure) so the shared budget does not permanently
+ * lose slots to a run that never started.
  */
-export function releaseRunFanoutBatch(descriptor: RunFanoutBudgetDescriptor, paths: string[]): void {
-	if (paths.length === 0) return;
+export function releaseRunFanoutBatch(descriptor: RunFanoutBudgetDescriptor, receipt: RunFanoutBatchReceipt): void {
+	if (receipt.claimIds.length === 0) return;
 	let valid: RunFanoutBudgetDescriptor;
 	try {
 		valid = validateRunFanoutBudgetDescriptor(descriptor);
 	} catch {
 		return;
 	}
-	const qualified = new Set(qualifyRunFanoutPaths(valid, paths));
+	const claimIds = new Set(receipt.claimIds);
 	try {
 		withAdmissionLock(valid.directory, () => {
 			const claimsDir = path.join(valid.directory, "claims");
@@ -298,7 +305,7 @@ export function releaseRunFanoutBatch(descriptor: RunFanoutBudgetDescriptor, pat
 				const slotPath = path.join(claimsDir, name);
 				try {
 					const claim = JSON.parse(fs.readFileSync(slotPath, "utf-8")) as Partial<ClaimV1>;
-					if (claim.version === 1 && typeof claim.path === "string" && qualified.has(claim.path)) fs.unlinkSync(slotPath);
+					if (claim.version === 1 && typeof claim.claimId === "string" && claimIds.has(claim.claimId)) fs.unlinkSync(slotPath);
 				} catch {
 					// A concurrent admission may have removed or replaced the slot; skip it.
 				}

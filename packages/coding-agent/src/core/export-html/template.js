@@ -38,8 +38,9 @@
         byId.set(entry.id, entry);
       }
 
-      // Tool call lookup (toolCallId -> {name, arguments})
+      // Tool lookups keyed by tool call ID
       const toolCallMap = new Map();
+      const toolResultMap = new Map();
       for (const entry of entries) {
         if (entry.type === 'message' && entry.message.role === 'assistant') {
           const content = entry.message.content;
@@ -50,6 +51,12 @@
               }
             }
           }
+        } else if (
+          entry.type === 'message' &&
+          entry.message.role === 'toolResult' &&
+          !toolResultMap.has(entry.message.toolCallId)
+        ) {
+          toolResultMap.set(entry.message.toolCallId, entry.message);
         }
       }
 
@@ -99,14 +106,15 @@
           }
         }
 
-        // Sort children by timestamp
-        function sortChildren(node) {
+        // Sort children by timestamp without recursing on deep session trees
+        const nodesToSort = [...roots];
+        while (nodesToSort.length > 0) {
+          const node = nodesToSort.pop();
           node.children.sort((a, b) =>
             new Date(a.entry.timestamp).getTime() - new Date(b.entry.timestamp).getTime()
           );
-          node.children.forEach(sortChildren);
+          nodesToSort.push(...node.children);
         }
-        roots.forEach(sortChildren);
 
         return roots;
       }
@@ -157,12 +165,12 @@
         // Build tree node map lazily
         if (!treeNodeMap) {
           treeNodeMap = new Map();
-          const tree = buildTree();
-          function mapNodes(node) {
+          const nodesToMap = buildTree();
+          while (nodesToMap.length > 0) {
+            const node = nodesToMap.pop();
             treeNodeMap.set(node.entry.id, node);
-            node.children.forEach(mapNodes);
+            nodesToMap.push(...node.children);
           }
-          tree.forEach(mapNodes);
         }
 
         const node = treeNodeMap.get(nodeId);
@@ -185,17 +193,21 @@
         const result = [];
         const multipleRoots = roots.length > 1;
 
-        // Mark which subtrees contain the active leaf
+        // Mark which subtrees contain the active leaf using an iterative post-order walk
         const containsActive = new Map();
-        function markActive(node) {
-          let has = activePathIds.has(node.entry.id);
-          for (const child of node.children) {
-            if (markActive(child)) has = true;
+        const nodesToMark = roots.map(node => [node, false]);
+        while (nodesToMark.length > 0) {
+          const [node, visited] = nodesToMark.pop();
+          if (!visited) {
+            nodesToMark.push([node, true]);
+            for (const child of node.children) nodesToMark.push([child, false]);
+            continue;
           }
-          containsActive.set(node, has);
-          return has;
+          containsActive.set(
+            node,
+            activePathIds.has(node.entry.id) || node.children.some(child => containsActive.get(child))
+          );
         }
-        roots.forEach(markActive);
 
         // Stack: [node, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild]
         const stack = [];
@@ -836,14 +848,7 @@
       }
 
       function findToolResult(toolCallId) {
-        for (const entry of entries) {
-          if (entry.type === 'message' && entry.message.role === 'toolResult') {
-            if (entry.message.toolCallId === toolCallId) {
-              return entry.message;
-            }
-          }
-        }
-        return null;
+        return toolResultMap.get(toolCallId) || null;
       }
 
       function formatExpandableOutput(text, maxLines, lang) {

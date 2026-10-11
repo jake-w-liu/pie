@@ -27,22 +27,28 @@ async function resizeImageInWorker(
 	inputBytes: Uint8Array,
 	mimeType: string,
 	options?: ImageResizeOptions,
+	signal?: AbortSignal,
 ): Promise<ResizedImage | null> {
+	signal?.throwIfAborted();
 	const worker = createResizeWorker(workerSpecifier);
 	try {
 		const inputBytesForWorker = toTransferableBytes(inputBytes);
 		return await new Promise<ResizedImage | null>((resolve, reject) => {
 			let settled = false;
+			const cleanup = (): void => signal?.removeEventListener("abort", onAbort);
 			const settle = (result: ResizedImage | null): void => {
 				if (settled) return;
 				settled = true;
+				cleanup();
 				resolve(result);
 			};
 			const fail = (error: Error): void => {
 				if (settled) return;
 				settled = true;
+				cleanup();
 				reject(error);
 			};
+			const onAbort = (): void => fail(new Error("Operation aborted"));
 
 			worker.once("message", (message: unknown) => {
 				if (!isResizeImageWorkerResponse(message)) {
@@ -61,6 +67,7 @@ async function resizeImageInWorker(
 					fail(new Error(`Image resize worker exited with code ${code}`));
 				}
 			});
+			signal?.addEventListener("abort", onAbort, { once: true });
 			worker.postMessage(
 				{
 					inputBytes: inputBytesForWorker,
@@ -71,7 +78,7 @@ async function resizeImageInWorker(
 			);
 		});
 	} finally {
-		void worker.terminate().catch(() => undefined);
+		await worker.terminate().catch(() => undefined);
 	}
 }
 
@@ -86,7 +93,9 @@ export async function resizeImage(
 	inputBytes: Uint8Array,
 	mimeType: string,
 	options?: ImageResizeOptions,
+	signal?: AbortSignal,
 ): Promise<ResizedImage | null> {
+	signal?.throwIfAborted();
 	const isTypeScriptRuntime = import.meta.url.endsWith(".ts");
 	const workerUrl = new URL(
 		isTypeScriptRuntime ? "./image-resize-worker.ts" : "./image-resize-worker.js",
@@ -103,21 +112,26 @@ export async function resizeImage(
 				inputBytes,
 				mimeType,
 				options,
+				signal,
 			);
 			if (bunWorkerResult) {
 				return bunWorkerResult;
 			}
-		} catch {}
+		} catch (error) {
+			if (signal?.aborted) throw error;
+		}
 	}
 
 	try {
-		const workerResult = await resizeImageInWorker(workerUrl, inputBytes, mimeType, options);
+		const workerResult = await resizeImageInWorker(workerUrl, inputBytes, mimeType, options, signal);
 		if (workerResult) {
 			return workerResult;
 		}
-	} catch {
+	} catch (error) {
+		if (signal?.aborted) throw error;
 		// Fall through to in-process resizing below.
 	}
+	signal?.throwIfAborted();
 	// A worker that runs but returns null (e.g. its image backend failed to load
 	// after a release swap) must not veto the in-process path. Genuinely
 	// unfittable images simply fail here a second time and still return null.

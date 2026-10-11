@@ -841,7 +841,7 @@ function splitIntoTokensWithAnsi(text: string): string[] {
 // line on every frame; without this, per-frame render cost grows with the
 // document and long streams visibly churn. Results are frozen: callers must
 // treat them as read-only (all current callers only iterate or spread).
-const WRAP_CACHE_MAX_ENTRIES = 1024;
+const WRAP_CACHE_MAX_ENTRIES = 16 * 1024;
 const WRAP_CACHE_MAX_TEXT_LENGTH = 32 * 1024;
 const WRAP_CACHE_MAX_CHARS = 4 * 1024 * 1024;
 const wrapCache = new Map<string, readonly string[]>();

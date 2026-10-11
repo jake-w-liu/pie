@@ -19,7 +19,7 @@ afterEach(async () => {
 	for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function start(dialogs = false) {
+function start(dialogs = false, respondToDialogs = true) {
 	const dir = mkdtempSync(join(tmpdir(), "pi-rpc-lifecycle-"));
 	dirs.push(dir);
 	const child = spawn(process.execPath, [fileURLToPath(new URL("./fixtures/rpc-lifecycle.ts", import.meta.url))], {
@@ -43,19 +43,23 @@ function start(dialogs = false) {
 	});
 	const responses: RpcResponse[] = [];
 	const methods: string[] = [];
+	const uiRequests: Array<{ id: string; method: string }> = [];
 	const send = (value: unknown) => child.stdin.write(`${JSON.stringify(value)}\n`);
 	attachJsonlLineReader(child.stdout, (line) => {
 		const value = JSON.parse(line);
 		if (value.type === "response") responses.push(value);
 		if (value.type === "extension_ui_request" && ["confirm", "select", "input", "editor"].includes(value.method)) {
 			methods.push(value.method);
-			send({
-				type: "extension_ui_response",
-				id: value.id,
-				...(value.method === "confirm"
-					? { confirmed: true }
-					: { value: value.method === "select" ? "selected" : `${value.method} value` }),
-			});
+			uiRequests.push(value);
+			if (respondToDialogs) {
+				send({
+					type: "extension_ui_response",
+					id: value.id,
+					...(value.method === "confirm"
+						? { confirmed: true }
+						: { value: value.method === "select" ? "selected" : `${value.method} value` }),
+				});
+			}
 		}
 	});
 	let nextId = 0;
@@ -75,7 +79,7 @@ function start(dialogs = false) {
 		child.stdin.end();
 		expect(await exited, stderr).toBe(0);
 	}
-	return { dir, child, methods, send, request, responses, close, stderr: () => stderr };
+	return { dir, child, methods, uiRequests, send, request, responses, close, stderr: () => stderr };
 }
 
 it("serves startup dialogs before initialization while gating ordinary commands", async () => {
@@ -91,6 +95,32 @@ it("serves startup dialogs before initialization while gating ordinary commands"
 					customType: "dialog-values",
 					data: [true, "selected", "input value", "editor value"],
 				}),
+			]),
+		},
+	});
+	await host.close();
+});
+
+it("does not settle an extension dialog with a malformed UI response", async () => {
+	const host = start(true, false);
+	await expect.poll(() => host.uiRequests[0], { timeout: 20_000 }).toMatchObject({ method: "confirm" });
+	const confirm = host.uiRequests[0];
+	host.send({ type: "extension_ui_response", id: confirm.id, confirmed: "not-a-boolean" });
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	expect(host.methods).toEqual(["confirm"]);
+
+	host.send({ type: "extension_ui_response", id: confirm.id, confirmed: true });
+	for (let index = 1; index < 4; index++) {
+		await expect.poll(() => host.uiRequests[index], { timeout: 5_000 }).toBeDefined();
+		const request = host.uiRequests[index];
+		host.send({ type: "extension_ui_response", id: request.id, value: "ok" });
+	}
+	expect(host.methods).toEqual(["confirm", "select", "input", "editor"]);
+	const entries = await host.request({ type: "get_entries" });
+	expect(entries).toMatchObject({
+		data: {
+			entries: expect.arrayContaining([
+				expect.objectContaining({ customType: "dialog-values", data: [true, "ok", "ok", "ok"] }),
 			]),
 		},
 	});

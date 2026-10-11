@@ -167,4 +167,18 @@ describe("Google thinking level maps", () => {
 
 		expect(payload).toMatchObject({ config: { thinkingConfig: { thinkingBudget: 4321 } } });
 	});
+
+	it("returns an error stream instead of throwing setup failures synchronously", async () => {
+		let returned: ReturnType<typeof streamSimpleVertex> | undefined;
+		expect(() => {
+			returned = streamSimpleVertex(vertexModel("gemini-2.5-flash", { high: "ultra" }), context, {
+				apiKey: "test",
+				reasoning: "high",
+			});
+		}).not.toThrow();
+
+		const result = await returned?.result();
+		expect(result?.stopReason).toBe("error");
+		expect(result?.errorMessage).toContain("Unsupported Google thinking level mapping");
+	});
 });

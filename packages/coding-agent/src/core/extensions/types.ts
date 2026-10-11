@@ -307,6 +307,8 @@ export interface CompactOptions {
 export type ExtensionMode = "tui" | "rpc" | "json" | "print";
 
 export interface ExtensionContext {
+	/** Whether this context still belongs to the active extension runner. */
+	isActive(): boolean;
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
 	/** Current run mode. Use "tui" to guard terminal-only UI such as custom components. */

@@ -272,5 +272,7 @@ export function truncateLine(
 	if (line.length <= maxChars) {
 		return { text: line, wasTruncated: false };
 	}
-	return { text: `${line.slice(0, maxChars)}... [truncated]`, wasTruncated: true };
+	let end = maxChars;
+	if (end > 0 && /[\uD800-\uDBFF]/.test(line[end - 1])) end--;
+	return { text: `${line.slice(0, end)}... [truncated]`, wasTruncated: true };
 }

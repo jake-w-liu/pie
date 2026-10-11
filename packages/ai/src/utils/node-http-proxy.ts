@@ -13,13 +13,9 @@ const DEFAULT_PROXY_PORTS: Record<string, number> = {
 function getProxyEnv(key: string, env?: ProviderEnv): string {
 	const lowercaseKey = key.toLowerCase();
 	const uppercaseKey = key.toUpperCase();
-	return (
-		env?.[lowercaseKey] ||
-		env?.[uppercaseKey] ||
-		getProviderEnvValue(lowercaseKey) ||
-		getProviderEnvValue(uppercaseKey) ||
-		""
-	);
+	const scopedValue = env?.[lowercaseKey] ?? env?.[uppercaseKey];
+	if (scopedValue !== undefined) return scopedValue;
+	return getProviderEnvValue(lowercaseKey) || getProviderEnvValue(uppercaseKey) || "";
 }
 
 function parseProxyTargetUrl(targetUrl: string | URL): URL | undefined {

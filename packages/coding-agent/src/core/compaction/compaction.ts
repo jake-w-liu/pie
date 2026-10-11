@@ -479,6 +479,10 @@ export function findCutPoint(
 		}
 	}
 
+	// Split-turn classification is based on the context-visible cut point. Metadata
+	// retained immediately before it must not turn a clean user boundary into a split.
+	const contextCutIndex = cutIndex;
+
 	// Scan backwards from cutIndex to include adjacent metadata entries that do not affect context.
 	while (cutIndex > startIndex) {
 		const prevEntry = entries[cutIndex - 1];
@@ -489,10 +493,10 @@ export function findCutPoint(
 		cutIndex--;
 	}
 
-	// Determine if this is a split turn
-	const cutEntry = entries[cutIndex];
+	// Determine if this is a split turn.
+	const cutEntry = entries[contextCutIndex];
 	const startsTurn = isTurnStartEntry(cutEntry);
-	const turnStartIndex = startsTurn ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
+	const turnStartIndex = startsTurn ? -1 : findTurnStartIndex(entries, contextCutIndex, startIndex);
 
 	return {
 		firstKeptEntryIndex: cutIndex,

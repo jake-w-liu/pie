@@ -40,7 +40,10 @@ export async function rewriteSearchQuery(
 		},
 		usesRegistryComplete ? { signal } : { apiKey, headers, signal },
 	);
-	if (response.stopReason === "aborted") throw new Error("Aborted");
+	if (!(["stop", "length", "toolUse"] as const).includes(response.stopReason as "stop" | "length" | "toolUse")) {
+		if (response.stopReason === "aborted") throw new Error("Aborted");
+		return query;
+	}
 	const contentParts = Array.isArray(response.content) ? response.content : [];
 	const text = contentParts
 		.map((part: unknown) => part && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string" ? (part as { text: string }).text : "")

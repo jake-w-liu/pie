@@ -1,4 +1,4 @@
-import type { FileSystem } from "../../types.ts";
+import type { FileSystem, HostIdentity } from "../../types.ts";
 import type { JsonValue, SessionCreateOptions, SessionMetadata } from "../types.ts";
 
 export type JsonlSessionRepoFileSystem = Pick<
@@ -16,7 +16,10 @@ export type JsonlSessionRepoFileSystem = Pick<
 	| "exists"
 	| "createDir"
 	| "remove"
->;
+> & {
+	/** Identity used to decide whether another process still holds a writer lease. */
+	readonly hostIdentity: HostIdentity;
+};
 
 export interface JsonlSessionRepoOptions {
 	fs: JsonlSessionRepoFileSystem;

@@ -65,6 +65,88 @@ function readJson(path) {
 	return JSON.parse(readFileSync(path, "utf8"));
 }
 
+function isRecord(value) {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validateCostRates(rates, label) {
+	if (!isRecord(rates)) throw new Error(`${label} must be an object`);
+	for (const field of ["input", "output", "cacheRead", "cacheWrite"]) {
+		if (typeof rates[field] !== "number" || !Number.isFinite(rates[field]) || rates[field] < 0) {
+			throw new Error(`${label}.${field} must be a non-negative finite number`);
+		}
+	}
+}
+
+function validatePublicModel(model, providerId, modelId) {
+	const label = `${providerId}/${modelId}`;
+	if (!isRecord(model)) throw new Error(`Invalid model entry: ${label}`);
+	if (model.id !== modelId || model.provider !== providerId) throw new Error(`Invalid model entry: ${label}`);
+	for (const field of ["api", "name"]) {
+		if (typeof model[field] !== "string" || model[field].length === 0) {
+			throw new Error(`Invalid model entry ${label}: ${field} must be a non-empty string`);
+		}
+	}
+	// Deployment-scoped providers such as azure-openai-responses resolve their endpoint from the caller's
+	// environment, so a published model may legitimately carry an empty baseUrl.
+	if (typeof model.baseUrl !== "string") {
+		throw new Error(`Invalid model entry ${label}: baseUrl must be a string`);
+	}
+	if (typeof model.reasoning !== "boolean") {
+		throw new Error(`Invalid model entry ${label}: reasoning must be a boolean`);
+	}
+	if (
+		!Array.isArray(model.input) ||
+		model.input.length === 0 ||
+		model.input.some((modality) => modality !== "text" && modality !== "image")
+	) {
+		throw new Error(`Invalid model entry ${label}: input must contain supported modalities`);
+	}
+	for (const field of ["contextWindow", "maxTokens"]) {
+		if (typeof model[field] !== "number" || !Number.isFinite(model[field]) || model[field] <= 0) {
+			throw new Error(`Invalid model entry ${label}: ${field} must be a positive finite number`);
+		}
+	}
+	validateCostRates(model.cost, `Invalid model entry ${label}: cost`);
+	if (model.cost.tiers !== undefined) {
+		if (!Array.isArray(model.cost.tiers)) throw new Error(`Invalid model entry ${label}: cost.tiers must be an array`);
+		let previousThreshold = -1;
+		for (const [index, tier] of model.cost.tiers.entries()) {
+			validateCostRates(tier, `Invalid model entry ${label}: cost.tiers[${index}]`);
+			if (
+				typeof tier.inputTokensAbove !== "number" ||
+				!Number.isFinite(tier.inputTokensAbove) ||
+				tier.inputTokensAbove < 0 ||
+				tier.inputTokensAbove <= previousThreshold
+			) {
+				throw new Error(`Invalid model entry ${label}: cost tier thresholds must be finite and increasing`);
+			}
+			previousThreshold = tier.inputTokensAbove;
+		}
+	}
+	if (model.cost.peak !== undefined) {
+		const peakLabel = `Invalid model entry ${label}: cost.peak`;
+		if (!isRecord(model.cost.peak)) throw new Error(`${peakLabel} must be an object`);
+		validateCostRates(model.cost.peak.rates, `${peakLabel}.rates`);
+		if (!Array.isArray(model.cost.peak.windows)) throw new Error(`${peakLabel}.windows must be an array`);
+		for (const [index, window] of model.cost.peak.windows.entries()) {
+			const windowLabel = `${peakLabel}.windows[${index}]`;
+			if (!isRecord(window)) throw new Error(`${windowLabel} must be an object`);
+			for (const field of ["startMinutes", "endMinutes"]) {
+				if (!Number.isInteger(window[field]) || window[field] < 0 || window[field] >= 24 * 60) {
+					throw new Error(`${windowLabel}.${field} must be an integer from 0 through 1439`);
+				}
+			}
+			if (
+				window.days !== undefined &&
+				(!Array.isArray(window.days) || window.days.some((day) => !Number.isInteger(day) || day < 0 || day > 6))
+			) {
+				throw new Error(`${windowLabel}.days must contain only integer weekdays from 0 through 6`);
+			}
+		}
+	}
+}
+
 function validateBundle(inputDir) {
 	const modelsPath = join(inputDir, "models.json");
 	const providerIndexPath = join(inputDir, "providers.json");
@@ -99,15 +181,7 @@ function validateBundle(inputDir) {
 			throw new Error(`Provider shard does not match models.json: ${providerId}`);
 		}
 		for (const [modelId, model] of Object.entries(providerModels)) {
-			if (
-				typeof model !== "object" ||
-				model === null ||
-				Array.isArray(model) ||
-				model.id !== modelId ||
-				model.provider !== providerId
-			) {
-				throw new Error(`Invalid model entry: ${providerId}/${modelId}`);
-			}
+			validatePublicModel(model, providerId, modelId);
 			modelCount++;
 		}
 	}

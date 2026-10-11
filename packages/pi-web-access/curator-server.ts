@@ -102,7 +102,7 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
 
 function parseJSONBody(req: IncomingMessage): Promise<unknown> {
 	return new Promise((resolve, reject) => {
-		let body = "";
+		const chunks: Buffer[] = [];
 		let size = 0;
 		req.on("data", (chunk: Buffer) => {
 			size += chunk.length;
@@ -111,11 +111,11 @@ function parseJSONBody(req: IncomingMessage): Promise<unknown> {
 				reject(new Error("Request body too large"));
 				return;
 			}
-			body += chunk.toString();
+			chunks.push(chunk);
 		});
 		req.on("end", () => {
 			try {
-				resolve(JSON.parse(body));
+				resolve(JSON.parse(Buffer.concat(chunks, size).toString("utf8")));
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
 				reject(new Error(`Invalid JSON: ${message}`));
@@ -607,7 +607,9 @@ export function startCuratorServer(
 					return;
 				}
 				const controller = new AbortController();
-				req.on("close", () => controller.abort());
+				res.once("close", () => {
+					if (!res.writableEnded) controller.abort();
+				});
 				touchHeartbeat();
 				try {
 					const rewritten = await callbacks.onRewriteQuery(query.trim(), controller.signal);

@@ -28,7 +28,7 @@ interface PackageCommandOptions {
 	conflictingOptions?: string;
 }
 
-function reportSettingsErrors(settingsManager: SettingsManager, context: string): void {
+function reportSettingsErrors(settingsManager: SettingsManager, context: string): number {
 	const errors = settingsManager.drainErrors();
 	for (const { scope, error } of errors) {
 		console.error(chalk.yellow(`Warning (${context}, ${scope} settings): ${error.message}`));
@@ -36,6 +36,7 @@ function reportSettingsErrors(settingsManager: SettingsManager, context: string)
 			console.error(chalk.dim(error.stack));
 		}
 	}
+	return errors.length;
 }
 
 function getPackageCommandUsage(command: PackageCommand): string {
@@ -529,7 +530,12 @@ export async function handlePackageCommand(
 		process.exitCode = 1;
 		return true;
 	}
-	reportSettingsErrors(settingsManager, "package command");
+	const initialSettingsErrorCount = reportSettingsErrors(settingsManager, "package command");
+	if (initialSettingsErrorCount > 0 && (options.command === "install" || options.command === "remove")) {
+		console.error(chalk.red("Cannot modify packages until settings errors are fixed."));
+		process.exitCode = 1;
+		return true;
+	}
 
 	const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
 
@@ -543,6 +549,10 @@ export async function handlePackageCommand(
 		switch (options.command) {
 			case "install":
 				await packageManager.installAndPersist(source!, { local: options.local });
+				await settingsManager.flush();
+				if (reportSettingsErrors(settingsManager, "package command") > 0) {
+					throw new Error("Package installation completed, but settings could not be persisted");
+				}
 				console.log(chalk.green(`Installed ${source}`));
 				return true;
 
@@ -552,6 +562,10 @@ export async function handlePackageCommand(
 					console.error(chalk.red(`No matching package found for ${source}`));
 					process.exitCode = 1;
 					return true;
+				}
+				await settingsManager.flush();
+				if (reportSettingsErrors(settingsManager, "package command") > 0) {
+					throw new Error("Package removal completed, but settings could not be persisted");
 				}
 				console.log(chalk.green(`Removed ${source}`));
 				return true;

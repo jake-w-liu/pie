@@ -48,15 +48,44 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
-	let disposed = false;
+	let disposePromise: Promise<void> | undefined;
+	let signalShutdown: Promise<void> | undefined;
 	const signalCleanupHandlers: Array<() => void> = [];
 
-	const disposeRuntime = async (): Promise<void> => {
-		if (disposed) return;
-		disposed = true;
-		unsubscribe?.();
-		unsubscribeBackpressure?.();
-		await runtimeHost.dispose();
+	const disposeRuntime = (): Promise<void> => {
+		if (!disposePromise) {
+			unsubscribe?.();
+			unsubscribeBackpressure?.();
+			disposePromise = Promise.resolve().then(() => runtimeHost.dispose());
+		}
+		return disposePromise;
+	};
+
+	/**
+	 * Finish the runtime once, whatever order shutdown and disposal complete in. A signal
+	 * that arrives while disposal is already running owns the exit code and flushes stdout
+	 * itself, so a disposal rejection must not preempt it; without a signal the failure is
+	 * reported to the caller. Signal handlers stay installed until the flush is done.
+	 */
+	const finalizeRuntime = async (): Promise<void> => {
+		try {
+			if (signalShutdown) {
+				await signalShutdown;
+				return;
+			}
+			try {
+				await disposeRuntime();
+			} catch (error: unknown) {
+				if (!signalShutdown) throw error;
+				await signalShutdown;
+				return;
+			}
+			await flushRawStdout();
+		} finally {
+			for (const cleanup of signalCleanupHandlers) {
+				cleanup();
+			}
+		}
 	};
 
 	const registerSignalHandlers = (): void => {
@@ -69,10 +98,19 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 		for (const signal of signals) {
 			const handler = () => {
-				killTrackedDetachedChildren();
-				void disposeRuntime().finally(() => {
+				if (signalShutdown) return;
+				signalShutdown = (async () => {
+					killTrackedDetachedChildren();
+					try {
+						await disposeRuntime();
+					} catch (error: unknown) {
+						console.error(
+							`Failed to dispose runtime during ${signal}: ${error instanceof Error ? error.message : String(error)}`,
+						);
+					}
+					await flushRawStdout();
 					process.exit(signal === "SIGHUP" ? 129 : signal === "SIGINT" ? 130 : 143);
-				});
+				})();
 			};
 			process.on(signal, handler);
 			signalCleanupHandlers.push(() => process.off(signal, handler));
@@ -157,20 +195,17 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			await session.prompt(message);
 		}
 
-		if (mode === "text") {
-			const state = session.state;
-			const lastMessage = state.messages[state.messages.length - 1];
-
-			if (lastMessage?.role === "assistant") {
-				const assistantMsg = lastMessage as AssistantMessage;
-				if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
-					console.error(assistantMsg.errorMessage || `Request ${assistantMsg.stopReason}`);
-					exitCode = 1;
-				} else {
-					for (const content of assistantMsg.content) {
-						if (content.type === "text") {
-							writeRawStdout(`${content.text}\n`);
-						}
+		const state = session.state;
+		const lastMessage = state.messages[state.messages.length - 1];
+		if (lastMessage?.role === "assistant") {
+			const assistantMsg = lastMessage as AssistantMessage;
+			if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
+				if (mode === "text") console.error(assistantMsg.errorMessage || `Request ${assistantMsg.stopReason}`);
+				exitCode = 1;
+			} else if (mode === "text") {
+				for (const content of assistantMsg.content) {
+					if (content.type === "text") {
+						writeRawStdout(`${content.text}\n`);
 					}
 				}
 			}
@@ -181,10 +216,6 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		console.error(error instanceof Error ? error.message : String(error));
 		return 1;
 	} finally {
-		for (const cleanup of signalCleanupHandlers) {
-			cleanup();
-		}
-		await disposeRuntime();
-		await flushRawStdout();
+		await finalizeRuntime();
 	}
 }

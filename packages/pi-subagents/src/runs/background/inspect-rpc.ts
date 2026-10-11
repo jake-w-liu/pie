@@ -395,10 +395,12 @@ export function buildInspectReply(request: InspectRequest, deps: InspectDeps = {
 
 		const result = readResultOutput(resultsDir, currentSessionId, node.status.runId, node.stepIndex, trustedRoots, step?.agent, deps.now ?? Date.now, deps.state?.trustedSessionFileRoot);
 		const failedText = step?.error ?? node.status.error;
-		if (result.output === undefined && result.errorText === undefined && failedText !== undefined) {
+		const selectedStepIsTerminal = step !== undefined && !["pending", "running"].includes(step.status);
+		const runIsActive = node.status.state === "queued" || node.status.state === "running";
+		if (result.output === undefined && result.errorText === undefined && failedText !== undefined && !(runIsActive && selectedStepIsTerminal)) {
 			return errorReply(request, "internal", "Inspection could not read the async run artifacts.");
 		}
-		const finalOutputRaw = result.output ?? result.errorText;
+		const finalOutputRaw = result.output ?? result.errorText ?? (runIsActive && selectedStepIsTerminal ? failedText : undefined);
 
 		const truncated = { task: false, messages: 0, finalOutput: false };
 		const boundedTask = task !== undefined ? boundContent(task, MAX_TASK_LENGTH) : undefined;

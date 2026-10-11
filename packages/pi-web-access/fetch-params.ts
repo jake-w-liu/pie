@@ -36,8 +36,6 @@ export function normalizeFetchContentParams(params: FetchContentParams): Normali
 	const timestamp = normalizeOptionalString(params.timestamp);
 	const frames = normalizeOptionalFrameCount(params.frames);
 
-	const shouldIncludeFrames = frames !== undefined && (timestamp !== undefined || frames > 1);
-
 	const forceClone = typeof params.forceClone === "boolean" ? params.forceClone : undefined;
 	const model = normalizeOptionalString(params.model);
 	const mode = normalizeMode(params.mode);
@@ -51,7 +49,7 @@ export function normalizeFetchContentParams(params: FetchContentParams): Normali
 			...(forceClone !== undefined ? { forceClone } : {}),
 			...(prompt !== undefined ? { prompt } : {}),
 			...(timestamp !== undefined ? { timestamp } : {}),
-			...(shouldIncludeFrames ? { frames } : {}),
+			...(frames !== undefined ? { frames } : {}),
 			...(model !== undefined ? { model } : {}),
 			...(mode !== undefined ? { mode } : {}),
 			...(answerModel !== undefined ? { answerModel } : {}),

@@ -261,10 +261,15 @@ class JsonRpcLspClient {
 	private stderr = "";
 	private exited = false;
 	private terminating = false;
+	private transportError: Error | undefined;
 	private readonly exitWaiters: Array<() => void> = [];
 
 	constructor(child: ChildProcessWithoutNullStreams) {
 		this.child = child;
+		// A server may close its read end while a large notification is still
+		// being written. Stream errors are asynchronous and cannot be caught by
+		// the caller's try/catch, so turn them into a normal transport failure.
+		child.stdin.on("error", (error) => this.failTransport(error));
 		child.stdout.on("data", (chunk: Buffer) => this.handleStdout(chunk));
 		child.stderr.on("data", (chunk: Buffer) => {
 			this.stderr = `${this.stderr}${chunk.toString("utf-8")}`.slice(-MAX_STDERR_LENGTH);
@@ -285,7 +290,12 @@ class JsonRpcLspClient {
 		const id = this.nextId++;
 		const promise = new Promise<unknown>((resolve, reject) => {
 			this.pending.set(id, { resolve, reject });
-			this.send({ jsonrpc: "2.0", id, method, params });
+			try {
+				this.send({ jsonrpc: "2.0", id, method, params });
+			} catch (error) {
+				this.pending.delete(id);
+				reject(error);
+			}
 		});
 		return withTimeout(promise, timeoutMs, `${method} timed out`, signal);
 	}
@@ -318,7 +328,8 @@ class JsonRpcLspClient {
 	}
 
 	private send(payload: JsonRpcMessage): void {
-		if (this.exited) throw new Error("language server already exited");
+		if (this.transportError) throw this.transportError;
+		if (this.exited || this.terminating || !this.child.stdin.writable) throw new Error("language server transport is closed");
 		const body = JSON.stringify(payload);
 		this.child.stdin.write(`Content-Length: ${Buffer.byteLength(body, "utf-8")}\r\n\r\n${body}`);
 	}
@@ -367,6 +378,13 @@ class JsonRpcLspClient {
 		} else {
 			pending.resolve(message.result);
 		}
+	}
+
+	private failTransport(error: Error): void {
+		if (this.transportError) return;
+		this.transportError = error;
+		this.rejectPending(error);
+		this.kill();
 	}
 
 	private failProtocol(error: Error): void {

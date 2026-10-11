@@ -16,6 +16,41 @@ export function normalizeToLF(text: string): string {
 	return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
 
+function applyNormalizedReplacementsToOriginal(
+	originalContent: string,
+	normalizedContent: string,
+	replacements: TextReplacement[],
+): string {
+	const boundaries: number[] = [0];
+	let normalized = "";
+	for (let index = 0; index < originalContent.length; index++) {
+		const char = originalContent[index];
+		if (char === "\r") {
+			if (originalContent[index + 1] === "\n") index++;
+			normalized += "\n";
+			boundaries.push(index + 1);
+		} else {
+			normalized += char;
+			boundaries.push(index + 1);
+		}
+	}
+	if (normalized !== normalizedContent) {
+		throw new Error("Cannot map normalized edit offsets to the original content.");
+	}
+	const lineEnding = detectLineEnding(originalContent);
+	let result = originalContent;
+	for (let index = replacements.length - 1; index >= 0; index--) {
+		const replacement = replacements[index];
+		const start = boundaries[replacement.matchIndex];
+		const end = boundaries[replacement.matchIndex + replacement.matchLength];
+		if (start === undefined || end === undefined)
+			throw new Error("Replacement range is outside the original content.");
+		const replacementText = restoreLineEndings(replacement.newText, lineEnding);
+		result = result.slice(0, start) + replacementText + result.slice(end);
+	}
+	return result;
+}
+
 export function restoreLineEndings(text: string, ending: "\r\n" | "\n"): string {
 	return ending === "\r\n" ? text.replace(/\n/g, "\r\n") : text;
 }
@@ -67,6 +102,69 @@ interface MatchedEdit {
 }
 
 type TextReplacement = Pick<MatchedEdit, "matchIndex" | "matchLength" | "newText">;
+
+interface SourceSpan {
+	start: number;
+	end: number;
+}
+
+function normalizeForFuzzyMatchWithSourceSpans(content: string): { content: string; sourceSpans: SourceSpan[] } {
+	let normalized = "";
+	const sourceSpans: SourceSpan[] = [];
+	const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+	for (const { segment, index } of segmenter.segment(content)) {
+		const normalizedSegment = segment.normalize("NFKC");
+		normalized += normalizedSegment;
+		if (normalizedSegment === segment) {
+			for (let offset = 0; offset < normalizedSegment.length; offset++) {
+				sourceSpans.push({ start: index + offset, end: index + offset + 1 });
+			}
+		} else {
+			for (let offset = 0; offset < normalizedSegment.length; offset++) {
+				sourceSpans.push({ start: index, end: index + segment.length });
+			}
+		}
+	}
+
+	let trimmed = "";
+	const trimmedSourceSpans: SourceSpan[] = [];
+	let lineStart = 0;
+	while (lineStart < normalized.length) {
+		const newlineIndex = normalized.indexOf("\n", lineStart);
+		const lineEnd = newlineIndex === -1 ? normalized.length : newlineIndex;
+		const trimmedLineEnd = lineStart + normalized.slice(lineStart, lineEnd).trimEnd().length;
+		trimmed += normalized.slice(lineStart, trimmedLineEnd);
+		trimmedSourceSpans.push(...sourceSpans.slice(lineStart, trimmedLineEnd));
+		if (newlineIndex === -1) break;
+		trimmed += "\n";
+		trimmedSourceSpans.push(sourceSpans[newlineIndex]);
+		lineStart = newlineIndex + 1;
+	}
+
+	const fuzzyContent = trimmed
+		.replace(/[\u2018\u2019\u201A\u201B]/g, "'")
+		.replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+		.replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, "-")
+		.replace(/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/g, " ");
+	if (fuzzyContent !== normalizeForFuzzyMatch(content)) {
+		throw new Error("Cannot map fuzzy edit offsets to the normalized content.");
+	}
+	return { content: fuzzyContent, sourceSpans: trimmedSourceSpans };
+}
+
+function mapFuzzyReplacementToSource(replacement: MatchedEdit, sourceSpans: SourceSpan[]): MatchedEdit {
+	const firstSpan = sourceSpans[replacement.matchIndex];
+	const lastSpan = sourceSpans[replacement.matchIndex + replacement.matchLength - 1];
+	if (!firstSpan || !lastSpan) {
+		throw new Error("Replacement range is outside the fuzzy-normalized content.");
+	}
+	return {
+		...replacement,
+		matchIndex: firstSpan.start,
+		matchLength: lastSpan.end - firstSpan.start,
+	};
+}
 
 function getLineSpans(content: string): LineSpan[] {
 	let offset = 0;
@@ -248,7 +346,19 @@ export function stripBom(content: string): { bom: string; text: string } {
 function countOccurrences(content: string, oldText: string): number {
 	const fuzzyContent = normalizeForFuzzyMatch(content);
 	const fuzzyOldText = normalizeForFuzzyMatch(oldText);
-	return fuzzyContent.split(fuzzyOldText).length - 1;
+	// A pattern with no characters has no occurrences, and stepping the scan by its length must advance.
+	if (fuzzyOldText.length === 0) return 0;
+	let count = 0;
+	// Overlapping occurrences count separately: a pattern that repeats inside its own match
+	// anchors at more than one offset, so the edit is ambiguous there.
+	for (
+		let index = fuzzyContent.indexOf(fuzzyOldText);
+		index !== -1;
+		index = fuzzyContent.indexOf(fuzzyOldText, index + 1)
+	) {
+		count++;
+	}
+	return count;
 }
 
 function getNotFoundError(path: string, editIndex: number, totalEdits: number): Error {
@@ -294,14 +404,15 @@ function getNoChangeError(path: string, totalEdits: number): Error {
  *
  * All edits are matched against the same original content. Replacements are
  * then applied in reverse order so offsets remain stable. If any edit needs
- * fuzzy matching, the operation runs in fuzzy-normalized content space and then
- * overlays those line-level changes onto the original content so unchanged line
- * blocks keep their original bytes.
+ * fuzzy matching, matches are found in fuzzy-normalized content space and then
+ * mapped back to normalized source offsets. Replacements are finally mapped onto
+ * the original content so every byte outside the matched ranges is preserved.
  */
 export function applyEditsToNormalizedContent(
 	normalizedContent: string,
 	edits: Edit[],
 	path: string,
+	originalContent?: string,
 ): AppliedEditsResult {
 	const normalizedEdits = edits.map((edit) => ({
 		oldText: normalizeToLF(edit.oldText),
@@ -316,13 +427,19 @@ export function applyEditsToNormalizedContent(
 
 	const initialMatches = normalizedEdits.map((edit) => fuzzyFindText(normalizedContent, edit.oldText));
 	const usedFuzzyMatch = initialMatches.some((match) => match.usedFuzzyMatch);
-	const replacementBaseContent = usedFuzzyMatch ? normalizeForFuzzyMatch(normalizedContent) : normalizedContent;
+	const fuzzyBase = usedFuzzyMatch ? normalizeForFuzzyMatchWithSourceSpans(normalizedContent) : undefined;
+	const replacementBaseContent = fuzzyBase?.content ?? normalizedContent;
 
-	const matchedEdits: MatchedEdit[] = [];
+	let matchedEdits: MatchedEdit[] = [];
 	for (let i = 0; i < normalizedEdits.length; i++) {
 		const edit = normalizedEdits[i];
 		const matchResult = fuzzyFindText(replacementBaseContent, edit.oldText);
 		if (!matchResult.found) {
+			throw getNotFoundError(path, i, normalizedEdits.length);
+		}
+		// Whitespace-only old text normalizes to an empty pattern, which "matches" at offset 0
+		// without anchoring to any character. Report it as not found instead of editing there.
+		if (matchResult.matchLength === 0) {
 			throw getNotFoundError(path, i, normalizedEdits.length);
 		}
 
@@ -339,6 +456,9 @@ export function applyEditsToNormalizedContent(
 		});
 	}
 
+	if (fuzzyBase) {
+		matchedEdits = matchedEdits.map((replacement) => mapFuzzyReplacementToSource(replacement, fuzzyBase.sourceSpans));
+	}
 	matchedEdits.sort((a, b) => a.matchIndex - b.matchIndex);
 	for (let i = 1; i < matchedEdits.length; i++) {
 		const previous = matchedEdits[i - 1];
@@ -350,10 +470,11 @@ export function applyEditsToNormalizedContent(
 		}
 	}
 
-	const baseContent = normalizedContent;
-	const newContent = usedFuzzyMatch
-		? applyReplacementsPreservingUnchangedLines(normalizedContent, replacementBaseContent, matchedEdits)
-		: applyReplacements(replacementBaseContent, matchedEdits);
+	const baseContent = originalContent ?? normalizedContent;
+	const newContent =
+		originalContent === undefined
+			? applyReplacements(normalizedContent, matchedEdits)
+			: applyNormalizedReplacementsToOriginal(originalContent, normalizedContent, matchedEdits);
 
 	if (baseContent === newContent) {
 		throw getNoChangeError(path, normalizedEdits.length);

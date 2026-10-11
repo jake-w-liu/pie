@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { writeAtomicJson } from "../shared/atomic-json.ts";
-import { BUILTIN_AGENT_NAMES } from "../agents/agents.ts";
+import { BUILTIN_AGENT_NAMES, validateSubagentAgentOverrides } from "../agents/agents.ts";
 import { getPiSpawnCommand } from "../runs/shared/pi-spawn.ts";
 import { findModelInfo, getSupportedThinkingLevels, splitKnownThinkingSuffix, toModelInfo } from "../shared/model-info.ts";
 import { getAgentDir } from "../shared/utils.ts";
@@ -138,24 +138,7 @@ function validateSubagentProfile(filePath: string, parsed: Record<string, unknow
 	if (!agentOverrides || typeof agentOverrides !== "object" || Array.isArray(agentOverrides)) {
 		throw new Error(`Profile '${filePath}' must contain 'subagents.agentOverrides' as an object.`);
 	}
-	for (const [name, value] of Object.entries(agentOverrides)) {
-		if (!value || typeof value !== "object" || Array.isArray(value)) {
-			throw new Error(`Profile '${filePath}' has invalid override '${name}'; expected an object.`);
-		}
-		const override = value as Record<string, unknown>;
-		const model = override.model;
-		if (model !== undefined && typeof model !== "string") {
-			throw new Error(`Profile '${filePath}' has invalid model for '${name}'; expected a string.`);
-		}
-		const thinking = override.thinking;
-		if (thinking !== undefined && thinking !== false && typeof thinking !== "string") {
-			throw new Error(`Profile '${filePath}' has invalid thinking for '${name}'; expected a string or false.`);
-		}
-		const fallbackModels = override.fallbackModels;
-		if (fallbackModels !== undefined && fallbackModels !== false && (!Array.isArray(fallbackModels) || fallbackModels.some((item) => typeof item !== "string"))) {
-			throw new Error(`Profile '${filePath}' has invalid fallbackModels for '${name}'; expected an array of strings or false.`);
-		}
-	}
+	validateSubagentAgentOverrides(agentOverrides, filePath);
 	const disableBuiltins = (subagents as Record<string, unknown>).disableBuiltins;
 	if (disableBuiltins !== undefined && typeof disableBuiltins !== "boolean") {
 		throw new Error(`Profile '${filePath}' has invalid subagents.disableBuiltins; expected a boolean.`);
@@ -517,16 +500,36 @@ export function applySubagentProfile(name: string): { filePath: string; settings
 function isProviderModelCatalogFile(value: unknown): value is ProviderModelCatalogFile {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const catalog = value as Record<string, unknown>;
-	if (typeof catalog.provider !== "string" || typeof catalog.refreshedAt !== "string") return false;
+	if (typeof catalog.provider !== "string" || typeof catalog.refreshedAt !== "string" || typeof catalog.maxAgeDays !== "number") return false;
 	if (!Array.isArray(catalog.sources) || !catalog.sources.every((source) => typeof source === "string")) return false;
 	if (!Array.isArray(catalog.models)) return false;
 	return catalog.models.every((model) => {
 		if (!model || typeof model !== "object" || Array.isArray(model)) return false;
 		const record = model as Record<string, unknown>;
 		if (typeof record.id !== "string" || typeof record.fullId !== "string") return false;
+		if (!Array.isArray(record.warnings) || !record.warnings.every((item) => typeof item === "string")) return false;
+		if (!Array.isArray(record.notes) || !record.notes.every((item) => typeof item === "string")) return false;
 		const observed = record.observed;
 		if (!observed || typeof observed !== "object" || Array.isArray(observed)) return false;
-		return typeof (observed as Record<string, unknown>).availableInRegistry === "boolean";
+		const observedRecord = observed as Record<string, unknown>;
+		if (typeof observedRecord.availableInRegistry !== "boolean" || !Array.isArray(observedRecord.thinkingLevels)
+			|| !observedRecord.thinkingLevels.every((item) => typeof item === "string")) return false;
+		const probe = observedRecord.probe;
+		if (!probe || typeof probe !== "object" || Array.isArray(probe)
+			|| typeof (probe as Record<string, unknown>).status !== "string"
+			|| typeof (probe as Record<string, unknown>).checkedAt !== "string") return false;
+		const derived = record.derived;
+		if (!derived || typeof derived !== "object" || Array.isArray(derived)) return false;
+		const derivedRecord = derived as Record<string, unknown>;
+		return typeof derivedRecord.profileRank === "number"
+			&& typeof derivedRecord.costTier === "string"
+			&& typeof derivedRecord.qualityTier === "string"
+			&& typeof derivedRecord.latencyTier === "string"
+			&& typeof derivedRecord.recommendedRoleTier === "string"
+			&& Array.isArray(derivedRecord.recommendedAgents)
+			&& derivedRecord.recommendedAgents.every((item) => typeof item === "string")
+			&& Array.isArray(derivedRecord.classificationSources)
+			&& derivedRecord.classificationSources.every((item) => item === "official-metadata" || item === "heuristic-name");
 	});
 }
 

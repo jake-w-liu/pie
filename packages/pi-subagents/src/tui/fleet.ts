@@ -18,7 +18,7 @@ import { stopAsyncRun } from "../runs/foreground/async-stop-action.ts";
 import { resolveWorkflowForegroundSteeringTarget, steerWorkflowForegroundTarget } from "../runs/foreground/workflow-foreground-steering.ts";
 import { contextModeBadge, contextModeLabel } from "../runs/shared/context-mode.ts";
 import { FLEET_STATUS_WIDGET_KEY } from "./fleet-status.ts";
-import { readFleetTranscript, renderFleetTranscript, type FleetTranscript } from "./fleet-transcript.ts";
+import { readFleetTranscriptIncrementally, renderFleetTranscript, type FleetTranscript } from "./fleet-transcript.ts";
 import { handleHerdrInspectorAction } from "../inspectors/herdr/actions.ts";
 import type { HerdrClient } from "../inspectors/herdr/client.ts";
 import { getLivePromptAudit, type LivePromptAudit, type PromptAuditView } from "../runs/foreground/prompt-audit.ts";
@@ -773,6 +773,13 @@ interface FleetDetailSections {
 	body: string[];
 }
 
+interface FleetEventRenderCache {
+	prefixKey: string;
+	prefixLines: string[];
+	eventKeys: string[];
+	eventLines: string[][];
+}
+
 interface FleetTranscriptCache {
 	path: string;
 	fingerprint: string;
@@ -780,6 +787,49 @@ interface FleetTranscriptCache {
 	expandedTools: boolean;
 	transcript: FleetTranscript;
 	body: string[];
+	readCache?: NonNullable<ReturnType<typeof readFleetTranscriptIncrementally>["cache"]>;
+	renderCache: FleetEventRenderCache;
+}
+
+export function renderFleetTranscriptIncrementally(
+	transcript: FleetTranscript,
+	previous: FleetEventRenderCache | undefined,
+	render: (transcript: FleetTranscript) => string[],
+): { body: string[]; cache: FleetEventRenderCache; renderedEvents: number } {
+	const prefixKey = JSON.stringify([transcript.truncated, transcript.warning]);
+	const prefixLines = previous?.prefixKey === prefixKey
+		? previous.prefixLines
+		: render({ ...transcript, events: [] });
+	const previousLines = new Map<string, string[]>();
+	if (previous) {
+		for (let index = 0; index < previous.eventKeys.length; index++) {
+			previousLines.set(previous.eventKeys[index]!, previous.eventLines[index]!);
+		}
+	}
+	let renderedEvents = 0;
+	const eventKeys: string[] = [];
+	const eventLines: string[][] = [];
+	const boundaryEvent = { kind: "notice", text: "fleet-boundary", tone: "muted" } as const;
+	const boundaryLines = render({ ...transcript, truncated: false, warning: undefined, events: [boundaryEvent] });
+	for (const event of transcript.events) {
+		const key = JSON.stringify(event);
+		eventKeys.push(key);
+		const cached = previousLines.get(key);
+		if (cached) {
+			eventLines.push(cached);
+		} else {
+			const withBoundary = render({ ...transcript, truncated: false, warning: undefined, events: [event, boundaryEvent] });
+			eventLines.push(withBoundary.slice(0, Math.max(0, withBoundary.length - boundaryLines.length)));
+			renderedEvents++;
+		}
+	}
+	const body = [...prefixLines, ...eventLines.flat()];
+	while (body.length > 0 && visibleWidth(body.at(-1) ?? "") === 1) body.pop();
+	return {
+		body,
+		cache: { prefixKey, prefixLines, eventKeys, eventLines },
+		renderedEvents,
+	};
 }
 
 function transcriptFingerprint(filePath: string): string {
@@ -1304,15 +1354,25 @@ export class SubagentFleetComponent implements Component {
 			&& this.transcriptCache.expandedTools === this.expandedTools) {
 			return { transcript: this.transcriptCache.transcript, body: [...this.transcriptCache.body] };
 		}
-		const transcript = readFleetTranscript(target.path, {
+		const read = readFleetTranscriptIncrementally(target.path, {
 			trustedRoots: target.trustedRoots,
 			...(target.trustedFiles ? { trustedFiles: target.trustedFiles } : {}),
 			...(target.trustedFileRoot ? { trustedFileRoot: target.trustedFileRoot } : {}),
-		});
-		const body = transcript.events.length > 0
-			? renderFleetTranscript(transcript, width, this.theme, this.markdownTheme, { expandedTools: this.expandedTools })
-			: [];
-		this.transcriptCache = { path: target.path, fingerprint, width, expandedTools: this.expandedTools, transcript, body };
+		}, this.transcriptCache?.path === target.path ? this.transcriptCache.readCache : undefined);
+		const transcript = read.transcript;
+		const compatibleCache = this.transcriptCache
+			&& this.transcriptCache.path === target.path
+			&& this.transcriptCache.width === width
+			&& this.transcriptCache.expandedTools === this.expandedTools
+			? this.transcriptCache.renderCache
+			: undefined;
+		const rendered = renderFleetTranscriptIncrementally(
+			transcript,
+			compatibleCache,
+			(value) => renderFleetTranscript(value, width, this.theme, this.markdownTheme, { expandedTools: this.expandedTools }),
+		);
+		const body = rendered.body;
+		this.transcriptCache = { path: target.path, fingerprint, width, expandedTools: this.expandedTools, transcript, body, readCache: read.cache, renderCache: rendered.cache };
 		return { transcript, body: [...body] };
 	}
 

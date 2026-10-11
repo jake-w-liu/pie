@@ -936,10 +936,11 @@ function startThemeWatcher(): void {
 	// Only watch if it's a custom theme (not built-in)
 	if (!currentThemeName || BUILTIN_THEME_NAME_SET.has(currentThemeName)) return;
 
-	const customThemesDir = getCustomThemesDir();
 	const watchedThemeName = currentThemeName;
-	const watchedFileName = `${watchedThemeName}.json`;
-	const themeFile = path.join(customThemesDir, watchedFileName);
+	const registeredSourcePath = registeredThemes.get(watchedThemeName)?.sourcePath;
+	const themeFile = registeredSourcePath ?? path.join(getCustomThemesDir(), `${watchedThemeName}.json`);
+	const watchedDirectory = path.dirname(themeFile);
+	const watchedFileName = path.basename(themeFile);
 
 	// Only watch if the file exists
 	if (!fs.existsSync(themeFile)) {
@@ -980,7 +981,7 @@ function startThemeWatcher(): void {
 
 	themeWatcher =
 		watchWithErrorHandler(
-			customThemesDir,
+			watchedDirectory,
 			(_eventType, filename) => {
 				if (currentThemeName !== watchedThemeName) {
 					return;

@@ -34,8 +34,7 @@ describe("StdinBuffer", () => {
 		return new Promise((resolve) => setTimeout(resolve, ms));
 	}
 
-	// A fully swallowed chunk still emits the buffer's empty data event; it
-	// carries no input, so assertions about typed text ignore it.
+	// Empty events carry no input, so assertions about typed text ignore them.
 	function typed(): string[] {
 		return emittedSequences.filter((sequence) => sequence !== "");
 	}
@@ -482,6 +481,37 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(received, []);
 		});
 
+		it("should keep typed characters after a flushed lone ESC", () => {
+			processInput("\x1b");
+			assert.deepStrictEqual(buffer.flush(), ["\x1b"]);
+			emittedSequences.length = 0;
+
+			for (const char of "hello") processInput(char);
+			assert.deepStrictEqual(typed(), ["h", "e", "l", "l", "o"]);
+
+			processInput("\x1b");
+			assert.deepStrictEqual(buffer.flush(), ["\x1b"]);
+			emittedSequences.length = 0;
+
+			// Digits and spaces cannot start a mouse tail, so none are swallowed.
+			for (const char of "12 ab") processInput(char);
+			assert.deepStrictEqual(typed(), ["1", "2", " ", "a", "b"]);
+
+			processInput("\x1b");
+			assert.deepStrictEqual(buffer.flush(), ["\x1b"]);
+			emittedSequences.length = 0;
+
+			// A leading `[` is held only while it can still become a mouse report.
+			for (const char of "[abc") processInput(char);
+			assert.deepStrictEqual(typed(), ["[", "a", "b", "c"]);
+
+			processInput("\x1b");
+			assert.deepStrictEqual(buffer.flush(), ["\x1b"]);
+			emittedSequences.length = 0;
+			processInput("[");
+			assert.deepStrictEqual(buffer.flush(), ["["]);
+		});
+
 		it("should return empty array if nothing to flush", () => {
 			const flushed = buffer.flush();
 			assert.deepStrictEqual(flushed, []);
@@ -493,6 +523,14 @@ describe("StdinBuffer", () => {
 
 			// Wait for timeout to resolve the held sequence
 			await wait(15);
+
+			assert.deepStrictEqual(emittedSequences, []);
+		});
+
+		it("should not emit empty data after consuming an abandoned mouse tail", async () => {
+			processInput("\x1b[<64;5;");
+			await wait(15);
+			processInput("5M");
 
 			assert.deepStrictEqual(emittedSequences, []);
 		});
@@ -680,6 +718,18 @@ describe("unicode input handling", () => {
 		assert.ok(pasted.length > 0);
 		// A lone high surrogate at the end means the cap cut an emoji in half.
 		assert.equal(last >= 0xd800 && last <= 0xdbff, false);
+		buffer.destroy();
+	});
+
+	it("does not let Kitty release events deduplicate the next raw keypress", () => {
+		const events: string[] = [];
+		const buffer = new StdinBuffer();
+		buffer.on("data", (sequence) => events.push(sequence));
+
+		buffer.process("a\x1b[97;1:3u");
+		buffer.process("a\x1b[97;1:3u");
+
+		assert.deepStrictEqual(events, ["a", "\x1b[97;1:3u", "a", "\x1b[97;1:3u"]);
 		buffer.destroy();
 	});
 });

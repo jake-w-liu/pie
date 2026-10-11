@@ -216,7 +216,7 @@ export default function promptUrlWidgetExtension(pi: ExtensionAPI) {
 		setWidget(ctx, match);
 		applySessionName(match);
 		void fetchGhMetadata(pi, match.kind, match.target, ctx.cwd).then((meta) => {
-			if (generation !== promptGeneration) return;
+			if (generation !== promptGeneration || !ctx.isActive()) return;
 			setWidget(ctx, match, meta);
 			applySessionName(match, meta);
 		});

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -594,6 +594,38 @@ describe("SettingsManager", () => {
 			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ sessionDir: "~/sessions" }));
 			const manager = SettingsManager.create(projectDir, agentDir);
 			expect(manager.getSessionDir()).toBe(join(homedir(), "sessions"));
+		});
+	});
+
+	describe("concurrent persistence regressions", () => {
+		it("merges per-model thinking levels written by stale managers", async () => {
+			const first = SettingsManager.create(projectDir, agentDir);
+			const second = SettingsManager.create(projectDir, agentDir);
+			first.setModelThinkingLevel("anthropic", "claude-opus", "high");
+			await first.flush();
+			second.setModelThinkingLevel("openai", "gpt-5", "low");
+			await second.flush();
+
+			expect(JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8")).modelThinkingLevels).toEqual({
+				"anthropic/claude-opus": "high",
+				"openai/gpt-5": "low",
+			});
+		});
+
+		it("loads valid settings without writing lock files", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ theme: "global-theme" }));
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ theme: "project-theme" }));
+			chmodSync(agentDir, 0o555);
+			chmodSync(join(projectDir, ".pi"), 0o555);
+			try {
+				const manager = SettingsManager.create(projectDir, agentDir);
+				expect(manager.getTheme()).toBe("project-theme");
+				expect(manager.drainErrors()).toEqual([]);
+				expect(existsSync(`${join(agentDir, "settings.json")}.lock`)).toBe(false);
+			} finally {
+				chmodSync(agentDir, 0o755);
+				chmodSync(join(projectDir, ".pi"), 0o755);
+			}
 		});
 	});
 

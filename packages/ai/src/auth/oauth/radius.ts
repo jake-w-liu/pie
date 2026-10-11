@@ -330,7 +330,7 @@ async function loginWithDeviceCode(gateway: string, interaction: ProviderAuthInt
 		intervalSeconds: device.interval,
 		expiresInSeconds: device.expires_in,
 		signal: interaction.signal,
-		poll: async () => {
+		poll: async (pollSignal) => {
 			try {
 				const credentials = await requestOAuthToken(
 					gateway,
@@ -339,7 +339,7 @@ async function loginWithDeviceCode(gateway: string, interaction: ProviderAuthInt
 						client_id: OAUTH_CLIENT_ID,
 						device_code: device.device_code,
 					}),
-					interaction.signal,
+					pollSignal,
 				);
 				return { status: "complete", value: credentials };
 			} catch (error) {

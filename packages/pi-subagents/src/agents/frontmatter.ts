@@ -1,43 +1,4 @@
-/**
- * Escape regex special characters for use in a RegExp constructor.
- */
-function escapeRegex(s: string): string {
-	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/**
- * Fold a YAML folded block scalar while preserving more-indented lines and
- * every blank-line separator. Trailing whitespace is trimmed.
- */
-function foldBlock(block: string): string {
-	let folded = "";
-	let hasContent = false;
-	let previousIsMoreIndented = false;
-	let blankLines = 0;
-
-	for (const line of block.split("\n")) {
-		const current = line.trimEnd();
-		if (current.trim() === "") {
-			if (hasContent) blankLines++;
-			continue;
-		}
-
-		const currentIsMoreIndented = current.length > current.trimStart().length;
-		if (hasContent) {
-			if (blankLines > 0) {
-				folded += "\n".repeat(blankLines + (previousIsMoreIndented || currentIsMoreIndented ? 1 : 0));
-			} else {
-				folded += previousIsMoreIndented || currentIsMoreIndented ? "\n" : " ";
-			}
-		}
-		folded += current;
-		hasContent = true;
-		previousIsMoreIndented = currentIsMoreIndented;
-		blankLines = 0;
-	}
-
-	return folded.trim();
-}
+import { parseDocument, stringify as stringifyYaml } from "yaml";
 
 /**
  * Normalize a simple-scalar frontmatter list from comma-separated or block-list syntax.
@@ -63,95 +24,37 @@ export function parseFrontmatterList(raw: string | undefined): string[] | undefi
  * The indentation of the block content is preserved relative to the key.
  */
 export function parseFrontmatter(content: string): { frontmatter: Record<string, string>; body: string } {
-	const frontmatter: Record<string, string> = {};
 	const normalized = content.replace(/\r\n/g, "\n");
+	if (!normalized.startsWith("---\n")) return { frontmatter: {}, body: normalized };
 
-	if (!normalized.startsWith("---")) {
-		return { frontmatter, body: normalized };
-	}
-
+	// The closing delimiter may start at offset 3, which is the very newline that ends the
+	// opening `---` line: an empty frontmatter block has no bytes between the delimiters.
 	const endIndex = normalized.indexOf("\n---", 3);
-	if (endIndex === -1) {
-		return { frontmatter, body: normalized };
-	}
+	if (endIndex === -1) return { frontmatter: {}, body: normalized };
 
-	const frontmatterBlock = normalized.slice(4, endIndex);
+	const block = normalized.slice(4, endIndex);
 	const body = normalized.slice(endIndex + 4).trim();
-
-	const lines = frontmatterBlock.split("\n");
-	let currentKey: string | null = null;
-	let currentBlockLines: string[] | null = null;
-	let currentIndent: number | null = null;
-	let currentFolded = false;
-	let currentLiteral = false;
-
-	for (const line of lines) {
-		const indent = line.search(/\S|$/); // position of first non-whitespace char
-		const trimmed = line.trim();
-
-		if (currentKey !== null && currentBlockLines !== null && (indent > (currentIndent ?? 0) || ((currentFolded || currentLiteral) && trimmed === ""))) {
-			// This line is part of the current block value
-			currentBlockLines.push(line);
-			continue;
-		}
-
-		// Flush any pending block value
-		if (currentKey !== null && currentBlockLines !== null) {
-			// Strip the common leading whitespace from the block so the
-			// serializer can add its own indentation level.
-			const rawBlock = currentBlockLines.join("\n");
-			const leadingSpaces = rawBlock.match(/^[ \t]+(?=\S)/m);
-			const prefix = leadingSpaces?.[0] ?? "";
-			const stripped = prefix
-				? rawBlock.replace(new RegExp(`^${escapeRegex(prefix)}`, "gm"), "").replace(/^\n/, "")
-				: rawBlock;
-			frontmatter[currentKey] = currentFolded ? foldBlock(stripped) : stripped;
-			currentKey = null;
-			currentBlockLines = null;
-			currentIndent = null;
-			currentFolded = false;
-			currentLiteral = false;
-		}
-
-		const match = line.match(/^([\w-]+):\s*(.*)$/);
-		if (match) {
-			const [key, rawValueValue] = match.slice(1);
-			if (key === undefined || rawValueValue === undefined) continue;
-			const rawValue = rawValueValue.trim();
-			const isQuoted = (rawValue.startsWith('"') && rawValue.endsWith('"')) || (rawValue.startsWith("'") && rawValue.endsWith("'"));
-			// YAML comments start at whitespace + '#'. Strip them from unquoted scalars so
-			// `description: d # note` yields "d" rather than "d # note", which would otherwise
-			// become part of tool/alias lists and can break child launches.
-			const scalarValue = isQuoted ? rawValue : rawValue.replace(/\s+#.*$/, "").trimEnd();
-			const value = isQuoted ? rawValue.slice(1, -1) : scalarValue;
-			const isFolded = !isQuoted && (scalarValue === ">" || scalarValue === ">-");
-			const isLiteral = !isQuoted && (scalarValue === "|" || scalarValue === "|-");
-
-			if (value === "" || isFolded || isLiteral) {
-				// Key with empty value or block scalar indicator — defer storing until we see indent
-				currentKey = key;
-				currentBlockLines = [];
-				currentIndent = indent;
-				currentFolded = isFolded;
-				currentLiteral = isLiteral;
-			} else {
-				// Simple key: value
-				frontmatter[key] = value;
-			}
-		}
-		// Lines that don't match a key pattern (e.g., comments, empty lines) are ignored
+	const document = parseDocument(block, {
+		schema: "core",
+		merge: false,
+		uniqueKeys: true,
+	});
+	if (document.errors.length > 0) throw new Error(`Invalid YAML frontmatter: ${document.errors[0]!.message}`);
+	// maxAliasCount is a toJS option: 0 refuses aliases outright, so an anchor-bomb
+	// frontmatter cannot expand exponentially while the document is converted.
+	const parsed = document.toJS({ maxAliasCount: 0 }) as unknown;
+	// An empty or comment-only block is a valid empty mapping, not a malformed file.
+	if (parsed === null || parsed === undefined) return { frontmatter: {}, body };
+	if (typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error("Invalid YAML frontmatter: expected a mapping.");
 	}
 
-	// Flush final block value
-	if (currentKey !== null && currentBlockLines !== null) {
-		const rawBlock = currentBlockLines.join("\n");
-		const leadingSpaces = rawBlock.match(/^[ \t]+(?=\S)/m);
-		const prefix = leadingSpaces?.[0] ?? "";
-		const stripped = prefix
-			? rawBlock.replace(new RegExp(`^${escapeRegex(prefix)}`, "gm"), "").replace(/^\n/, "")
-			: rawBlock;
-		frontmatter[currentKey] = currentFolded ? foldBlock(stripped) : stripped;
+	const frontmatter: Record<string, string> = {};
+	for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+		if (value === null || value === undefined) frontmatter[key] = "";
+		else if (typeof value === "string") frontmatter[key] = value;
+		else if (typeof value === "number" || typeof value === "boolean") frontmatter[key] = String(value);
+		else frontmatter[key] = stringifyYaml(value, { schema: "core" }).trimEnd();
 	}
-
 	return { frontmatter, body };
 }

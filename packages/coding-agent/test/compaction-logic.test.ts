@@ -98,6 +98,26 @@ describe("findCutPoint", () => {
 		const result = findCutPoint(entries, 0, entries.length, 100_000);
 		expect(result.firstKeptEntryIndex).toBe(0);
 	});
+
+	it("retains metadata before a clean user boundary without classifying a split turn", () => {
+		const metadata = {
+			type: "model_change",
+			id: "model",
+			parentId: null,
+			timestamp: "2025-01-01T00:00:00Z",
+			provider: "test",
+			modelId: "model",
+		} as SessionEntry;
+		const entries: SessionEntry[] = [
+			msgEntry("u0", "user", "old question"),
+			msgEntry("a0", "assistant", "old answer"),
+			metadata,
+			msgEntry("u1", "user", "new question"),
+			msgEntry("a1", "assistant", "new answer"),
+		];
+		const result = findCutPoint(entries, 0, entries.length, 5);
+		expect(result).toEqual({ firstKeptEntryIndex: 2, turnStartIndex: -1, isSplitTurn: false });
+	});
 });
 
 describe("estimateContextTokens", () => {

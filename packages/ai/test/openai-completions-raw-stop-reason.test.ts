@@ -4,6 +4,7 @@ import type { Context, Model } from "../src/types.ts";
 
 const mockState = vi.hoisted(() => ({
 	chunks: [] as unknown[],
+	streamError: undefined as Error | undefined,
 }));
 
 vi.mock("openai", () => {
@@ -15,6 +16,7 @@ vi.mock("openai", () => {
 					const stream = {
 						async *[Symbol.asyncIterator]() {
 							for (const chunk of chunks) yield chunk;
+							if (mockState.streamError) throw mockState.streamError;
 						},
 					};
 					const promise = Promise.resolve(stream) as Promise<typeof stream> & {
@@ -55,6 +57,7 @@ const context: Context = {
 describe("OpenAI completions raw stop reasons", () => {
 	beforeEach(() => {
 		mockState.chunks = [];
+		mockState.streamError = undefined;
 	});
 
 	it("preserves raw finish reasons for successful stops", async () => {
@@ -75,5 +78,39 @@ describe("OpenAI completions raw stop reasons", () => {
 		expect(message.stopReason).toBe("error");
 		expect(message.rawStopReason).toBe("content_filter");
 		expect(message.errorMessage).toBe("Provider finish_reason: content_filter");
+	});
+
+	it("removes parser scratch fields after a transport error", async () => {
+		mockState.chunks = [
+			{
+				id: "chatcmpl-3",
+				choices: [
+					{
+						index: 0,
+						delta: {
+							tool_calls: [
+								{
+									index: 0,
+									id: "call-1",
+									type: "function",
+									function: { name: "read", arguments: '{"path":"a' },
+								},
+							],
+						},
+						finish_reason: null,
+					},
+				],
+			},
+		];
+		mockState.streamError = new Error("terminated");
+
+		const message = await streamOpenAICompletions(model, context, { apiKey: "test" }).result();
+		const toolCall = message.content.find((block) => block.type === "toolCall");
+
+		expect(message.stopReason).toBe("error");
+		expect(toolCall).toMatchObject({ type: "toolCall", id: "call-1", name: "read" });
+		expect(toolCall).not.toHaveProperty("partialArgs");
+		expect(toolCall).not.toHaveProperty("parsedArgsLength");
+		expect(toolCall).not.toHaveProperty("streamIndex");
 	});
 });

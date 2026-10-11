@@ -142,19 +142,22 @@ describe("runPrintMode", () => {
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
 	});
 
-	it("emits session_shutdown and returns non-zero on assistant error", async () => {
-		const runtimeHost = createRuntimeHost(
-			createAssistantMessage({ stopReason: "error", errorMessage: "provider failure" }),
-		);
+	// The text rows guard established behavior; the JSON rows cover the regression where these failures returned zero.
+	it.each([
+		["text", "error"],
+		["text", "aborted"],
+		["json", "error"],
+		["json", "aborted"],
+	] as const)("returns non-zero in %s mode for an assistant %s response", async (mode, stopReason) => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ stopReason, errorMessage: "provider failure" }));
 		const { session } = runtimeHost;
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
-		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
-			mode: "text",
-		});
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], { mode });
 
 		expect(exitCode).toBe(1);
-		expect(errorSpy).toHaveBeenCalledWith("provider failure");
+		if (mode === "text") expect(errorSpy).toHaveBeenCalledWith("provider failure");
+		else expect(errorSpy).not.toHaveBeenCalled();
 		expect(session.extensionRunner.emit).toHaveBeenCalledTimes(1);
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
 	});

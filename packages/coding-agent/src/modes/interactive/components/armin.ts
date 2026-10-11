@@ -88,20 +88,20 @@ export class ArminComponent implements Component {
 			return this.cachedLines;
 		}
 
-		const padding = 1;
-		const availableWidth = width - padding;
+		const padding = Math.min(1, Math.max(0, width));
+		const availableWidth = Math.max(0, width - padding);
 
 		this.cachedLines = this.currentGrid.map((row) => {
 			// Clip row to available width before applying color
 			const clipped = row.slice(0, availableWidth).join("");
 			const padRight = Math.max(0, width - padding - clipped.length);
-			return ` ${theme.fg("accent", clipped)}${" ".repeat(padRight)}`;
+			return `${" ".repeat(padding)}${theme.fg("accent", clipped)}${" ".repeat(padRight)}`;
 		});
 
 		// Add "ARMIN SAYS HI" at the end
-		const message = "ARMIN SAYS HI";
+		const message = "ARMIN SAYS HI".slice(0, availableWidth);
 		const msgPadRight = Math.max(0, width - padding - message.length);
-		this.cachedLines.push(` ${theme.fg("accent", message)}${" ".repeat(msgPadRight)}`);
+		this.cachedLines.push(`${" ".repeat(padding)}${theme.fg("accent", message)}${" ".repeat(msgPadRight)}`);
 
 		this.cachedWidth = width;
 		this.cachedVersion = this.gridVersion;

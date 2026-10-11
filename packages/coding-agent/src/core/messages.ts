@@ -90,6 +90,8 @@ export function bashExecutionToText(msg: BashExecutionMessage): string {
 		text += "\n\n(command cancelled)";
 	} else if (msg.exitCode !== null && msg.exitCode !== undefined && msg.exitCode !== 0) {
 		text += `\n\nCommand exited with code ${msg.exitCode}`;
+	} else if (msg.exitCode === null || msg.exitCode === undefined) {
+		text += "\n\nCommand terminated abnormally";
 	}
 	if (msg.truncated && msg.fullOutputPath) {
 		text += `\n\n[Output truncated. Full output: ${msg.fullOutputPath}]`;

@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import { describe, expect, it } from "vitest";
 import { createNodeSqliteFactory, createSqliteSessionSearch, SqliteSessionRepository } from "../src/index.ts";
@@ -275,6 +276,29 @@ describe("SQLite FTS5 session search", () => {
 		await expect(getSqliteEntries(reopened)).resolves.toHaveLength(1);
 	});
 
+	it("uses read-only query connections after one-time initialization", async () => {
+		const root = createTempDir();
+		const databasePath = join(root, "sessions.sqlite");
+		await using fixture = createSqliteFixture({
+			env: new NodeExecutionEnv({ cwd: root }),
+			sqlite: createNodeSqliteFactory(),
+			databasePath,
+		});
+		const session = await fixture.repository.create({ cwd: root, id: "session-1" });
+		await session.appendMessage(createUserMessage("Find the auth defect"));
+		await expect(collect(fixture.search.search("auth"))).resolves.toHaveLength(1);
+		const blocker = new DatabaseSync(databasePath);
+		blocker.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=0; BEGIN IMMEDIATE");
+		try {
+			const started = Date.now();
+			await expect(collect(fixture.search.search("auth"))).resolves.toHaveLength(1);
+			expect(Date.now() - started).toBeLessThan(1_000);
+		} finally {
+			blocker.exec("ROLLBACK");
+			blocker.close();
+		}
+	}, 7_000);
+
 	it("closes the database when search setup fails", async () => {
 		const root = createTempDir();
 		const { sqlite, counts } = createSetupFailureSqlite();
@@ -286,6 +310,8 @@ describe("SQLite FTS5 session search", () => {
 
 		await expect(collect(search.search("auth"))).rejects.toThrow("setup failed");
 		expect(counts.closes).toBe(1);
+		await expect(collect(search.search("auth"))).rejects.toThrow("setup failed");
+		expect(counts.closes).toBe(2);
 	});
 
 	it("initializes canonical storage when searched before the first session is created", async () => {

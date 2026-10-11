@@ -24,7 +24,9 @@ export class RuntimeCredentials implements CredentialStore {
 	async read(providerId: string, options?: AuthOperationOptions): Promise<Credential | undefined> {
 		options?.signal?.throwIfAborted();
 		const override = this.overrides.get(providerId);
-		return override ? { type: "api_key", key: override } : this.store.read(providerId, options);
+		if (override === undefined) return this.store.read(providerId, options);
+		const stored = await this.store.read(providerId, options);
+		return stored?.type === "api_key" ? { ...stored, key: override } : { type: "api_key", key: override };
 	}
 
 	async list(options?: AuthOperationOptions): Promise<readonly CredentialInfo[]> {

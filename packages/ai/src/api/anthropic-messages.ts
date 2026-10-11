@@ -32,6 +32,7 @@ import type {
 import { splitDeferredTools } from "../utils/deferred-tools.ts";
 import { normalizeProviderError, safeJsonStringify } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
+import { shortHash } from "../utils/hash.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { cancelResponseBody } from "../utils/http-response.ts";
 import { parseJsonWithRepair, parseStreamingJson, shouldReparseStreamingJson } from "../utils/json-parse.ts";
@@ -518,14 +519,21 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			for await (const event of iterateAnthropicEvents(response, options?.signal)) {
 				if (event.type === "message_start") {
 					output.responseId = event.message.id;
-					output.model = event.message.model;
-					const fallbackCost =
-						output.model === model.id
+					const responseModel = event.message.model;
+					const fallback =
+						responseModel === model.id
 							? undefined
 							: model.compat?.allowedFallbackModels?.find(
-									(fallback) => fallback.provider === model.provider && fallback.model === output.model,
-								)?.cost;
-					usageModel = fallbackCost ? { ...model, id: output.model, cost: fallbackCost } : model;
+									(candidate) => candidate.provider === model.provider && candidate.model === responseModel,
+								);
+					if (responseModel !== model.id) {
+						output.responseModel = responseModel;
+						// A configured fallback is a genuinely different model, while an unlisted response model may
+						// be the concrete snapshot behind an alias. Record which one it is here, because replay cannot
+						// re-derive it from a model object that may no longer carry the fallback list.
+						if (fallback) output.crossModelResponse = true;
+					}
+					usageModel = fallback ? { ...model, id: responseModel, cost: fallback.cost } : model;
 					// Capture initial token usage from message_start event
 					// This ensures we have input token counts even if the stream is aborted early
 					output.usage.input = event.message.usage.input_tokens || 0;
@@ -922,7 +930,15 @@ function buildParams(
 ): MessageCreateParamsStreamingWithFallbacks {
 	const { cacheControl } = getCacheControl(model, options?.cacheRetention, options?.env);
 	const compat = getAnthropicCompat(model);
-	const transformedMessages = transformMessages(context.messages, model, normalizeToolCallId);
+	// A turn whose response came from a configured fallback model must replay under the served model, so
+	// thinking and tool-call signatures that only that model can verify are dropped instead of replayed.
+	const messagesForTransform = context.messages.map((message) =>
+		message.role === "assistant" && message.crossModelResponse === true && message.responseModel
+			? { ...message, model: message.responseModel }
+			: message,
+	);
+	const normalizeToolCallId = createToolCallIdNormalizer();
+	const transformedMessages = transformMessages(messagesForTransform, model, (id) => normalizeToolCallId(id));
 	const normalizeToolName = isOAuthToken ? toClaudeCodeName : (name: string) => name;
 	const toolPlacement = splitDeferredTools(
 		{ ...context, messages: transformedMessages },
@@ -1066,9 +1082,28 @@ function buildParams(
 	return params;
 }
 
-// Normalize tool call IDs to match Anthropic's required pattern and length
-function normalizeToolCallId(id: string): string {
-	return id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+// Normalize tool call IDs to match Anthropic's required pattern and length while
+// keeping distinct source IDs distinct within a request.
+function createToolCallIdNormalizer(): (id: string) => string {
+	const idMap = new Map<string, string>();
+	const reverseMap = new Map<string, string>();
+
+	return (id: string): string => {
+		const existing = idMap.get(id);
+		if (existing) return existing;
+
+		const sanitized = id.replace(/[^a-zA-Z0-9_-]/g, "_") || "_";
+		for (let attempt = 0; ; attempt++) {
+			const suffix = attempt === 0 ? "" : `_${shortHash(`${id}:${attempt}`).slice(0, 10)}`;
+			const candidate = `${sanitized.slice(0, 64 - suffix.length)}${suffix}`;
+			const owner = reverseMap.get(candidate);
+			if (!owner || owner === id) {
+				idMap.set(id, candidate);
+				reverseMap.set(candidate, id);
+				return candidate;
+			}
+		}
+	};
 }
 
 function convertToolResult(

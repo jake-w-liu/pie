@@ -11,6 +11,28 @@ import { incrementMessageCount } from "../src/sqlite/storage/session-stats.ts";
 import { createTempDir, createUserMessage } from "./test-utils.ts";
 
 describe("SQLite fork snapshots", () => {
+	it("records the main lane mutation in a branch fork log", async () => {
+		const root = createTempDir();
+		await using repository = new SqliteSessionRepository({
+			env: new NodeExecutionEnv({ cwd: root }),
+			sqlite: createNodeSqliteFactory(),
+			databasePath: join(root, "sessions.sqlite"),
+		});
+		const source = await repository.create({ id: "source", cwd: root });
+		await source.appendMessage(createUserMessage("root"));
+		const tail = await source.appendMessage(createUserMessage("tail"));
+		const fork = await repository.fork(await source.getMetadata(), {
+			id: "fork",
+			cwd: root,
+			scope: "branch",
+			entryId: tail,
+			position: "at",
+		});
+
+		expect((await fork.getLog()).map(({ kind }) => kind)).toEqual(["entry", "entry", "lane"]);
+		expect(await fork.getLanes()).toEqual([{ lane: "main", leafId: tail }]);
+	});
+
 	it.each([
 		["metadata", "delete"],
 		["entries", "delete"],

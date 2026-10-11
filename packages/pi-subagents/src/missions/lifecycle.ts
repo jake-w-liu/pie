@@ -102,7 +102,10 @@ function runStatusForResult(result: AgentToolResult<Details>): string {
 function missionStatusForRun(record: MissionRecord, runId: string, runStatus: string): MissionStatus {
 	if (record.status === "completed" || record.status === "failed" || record.status === "cancelled") return record.status;
 	if (runStatus === "active" || runStatus === "queued" || runStatus === "running") return "active";
-	if (record.goal) return "active";
+	// A terminal goal run does not itself decide the goal's next state. Preserve
+	// needs_decision/waiting (and active, pending the goal driver) until that
+	// state is explicitly transitioned.
+	if (record.goal) return record.status;
 	if (runStatus === "paused") return "waiting";
 	const otherActive = record.runs.some((run) => run.runId !== runId && (run.status === "active" || run.status === "queued" || run.status === "running"));
 	if (otherActive) return "active";
@@ -126,6 +129,30 @@ function usageFromUnknown(value: unknown): { tokens: number } | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	const total = (value as { total?: unknown }).total;
 	return Number.isSafeInteger(total) && (total as number) >= 0 ? { tokens: total as number } : undefined;
+}
+
+const COST_TOKEN_FIELDS = ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"] as const;
+
+function usageFromCost(value: unknown): { tokens: number } | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const cost = value as Record<string, unknown>;
+	let tokens = 0;
+	let found = false;
+	for (const field of COST_TOKEN_FIELDS) {
+		const count = cost[field];
+		if (count === undefined) continue;
+		if (!Number.isSafeInteger(count) || (count as number) < 0) return undefined;
+		tokens += count as number;
+		found = true;
+	}
+	return found && Number.isSafeInteger(tokens) ? { tokens } : undefined;
+}
+
+function completeUsageFromCost(value: unknown): { tokens: number } | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const cost = value as Record<string, unknown>;
+	if (!COST_TOKEN_FIELDS.every((field) => cost[field] !== undefined)) return undefined;
+	return usageFromCost(cost);
 }
 
 function artifactsForResult(result: AgentToolResult<Details>): MissionArtifact[] {
@@ -338,13 +365,31 @@ export function syncMissionFromAsyncCompletion(value: unknown): MissionRecord | 
 		}
 	}
 	const summary = typeof event.summary === "string" && event.summary.trim() ? event.summary.slice(0, 2000) : undefined;
-	const usage = usageFromUnknown(event.totalTokens)
-		?? (Array.isArray(event.results)
-			? { tokens: event.results.reduce((total, result) => {
-				if (!result || typeof result !== "object") return total;
-				return total + (usageFromUnknown((result as { tokens?: unknown }).tokens)?.tokens ?? 0);
-			}, 0) }
-			: undefined);
+	// Async totalTokens intentionally tracks only input/output for display. The
+	// cost summary is the authoritative billed-token total and also includes
+	// prompt-cache reads and writes, matching foreground mission accounting.
+	const resultCosts = Array.isArray(event.results)
+		? event.results.flatMap((result) => {
+			if (!result || typeof result !== "object") return [];
+			const child = result as { totalCost?: unknown; tokens?: unknown };
+			return [{
+				usage: usageFromCost(child.totalCost) ?? usageFromUnknown(child.tokens),
+				completeUsage: completeUsageFromCost(child.totalCost),
+			}];
+		})
+		: [];
+	const resultTokens = resultCosts.reduce<number | undefined>(
+		(total, child) => child.usage ? (total ?? 0) + child.usage.tokens : total,
+		undefined,
+	);
+	const completeResultTokens = resultCosts.length > 0 && resultCosts.every((child) => child.completeUsage)
+		? resultCosts.reduce((total, child) => total + child.completeUsage!.tokens, 0)
+		: undefined;
+	const usage = completeUsageFromCost(event.totalCost)
+		?? (completeResultTokens !== undefined ? { tokens: completeResultTokens } : undefined)
+		?? usageFromCost(event.totalCost)
+		?? (resultTokens !== undefined ? { tokens: resultTokens } : undefined)
+		?? usageFromUnknown(event.totalTokens);
 	const workflowRunId = typeof event.parentWorkflowRunId === "string" && event.parentWorkflowRunId.trim() ? event.parentWorkflowRunId.trim() : undefined;
 	const workflowKey = typeof event.workflowKey === "string" && event.workflowKey.trim() ? event.workflowKey.trim() : undefined;
 	const workflowChildStatus = runStatus === "complete" || runStatus === "completed" || event.success === true

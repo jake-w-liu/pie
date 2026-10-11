@@ -38,10 +38,12 @@ export async function execCommand(
 	options?: ExecOptions,
 ): Promise<ExecResult> {
 	return new Promise((resolve) => {
+		const useProcessGroup = process.platform !== "win32";
 		const proc = spawn(command, args, {
 			cwd,
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
+			detached: useProcessGroup,
 		});
 
 		let stdout = "";
@@ -50,15 +52,27 @@ export async function execCommand(
 		let timeoutId: NodeJS.Timeout | undefined;
 		let forceKillId: NodeJS.Timeout | undefined;
 
+		const sendSignal = (signal: NodeJS.Signals) => {
+			if (useProcessGroup && proc.pid !== undefined) {
+				try {
+					process.kill(-proc.pid, signal);
+					return;
+				} catch {
+					// Fall back to the direct child if its process group is already gone.
+				}
+			}
+			proc.kill(signal);
+		};
+
 		const killProcess = () => {
 			if (!killed && proc.exitCode === null && proc.signalCode === null) {
 				killed = true;
-				proc.kill("SIGTERM");
+				sendSignal("SIGTERM");
 				// Force kill after 5 seconds if SIGTERM doesn't work
 				forceKillId = setTimeout(() => {
 					// `killed` means a signal was sent, not that the child exited.
 					if (proc.exitCode === null && proc.signalCode === null) {
-						proc.kill("SIGKILL");
+						sendSignal("SIGKILL");
 					}
 				}, 5000);
 			}
@@ -80,18 +94,23 @@ export async function execCommand(
 			}, options.timeout);
 		}
 
-		proc.stdout?.on("data", (data) => {
-			stdout += data.toString();
+		proc.stdout?.setEncoding("utf8");
+		proc.stdout?.on("data", (data: string) => {
+			stdout += data;
 		});
 
-		proc.stderr?.on("data", (data) => {
-			stderr += data.toString();
+		proc.stderr?.setEncoding("utf8");
+		proc.stderr?.on("data", (data: string) => {
+			stderr += data;
 		});
 
 		// Wait for process termination without hanging on inherited stdio handles
 		// held open by detached descendants.
 		waitForChildProcess(proc)
 			.then((code) => {
+				// The group leader can exit after TERM while a descendant ignores it.
+				// Finish cleaning up the owned process group before reporting completion.
+				if (killed && useProcessGroup) sendSignal("SIGKILL");
 				if (timeoutId) clearTimeout(timeoutId);
 				if (forceKillId) clearTimeout(forceKillId);
 				if (options?.signal) {
@@ -100,6 +119,7 @@ export async function execCommand(
 				resolve({ stdout, stderr, code: code ?? 1, killed });
 			})
 			.catch((_err) => {
+				if (killed && useProcessGroup) sendSignal("SIGKILL");
 				if (timeoutId) clearTimeout(timeoutId);
 				if (forceKillId) clearTimeout(forceKillId);
 				if (options?.signal) {

@@ -9,6 +9,7 @@ import type { DynamicRunnerGroup, ParallelStepGroup, RunnerStep, RunnerSubagentS
 import { isDynamicRunnerGroup, isParallelGroup } from "../shared/parallel-utils.ts";
 
 const APPEND_REQUESTS_DIR = "append-requests";
+const APPEND_INBOX_CLOSED_FILE = "append-inbox-closed";
 
 export interface ChainAppendRequest {
 	id: string;
@@ -30,6 +31,22 @@ function appendDir(asyncDir: string): string {
 
 function appendRequestPath(asyncDir: string, request: ChainAppendRequest): string {
 	return path.join(appendDir(asyncDir), `${request.createdAt}-${request.id}.json`);
+}
+
+function appendInboxClosedPath(asyncDir: string): string {
+	return path.join(asyncDir, APPEND_INBOX_CLOSED_FILE);
+}
+
+export function closeChainAppendInbox(asyncDir: string): void {
+	try {
+		fs.writeFileSync(appendInboxClosedPath(asyncDir), "", { flag: "wx" });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+	}
+}
+
+function isChainAppendInboxClosed(asyncDir: string): boolean {
+	return fs.existsSync(appendInboxClosedPath(asyncDir));
 }
 
 function listAppendRequestFiles(asyncDir: string): string[] {
@@ -75,6 +92,7 @@ export function enqueueChainAppendRequest(input: {
 	if (status.runId !== input.runId) throw new Error(`Async run id mismatch: expected '${input.runId}', found '${status.runId}'.`);
 	if (status.mode !== "chain") throw new Error(`Run '${input.runId}' is ${status.mode}; only active chain runs accept appended steps.`);
 	if (status.state !== "running") throw new Error(`Run '${input.runId}' is ${status.state}; only running chain runs accept appended steps.`);
+	if (isChainAppendInboxClosed(input.asyncDir)) throw new Error(`Run '${input.runId}' is finalizing; its append inbox is closed.`);
 	const stillInProgress = (status.steps ?? []).some((step) => step.status === "running" || step.status === "pending") || (status.pendingAppends ?? 0) > 0;
 	if (!stillInProgress) throw new Error(`Run '${input.runId}' has no running or pending chain steps left; append-step must target an in-progress chain.`);
 	if (input.steps.length === 0) throw new Error("append-step requires one chain step.");
@@ -85,9 +103,23 @@ export function enqueueChainAppendRequest(input: {
 		steps: input.steps,
 	};
 	fs.mkdirSync(appendDir(input.asyncDir), { recursive: true });
-	const persist = () => writeAtomicJson(appendRequestPath(input.asyncDir, request), request);
+	const requestPath = appendRequestPath(input.asyncDir, request);
+	const persist = () => writeAtomicJson(requestPath, request);
 	if (input.admit) input.admit(persist);
 	else persist();
+
+	const currentStatus = readStatus(input.asyncDir);
+	if (isChainAppendInboxClosed(input.asyncDir) || currentStatus?.state !== "running") {
+		try {
+			fs.unlinkSync(requestPath);
+			throw new Error(`Run '${input.runId}' is finalizing; its append inbox is closed.`);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			// The runner atomically claimed this request before closing the inbox,
+			// so it is guaranteed to execute even if finalization has begun.
+		}
+	}
+
 	let pendingCount = 1;
 	const bookkeepingErrors: string[] = [];
 	try {
@@ -96,11 +128,13 @@ export function enqueueChainAppendRequest(input: {
 		bookkeepingErrors.push(`pending append count failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
 	const statusPath = path.join(input.asyncDir, "status.json");
-	const updatedStatus = { ...status, pendingAppends: pendingCount, lastUpdate: request.createdAt };
-	try {
-		writeAtomicJson(statusPath, updatedStatus);
-	} catch (error) {
-		bookkeepingErrors.push(`status update failed: ${error instanceof Error ? error.message : String(error)}`);
+	if (currentStatus?.state === "running") {
+		const updatedStatus = { ...currentStatus, pendingAppends: pendingCount, lastUpdate: request.createdAt };
+		try {
+			writeAtomicJson(statusPath, updatedStatus);
+		} catch (error) {
+			bookkeepingErrors.push(`status update failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
 	}
 	try {
 		appendJsonl(path.join(input.asyncDir, "events.jsonl"), JSON.stringify({
@@ -136,9 +170,16 @@ export function readPendingChainAppendRequests(asyncDir: string): ChainAppendReq
 export function consumeChainAppendRequests(asyncDir: string): ChainAppendRequest[] {
 	const requests: ChainAppendRequest[] = [];
 	for (const filePath of listAppendRequestFiles(asyncDir)) {
-		const request = readAppendRequest(filePath);
+		const claimedPath = `${filePath}.claimed`;
 		try {
-			fs.unlinkSync(filePath);
+			fs.renameSync(filePath, claimedPath);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+			throw error;
+		}
+		const request = readAppendRequest(claimedPath);
+		try {
+			fs.unlinkSync(claimedPath);
 		} catch {
 			// The runner should not execute a consumed request twice.
 		}

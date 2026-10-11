@@ -60,12 +60,19 @@ export interface FleetTranscript {
 	warning?: string;
 }
 
-interface FleetTranscriptReadOptions {
+export interface FleetTranscriptReadOptions {
 	trustedRoots: string[];
 	trustedFiles?: string[];
 	trustedFileRoot?: string;
 	maxRecords?: number;
 	maxBytes?: number;
+}
+
+interface ParsedTranscriptRecord {
+	record?: Record<string, unknown>;
+	malformed: boolean;
+	byteLength: number;
+	event?: FleetTranscriptEvent;
 }
 
 interface MutableToolEvent {
@@ -184,25 +191,31 @@ function clipMessage(text: string): string {
 	return `${text.slice(0, MAX_MESSAGE_CHARS)}\n\n… message truncated`;
 }
 
+const SAFE_TRANSCRIPT_EVENTS = new WeakSet<object>();
+
 function safeTranscriptEvent(event: FleetTranscriptEvent): FleetTranscriptEvent {
+	if (SAFE_TRANSCRIPT_EVENTS.has(event)) return event;
+	let safe: FleetTranscriptEvent;
 	if (event.kind === "assistant") {
-		return {
+		safe = {
 			...event,
 			text: safeDisplayText(event.text),
 			...(event.model ? { model: safeDisplayText(event.model) } : {}),
 		};
+	} else if (event.kind === "user" || event.kind === "notice") {
+		safe = { ...event, text: safeDisplayText(event.text) };
+	} else {
+		safe = {
+			...event,
+			name: safeDisplayText(event.name),
+			...(event.args !== undefined ? { args: safeDisplayText(event.args) } : {}),
+			...(event.argsPayload !== undefined ? { argsPayload: safeToolArgsPayload(event.argsPayload) } : {}),
+			...(event.output !== undefined ? { output: safeDisplayText(event.output) } : {}),
+			...(event.error !== undefined ? { error: safeDisplayText(event.error) } : {}),
+		};
 	}
-	if (event.kind === "user" || event.kind === "notice") {
-		return { ...event, text: safeDisplayText(event.text) };
-	}
-	return {
-		...event,
-		name: safeDisplayText(event.name),
-		...(event.args !== undefined ? { args: safeDisplayText(event.args) } : {}),
-		...(event.argsPayload !== undefined ? { argsPayload: safeToolArgsPayload(event.argsPayload) } : {}),
-		...(event.output !== undefined ? { output: safeDisplayText(event.output) } : {}),
-		...(event.error !== undefined ? { error: safeDisplayText(event.error) } : {}),
-	};
+	SAFE_TRANSCRIPT_EVENTS.add(safe);
+	return safe;
 }
 
 function findTool(
@@ -231,33 +244,60 @@ function appendTextEvent(
 	kind: "assistant" | "user",
 	text: string,
 	metadata: { model?: string; timestamp?: number },
-): void {
+): FleetTranscriptEvent | undefined {
 	const clipped = clipMessage(text.trim());
-	if (!clipped) return;
+	if (!clipped) return undefined;
 	const previous = events.at(-1);
-	if (previous?.kind === kind && previous.text === clipped) return;
-	events.push({ kind, text: clipped, ...metadata });
+	if (previous?.kind === kind && previous.text === clipped) return undefined;
+	const event: FleetTranscriptEvent = { kind, text: clipped, ...metadata };
+	events.push(event);
+	return event;
 }
 
-function parseTranscriptLines(lines: string[], conversationStarted = false): { events: FleetTranscriptEvent[]; malformed: number; explicitTruncation: boolean } {
+function sanitizeTranscriptRecord(record: Record<string, unknown>): Record<string, unknown> {
+	const safe = { ...record };
+	for (const key of ["text", "model", "toolName", "argsPreview"] as const) {
+		if (typeof safe[key] === "string") safe[key] = safeDisplayText(safe[key] as string);
+	}
+	if (typeof safe.argsPayload === "string") safe.argsPayload = safeToolArgsPayload(safe.argsPayload);
+	const message = objectValue(safe.message);
+	if (message) {
+		const safeMessage = { ...message };
+		for (const key of ["text", "content", "toolName"] as const) {
+			if (typeof safeMessage[key] === "string") safeMessage[key] = safeDisplayText(safeMessage[key] as string);
+		}
+		safe.message = safeMessage;
+	}
+	return safe;
+}
+
+function parseTranscriptRecord(line: string): ParsedTranscriptRecord {
+	const byteLength = Buffer.byteLength(line) + 1;
+	if (!line.trim()) return { malformed: false, byteLength };
+	try {
+		const record = objectValue(JSON.parse(line));
+		return record ? { record: sanitizeTranscriptRecord(record), malformed: false, byteLength } : { malformed: true, byteLength };
+	} catch {
+		return { malformed: true, byteLength };
+	}
+}
+
+function parseTranscriptLines(lines: Array<string | ParsedTranscriptRecord>, conversationStarted = false): { events: FleetTranscriptEvent[]; malformed: number; explicitTruncation: boolean } {
 	const events: FleetTranscriptEvent[] = [];
+	const recordsAreDisplaySafe = lines.every((line) => typeof line !== "string");
 	let malformed = 0;
 	let explicitTruncation = false;
 	let assistantSeen = conversationStarted;
 
 	for (const line of lines) {
-		if (!line.trim()) continue;
-		let record: Record<string, unknown> | undefined;
-		try {
-			record = objectValue(JSON.parse(line));
-		} catch {
+		if (typeof line === "string" && !line.trim()) continue;
+		const parsed = typeof line === "string" ? parseTranscriptRecord(line) : line;
+		if (parsed.malformed) {
 			malformed++;
 			continue;
 		}
-		if (!record) {
-			malformed++;
-			continue;
-		}
+		if (!parsed.record) continue;
+		const record = parsed.record;
 
 		const recordType = stringValue(record.recordType);
 		const timestamp = numberValue(record.ts);
@@ -286,7 +326,10 @@ function parseTranscriptLines(lines: string[], conversationStarted = false): { e
 		}
 		if (recordType === "stderr") {
 			const text = stringValue(record.text);
-			if (text) events.push({ kind: "notice", text: clipMessage(text), tone: "error", ...(timestamp !== undefined ? { timestamp } : {}) });
+			if (text) {
+				parsed.event ??= safeTranscriptEvent({ kind: "notice", text: clipMessage(text), tone: "error", ...(timestamp !== undefined ? { timestamp } : {}) });
+				events.push(parsed.event);
+			}
 			continue;
 		}
 		if (recordType !== "message") continue;
@@ -323,21 +366,48 @@ function parseTranscriptLines(lines: string[], conversationStarted = false): { e
 		}
 		if (role === "assistant") {
 			assistantSeen = true;
-			if (text) appendTextEvent(events, "assistant", text, {
-				...(stringValue(record.model) ? { model: stringValue(record.model) } : {}),
-				...(timestamp !== undefined ? { timestamp } : {}),
-			});
+			if (text) {
+				if (parsed.event) {
+					const previous = events.at(-1);
+					const next = parsed.event;
+					if (!previous || previous.kind !== "assistant" || next.kind !== "assistant" || previous.text !== next.text) {
+						events.push(next);
+					}
+				} else {
+					const event = appendTextEvent(events, "assistant", text, {
+						...(stringValue(record.model) ? { model: stringValue(record.model) } : {}),
+						...(timestamp !== undefined ? { timestamp } : {}),
+					});
+					if (event) {
+						parsed.event = safeTranscriptEvent(event);
+						events[events.length - 1] = parsed.event;
+					}
+				}
+			}
 			continue;
 		}
 		if (role === "user" && assistantSeen && text) {
-			appendTextEvent(events, "user", text, timestamp !== undefined ? { timestamp } : {});
+			if (parsed.event) {
+				const previous = events.at(-1);
+				const next = parsed.event;
+				if (!previous || previous.kind !== "user" || next.kind !== "user" || previous.text !== next.text) events.push(next);
+			} else {
+				const event = appendTextEvent(events, "user", text, timestamp !== undefined ? { timestamp } : {});
+				if (event) {
+					parsed.event = safeTranscriptEvent(event);
+					events[events.length - 1] = parsed.event;
+				}
+			}
 		}
 	}
 
 	for (const event of events) {
 		if (event.kind === "tool") delete (event as MutableToolEvent).resultSeen;
 	}
-	return { events: events.map(safeTranscriptEvent), malformed, explicitTruncation };
+	if (recordsAreDisplaySafe) {
+		for (const event of events) SAFE_TRANSCRIPT_EVENTS.add(event);
+	}
+	return { events: recordsAreDisplaySafe ? events : events.map(safeTranscriptEvent), malformed, explicitTruncation };
 }
 
 export function readFleetTranscript(filePath: string, options: FleetTranscriptReadOptions): FleetTranscript {
@@ -349,7 +419,7 @@ export function readFleetTranscript(filePath: string, options: FleetTranscriptRe
 	const tail = readTailLines(validated.resolvedPath, Math.max(1024, options.maxBytes ?? DEFAULT_MAX_BYTES));
 	const recordsOmitted = tail.truncated || tail.lines.length > maxRecords;
 	const selectedLines = tail.lines.slice(-maxRecords);
-	const parsed = parseTranscriptLines(selectedLines, recordsOmitted);
+	const parsed = parseTranscriptLines(selectedLines.map(parseTranscriptRecord), recordsOmitted);
 	const warnings = [
 		tail.warning,
 		parsed.malformed > 0 ? `Skipped ${parsed.malformed} malformed transcript record${parsed.malformed === 1 ? "" : "s"}.` : undefined,
@@ -360,6 +430,189 @@ export function readFleetTranscript(filePath: string, options: FleetTranscriptRe
 		truncated: tail.truncated || tail.lines.length > maxRecords || parsed.explicitTruncation,
 		...(warnings.length ? { warning: safeDisplayText(warnings.join(" ")) } : {}),
 	};
+}
+
+interface FleetTranscriptReadCache {
+	resolvedPath: string;
+	dev: number;
+	ino: number;
+	size: number;
+	mtimeMs: number;
+	maxRecords: number;
+	maxBytes: number;
+	records: ParsedTranscriptRecord[];
+	pending: Buffer;
+	recordsOmitted: boolean;
+	anchor: string;
+}
+
+interface IncrementalFleetTranscriptRead {
+	transcript: FleetTranscript;
+	cache?: FleetTranscriptReadCache;
+	bytesRead: number;
+	parsedRecords: number;
+}
+
+function anchorAt(fd: number, size: number): string {
+	const length = Math.min(128, size);
+	if (length === 0) return "";
+	const buffer = Buffer.alloc(length);
+	const bytesRead = fs.readSync(fd, buffer, 0, length, size - length);
+	return buffer.subarray(0, bytesRead).toString("base64");
+}
+
+function transcriptFromParsedRecords(
+	filePath: string,
+	records: ParsedTranscriptRecord[],
+	pendingBytes: Buffer,
+	recordsOmitted: boolean,
+	maxRecords: number,
+): FleetTranscript {
+	const pending = pendingBytes.toString("utf-8");
+	const pendingRecord = pending && isCompleteRecord(pending) ? parseTranscriptRecord(pending) : undefined;
+	const available = pendingRecord ? [...records, pendingRecord] : records;
+	const omitted = recordsOmitted || available.length > maxRecords;
+	const parsed = parseTranscriptLines(available.slice(-maxRecords), omitted);
+	const warning = parsed.malformed > 0
+		? `Skipped ${parsed.malformed} malformed transcript record${parsed.malformed === 1 ? "" : "s"}.`
+		: undefined;
+	return {
+		path: filePath,
+		events: parsed.events,
+		truncated: omitted || parsed.explicitTruncation,
+		...(warning ? { warning: warning } : {}),
+	};
+}
+
+function fullIncrementalRead(filePath: string, resolvedPath: string, maxRecords: number, maxBytes: number): IncrementalFleetTranscriptRead {
+	let fd: number | undefined;
+	try {
+		const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+		fd = fs.openSync(resolvedPath, fs.constants.O_RDONLY | noFollow);
+		const stat = fs.fstatSync(fd);
+		if (!stat.isFile()) return { transcript: { path: filePath, events: [], truncated: false, warning: `Transcript path is not a file: ${filePath}` }, bytesRead: 0, parsedRecords: 0 };
+		const bytesToRead = Math.min(stat.size, maxBytes);
+		const start = stat.size - bytesToRead;
+		const buffer = Buffer.alloc(bytesToRead);
+		const bytesRead = bytesToRead > 0 ? fs.readSync(fd, buffer, 0, bytesToRead, start) : 0;
+		const content = buffer.subarray(0, bytesRead);
+		const lastNewline = content.lastIndexOf(0x0a);
+		const completed = lastNewline >= 0 ? content.subarray(0, lastNewline) : Buffer.alloc(0);
+		const pending = start > 0 && lastNewline < 0
+			? Buffer.alloc(0)
+			: lastNewline >= 0 ? content.subarray(lastNewline + 1) : content;
+		let lines = completed.length > 0
+			? completed.toString("utf-8").split(/\n/).map((line) => line.endsWith("\r") ? line.slice(0, -1) : line)
+			: [];
+		if (start > 0 && lines.length > 0) lines = lines.slice(1);
+		const parsedLines = lines.map(parseTranscriptRecord);
+		const recordsOmitted = start > 0 || parsedLines.length > maxRecords;
+		const records = parsedLines.slice(-maxRecords);
+		const cache: FleetTranscriptReadCache = {
+			resolvedPath,
+			dev: stat.dev,
+			ino: stat.ino,
+			size: stat.size,
+			mtimeMs: stat.mtimeMs,
+			maxRecords,
+			maxBytes,
+			records,
+			pending,
+			recordsOmitted,
+			anchor: anchorAt(fd, stat.size),
+		};
+		return {
+			transcript: transcriptFromParsedRecords(filePath, records, pending, recordsOmitted, maxRecords),
+			cache,
+			bytesRead,
+			parsedRecords: parsedLines.length + (pending.length > 0 && isCompleteRecord(pending.toString("utf-8")) ? 1 : 0),
+		};
+	} catch (error) {
+		return { transcript: { path: filePath, events: [], truncated: false, warning: `Transcript could not be read: ${errorMessage(error)}` }, bytesRead: 0, parsedRecords: 0 };
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+	}
+}
+
+export function readFleetTranscriptIncrementally(
+	filePath: string,
+	options: FleetTranscriptReadOptions,
+	previous?: FleetTranscriptReadCache,
+): IncrementalFleetTranscriptRead {
+	const validated = validateTranscriptPath(filePath, options.trustedRoots, options.trustedFiles, options.trustedFileRoot);
+	if (!validated.resolvedPath) {
+		return { transcript: { path: filePath, events: [], truncated: false, ...(validated.warning ? { warning: safeDisplayText(validated.warning) } : {}) }, bytesRead: 0, parsedRecords: 0 };
+	}
+	const maxRecords = Math.max(1, options.maxRecords ?? DEFAULT_MAX_RECORDS);
+	const maxBytes = Math.max(1024, options.maxBytes ?? DEFAULT_MAX_BYTES);
+	if (!previous || previous.resolvedPath !== validated.resolvedPath || previous.maxRecords !== maxRecords || previous.maxBytes !== maxBytes) {
+		return fullIncrementalRead(filePath, validated.resolvedPath, maxRecords, maxBytes);
+	}
+	let fd: number | undefined;
+	try {
+		const noFollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+		fd = fs.openSync(validated.resolvedPath, fs.constants.O_RDONLY | noFollow);
+		const stat = fs.fstatSync(fd);
+		const appendBytes = stat.size - previous.size;
+		const canAppend = stat.isFile()
+			&& stat.dev === previous.dev
+			&& stat.ino === previous.ino
+			&& appendBytes >= 0
+			&& appendBytes <= maxBytes
+			&& anchorAt(fd, previous.size) === previous.anchor;
+		if (!canAppend || (appendBytes === 0 && stat.mtimeMs !== previous.mtimeMs)) {
+			fs.closeSync(fd);
+			fd = undefined;
+			return fullIncrementalRead(filePath, validated.resolvedPath, maxRecords, maxBytes);
+		}
+		if (appendBytes === 0) {
+			return { transcript: transcriptFromParsedRecords(filePath, previous.records, previous.pending, previous.recordsOmitted, maxRecords), cache: previous, bytesRead: 0, parsedRecords: 0 };
+		}
+		const buffer = Buffer.alloc(appendBytes);
+		const bytesRead = fs.readSync(fd, buffer, 0, appendBytes, previous.size);
+		const content = Buffer.concat([previous.pending, buffer.subarray(0, bytesRead)]);
+		const lastNewline = content.lastIndexOf(0x0a);
+		const completed = lastNewline >= 0 ? content.subarray(0, lastNewline) : Buffer.alloc(0);
+		const pending = lastNewline >= 0 ? content.subarray(lastNewline + 1) : content;
+		const lines = completed.length > 0
+			? completed.toString("utf-8").split(/\n/).map((line) => line.endsWith("\r") ? line.slice(0, -1) : line)
+			: [];
+		const appendedRecords = lines.map(parseTranscriptRecord);
+		const combined = [...previous.records, ...appendedRecords];
+		let recordsOmitted = previous.recordsOmitted || combined.length > maxRecords;
+		let records = combined.slice(-maxRecords);
+		let retainedBytes = pending.length + records.reduce((total, record) => total + record.byteLength, 0);
+		while (records.length > 0 && retainedBytes > maxBytes) {
+			retainedBytes -= records.shift()!.byteLength;
+			recordsOmitted = true;
+		}
+		if (retainedBytes > maxBytes) {
+			fs.closeSync(fd);
+			fd = undefined;
+			return fullIncrementalRead(filePath, validated.resolvedPath, maxRecords, maxBytes);
+		}
+		const cache: FleetTranscriptReadCache = {
+			...previous,
+			size: stat.size,
+			mtimeMs: stat.mtimeMs,
+			records,
+			pending,
+			recordsOmitted,
+			anchor: anchorAt(fd, stat.size),
+		};
+		return {
+			transcript: transcriptFromParsedRecords(filePath, records, pending, recordsOmitted, maxRecords),
+			cache,
+			bytesRead,
+			parsedRecords: appendedRecords.length + (pending.length > 0 && isCompleteRecord(pending.toString("utf-8")) ? 1 : 0),
+		};
+	} catch {
+		if (fd !== undefined) fs.closeSync(fd);
+		fd = undefined;
+		return fullIncrementalRead(filePath, validated.resolvedPath, maxRecords, maxBytes);
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+	}
 }
 
 function statusGlyph(event: Extract<FleetTranscriptEvent, { kind: "tool" }>, theme: Theme): string {

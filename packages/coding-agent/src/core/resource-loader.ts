@@ -567,10 +567,6 @@ export class DefaultResourceLoader implements ResourceLoader {
 		return extensionsResult;
 	}
 
-	private resolveExtensionLoadPath(path: string): string {
-		return resolvePath(path, this.cwd, { normalizeUnicodeSpaces: true });
-	}
-
 	private async loadFinalExtensionSet(
 		extensionPaths: string[],
 		preTrustExtensions: LoadExtensionsResult | undefined,
@@ -584,42 +580,13 @@ export class DefaultResourceLoader implements ResourceLoader {
 			return extensionsResult;
 		}
 
-		const preloadedByPath = new Map(
-			preTrustExtensions.extensions
-				.filter((extension) => !extension.path.startsWith("<inline:"))
-				.map((extension) => [extension.resolvedPath, extension]),
-		);
-		const failedPreloadPaths = new Set(
-			preTrustExtensions.errors.map((error) => this.resolveExtensionLoadPath(error.path)),
-		);
-		const remainingPaths = extensionPaths.filter((path) => {
-			const resolvedPath = this.resolveExtensionLoadPath(path);
-			return !preloadedByPath.has(resolvedPath) && !failedPreloadPaths.has(resolvedPath);
-		});
-		const remainingExtensions = await loadExtensionsCached(
-			remainingPaths,
-			this.cwd,
-			this.eventBus,
-			preTrustExtensions.runtime,
-		);
-		const loadedByPath = new Map(preloadedByPath);
-		for (const extension of remainingExtensions.extensions) {
-			loadedByPath.set(extension.resolvedPath, extension);
-		}
-
-		const inlineExtensions = preTrustExtensions.extensions.filter((extension) =>
-			extension.path.startsWith("<inline:"),
-		);
-		const orderedExtensions = extensionPaths
-			.map((path) => loadedByPath.get(this.resolveExtensionLoadPath(path)))
-			.filter((extension): extension is Extension => extension !== undefined);
-		orderedExtensions.push(...inlineExtensions);
-
-		const extensionsResult: LoadExtensionsResult = {
-			extensions: orderedExtensions,
-			errors: [...preTrustExtensions.errors, ...remainingExtensions.errors],
-			runtime: preTrustExtensions.runtime,
-		};
+		// The trust bootstrap set can differ from the final precedence-resolved set.
+		// Tear down its subscriptions and runtime state, then load the final set cleanly.
+		preTrustExtensions.runtime.invalidate("Project trust bootstrap extensions have been replaced by the final set.");
+		const extensionsResult = await loadExtensionsCached(extensionPaths, this.cwd, this.eventBus);
+		const inlineExtensions = await this.loadExtensionFactories(extensionsResult.runtime);
+		extensionsResult.extensions.push(...inlineExtensions.extensions);
+		extensionsResult.errors.push(...inlineExtensions.errors);
 		this.addExtensionConflictDiagnostics(extensionsResult);
 		return extensionsResult;
 	}

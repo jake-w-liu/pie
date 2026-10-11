@@ -5,6 +5,7 @@ import type { ImagesContext, ImagesModel } from "../src/types.ts";
 const mockState = vi.hoisted(() => ({
 	lastParams: undefined as unknown,
 	lastRequestOptions: undefined as unknown,
+	response: undefined as unknown | undefined,
 }));
 
 vi.mock("openai", () => {
@@ -23,7 +24,7 @@ vi.mock("openai", () => {
 							},
 						};
 					}
-					const response = {
+					const response = mockState.response ?? {
 						id: "img-1",
 						usage: {
 							prompt_tokens: 12,
@@ -32,6 +33,7 @@ vi.mock("openai", () => {
 						},
 						choices: [
 							{
+								finish_reason: "stop",
 								message: {
 									content: "Here is your image.",
 									images: [{ image_url: "data:image/png;base64,ZmFrZS1wbmc=" }],
@@ -62,6 +64,7 @@ describe("openrouter images", () => {
 	beforeEach(() => {
 		mockState.lastParams = undefined;
 		mockState.lastRequestOptions = undefined;
+		mockState.response = undefined;
 	});
 
 	it("returns text plus images in final output", async () => {
@@ -94,6 +97,43 @@ describe("openrouter images", () => {
 		expect(params.stream).toBe(false);
 		expect(params.modalities).toEqual(["image", "text"]);
 		expect(params.messages?.[0]?.content?.[0]).toMatchObject({ type: "text", text: "Generate a dog" });
+	});
+
+	it("returns content-filter refusals as errors", async () => {
+		mockState.response = {
+			id: "img-filtered",
+			usage: { prompt_tokens: 10, completion_tokens: 0 },
+			choices: [
+				{
+					finish_reason: "content_filter",
+					message: {
+						content: "",
+						refusal: "Image blocked by safety policy",
+						images: [],
+					},
+				},
+			],
+		};
+		const model: ImagesModel<"openrouter-images"> = {
+			id: "black-forest-labs/flux.2-pro",
+			name: "FLUX.2 Pro",
+			api: "openrouter-images",
+			provider: "openrouter",
+			baseUrl: "https://openrouter.ai/api/v1",
+			input: ["text", "image"],
+			output: ["image"],
+			cost: { input: 0.015, output: 0.03, cacheRead: 0, cacheWrite: 0 },
+		};
+		const context: ImagesContext = {
+			input: [{ type: "text", text: "Generate a dog" }],
+		};
+
+		const output = await generateImages(model, context, { apiKey: "test" });
+
+		expect(output.stopReason).toBe("error");
+		expect(output.errorMessage).toContain("Image blocked by safety policy");
+		expect(output.errorMessage).toContain("finish_reason: content_filter");
+		expect(output.output).toEqual([]);
 	});
 
 	it("passes through abort signal and returns aborted result", async () => {

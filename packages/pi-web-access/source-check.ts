@@ -93,23 +93,39 @@ function tokenize(value: string): string[] {
 	return [...new Set(value.toLowerCase().split(/[^a-z0-9]+/).filter((term) => term.length > 3))];
 }
 
-function extractRelevantSpans(content: string, hint: string): Span[] {
+function extractRelevantSpans(content: string, hint: string, supplementalHint = ""): Span[] {
 	const sentences: Span[] = [];
-	const sentencePattern = /[^.!?]+(?:[.!?]+(?=\s|$)|$)/g;
-	for (const match of content.matchAll(sentencePattern)) {
-		const raw = match[0];
+	let sentenceStart = 0;
+	const addSentence = (end: number) => {
+		const raw = content.slice(sentenceStart, end);
 		const text = raw.trim();
 		if (text.length > 0 && text.length <= 400) {
-			const start = (match.index ?? 0) + raw.indexOf(text);
+			const start = sentenceStart + raw.indexOf(text);
 			sentences.push({ text, start, end: start + text.length });
 		}
+		sentenceStart = end;
+	};
+	for (let index = 0; index < content.length; index++) {
+		if (content[index] !== "." && content[index] !== "!" && content[index] !== "?") continue;
+		let end = index + 1;
+		while (end < content.length && (content[end] === "." || content[end] === "!" || content[end] === "?")) end++;
+		if (end === content.length || /\s/.test(content[end] ?? "")) addSentence(end);
+		index = end - 1;
 	}
-	const terms = tokenize(hint);
-	if (terms.length === 0) return [];
+	if (sentenceStart < content.length) addSentence(content.length);
+
+	const primaryTerms = tokenize(hint);
+	const supplementalTerms = tokenize(supplementalHint).filter((term) => !primaryTerms.includes(term));
+	if (primaryTerms.length === 0 && supplementalTerms.length === 0) return [];
 	return sentences
-		.map((sentence, index) => ({ sentence, index, score: terms.filter((term) => sentence.text.toLowerCase().includes(term)).length }))
-		.filter((item) => item.score > 0)
-		.sort((a, b) => b.score - a.score || a.index - b.index)
+		.map((sentence, index) => {
+			const lower = sentence.text.toLowerCase();
+			const primaryScore = primaryTerms.filter((term) => lower.includes(term)).length;
+			const supplementalScore = supplementalTerms.filter((term) => lower.includes(term)).length;
+			return { sentence, index, primaryScore, supplementalScore };
+		})
+		.filter((item) => item.primaryScore > 0 || item.supplementalScore > 0)
+		.sort((a, b) => b.primaryScore - a.primaryScore || b.supplementalScore - a.supplementalScore || a.index - b.index)
 		.slice(0, 3)
 		.map(({ sentence }) => sentence);
 }
@@ -128,8 +144,7 @@ export function buildPassages(sources: ResearchSource[], fetched: ExtractedConte
 		// passage with no `extraction_span` to verify against.
 		const page = fetchedByUrl.get(source.url);
 		if (page && !page.error && page.content) {
-			const passageHint = source.snippet?.trim() || hint;
-			for (const [index, span] of extractRelevantSpans(page.content, passageHint).entries()) {
+			for (const [index, span] of extractRelevantSpans(page.content, hint, source.snippet?.trim()).entries()) {
 				passages.push({
 					passage_id: passageId(source.rank, index + 1),
 					source_url: source.url,
@@ -166,7 +181,7 @@ function hasPolarityMarker(value: string, markers: string[], allowNegated = fals
 	return markers.some((marker) => containsPhrase(value, marker) && (allowNegated || !markerIsNegated(value, marker)));
 }
 
-const CLAUSE_SPLIT_PATTERN = /[^.!?\n]+(?:[.!?]+(?=\s|$)|$)/g;
+const CLAUSE_SPLIT_PATTERN = /(?:[^.!?\n]|[.!?]+(?!\s|$))+(?:[.!?]+(?=\s|$)|$)/g;
 const NEGATION_WINDOW_CHARS = 48;
 const NEGATION_CUES = [
 	"not", "isn't", "aren't", "wasn't", "weren't", "cannot", "can't", "no longer", "never",

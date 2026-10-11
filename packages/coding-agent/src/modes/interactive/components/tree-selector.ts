@@ -414,10 +414,8 @@ class TreeList implements Component {
 		// Try to preserve cursor on the same node, or find nearest visible ancestor
 		if (this.lastSelectedId) {
 			this.selectedIndex = this.findNearestVisibleIndex(this.lastSelectedId);
-		} else if (this.selectedIndex >= this.filteredNodes.length) {
-			// Clamp index if out of bounds
-			this.selectedIndex = Math.max(0, this.filteredNodes.length - 1);
 		}
+		this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, Math.max(0, this.filteredNodes.length - 1)));
 
 		// Update lastSelectedId to the actual selection (may have changed due to parent walk)
 		if (this.filteredNodes.length > 0) {
@@ -995,6 +993,17 @@ class TreeList implements Component {
 
 	handleInput(keyData: string): void {
 		const kb = getKeybindings();
+		const isNavigation =
+			kb.matches(keyData, "tui.select.up") ||
+			kb.matches(keyData, "tui.select.down") ||
+			kb.matches(keyData, "app.tree.foldOrUp") ||
+			kb.matches(keyData, "app.tree.unfoldOrDown") ||
+			kb.matches(keyData, "tui.editor.cursorLeft") ||
+			kb.matches(keyData, "tui.select.pageUp") ||
+			kb.matches(keyData, "tui.editor.cursorRight") ||
+			kb.matches(keyData, "tui.select.pageDown");
+		if (isNavigation && this.filteredNodes.length === 0) return;
+
 		if (kb.matches(keyData, "tui.select.up")) {
 			this.selectedIndex = this.selectedIndex === 0 ? this.filteredNodes.length - 1 : this.selectedIndex - 1;
 		} else if (kb.matches(keyData, "tui.select.down")) {

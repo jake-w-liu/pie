@@ -411,3 +411,47 @@ describe("workflowScript synchronous host throws stay in the context realm", () 
 		expect(reported?.escape).not.toBe("object");
 	}, 20_000);
 });
+
+describe("workflowScript host values are not observable through script-patched intrinsics", () => {
+	const VECTORS: Array<{ name: string; script: string }> = [
+		{
+			name: "Object.keys",
+			script: [
+				"let leaked;",
+				"const origKeys = Object.keys;",
+				"Object.keys = function (v) { if (leaked === undefined && Object.getPrototypeOf(v) !== Object.prototype) leaked = v; return origKeys(v); };",
+				'const r = await runs.run("a", { agent: "worker", task: "A" });',
+				"Object.keys = origKeys;",
+				"return leaked === undefined ? 'no-leak' : 'leak';",
+			].join("\n"),
+		},
+		{
+			name: "Error[Symbol.hasInstance]",
+			script: [
+				"let leaked;",
+				"Object.defineProperty(Error, Symbol.hasInstance, { configurable: true, value(v) { if (leaked === undefined) leaked = v; return false; } });",
+				"try { await runs.run(42, { agent: 'worker', task: 'A' }); } catch {}",
+				"delete Error[Symbol.hasInstance];",
+				"return leaked === undefined ? 'no-leak' : 'leak';",
+			].join("\n"),
+		},
+		{
+			name: "Map.prototype.set",
+			script: [
+				"let leaked;",
+				"const origSet = Map.prototype.set;",
+				"Map.prototype.set = function (k, v) { if (leaked === undefined && k && typeof k === 'object' && Object.getPrototypeOf(k) !== Object.prototype && Object.getPrototypeOf(k) !== Array.prototype) leaked = k; return origSet.call(this, k, v); };",
+				'const r = await runs.run("a", { agent: "worker", task: "A" });',
+				"Map.prototype.set = origSet;",
+				"return leaked === undefined ? 'no-leak' : 'leak';",
+			].join("\n"),
+		},
+	];
+
+	for (const { name, script } of VECTORS) {
+		it(`does not hand a host value to the patched ${name} intrinsic`, async () => {
+			const result = await probe(script);
+			expect(result).toBe("no-leak");
+		}, 20_000);
+	}
+});

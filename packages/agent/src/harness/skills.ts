@@ -53,6 +53,7 @@ export async function loadSkills(
 ): Promise<{ skills: Skill[]; diagnostics: SkillDiagnostic[] }> {
 	const skills: Skill[] = [];
 	const diagnostics: SkillDiagnostic[] = [];
+	const visitedDirectories = new Set<string>();
 	for (const dir of Array.isArray(dirs) ? dirs : [dirs]) {
 		const rootInfoResult = await env.fileInfo(dir);
 		if (!rootInfoResult.ok) {
@@ -68,7 +69,14 @@ export async function loadSkills(
 		}
 		const rootInfo = rootInfoResult.value;
 		if ((await resolveKind(env, rootInfo, diagnostics)) !== "directory") continue;
-		const result = await loadSkillsFromDirInternal(env, rootInfo.path, true, ignore(), rootInfo.path);
+		const result = await loadSkillsFromDirInternal(
+			env,
+			rootInfo.path,
+			true,
+			ignore(),
+			rootInfo.path,
+			visitedDirectories,
+		);
 		skills.push(...result.skills);
 		diagnostics.push(...result.diagnostics);
 	}
@@ -107,9 +115,16 @@ async function loadSkillsFromDirInternal(
 	includeRootFiles: boolean,
 	ignoreMatcher: IgnoreMatcher,
 	rootDir: string,
+	visitedDirectories: Set<string>,
 ): Promise<{ skills: Skill[]; diagnostics: SkillDiagnostic[] }> {
 	const skills: Skill[] = [];
 	const diagnostics: SkillDiagnostic[] = [];
+
+	const canonicalDir = await env.canonicalPath(dir);
+	if (canonicalDir.ok) {
+		if (visitedDirectories.has(canonicalDir.value)) return { skills, diagnostics };
+		visitedDirectories.add(canonicalDir.value);
+	}
 
 	const dirInfoResult = await env.fileInfo(dir);
 	if (!dirInfoResult.ok) {
@@ -160,7 +175,14 @@ async function loadSkillsFromDirInternal(
 		if (ignoreMatcher.ignores(ignorePath)) continue;
 
 		if (kind === "directory") {
-			const result = await loadSkillsFromDirInternal(env, fullPath, false, ignoreMatcher, rootDir);
+			const result = await loadSkillsFromDirInternal(
+				env,
+				fullPath,
+				false,
+				ignoreMatcher,
+				rootDir,
+				visitedDirectories,
+			);
 			skills.push(...result.skills);
 			diagnostics.push(...result.diagnostics);
 			continue;
@@ -324,7 +346,10 @@ function parseFrontmatter<T extends Record<string, unknown>>(
 	content: string,
 ): Result<{ frontmatter: T; body: string }, Error> {
 	try {
-		const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+		const normalized = content
+			.replace(/^\uFEFF/, "")
+			.replace(/\r\n/g, "\n")
+			.replace(/\r/g, "\n");
 		if (!normalized.startsWith("---")) return { ok: true, value: { frontmatter: {} as T, body: normalized } };
 		const endIndex = normalized.indexOf("\n---", 3);
 		if (endIndex === -1) return { ok: true, value: { frontmatter: {} as T, body: normalized } };

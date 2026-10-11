@@ -45,11 +45,12 @@ export interface FetchRetryOptions {
  * Caller cancellation and timeoutMs are terminal. attemptTimeoutMs aborts
  * only the current attempt so a hung connection can be retried.
  */
-export async function fetchWithRetry(
+async function fetchAndConsumeWithRetry<T>(
 	input: FetchInput,
-	init: RequestInit | undefined = undefined,
-	options: FetchRetryOptions = {},
-): Promise<Response> {
+	init: RequestInit | undefined,
+	options: FetchRetryOptions,
+	consume: (response: Response) => Promise<T>,
+): Promise<T> {
 	const maxRetries =
 		options.maxRetries === undefined || !Number.isFinite(options.maxRetries)
 			? 2
@@ -73,7 +74,7 @@ export async function fetchWithRetry(
 		try {
 			const response = await fetch(input, signal ? { ...init, signal } : init);
 			const shouldRetry = retryOnStatus && RETRYABLE_STATUS_CODES.has(response.status) && attempt < maxRetries;
-			if (!shouldRetry) return response;
+			if (!shouldRetry) return await consume(response);
 			try {
 				await response.body?.cancel();
 			} catch {
@@ -110,4 +111,22 @@ export async function fetchWithRetry(
 			}
 		}
 	}
+}
+
+export async function fetchWithRetry(
+	input: FetchInput,
+	init: RequestInit | undefined = undefined,
+	options: FetchRetryOptions = {},
+): Promise<Response> {
+	return fetchAndConsumeWithRetry(input, init, options, async (response) => response);
+}
+
+/** Fetch and consume a response body inside each timed retry attempt. */
+export async function fetchWithRetryAndConsume<T>(
+	input: FetchInput,
+	init: RequestInit | undefined,
+	options: FetchRetryOptions,
+	consume: (response: Response) => Promise<T>,
+): Promise<T> {
+	return fetchAndConsumeWithRetry(input, init, options, consume);
 }

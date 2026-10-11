@@ -152,7 +152,7 @@ async function pollForToken(
 		expiresInSeconds: device.expiresInSeconds,
 		waitBeforeFirstPoll: true,
 		signal,
-		poll: async () => {
+		poll: async (pollSignal) => {
 			const response = await fetch(`${oauthHost}/api/oauth/token`, {
 				method: "POST",
 				headers: {
@@ -164,7 +164,7 @@ async function pollForToken(
 					device_code: device.deviceCode,
 					grant_type: "urn:ietf:params:oauth:grant-type:device_code",
 				}),
-				signal: requestSignal(signal),
+				signal: requestSignal(pollSignal),
 			});
 
 			if (response.status >= 500) {

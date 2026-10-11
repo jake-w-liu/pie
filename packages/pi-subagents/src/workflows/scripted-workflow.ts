@@ -546,6 +546,30 @@ function omitUndefinedWorkflowValues(value, seen = new Set()) {
 function installWorkflowApi(host) {
   "use strict";
 
+  // Capture pristine context-realm intrinsics before the script can run. The
+  // script may patch Object.keys, Error[Symbol.hasInstance], Map.prototype.set,
+  // and friends, but adopt()/asContextError() must keep using the originals so a
+  // host-realm value in flight can never be observed by a script-controlled
+  // intrinsic and walked back to the worker realm's Function.
+  const ObjectKeys = Object.keys;
+  const ObjectDefineProperty = Object.defineProperty;
+  const ArrayIsArray = Array.isArray;
+  const ObjectProtoHasOwnProperty = Object.prototype.hasOwnProperty;
+  const ObjectProtoIsPrototypeOf = Object.prototype.isPrototypeOf;
+  const ErrorCtor = Error;
+  const ErrorProto = Error.prototype;
+  const StringCtor = String;
+  const NumberCtor = Number;
+  const NumberIsSafeInteger = Number.isSafeInteger;
+  const PromiseCtor = Promise;
+  const MapCtor = Map;
+  const MapProtoSet = Map.prototype.set;
+  const MapProtoGet = Map.prototype.get;
+  const MapProtoHas = Map.prototype.has;
+  const ProxyCtor = Proxy;
+  const ReflectApply = Reflect.apply;
+  const ReflectGet = Reflect.get;
+
   function adoptValue(value, seen) {
     if (value === null) return null;
     const kind = typeof value;
@@ -553,18 +577,18 @@ function installWorkflowApi(host) {
     if (kind === "function" || kind === "symbol") {
       // A function would carry the host realm on its .constructor. Host payloads are
       // JSON-shaped by contract, so refuse loudly rather than hand over a live object.
-      throw new Error("workflow host call returned a " + kind + ", which cannot be exposed to the sandbox.");
+      throw new ErrorCtor("workflow host call returned a " + kind + ", which cannot be exposed to the sandbox.");
     }
-    if (seen.has(value)) return seen.get(value);
-    if (Array.isArray(value)) {
+    if (ReflectApply(MapProtoHas, seen, [value])) return ReflectApply(MapProtoGet, seen, [value]);
+    if (ArrayIsArray(value)) {
       const copy = [];
-      seen.set(value, copy);
+      ReflectApply(MapProtoSet, seen, [value, copy]);
       for (let index = 0; index < value.length; index++) copy[index] = adoptValue(value[index], seen);
       return copy;
     }
     const copy = {};
-    seen.set(value, copy);
-    for (const key of Object.keys(value)) {
+    ReflectApply(MapProtoSet, seen, [value, copy]);
+    for (const key of ObjectKeys(value)) {
       const entry = adoptValue(value[key], seen);
       // A host key literally named "__proto__" is a data property (JSON.parse
       // produces one, and mission state round-trips through JSON). Assigning it
@@ -572,14 +596,14 @@ function installWorkflowApi(host) {
       // dropping the key, so the adopted value would no longer be JSON at all.
       // Only that key needs defineProperty; measured on 50-key payloads it is free
       // next to defineProperty on every key (0.0133ms vs 0.0276ms per adopt).
-      if (key === "__proto__") Object.defineProperty(copy, key, { value: entry, writable: true, enumerable: true, configurable: true });
+      if (key === "__proto__") ObjectDefineProperty(copy, key, { value: entry, writable: true, enumerable: true, configurable: true });
       else copy[key] = entry;
     }
     // Run results carry a non-enumerable toString for readable interpolation. Rebuild
     // it here from the adopted copy rather than freezing the host's string, so it
     // stays live if the script mutates the result.
-    if (typeof value.toString === "function" && Object.prototype.hasOwnProperty.call(value, "toString")) {
-      Object.defineProperty(copy, "toString", { value: resultToString, enumerable: false, configurable: true });
+    if (typeof value.toString === "function" && ReflectApply(ObjectProtoHasOwnProperty, value, ["toString"])) {
+      ObjectDefineProperty(copy, "toString", { value: resultToString, enumerable: false, configurable: true });
     }
     return copy;
   }
@@ -587,22 +611,22 @@ function installWorkflowApi(host) {
   function resultToString() {
     const output = this && typeof this.output === "string" ? this.output.trim() : "";
     if (output) return output;
-    if (!this || typeof this !== "object") return String(this);
+    if (!this || typeof this !== "object") return StringCtor(this);
     const parts = ["run " + (this.key || "unknown")];
-    if (this.runId) parts.push("id=" + String(this.runId).slice(0, 8));
+    if (this.runId) parts.push("id=" + StringCtor(this.runId).slice(0, 8));
     return "[" + parts.join("; ") + "]";
   }
 
   function adopt(value) {
-    return adoptValue(value, new Map());
+    return adoptValue(value, new MapCtor());
   }
 
   function asContextError(error) {
-    if (error instanceof Error) return error;
-    const message = error && typeof error.message === "string" ? error.message : String(error);
+    if (ReflectApply(ObjectProtoIsPrototypeOf, ErrorProto, [error])) return error;
+    const message = error && typeof error.message === "string" ? error.message : StringCtor(error);
     // Deliberately not copying the host stack or arbitrary host properties.
     // Only the detached receipt's scalar classification crosses the boundary.
-    const contextError = new Error(message);
+    const contextError = new ErrorCtor(message);
     if (error && error.workflowErrorKind === "detached-child") contextError.workflowErrorKind = "detached-child";
     return contextError;
   }
@@ -621,7 +645,7 @@ function installWorkflowApi(host) {
     try {
       result = invoke();
     } catch (error) {
-      return Promise.reject(asContextError(error));
+      return PromiseCtor.reject(asContextError(error));
     }
     return result;
   }
@@ -635,7 +659,7 @@ function installWorkflowApi(host) {
   function toContextPromise(hostPromise, transform) {
     let resolvePromise;
     let rejectPromise;
-    const base = new Promise(function (resolve, reject) { resolvePromise = resolve; rejectPromise = reject; });
+    const base = new PromiseCtor(function (resolve, reject) { resolvePromise = resolve; rejectPromise = reject; });
     hostPromise.then(
       function (value) {
         try {
@@ -655,14 +679,14 @@ function installWorkflowApi(host) {
   // reads as unawaited. The relay is a context-realm Proxy: wrapping the host
   // promise instead would hand the script a host prototype chain again.
   function reportConsumption(base, hostPromise) {
-    return new Proxy(base, {
+    return new ProxyCtor(base, {
       get: function (target, prop, receiver) {
         if (prop === "then") {
           return function (onFulfilled, onRejected) {
             host.consume(hostPromise);
             // Forward the value untouched: it is already a context-realm value, and
             // adopting it again would copy plain arrays and strip the runs.all guard.
-            return Reflect.apply(target.then, target, [
+            return ReflectApply(target.then, target, [
               typeof onFulfilled === "function" ? function (value) { return onFulfilled(value); } : onFulfilled,
               typeof onRejected === "function" ? function (error) { return onRejected(asContextError(error)); } : onRejected,
             ]);
@@ -671,7 +695,7 @@ function installWorkflowApi(host) {
         if (prop === "catch") {
           return function (onRejected) {
             host.consume(hostPromise);
-            return Reflect.apply(target.catch, target, [
+            return ReflectApply(target.catch, target, [
               typeof onRejected === "function" ? function (error) { return onRejected(asContextError(error)); } : onRejected,
             ]);
           };
@@ -679,18 +703,18 @@ function installWorkflowApi(host) {
         if (prop === "finally") {
           return function (onFinally) {
             host.consume(hostPromise);
-            return Reflect.apply(target.finally, target, [
+            return ReflectApply(target.finally, target, [
               typeof onFinally === "function" ? function (value) { return onFinally(value); } : onFinally,
             ]);
           };
         }
-        return Reflect.get(target, prop, receiver);
+        return ReflectGet(target, prop, receiver);
       },
     });
   }
 
   function runsAllKeyError(prop) {
-    return new Error(
+    return new ErrorCtor(
       "Cannot read runs.all result property '" + prop + "'. runs.all resolves to an ordered array, not a key map. " +
       "Use results[0], array destructuring, or results.map((result) => result.output), not results." + prop + ".",
     );
@@ -704,19 +728,19 @@ function installWorkflowApi(host) {
   // escape, so no re-parse can change what it matches.
   function isArrayIndexProperty(prop) {
     if (!/^(0|[1-9][0-9]*)$/.test(prop)) return false;
-    const index = Number(prop);
-    return Number.isSafeInteger(index) && index >= 0 && index < 4294967295;
+    const index = NumberCtor(prop);
+    return NumberIsSafeInteger(index) && index >= 0 && index < 4294967295;
   }
 
   // Rebuild the ordered-array guard in this realm so results.<key> still fails with
   // the actionable message instead of silently returning undefined. The proxy is
   // registered with the host so emit/state.set can unwrap it back to plain data.
   function guardResultsArray(results) {
-    const guarded = new Proxy(results, {
+    const guarded = new ProxyCtor(results, {
       get: function (target, prop, receiver) {
-        if (typeof prop !== "string") return Reflect.get(target, prop, receiver);
+        if (typeof prop !== "string") return ReflectGet(target, prop, receiver);
         if (prop === "then" || prop === "toJSON") return undefined;
-        if (prop in target || isArrayIndexProperty(prop)) return Reflect.get(target, prop, receiver);
+        if (prop in target || isArrayIndexProperty(prop)) return ReflectGet(target, prop, receiver);
         throw runsAllKeyError(prop);
       },
     });
@@ -754,16 +778,16 @@ function installWorkflowApi(host) {
   // refuses to build from a string. Defining this from the worker realm instead
   // would restore the escape this rewrite exists to close.
   if (host.nativeThen) {
-    Object.defineProperty(Promise.prototype, "then", {
+    ObjectDefineProperty(PromiseCtor.prototype, "then", {
       ...host.nativeThenDescriptor,
       value: function workflowPromiseThen(...args) {
         // Capture the receiver lexically: the suppressed branch hands a plain
         // function to a host caller, which would otherwise rebind the receiver.
         const receiver = this;
         if (host.isDirectHandlerCall() || host.suppressionDepth() > 0) {
-          return host.withSuppressedConsumption(function () { return Reflect.apply(host.nativeThen, receiver, args); });
+          return host.withSuppressedConsumption(function () { return ReflectApply(host.nativeThen, receiver, args); });
         }
-        return Reflect.apply(host.nativeThen, receiver, args);
+        return ReflectApply(host.nativeThen, receiver, args);
       },
     });
   }

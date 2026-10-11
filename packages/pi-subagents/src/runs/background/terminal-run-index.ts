@@ -60,6 +60,12 @@ export function updateTerminalRunIndex(asyncDir: string, status: AsyncStatus): v
 	writeAtomicJson(marker, entry);
 }
 
+export function removeTerminalRunIndex(asyncDirRoot: string, status: AsyncStatus): void {
+	if (!isTerminalState(status.state) || typeof status.sessionId !== "string" || !status.sessionId) return;
+	const endedAt = status.endedAt ?? status.lastUpdate ?? status.startedAt;
+	removeInvalidMarker(path.join(sessionIndexDir(asyncDirRoot, status.sessionId), markerName(endedAt, status.runId)));
+}
+
 function removeInvalidMarker(marker: string): void {
 	try {
 		fs.rmSync(marker, { force: true });

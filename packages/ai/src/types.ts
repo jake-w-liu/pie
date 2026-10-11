@@ -431,6 +431,12 @@ export interface AssistantMessage {
 	provider: ProviderId;
 	model: string;
 	responseModel?: string; // Concrete `chunk.model` when different from the requested `model` (e.g. OpenRouter `auto` -> `anthropic/...`)
+	/**
+	 * Set when the response came from a genuinely different model rather than a concrete alias or snapshot
+	 * of the requested one. Replay must treat the turn as cross-model even when the current model object no
+	 * longer lists the served model, so the verdict is recorded when the fallback list is still known.
+	 */
+	crossModelResponse?: boolean;
 	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
 	diagnostics?: AssistantMessageDiagnostic[]; // Redacted provider/runtime diagnostics for failures and recoveries.
 	usage: Usage;

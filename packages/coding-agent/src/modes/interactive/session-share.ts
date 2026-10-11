@@ -123,9 +123,17 @@ async function tryShareViaRadius(tmpFile: string, context: SessionShareContext):
 	const provider = context.session.modelRuntime.getProvider("radius");
 	if (!provider) return false;
 
-	const token = getAuthCredential(
-		await context.session.modelRuntime.getAuth("radius", { minOAuthValidityMs: 5 * 60_000 }),
-	);
+	let token: string | undefined;
+	try {
+		token = getAuthCredential(
+			await context.session.modelRuntime.getAuth("radius", { minOAuthValidityMs: 5 * 60_000 }),
+		);
+	} catch (error) {
+		context.showError(
+			`Failed to authenticate with Radius: ${error instanceof Error ? error.message : "Unknown error"}`,
+		);
+		return true;
+	}
 	if (!token) return false;
 
 	const loader = new BorderedLoader(context.ui, theme, "Uploading to Radius...");

@@ -46,12 +46,13 @@ export function spawnProcessSync(
  * us reading, while a quiet inherited handle (e.g. a Windows daemonized descendant
  * that never lets `close` fire) still releases us after the grace elapses.
  */
-export function waitForChildProcess(child: ChildProcess): Promise<number | null> {
+export function waitForChildProcess(child: ChildProcess, cancellationSignal?: AbortSignal): Promise<number | null> {
 	return new Promise((resolve, reject) => {
 		let settled = false;
 		let exited = false;
 		let exitCode: number | null = null;
 		let postExitTimer: NodeJS.Timeout | undefined;
+		let cancellationTimer: NodeJS.Timeout | undefined;
 		let stdoutEnded = child.stdout === null;
 		let stderrEnded = child.stderr === null;
 
@@ -60,6 +61,11 @@ export function waitForChildProcess(child: ChildProcess): Promise<number | null>
 				clearTimeout(postExitTimer);
 				postExitTimer = undefined;
 			}
+			if (cancellationTimer) {
+				clearTimeout(cancellationTimer);
+				cancellationTimer = undefined;
+			}
+			cancellationSignal?.removeEventListener("abort", onCancellation);
 			child.removeListener("error", onError);
 			child.removeListener("exit", onExit);
 			child.removeListener("close", onClose);
@@ -126,6 +132,12 @@ export function waitForChildProcess(child: ChildProcess): Promise<number | null>
 			finalize(code);
 		};
 
+		const onCancellation = () => {
+			// A regrouped descendant can keep writing forever after the shell is
+			// killed. Cancellation has a fixed pipe deadline, unlike normal exit.
+			cancellationTimer ??= setTimeout(() => finalize(exitCode), EXIT_STDIO_GRACE_MS * 2);
+		};
+
 		child.stdout?.once("end", onStdoutEnd);
 		child.stderr?.once("end", onStderrEnd);
 		child.stdout?.on("data", onData);
@@ -133,5 +145,7 @@ export function waitForChildProcess(child: ChildProcess): Promise<number | null>
 		child.once("error", onError);
 		child.once("exit", onExit);
 		child.once("close", onClose);
+		if (cancellationSignal?.aborted) onCancellation();
+		else cancellationSignal?.addEventListener("abort", onCancellation, { once: true });
 	});
 }

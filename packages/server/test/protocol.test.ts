@@ -395,6 +395,7 @@ describe("pi-ai protocol bridge", () => {
 		circular.self = circular;
 
 		expect(() => toProtocolJsonValue(Number.POSITIVE_INFINITY)).toThrow(TypeError);
+		expect(() => toProtocolJsonValue(Number.MAX_SAFE_INTEGER + 1)).toThrow(/safe integers/);
 		expect(() => toProtocolJsonValue(1n)).toThrow(TypeError);
 		expect(() => toProtocolJsonValue(undefined)).toThrow(TypeError);
 		expect(() => toProtocolJsonValue(circular)).toThrow(TypeError);
@@ -406,5 +407,8 @@ describe("pi-ai protocol bridge", () => {
 
 		expect(() => toProtocolJsonValue(sparse)).toThrow(/undefined/i);
 		expect(sanitizeProtocolDetails(sparse)).toEqual([null, "value"]);
+		expect(sanitizeProtocolDetails({ unsafe: Number.MAX_SAFE_INTEGER + 1 })).toEqual({
+			unsafe: String(Number.MAX_SAFE_INTEGER + 1),
+		});
 	});
 });

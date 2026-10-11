@@ -5,10 +5,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	assertExactModelIds,
 	createModelDataManifest,
+	hasUnknownPricing,
 	MODEL_DATA_MANIFEST_FILE,
 	MODEL_DATA_SCHEMA_VERSION,
 	type ModelDataStructure,
 	readModelDataStructure,
+	UNKNOWN_PRICING_SENTINEL,
 	validateModelDataDirectory,
 } from "../scripts/model-data.ts";
 
@@ -112,6 +114,44 @@ describe("generated model data validation", () => {
 		model[field] = value;
 		writeFixtureData(fixture.dataDir, fixture.structure, fixture.values);
 		expect(() => validateModelDataDirectory(fixture.structure, fixture.dataDir)).toThrow(expectedMessage);
+	});
+
+	it.each(["input", "output", "cacheRead", "cacheWrite"] as const)("rejects negative cost.%s", (field) => {
+		const fixture = createFixture();
+		const model = fixture.values["model-a"] as { cost: Record<string, number> };
+		model.cost[field] = -1;
+		writeFixtureData(fixture.dataDir, fixture.structure, fixture.values);
+		expect(() => validateModelDataDirectory(fixture.structure, fixture.dataDir)).toThrow(`invalid cost.${field}`);
+	});
+
+	it("accepts the unknown-pricing sentinel that survives in hydrated shards", () => {
+		const fixture = createFixture();
+		const model = fixture.values["model-a"] as { cost: Record<string, number> };
+		model.cost.input = UNKNOWN_PRICING_SENTINEL;
+		model.cost.output = UNKNOWN_PRICING_SENTINEL;
+		writeFixtureData(fixture.dataDir, fixture.structure, fixture.values);
+		expect(() => validateModelDataDirectory(fixture.structure, fixture.dataDir)).not.toThrow();
+	});
+
+	it("detects the unknown-pricing sentinel so the published catalog can drop those models", () => {
+		expect(hasUnknownPricing({ input: UNKNOWN_PRICING_SENTINEL, output: 1, cacheRead: 0, cacheWrite: 0 })).toBe(true);
+		expect(hasUnknownPricing({ input: 1, output: 2, cacheRead: 0, cacheWrite: UNKNOWN_PRICING_SENTINEL })).toBe(true);
+		expect(hasUnknownPricing({ input: 1, output: 2, cacheRead: 0, cacheWrite: 0 })).toBe(false);
+		expect(hasUnknownPricing({ input: 1, tiers: [{ input: UNKNOWN_PRICING_SENTINEL }] })).toBe(false);
+		expect(hasUnknownPricing(undefined)).toBe(false);
+	});
+
+	it("rejects invalid and unordered tier pricing", () => {
+		const fixture = createFixture();
+		const model = fixture.values["model-a"] as { cost: Record<string, unknown> };
+		model.cost.tiers = [
+			{ input: 1, output: 2, cacheRead: 0, cacheWrite: 0, inputTokensAbove: 100 },
+			{ input: -1, output: 2, cacheRead: 0, cacheWrite: 0, inputTokensAbove: 50 },
+		];
+		writeFixtureData(fixture.dataDir, fixture.structure, fixture.values);
+		expect(() => validateModelDataDirectory(fixture.structure, fixture.dataDir)).toThrow(
+			/cost\.tiers\[1\]\.input|unordered/,
+		);
 	});
 
 	it("rejects a model in the wrong API group", () => {

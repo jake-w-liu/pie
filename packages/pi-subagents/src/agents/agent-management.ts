@@ -130,11 +130,12 @@ function availableAgentNames(cwd: string): string[] {
 function findAgentsInDiscovery(name: string, d: { builtin: AgentConfig[]; package: AgentConfig[]; user: AgentConfig[]; project: AgentConfig[] }, scope: AgentScope = "both"): AgentConfig[] {
 	const raw = name.trim();
 	const sanitized = sanitizeName(raw);
-	const scoped = mergeAgentsForScope(scope, d.user, d.project, d.builtin, d.package);
-	let resolved = resolveAgentName(raw, scoped);
-	if (!resolved.agent && !resolved.error && sanitized !== raw) resolved = resolveAgentName(sanitized, scoped);
-	if (resolved.agent) return scoped.filter((agent) => agent.name === resolved.agent!.name).sort((a, b) => a.source.localeCompare(b.source));
-	return scoped
+	const definitions = scope === "user"
+		? [...d.builtin, ...d.package, ...d.user]
+		: scope === "project"
+			? [...d.builtin, ...d.package, ...d.project]
+			: [...d.builtin, ...d.package, ...d.user, ...d.project];
+	return definitions
 		.filter((agent) => Boolean(resolveAgentName(raw, [agent]).agent)
 			|| (sanitized !== raw && Boolean(resolveAgentName(sanitized, [agent]).agent)))
 		.sort((a, b) => a.source.localeCompare(b.source));
@@ -171,13 +172,24 @@ function resolveEffectiveAgent(d: ReturnType<typeof discoverAgentsAll>, name: st
 function nameExistsInScope(cwd: string, scope: ManagementScope, name: string, excludePath?: string): boolean {
 	const d = discoverAgentsAll(cwd);
 	for (const a of scope === "user" ? d.user : d.project) {
-		if (a.name === name && a.filePath !== excludePath) return true;
+		if (a.name === name && a.filePath !== excludePath && !isExtraAgentPath(a.filePath)) return true;
 	}
 	return false;
 }
 
 function isMutableSource(source: AgentSource): source is ManagementScope {
 	return source === "user" || source === "project";
+}
+
+function isExtraAgentPath(filePath: string): boolean {
+	const raw = process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS;
+	if (!raw) return false;
+	const resolved = path.resolve(filePath);
+	return raw.split(path.delimiter).some((dir) => {
+		if (!dir.trim()) return false;
+		const relative = path.relative(path.resolve(dir.trim()), resolved);
+		return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
+	});
 }
 
 function modelWarning(ctx: ManagementContext, model: string | undefined): string | undefined {
@@ -246,10 +258,14 @@ export function editableAgentConfig(agent: AgentConfig): AgentConfig {
 		...editable
 	} = withoutExtensions;
 	if (!base) {
-		return withDeclaredExtensionPaths({
+		const fields = readAgentFrontmatterFields(agent.filePath);
+		const sourceConfig = {
 			...withoutExtensions,
 			...(agent.extensionsFromDefault ? {} : agent.extensions !== undefined ? { extensions: [...agent.extensions] } : {}),
-		}, agent.filePath);
+		};
+		if (!fields.has("model")) delete sourceConfig.model;
+		if (!fields.has("thinking")) delete sourceConfig.thinking;
+		return withDeclaredExtensionPaths(sourceConfig, agent.filePath);
 	}
 
 	return withDeclaredExtensionPaths({
@@ -599,7 +615,7 @@ function resolveTarget<T extends { name: string; source: AgentSource; filePath: 
 ): T | AgentToolResult<Details> {
 	const distinctNames = [...new Set(matches.map((match) => match.name))];
 	if (distinctNames.length > 1) return result(`Ambiguous agent alias or name '${name}': ${distinctNames.sort((a, b) => a.localeCompare(b)).join(", ")}`, true);
-	const mutable = matches.filter((match): match is T & { source: ManagementScope } => isMutableSource(match.source));
+	const mutable = matches.filter((match): match is T & { source: ManagementScope } => isMutableSource(match.source) && !isExtraAgentPath(match.filePath));
 	if (mutable.length === 0) {
 		if (matches.length > 0) return result(`Agent '${name}' is read-only and cannot be modified. Create a same-named agent in user or project scope to override it.`, true);
 		return result(`Agent '${name}' not found. Available: ${availableAgentNames(cwd).join(", ") || "none"}.`, true);
@@ -1045,7 +1061,8 @@ function handleEject(params: ManagementParams, ctx: ManagementContext): AgentToo
 		return result(`Agent '${raw}' not found or is not a bundled/package agent. eject copies a builtin or package agent to ${scope} scope so it can be customized. Available: ${availableAgentNames(ctx.cwd).join(", ") || "none"}.`, true);
 	}
 	const runtimeName = source.name;
-	const existingCustom = (scope === "user" ? d.user : d.project).find((a) => a.name === runtimeName);
+	const existingCustom = (scope === "user" ? d.user : d.project)
+		.find((a) => a.name === runtimeName && !isExtraAgentPath(a.filePath));
 	if (existingCustom) {
 		return result(`Agent '${runtimeName}' is already a custom ${scope} agent at ${existingCustom.filePath}. Edit it with { action: "update", agent: "${runtimeName}" } or delete it first.`, true);
 	}
@@ -1133,6 +1150,14 @@ function handleReset(params: ManagementParams, ctx: ManagementContext): AgentToo
 	if (scope === "project" && d.projectSettingsPath === null) {
 		return result("Project override is not available here: no project config root (.pi or .agents) was found above the cwd. Use agentScope: 'user' or run from inside a project.", true);
 	}
+	if (params.agentScope === undefined) {
+		const matches = findAgentsInDiscovery(params.agent, d, "both");
+		const mutableMatches = matches.filter((match) => isMutableSource(match.source) && !isExtraAgentPath(match.filePath));
+		if (mutableMatches.length > 1) {
+			const targetOrError = resolveTarget(params.agent, matches, ctx.cwd);
+			if ("content" in targetOrError) return targetOrError;
+		}
+	}
 	const bundled = [...d.package, ...d.builtin].find((a) => a.name === raw || a.name === sanitized);
 	if (!bundled) {
 		const custom = [...d.user, ...d.project].find((a) => a.name === raw || a.name === sanitized);
@@ -1142,7 +1167,12 @@ function handleReset(params: ManagementParams, ctx: ManagementContext): AgentToo
 		return result(`Agent '${raw}' not found. Available: ${availableAgentNames(ctx.cwd).join(", ") || "none"}.`, true);
 	}
 	const runtimeName = bundled.name;
-	const custom = (scope === "user" ? d.user : d.project).find((a) => a.name === raw || a.name === sanitized);
+	const scopedCustoms = (scope === "user" ? d.user : d.project)
+		.filter((a) => a.name === raw || a.name === sanitized);
+	const custom = scopedCustoms.find((agent) => !isExtraAgentPath(agent.filePath));
+	if (!custom && scopedCustoms.some((agent) => isExtraAgentPath(agent.filePath))) {
+		return result(`Agent '${runtimeName}' is defined in a read-only extra agent directory and cannot be reset.`, true);
+	}
 	const lines: string[] = [];
 	if (custom) {
 		fs.unlinkSync(custom.filePath);

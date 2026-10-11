@@ -678,4 +678,12 @@ describe("kitty function keys", () => {
 		assert.equal(matchesKey("\x1b[15~", "f5"), true);
 		assert.equal(parseKey("\x1bOP"), "f1");
 	});
+
+	it("does not parse bare DCS introducers as F1-F4", () => {
+		for (const final of ["P", "Q", "R", "S"]) {
+			assert.equal(parseKey(`\x1b${final}`), undefined);
+		}
+		assert.equal(parseKey("\x1bOP"), "f1");
+		assert.equal(parseKey("\x1b[1;2P"), "shift+f1");
+	});
 });

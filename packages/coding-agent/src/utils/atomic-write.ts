@@ -1,5 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, fsyncSync, linkSync, openSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+	closeSync,
+	fsyncSync,
+	linkSync,
+	lstatSync,
+	openSync,
+	realpathSync,
+	renameSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 
 function createTempPath(targetPath: string): string {
@@ -24,12 +35,21 @@ export function atomicWriteFileSync(
 	data: string | NodeJS.ArrayBufferView,
 	options?: { mode?: number; encoding?: BufferEncoding },
 ): void {
-	const tempPath = createTempPath(targetPath);
+	let writeTarget = targetPath;
+	let existingMode: number | undefined;
+	try {
+		if (lstatSync(targetPath).isSymbolicLink()) writeTarget = realpathSync(targetPath);
+		existingMode = statSync(writeTarget).mode & 0o7777;
+	} catch {
+		// Missing targets use the caller's mode or the process default.
+	}
+	const mode = options?.mode ?? existingMode;
+	const tempPath = createTempPath(writeTarget);
 	try {
 		if (typeof data === "string") {
-			writeFileSync(tempPath, data, { encoding: options?.encoding ?? "utf-8", mode: options?.mode });
+			writeFileSync(tempPath, data, { encoding: options?.encoding ?? "utf-8", mode });
 		} else {
-			writeFileSync(tempPath, data, { mode: options?.mode });
+			writeFileSync(tempPath, data, { mode });
 		}
 		// fsync requires a write-capable handle on Windows ("r" fails with EPERM).
 		const fd = openSync(tempPath, "r+");
@@ -38,7 +58,7 @@ export function atomicWriteFileSync(
 		} finally {
 			closeSync(fd);
 		}
-		renameSync(tempPath, targetPath);
+		renameSync(tempPath, writeTarget);
 	} catch (error) {
 		removeTempFile(tempPath);
 		throw error;

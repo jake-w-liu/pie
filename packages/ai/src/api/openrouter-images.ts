@@ -88,6 +88,12 @@ export const generateImages: ImagesFunction<"openrouter-images", ImagesOptions> 
 
 		const choice = imageResponse.choices[0];
 		if (choice) {
+			const refusal = choice.message.refusal;
+			if (refusal || (choice.finish_reason && choice.finish_reason !== "stop")) {
+				const reason = choice.finish_reason ? `finish_reason: ${choice.finish_reason}` : undefined;
+				throw new Error([refusal, reason].filter(Boolean).join("; "));
+			}
+
 			const content = choice.message.content;
 			if (typeof content === "string" && content.length > 0) {
 				output.output.push({ type: "text", text: content } satisfies TextContent);

@@ -209,6 +209,24 @@ function isCsiFinalByte(code: number): boolean {
 	return code >= 0x40 && code <= 0x7e;
 }
 
+/**
+ * Classify bytes arriving after a lone ESC timed out. Only mouse reports are
+ * safe to discard: SGR (`[<Cb;Cx;CyM|m`) and legacy X10 (`[M` + 3 bytes).
+ */
+function classifyLateMouseTail(candidate: string): "complete" | "incomplete" | "invalid" {
+	if (candidate === "[") return "incomplete";
+
+	if (candidate.startsWith("[M")) {
+		if (candidate.length < 5) return "incomplete";
+		return candidate.length === 5 ? "complete" : "invalid";
+	}
+
+	if (!candidate.startsWith("[<")) return "invalid";
+	const parameters = candidate.slice(2);
+	if (/^\d+;\d+;\d+[Mm]$/.test(parameters)) return "complete";
+	return /^\d*(?:;\d*){0,2}$/.test(parameters) ? "incomplete" : "invalid";
+}
+
 /** True for a CSI that is still in its parameter phase (no final byte yet). */
 function isCsiParameterPhase(sequence: string): boolean {
 	return /^\x1b\[[\x20-\x3f]*$/.test(sequence);
@@ -223,6 +241,9 @@ function isSgrMouseParameterPhase(sequence: string): boolean {
  * Split accumulated buffer into complete sequences
  */
 function parseUnmodifiedKittyPrintableCodepoint(sequence: string): number | undefined {
+	// Releases cannot have a duplicate raw character. Arming deduplication for
+	// one would instead eat the next genuine press of the same key.
+	if (/;\d+:3u$/.test(sequence)) return undefined;
 	// Mirror insertion exactly: the pending value must be the code point the
 	// consumer will insert (shift-preferred, functional-normalized), not the
 	// raw CSI-u base code point, or a following genuine keypress gets eaten.
@@ -411,7 +432,10 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	 * them here keeps a split mouse report out of the input line instead of
 	 * typing "<65;58;23M" into the editor.
 	 */
-	private abandonedCsi: { final: "Mm" | undefined; budget: number; introducer: boolean } | undefined;
+	private abandonedCsi:
+		| { kind: "mouse-after-escape"; candidate: string; budget: number }
+		| { kind: "csi-tail"; final: "Mm" | undefined; budget: number }
+		| undefined;
 
 	constructor(options: StdinBufferOptions = {}) {
 		super();
@@ -443,10 +467,22 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			str = data;
 		}
 
+		const hadAbandonedInput = this.abandonedCsi !== undefined && str.length > 0;
 		if (this.abandonedCsi) str = this.consumeAbandonedCsiRemainder(str);
+		const consumedAbandonedTail = hadAbandonedInput && str.length === 0;
 
 		if (str.length === 0 && this.buffer.length === 0 && this.pendingBytes.length === 0) {
-			this.emitDataSequence("");
+			// A candidate mouse tail needs a bounded wait for its next byte. If it
+			// never becomes a mouse report, flush returns the held typed characters.
+			if (this.abandonedCsi?.kind === "mouse-after-escape" && this.abandonedCsi.candidate.length > 0) {
+				this.timeout = setTimeout(() => {
+					const flushed = this.flush();
+					for (const sequence of flushed) this.emitDataSequence(sequence);
+				}, this.timeoutMs);
+			}
+			// Preserve the explicit empty-chunk contract, but do not synthesize an
+			// empty key event when resynchronization consumed a real input chunk.
+			if (!consumedAbandonedTail) this.emitDataSequence("");
 			return;
 		}
 
@@ -583,34 +619,46 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private consumeAbandonedCsiRemainder(text: string): string {
 		let index = 0;
 		while (index < text.length && this.abandonedCsi) {
+			const abandoned = this.abandonedCsi;
 			const char = text[index]!;
-			if (char === ESC) {
-				// The abandoned sequence can never complete now that a new one
-				// started; resume normal parsing from here.
-				this.abandonedCsi = undefined;
-				break;
-			}
-			if (this.abandonedCsi.budget <= 0) {
-				this.abandonedCsi = undefined;
-				break;
-			}
-			// A sequence abandoned right after its ESC lost only the introducer;
-			// the CSI introducer is the one byte that can still arrive first.
-			if (this.abandonedCsi.introducer && char === "[") {
-				this.abandonedCsi.introducer = false;
+
+			if (abandoned.kind === "mouse-after-escape") {
+				if (abandoned.budget <= 0) {
+					const replay = abandoned.candidate + text.slice(index);
+					this.abandonedCsi = undefined;
+					return replay;
+				}
+				abandoned.candidate += char;
+				abandoned.budget--;
 				index++;
+				const status = classifyLateMouseTail(abandoned.candidate);
+				if (status === "complete") {
+					this.abandonedCsi = undefined;
+					continue;
+				}
+				if (status === "invalid") {
+					const replay = abandoned.candidate + text.slice(index);
+					this.abandonedCsi = undefined;
+					return replay;
+				}
 				continue;
 			}
-			this.abandonedCsi.budget--;
+
+			if (char === ESC || abandoned.budget <= 0) {
+				// The abandoned sequence can never complete now that a new one
+				// started (or its bounded resync budget is exhausted).
+				this.abandonedCsi = undefined;
+				break;
+			}
+			abandoned.budget--;
 			const code = char.charCodeAt(0);
 			if (isCsiParameterByte(code)) {
 				index++;
 				continue;
 			}
 			if (isCsiFinalByte(code)) {
-				const final = this.abandonedCsi.final;
 				this.abandonedCsi = undefined;
-				if (final === undefined || final.includes(char)) {
+				if (abandoned.final === undefined || abandoned.final.includes(char)) {
 					index++;
 					continue;
 				}
@@ -662,6 +710,10 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.pendingBytes = Buffer.alloc(0);
 		}
 		if (this.buffer.length === 0) {
+			if (this.abandonedCsi?.kind === "mouse-after-escape" && this.abandonedCsi.candidate.length > 0) {
+				sequences.push(this.abandonedCsi.candidate);
+				this.abandonedCsi = undefined;
+			}
 			return sequences;
 		}
 
@@ -672,8 +724,14 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		if (held === ESC) {
 			sequences.push(ESC);
 			// The peer may have split the sequence one byte later; keep resyncing
-			// so the remainder is not typed into the input line.
-			this.abandonedCsi = { final: undefined, budget: MAX_ABANDONED_SEQUENCE_SWALLOW, introducer: true };
+			// so a CSI remainder is not typed into the input line. Only a tail that
+			// starts with the CSI introducer is swallowed: pressing Escape and then
+			// typing emits the typed character instead of losing it.
+			this.abandonedCsi = {
+				kind: "mouse-after-escape",
+				candidate: "",
+				budget: MAX_ABANDONED_SEQUENCE_SWALLOW,
+			};
 			return sequences;
 		}
 		if (isCsiParameterPhase(held)) {
@@ -682,9 +740,9 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			// key input (the host replays it when Kitty negotiation finishes).
 			if (!isSgrMouseParameterPhase(held)) sequences.push(held);
 			this.abandonedCsi = {
+				kind: "csi-tail",
 				final: isSgrMouseParameterPhase(held) ? "Mm" : undefined,
 				budget: MAX_ABANDONED_SEQUENCE_SWALLOW,
-				introducer: false,
 			};
 			return sequences;
 		}

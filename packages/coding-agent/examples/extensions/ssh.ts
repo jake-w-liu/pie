@@ -92,8 +92,8 @@ function createRemoteBashOps(remote: string, remoteCwd: string, localCwd: string
 							child.kill();
 						}, timeout * 1000)
 					: undefined;
-				child.stdout.on("data", onData);
-				child.stderr.on("data", onData);
+				child.stdout.on("data", (data: Buffer) => onData(data, "stdout"));
+				child.stderr.on("data", (data: Buffer) => onData(data, "stderr"));
 				child.on("error", (e) => {
 					if (timer) clearTimeout(timer);
 					reject(e);

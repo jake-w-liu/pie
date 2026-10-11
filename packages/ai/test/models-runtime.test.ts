@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { InMemoryCredentialStore } from "../src/auth/credential-store.ts";
 import type { ApiKeyAuth, CredentialStore, OAuthAuth, OAuthCredential, ProviderAuth } from "../src/auth/types.ts";
-import { calculateCost, createModels, createProvider, hasApi, type Provider } from "../src/models.ts";
+import { calculateCost, createModels, createProvider, hasApi, isInPeakWindow, type Provider } from "../src/models.ts";
 import { InMemoryModelsStore, type ModelsStore, type ModelsStoreEntry } from "../src/models-store.ts";
 import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions, StreamOptions, Usage } from "../src/types.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
@@ -197,6 +197,14 @@ describe("Models runtime", () => {
 		// Sunday 02:00 UTC is off-peak even though the clock time is a peak hour.
 		const weekend = calculateCost(model, usage, new Date(Date.UTC(2026, 0, 4, 2, 0)));
 		expect(weekend.input).toBeCloseTo(0.22, 5);
+	});
+
+	it("applies a wrapped peak window after midnight on the following day", () => {
+		const windows = [{ days: [0], startMinutes: 23 * 60, endMinutes: 60 }];
+
+		expect(isInPeakWindow(windows, new Date("2026-04-05T23:30:00Z"))).toBe(true);
+		expect(isInPeakWindow(windows, new Date("2026-04-06T00:30:00Z"))).toBe(true);
+		expect(isInPeakWindow(windows, new Date("2026-04-06T23:30:00Z"))).toBe(false);
 	});
 
 	it("registers, replaces, and deletes providers", () => {

@@ -7,6 +7,7 @@
 - Changed the default interrupt shortcut from Escape to Ctrl+Alt+C. Escape now clears all editor input without aborting; when a completion menu is open, it closes the menu first. With empty editor input, Escape acts as interrupt again (aborts streaming turns, bash execution, compaction, and retry). Both shortcuts remain configurable.
 - Removed the `pi-fff` extension (`@earendil-works/pi-ext-fff`) and its `@ff-labs/fff-node` / `@ff-labs/fff-bin-*` native dependencies. fff located its Rust library through `node_modules` resolution that cannot work inside a single-file binary: Bun flattens bundled modules to `/$bunfs/root/<outfile>`, so every released binary failed with `fff native library not found` on all platforms. The `find_files` and `fff_multi_grep` tools and the `/fff-*` commands are gone. File search and content search remain available as the built-in `find` and `grep` tools, which use `fd` and `ripgrep` and are downloaded on first use.
 - Removed `GrepOperations.readFile` from the grep tool options. Context lines now come from ripgrep's own context events, so the tool no longer opens every matched file a second time. `GrepOperations.isDirectory` is unchanged.
+- Made the stream label required for `BashOperations.exec` output callbacks. Custom bash operations must now pass `"stdout"` or `"stderr"` with every chunk so independently chunked UTF-8 output is decoded without cross-stream corruption.
 
 ### Changed
 
@@ -141,6 +142,9 @@
 - Fixed print mode returning success after a context-limit stop and Perplexity accepting non-object JSON responses.
 - Fixed `pi.exec` reporting exit code 0 when the command was killed by a signal (including its own timeout/abort); it now reports 1.
 - Fixed `/share` via gist crashing on a `gh` launch failure; it now reports the failure.
+- Fixed an edit whose old text was only whitespace inserting the replacement at the start of the file instead of reporting that the text was not found; the file is now left untouched and the edit fails with the usual not-found error.
+- Fixed a prompt that started while an `agent_settled` extension handler was still running clearing the live run's wait promise, which let manual compaction proceed while the other run was still writing to the session.
+- Fixed a paused bash output pipe staying paused when the output spool closed before its backpressure wait settled.
 
 ## [0.84.3] - 2026-08-24
 

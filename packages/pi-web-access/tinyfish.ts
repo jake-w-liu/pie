@@ -341,8 +341,12 @@ export async function searchWithTinyFish(query: string, options: TinyFishSearchO
 		const results = deduplicateResults(combined, numResults);
 		const response: SearchResponse = { answer: buildAnswer(results), results };
 		if (options.includeContent && results.length > 0) {
-			const inlineContent = await fetchInlineContent(results.map(result => result.url), apiKey, options.signal);
-			if (inlineContent.length > 0) response.inlineContent = inlineContent;
+			try {
+				const inlineContent = await fetchInlineContent(results.map(result => result.url), apiKey, options.signal);
+				if (inlineContent.length > 0) response.inlineContent = inlineContent;
+			} catch (err) {
+				if (options.signal?.aborted || (err instanceof Error && err.name === "AbortError")) throw err;
+			}
 		}
 		activityMonitor.logComplete(activityId, 200);
 		return response;

@@ -36,7 +36,7 @@ permissions:
 
 jobs:
   generate:
-    if: ${{ github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main') }}
+    if: ${{ github.event_name != 'workflow_run' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository) }}
     runs-on: ubuntu-latest
     env:
       SOURCE_REF: ${{ github.event.workflow_run.head_sha || inputs.source_ref || github.sha }}
@@ -86,8 +86,9 @@ jobs:
       AWS_EC2_METADATA_DISABLED: 'true'
       R2_ENDPOINT: https://67c0d357268b0fca6e0b465bb9d01b84.r2.cloudflarestorage.com
     steps:
-      # Forks and external PRs have no R2 credentials: skip the upload steps
-      # instead of failing the run with "Unable to locate credentials".
+      # Runs without R2 credentials skip upload rather than failing with
+      # "Unable to locate credentials". workflow_run generation is separately
+      # restricted to commits from this repository.
       # (The secrets context is not available in job-level if conditions.)
       - name: Check R2 credentials
         id: r2-credentials

@@ -322,6 +322,8 @@ export class AgentSession {
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
 	private _runAbortController: AbortController | undefined;
+	private _agentRunWaitPromise: Promise<void> | undefined;
+	private _resolveAgentRunWait: (() => void) | undefined;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
 
@@ -659,12 +661,22 @@ export class AgentSession {
 	// Event Subscription
 	// =========================================================================
 
-	/** Emit an event to all listeners */
+	/** Emit an event to all listeners without allowing observer failures to interrupt session processing. */
 	private _emit(event: AgentSessionEvent): void {
+		const reportListenerError = (error: unknown) => {
+			console.error("AgentSession event listener failed:", error);
+		};
 		// Snapshot: a listener that unsubscribes itself mid-dispatch must not shift
 		// the live array under the iterator and skip the next listener.
-		for (const l of [...this._eventListeners]) {
-			l(event);
+		for (const listener of [...this._eventListeners]) {
+			try {
+				const result = listener(event) as unknown;
+				if (result && (typeof result === "object" || typeof result === "function") && "then" in result) {
+					void Promise.resolve(result).catch(reportListenerError);
+				}
+			} catch (error) {
+				reportListenerError(error);
+			}
 		}
 	}
 
@@ -682,6 +694,15 @@ export class AgentSession {
 		}
 	}
 
+	private _markAgentRunActive(): void {
+		if (!this._isAgentRunActive) {
+			this._agentRunWaitPromise = new Promise((resolve) => {
+				this._resolveAgentRunWait = resolve;
+			});
+		}
+		this._isAgentRunActive = true;
+	}
+
 	private _getIdleWaitPromise(): Promise<void> {
 		if (!this._idleWaitPromise) {
 			this._idleWaitPromise = new Promise((resolve) => {
@@ -692,7 +713,7 @@ export class AgentSession {
 	}
 
 	private _resolveIdleWaitIfIdle(): void {
-		if (this._isAgentRunActive || !this._resolveIdleWait) {
+		if (!this.isIdle || !this._resolveIdleWait) {
 			return;
 		}
 		const resolve = this._resolveIdleWait;
@@ -702,6 +723,9 @@ export class AgentSession {
 	}
 
 	private async _emitAgentSettled(): Promise<void> {
+		// The settling run owns the wait promise created when it started. A run that begins while the
+		// extension handler is awaited installs its own, which this one must neither resolve nor clear.
+		const resolveAgentRunWait = this._resolveAgentRunWait;
 		this._isAgentRunActive = false;
 		this._runAbortController = undefined;
 		this._stopAfterTurnForContextLimit = false;
@@ -709,6 +733,11 @@ export class AgentSession {
 			await this._extensionRunner.emit({ type: "agent_settled" });
 			this._emit({ type: "agent_settled" });
 		} finally {
+			if (this._resolveAgentRunWait === resolveAgentRunWait) {
+				this._agentRunWaitPromise = undefined;
+				this._resolveAgentRunWait = undefined;
+				resolveAgentRunWait?.();
+			}
 			this._resolveIdleWaitIfIdle();
 		}
 	}
@@ -743,10 +772,7 @@ export class AgentSession {
 		// Emit to extensions first
 		await this._emitExtensionEvent(event);
 
-		// Notify all listeners
-		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
-
-		// Handle session persistence
+		// Handle session persistence before notifying public observers.
 		if (event.type === "message_end") {
 			// Check if this is a custom message from extensions
 			if (event.message.role === "custom") {
@@ -788,6 +814,9 @@ export class AgentSession {
 				}
 			}
 		}
+
+		// Public observers cannot interrupt the internal extension and persistence path.
+		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
 
 		// A turn ends after its assistant message and every tool result has been appended,
 		// so this is the first point in the run where a context-only custom message can be
@@ -999,9 +1028,9 @@ export class AgentSession {
 		return this._isAgentRunActive;
 	}
 
-	/** Whether the session has no active agent run, retry, auto-compaction, or queued continuation. */
+	/** Whether the session has no active agent run, retry, compaction, branch summary, or queued continuation. */
 	get isIdle(): boolean {
-		return !this._isAgentRunActive;
+		return !this._isAgentRunActive && !this.isCompacting;
 	}
 
 	/** Current effective system prompt (includes any per-turn extension modifications) */
@@ -1181,7 +1210,7 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
-		this._isAgentRunActive = true;
+		this._markAgentRunActive();
 		this._runAbortController ??= new AbortController();
 		try {
 			await this.agent.prompt(messages);
@@ -1263,9 +1292,9 @@ export class AgentSession {
 				}
 			}
 
-			if (this._compactionAbortController !== undefined) {
+			if (this._compactionAbortController || this._branchSummaryAbortController) {
 				throw new Error(
-					"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
+					"Cannot submit a prompt while compaction or branch summarization is in progress. Wait for it to finish and retry.",
 				);
 			}
 
@@ -1314,7 +1343,7 @@ export class AgentSession {
 
 			// Claim the run before asynchronous preflight, including auto-compaction.
 			// Concurrent prompts can now queue, and abort()/waitForIdle() cover this work.
-			this._isAgentRunActive = true;
+			this._markAgentRunActive();
 			this._runAbortController = new AbortController();
 			ownsRun = true;
 
@@ -2055,15 +2084,22 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
-		await this.abort();
-		if (this._compactionAbortController) {
-			throw new Error("Compaction is already in progress");
+		if (this.isCompacting) {
+			throw new Error("Compaction or branch summarization is already in progress");
 		}
+		// Claim the operation synchronously so tree navigation cannot race the abort wait.
 		this._compactionAbortController = new AbortController();
-		this._emit({ type: "compaction_start", reason: "manual" });
 		let fromExtension = false;
 
 		try {
+			this._runAbortController?.abort();
+			this.abortRetry();
+			this.agent.abort();
+			if (this._isAgentRunActive) {
+				await this._agentRunWaitPromise;
+			}
+			this._compactionAbortController.signal.throwIfAborted();
+			this._emit({ type: "compaction_start", reason: "manual" });
 			if (!this.model) {
 				throw new Error(formatNoModelSelectedMessage());
 			}
@@ -2209,6 +2245,7 @@ export class AgentSession {
 			throw error;
 		} finally {
 			this._compactionAbortController = undefined;
+			this._resolveIdleWaitIfIdle();
 		}
 	}
 
@@ -2567,6 +2604,7 @@ export class AgentSession {
 			return false;
 		} finally {
 			this._autoCompactionAbortController = undefined;
+			this._resolveIdleWaitIfIdle();
 		}
 	}
 
@@ -3287,8 +3325,8 @@ export class AgentSession {
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
-		if (this.isStreaming) {
-			throw new Error("Wait for the current response to finish before navigating the session tree.");
+		if (!this.isIdle) {
+			throw new Error("Wait for the current session operation to finish before navigating the session tree.");
 		}
 
 		const oldLeafId = this.sessionManager.getLeafId();
@@ -3473,6 +3511,7 @@ export class AgentSession {
 			return { editorText, cancelled: false, summaryEntry };
 		} finally {
 			this._branchSummaryAbortController = undefined;
+			this._resolveIdleWaitIfIdle();
 		}
 	}
 

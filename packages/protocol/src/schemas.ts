@@ -8,12 +8,14 @@ const StrictObject = <const T extends Parameters<typeof Type.Object>[0]>(propert
 	Type.Object(properties, { additionalProperties: false });
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+const PROTOCOL_JSON_NUMBER_MIN = Number.MIN_SAFE_INTEGER;
+const PROTOCOL_JSON_NUMBER_MAX = Number.MAX_SAFE_INTEGER;
 const JsonValueRecursiveSchema = Type.Cyclic(
 	{
 		JsonValue: Type.Union([
 			Type.Null(),
 			Type.Boolean(),
-			Type.Number(),
+			Type.Number({ minimum: PROTOCOL_JSON_NUMBER_MIN, maximum: PROTOCOL_JSON_NUMBER_MAX }),
 			Type.String(),
 			Type.Array(Type.Ref("JsonValue")),
 			Type.Record(Type.String(), Type.Ref("JsonValue")),
@@ -129,6 +131,7 @@ const AssistantTranscriptItemProperties = {
 	content: Type.Array(AssistantContentSchema),
 	model: ModelRefSchema,
 	responseModel: Type.Optional(Type.String({ minLength: 1 })),
+	crossModelResponse: Type.Optional(Type.Boolean()),
 	usage: Type.Optional(UsageSchema),
 	timestamp: TimestampSchema,
 } as const;

@@ -35,7 +35,7 @@ export function createTranscriptState(snapshot: SessionSnapshot): TranscriptStat
 }
 
 export function applyTranscriptSnapshot(state: TranscriptState, snapshot: SessionSnapshot): TranscriptState {
-	if (state.snapshot.id === snapshot.id && snapshot.revision < state.snapshot.revision) return state;
+	if (state.snapshot.id === snapshot.id && snapshot.revision <= state.snapshot.revision) return state;
 	return createTranscriptState(snapshot);
 }
 

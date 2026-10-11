@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { NodeExecutionEnv } from "@earendil-works/pi-agent-core/node";
 import { describe, expect, it, vi } from "vitest";
 import { createNodeSqliteFactory, type SqliteSessionMetadata, SqliteSessionRepository } from "../src/index.ts";
@@ -153,6 +154,25 @@ describe("SQLite session writer leases", () => {
 			message: expect.stringContaining("already has an active writer"),
 		});
 	});
+
+	it("retries a release after a transient database lock", async () => {
+		const root = createTempDir();
+		const databasePath = join(root, "sessions.sqlite");
+		await using repository = createRepository(root, databasePath);
+		const session = await repository.create({ cwd: root, id: "session-1" });
+		const metadata = await session.getMetadata();
+		const blocker = new DatabaseSync(databasePath);
+		blocker.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=0; BEGIN IMMEDIATE");
+		try {
+			await expect(repository.delete(metadata)).rejects.toThrow(/database is locked/i);
+		} finally {
+			blocker.exec("ROLLBACK");
+			blocker.close();
+		}
+
+		await expect(repository.delete(metadata)).resolves.toBeUndefined();
+		await expect(repository.list()).resolves.toEqual([]);
+	}, 10_000);
 
 	it("rejects a second writer until the first session releases its claim", async () => {
 		const root = createTempDir();

@@ -30,12 +30,9 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	"overloaded",
 	"rate.?limit",
 	"too many requests",
-	"429",
-	"500",
-	"502",
-	"503",
-	"504",
-	"524",
+	// Numeric status codes must appear as the leading code or in explicit status/error
+	// syntax. Bare alternatives match unrelated values such as token limit 65000.
+	"(?:^\\s*|\\b(?:http(?:\\s+status)?|status(?:\\s+code)?|error)\\D{0,12})(?:429|500|502|503|504|524)(?!\\d)",
 	"service.?unavailable",
 	"server.?error",
 	"internal.?error",

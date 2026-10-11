@@ -238,6 +238,10 @@ describe("NodeExecutionEnv", () => {
 		const createResult = await env.createDir("missing/child", { recursive: false });
 		expect(createResult.ok).toBe(false);
 		if (!createResult.ok) expect(createResult.error).toMatchObject({ code: "not_found" });
+		getOrThrow(await env.createDir("existing", { recursive: false }));
+		const existingResult = await env.createDir("existing", { recursive: false });
+		expect(existingResult.ok).toBe(false);
+		if (!existingResult.ok) expect(existingResult.error).toMatchObject({ code: "already_exists" });
 
 		getOrThrow(await env.writeFile("dir/child/file.txt", "hello"));
 		const removeDirectory = await env.remove("dir", { recursive: false });

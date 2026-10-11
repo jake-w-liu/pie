@@ -1,4 +1,5 @@
 import { symlink } from "node:fs/promises";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import { applyPatch } from "diff";
 import { describe, expect, it } from "vitest";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
@@ -205,6 +206,18 @@ describe("AgentHarness tools", () => {
 			).rejects.toThrow("Offset 100 is beyond end of file (3 lines total)");
 		});
 
+		it.each([
+			{ path: "test.txt", offset: 0 },
+			{ path: "test.txt", offset: 1.5 },
+			{ path: "test.txt", limit: -1 },
+			{ path: "test.txt", limit: 1.5 },
+		])("rejects non-positive and fractional line ranges: $offset $limit", (arguments_) => {
+			const tool = createReadTool();
+			expect(() =>
+				validateToolArguments(tool, { type: "toolCall", id: "read-invalid", name: "read", arguments: arguments_ }),
+			).toThrow("Validation failed");
+		});
+
 		it("detects supported images by content", async () => {
 			const context = createContext();
 			const png = Uint8Array.from(
@@ -373,6 +386,22 @@ describe("AgentHarness tools", () => {
 			).rejects.toThrow(/Found 3 occurrences/);
 		});
 
+		it("rejects whitespace-only old text instead of inserting at the start of the file", async () => {
+			const context = createContext();
+			getOrThrow(await context.env.writeFile("edit.txt", "hello world\n"));
+
+			await expect(
+				createEditTool().execute(
+					"edit-whitespace",
+					{ path: "edit.txt", edits: [{ oldText: "\u00a0", newText: "X" }] },
+					undefined,
+					undefined,
+					context,
+				),
+			).rejects.toThrow(/Could not find the exact text/);
+			expect(getOrThrow(await context.env.readTextFile("edit.txt"))).toBe("hello world\n");
+		});
+
 		it("keeps the mutation queue locked until an aborted edit write settles", async () => {
 			const env = new BlockingEditExecutionEnv({ cwd: createTempDir() });
 			getOrThrow(await env.writeFile("file.txt", "alpha\nbeta\n"));
@@ -445,6 +474,75 @@ describe("AgentHarness tools", () => {
 
 			expect(getOrThrow(await context.env.readTextFile("target.txt"))).toBe("after\n");
 		});
+
+		it.each([
+			["header\r\nalpha\nbeta\ngamma\n", "header\r\nalpha\nBETA\ngamma\n"],
+			["header\nalpha\r\nbeta\r\ngamma\r\n", "header\nalpha\r\nBETA\r\ngamma\r\n"],
+			["progress\rupdate\nkeep\ntarget\n", "progress\rupdate\nkeep\nTARGET\n"],
+		])("preserves untouched mixed line endings", async (original, expected) => {
+			const context = createContext();
+			getOrThrow(await context.env.writeFile("mixed.txt", original));
+
+			const result = await createEditTool().execute(
+				"edit-mixed",
+				{
+					path: "mixed.txt",
+					edits: [
+						{
+							oldText: original.includes("beta") ? "beta" : "target",
+							newText: original.includes("beta") ? "BETA" : "TARGET",
+						},
+					],
+				},
+				undefined,
+				undefined,
+				context,
+			);
+
+			expect(getOrThrow(await context.env.readTextFile("mixed.txt"))).toBe(expected);
+			expect(applyPatch(original, result.details?.patch ?? "")).toBe(expected);
+		});
+
+		it.each([
+			["one\r\n“target”\r\nthree\r\n", "one\r\nDONE\r\nthree\r\n"],
+			["progress\rupdate\n“target”\n", "progress\rupdate\nDONE\n"],
+		])("preserves untouched CRLF and lone CR bytes during fuzzy matches", async (original, expected) => {
+			const context = createContext();
+			getOrThrow(await context.env.writeFile("fuzzy-eol.txt", original));
+
+			const result = await createEditTool().execute(
+				"edit-fuzzy-eol",
+				{ path: "fuzzy-eol.txt", edits: [{ oldText: '"target"', newText: "DONE" }] },
+				undefined,
+				undefined,
+				context,
+			);
+
+			expect(getOrThrow(await context.env.readTextFile("fuzzy-eol.txt"))).toBe(expected);
+			expect(applyPatch(original, result.details?.patch ?? "")).toBe(expected);
+		});
+
+		it.each([
+			["a\r\nb\r\n", "b", "B\nC", "a\r\nB\r\nC\r\n"],
+			["progress\rkeep\r\n“target”\r\n", '"target"', "DONE\nNEXT", "progress\rkeep\r\nDONE\r\nNEXT\r\n"],
+		])(
+			"uses the file line ending for multiline replacements without changing untouched bytes",
+			async (original, oldText, newText, expected) => {
+				const context = createContext();
+				getOrThrow(await context.env.writeFile("multiline-eol.txt", original));
+
+				const result = await createEditTool().execute(
+					"edit-multiline-eol",
+					{ path: "multiline-eol.txt", edits: [{ oldText, newText }] },
+					undefined,
+					undefined,
+					context,
+				);
+
+				expect(getOrThrow(await context.env.readTextFile("multiline-eol.txt"))).toBe(expected);
+				expect(applyPatch(original, result.details?.patch ?? "")).toBe(expected);
+			},
+		);
 
 		it("preserves BOM and CRLF line endings", async () => {
 			const context = createContext();

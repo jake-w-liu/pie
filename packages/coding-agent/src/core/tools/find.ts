@@ -1,4 +1,3 @@
-import { createInterface } from "node:readline";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Text } from "@earendil-works/pi-tui";
 import { spawn } from "child_process";
@@ -44,6 +43,11 @@ export type FindToolInput = Static<typeof findSchema>;
 const DEFAULT_LIMIT = 1000;
 // Upper bound so a garbage limit cannot turn a listing into an unbounded scan.
 const MAX_LIMIT = 100_000;
+
+export function getFindProcessError(code: number | null, stderr: string): Error | undefined {
+	if (code === 0) return undefined;
+	return new Error(stderr.trim() || `fd exited with code ${code}`);
+}
 
 function sanitizeLimit(limit: number | undefined): number {
 	if (limit === undefined || !Number.isFinite(limit)) return DEFAULT_LIMIT;
@@ -239,7 +243,7 @@ export function createFindToolDefinition(
 							return;
 						}
 
-						const args: string[] = ["--glob", "--color=never", "--hidden"];
+						const args: string[] = ["--glob", "--color=never", "--hidden", "--exclude", ".git", "--print0"];
 
 						// fd normally ignores .gitignore outside git repos, so keep --no-require-git
 						// there. Inside repos, use fd's default git-aware behavior so parent
@@ -282,8 +286,8 @@ export function createFindToolDefinition(
 						args.push("--", effectivePattern, searchPath);
 
 						const child = spawn(fdPath, args, { stdio: ["ignore", "pipe", "pipe"] });
-						const rl = createInterface({ input: child.stdout });
 						let stderr = "";
+						let pending = "";
 						const lines: string[] = [];
 
 						stopChild = () => {
@@ -292,36 +296,36 @@ export function createFindToolDefinition(
 							}
 						};
 
-						const cleanup = () => {
-							rl.close();
-						};
-
 						child.stderr?.on("data", (chunk) => {
 							stderr += chunk.toString();
 						});
 
-						rl.on("line", (line) => {
-							lines.push(line);
+						child.stdout.setEncoding("utf8");
+						child.stdout.on("data", (chunk: string) => {
+							pending += chunk;
+							let separator = pending.indexOf("\0");
+							while (separator !== -1) {
+								lines.push(pending.slice(0, separator));
+								pending = pending.slice(separator + 1);
+								separator = pending.indexOf("\0");
+							}
 						});
 
 						child.on("error", (error) => {
-							cleanup();
 							settle(() => reject(new Error(`Failed to run fd: ${error.message}`)));
 						});
 
 						child.on("close", (code) => {
-							cleanup();
+							if (pending) lines.push(pending);
 							if (signal?.aborted) {
 								settle(() => reject(new Error("Operation aborted")));
 								return;
 							}
 							const output = lines.join("\n");
-							if (code !== 0) {
-								const errorMsg = stderr.trim() || `fd exited with code ${code}`;
-								if (!output) {
-									settle(() => reject(new Error(errorMsg)));
-									return;
-								}
+							const processError = getFindProcessError(code, stderr);
+							if (processError) {
+								settle(() => reject(processError));
+								return;
 							}
 							if (!output) {
 								settle(() =>
@@ -334,8 +338,7 @@ export function createFindToolDefinition(
 							}
 
 							const relativized: string[] = [];
-							for (const rawLine of lines) {
-								const line = rawLine.replace(/\r$/, "").trim();
+							for (const line of lines) {
 								if (!line) continue;
 								relativized.push(relativizeFindResultPath(line, searchPath));
 							}

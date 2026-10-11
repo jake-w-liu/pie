@@ -166,8 +166,7 @@ export const stream: StreamFunction<"mistral-conversations", MistralOptions> = (
 			stream.end();
 		} catch (error) {
 			for (const block of output.content) {
-				// partialArgs is only a streaming scratch buffer; never persist it.
-				delete (block as { partialArgs?: string }).partialArgs;
+				stripToolCallScratch(block);
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = formatMistralError(error);
@@ -233,6 +232,13 @@ function createOutput(model: Model<"mistral-conversations">): AssistantMessage {
 	};
 }
 
+function stripToolCallScratch(block: AssistantMessage["content"][number]): void {
+	if (block.type !== "toolCall") return;
+	const streamingBlock = block as ToolCall & { partialArgs?: string; parsedArgsLength?: number };
+	delete streamingBlock.partialArgs;
+	delete streamingBlock.parsedArgsLength;
+}
+
 function createMistralToolCallIdNormalizer(): (id: string) => string {
 	const idMap = new Map<string, string>();
 	const reverseMap = new Map<string, string>();
@@ -262,6 +268,7 @@ function deriveMistralToolCallId(id: string, attempt: number): string {
 	const seed = attempt === 0 ? seedBase : `${seedBase}:${attempt}`;
 	return shortHash(seed)
 		.replace(/[^a-zA-Z0-9]/g, "")
+		.padEnd(MISTRAL_TOOL_CALL_ID_LENGTH, "0")
 		.slice(0, MISTRAL_TOOL_CALL_ID_LENGTH);
 }
 
@@ -696,10 +703,8 @@ async function consumeChatStream(
 		if (block.type !== "toolCall") continue;
 		const toolBlock = block as ToolCall & { partialArgs?: string; parsedArgsLength?: number };
 		toolBlock.arguments = parseStreamingJson<Record<string, unknown>>(toolBlock.partialArgs);
-		// Finalize in-place and strip the scratch buffer so replay only
-		// carries parsed arguments.
-		delete toolBlock.partialArgs;
-		delete toolBlock.parsedArgsLength;
+		// Finalize in-place and strip scratch state so replay only carries parsed arguments.
+		stripToolCallScratch(toolBlock);
 		stream.push({
 			type: "toolcall_end",
 			contentIndex: index,

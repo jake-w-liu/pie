@@ -103,11 +103,12 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
 				output.responseId ||= chunk.responseId;
 				const candidate = chunk.candidates?.[0];
 				if (candidate?.content?.parts) {
-					for (const part of candidate.content.parts) {
+					for (const [partIndex, part] of candidate.content.parts.entries()) {
 						if (part.text !== undefined) {
 							const isThinking = isThinkingPart(part);
 							if (
 								!currentBlock ||
+								partIndex > 0 ||
 								(isThinking && currentBlock.type !== "thinking") ||
 								(!isThinking && currentBlock.type !== "text")
 							) {
@@ -220,6 +221,10 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
 					if (output.content.some((b) => b.type === "toolCall") && output.stopReason === "stop") {
 						output.stopReason = "toolUse";
 					}
+				}
+				if (chunk.promptFeedback?.blockReason) {
+					output.rawStopReason = chunk.promptFeedback.blockReason;
+					output.stopReason = "error";
 				}
 
 				if (chunk.usageMetadata) {

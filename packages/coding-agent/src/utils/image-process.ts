@@ -7,6 +7,8 @@ export interface ProcessImageOptions {
 	autoResizeImages?: boolean;
 	/** Optional resize overrides. Uses resizeImage defaults when omitted. */
 	resizeOptions?: ImageResizeOptions;
+	/** Cancels image decoding and resizing work. */
+	signal?: AbortSignal;
 }
 
 export type ProcessImageResult =
@@ -76,7 +78,9 @@ export async function processImage(
 	options?: ProcessImageOptions,
 ): Promise<ProcessImageResult> {
 	const autoResizeImages = options?.autoResizeImages ?? true;
+	options?.signal?.throwIfAborted();
 	const normalized = await normalizeImage(bytes, mimeType);
+	options?.signal?.throwIfAborted();
 	if (!normalized) {
 		return {
 			ok: false,
@@ -85,11 +89,12 @@ export async function processImage(
 	}
 
 	if (autoResizeImages) {
-		const resized = await resizeImage(normalized.bytes, normalized.mimeType, options?.resizeOptions);
+		const resized = await resizeImage(normalized.bytes, normalized.mimeType, options?.resizeOptions, options?.signal);
 		if (!resized) {
 			// resizeImage intentionally returns null for every failure mode. Blaming
 			// the size limit when the backend itself is missing sends reporters down
 			// the wrong path, so distinguish the two before giving up.
+			options?.signal?.throwIfAborted();
 			const engineAvailable = await loadPhoton();
 			return {
 				ok: false,

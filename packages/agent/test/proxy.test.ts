@@ -169,6 +169,38 @@ describe("streamProxy", () => {
 		});
 	});
 
+	it("reconstructs large tool arguments without reparsing every delta", async () => {
+		const value = "x".repeat(128 * 1024);
+		const json = JSON.stringify({ value });
+		const proxyEvents: ProxyAssistantMessageEvent[] = [
+			{ type: "start" },
+			{ type: "toolcall_start", contentIndex: 0, id: "large", toolName: "write" },
+			...Array.from({ length: Math.ceil(json.length / 32) }, (_, index) => ({
+				type: "toolcall_delta" as const,
+				contentIndex: 0,
+				delta: json.slice(index * 32, index * 32 + 32),
+			})),
+			{
+				type: "toolcall_end",
+				contentIndex: 0,
+				toolCall: { type: "toolCall", id: "large", name: "write", arguments: { value } },
+			},
+			{ type: "done", reason: "toolUse", usage },
+		];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => new Response(proxyEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""))),
+		);
+
+		const stream = streamProxy(model, { messages: [] }, { authToken: "token", proxyUrl: "https://proxy.invalid" });
+		const deltas: AssistantMessageEvent[] = [];
+		for await (const event of stream) if (event.type === "toolcall_delta") deltas.push(event);
+		const result = await stream.result();
+
+		expect(deltas).toHaveLength(Math.ceil(json.length / 32));
+		expect(result.content[0]).toMatchObject({ type: "toolCall", arguments: { value } });
+	}, 3000);
+
 	it("resolves result() with an error when the stream ends without a terminal event (regression: clean-EOF hang)", async () => {
 		// Server drops the connection after content but before a done/error event.
 		const proxyEvents: ProxyAssistantMessageEvent[] = [

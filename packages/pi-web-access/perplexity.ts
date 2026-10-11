@@ -5,6 +5,7 @@ import { hasCredentialSource, redactCredential, resolveCredential } from "./cred
 import { getWebSearchConfigPath , jsonParseDiagnostic } from "./utils.ts";
 
 const PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions";
+const SEARCH_TIMEOUT_MS = 30000;
 const CONFIG_PATH = getWebSearchConfigPath();
 
 const RATE_LIMIT = {
@@ -148,7 +149,9 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
 				"Content-Type": "application/json",
 			},
 			body: JSON.stringify(requestBody),
-			...(options.signal ? { signal: options.signal } : {}),
+			signal: options.signal
+				? AbortSignal.any([AbortSignal.timeout(SEARCH_TIMEOUT_MS), options.signal])
+				: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
 		});
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);

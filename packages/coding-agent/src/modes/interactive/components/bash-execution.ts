@@ -18,14 +18,22 @@ import { truncateToVisualLines } from "./visual-truncate.ts";
 // Preview line limit when not expanded (matches tool execution behavior)
 const PREVIEW_LINES = 20;
 
-function selectVisualTail(lines: string[], width: number, paddingX: number, maxVisualLines: number): string[] {
+function selectVisualTail(
+	lines: string[],
+	width: number,
+	paddingX: number,
+	maxVisualLines: number,
+): { lines: string[]; omitted: boolean } {
 	const contentWidth = Math.max(1, width - paddingX * 2);
 	const selected: string[] = [];
 	let remaining = maxVisualLines;
+	let firstSelectedIndex = lines.length;
+	let slicedFirstLine = false;
 	for (let index = lines.length - 1; index >= 0 && remaining > 0; index--) {
 		const line = lines[index]!;
 		const lineWidth = visibleWidth(line);
 		const visualLines = Math.max(1, Math.ceil(lineWidth / contentWidth));
+		firstSelectedIndex = index;
 		if (visualLines <= remaining) {
 			selected.unshift(line);
 			remaining -= visualLines;
@@ -33,9 +41,10 @@ function selectVisualTail(lines: string[], width: number, paddingX: number, maxV
 		}
 		const keepColumns = remaining * contentWidth;
 		selected.unshift(sliceByColumn(line, Math.max(0, lineWidth - keepColumns), keepColumns, true));
+		slicedFirstLine = true;
 		remaining = 0;
 	}
-	return selected;
+	return { lines: selected, omitted: firstSelectedIndex > 0 || slicedFirstLine };
 }
 
 function takeLastLogicalLines(text: string, maxLines: number): string[] {
@@ -72,14 +81,16 @@ export class BashExecutionComponent extends Container {
 	private fullOutputPath?: string;
 	private expanded = false;
 	private contentContainer: Container;
+	private readonly colorKey: "dim" | "bashMode";
+	private displayWidth?: number;
 
 	constructor(command: string, ui: TUI, excludeFromContext = false) {
 		super();
 		this.command = command;
 
 		// Use dim border for excluded-from-context commands (!! prefix)
-		const colorKey = excludeFromContext ? "dim" : "bashMode";
-		const borderColor = (str: string) => theme.fg(colorKey, str);
+		this.colorKey = excludeFromContext ? "dim" : "bashMode";
+		const borderColor = (str: string) => theme.fg(this.colorKey, str);
 
 		// Add spacer
 		this.addChild(new Spacer(1));
@@ -92,13 +103,13 @@ export class BashExecutionComponent extends Container {
 		this.addChild(this.contentContainer);
 
 		// Command header
-		const header = new Text(theme.fg(colorKey, theme.bold(`$ ${command}`)), 1, 0);
+		const header = new Text(theme.fg(this.colorKey, theme.bold(`$ ${command}`)), 1, 0);
 		this.contentContainer.addChild(header);
 
 		// Loader
 		this.loader = new Loader(
 			ui,
-			(spinner) => theme.fg(colorKey, spinner),
+			(spinner) => theme.fg(this.colorKey, spinner),
 			(text) => theme.fg("muted", text),
 			`Running... (${keyText("tui.select.cancel")} to cancel)`, // Plain text for loader
 		);
@@ -123,9 +134,10 @@ export class BashExecutionComponent extends Container {
 	}
 
 	override render(width: number): string[] {
-		if (this.displayDirty) {
-			this.updateDisplay();
+		if (this.displayDirty || this.displayWidth !== width) {
+			this.updateDisplay(width);
 			this.displayDirty = false;
+			this.displayWidth = width;
 		}
 		return super.render(width);
 	}
@@ -186,7 +198,7 @@ export class BashExecutionComponent extends Container {
 		this.displayDirty = true;
 	}
 
-	private updateDisplay(): void {
+	private updateDisplay(width: number): void {
 		this.compactOutputTail();
 		const totalLineCount = this.hasOutput ? this.totalLineBreaks + (this.outputEndsWithNewline ? 0 : 1) : 0;
 		const retainedLineCount = this.outputTail
@@ -200,12 +212,15 @@ export class BashExecutionComponent extends Container {
 		const hiddenLineCount = this.expanded
 			? Math.max(0, retainedLineCount - PREVIEW_LINES)
 			: Math.max(0, totalLineCount - previewLogicalLines.length);
+		const visualPreview = this.expanded
+			? { lines: previewLogicalLines, omitted: false }
+			: selectVisualTail(previewLogicalLines, width, 1, PREVIEW_LINES);
 
 		// Rebuild content container
 		this.contentContainer.clear();
 
 		// Command header
-		const header = new Text(theme.fg("bashMode", theme.bold(`$ ${this.command}`)), 1, 0);
+		const header = new Text(theme.fg(this.colorKey, theme.bold(`$ ${this.command}`)), 1, 0);
 		this.contentContainer.addChild(header);
 
 		// Output
@@ -221,7 +236,7 @@ export class BashExecutionComponent extends Container {
 				this.contentContainer.addChild({
 					render: (width: number) => {
 						if (cachedLines === undefined || cachedWidth !== width) {
-							const selected = selectVisualTail(previewLogicalLines, width, 1, PREVIEW_LINES);
+							const selected = selectVisualTail(previewLogicalLines, width, 1, PREVIEW_LINES).lines;
 							const styledOutput = selected.map((line) => theme.fg("muted", line)).join("\n");
 							const result = truncateToVisualLines(`\n${styledOutput}`, PREVIEW_LINES, width, 1);
 							cachedLines = result.visualLines;
@@ -244,14 +259,15 @@ export class BashExecutionComponent extends Container {
 			const statusParts: string[] = [];
 
 			// Show how many lines are hidden (collapsed preview)
-			if (hiddenLineCount > 0) {
+			if (hiddenLineCount > 0 || visualPreview.omitted) {
 				if (this.expanded) {
 					statusParts.push(
 						`${theme.fg("muted", "(")}${keyHint("app.tools.expand", "to collapse")}${theme.fg("muted", ")")}`,
 					);
 				} else {
+					const hiddenText = hiddenLineCount > 0 ? `... ${hiddenLineCount} more lines (` : "... more output (";
 					statusParts.push(
-						`${theme.fg("muted", `... ${hiddenLineCount} more lines (`)}${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`,
+						`${theme.fg("muted", hiddenText)}${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`,
 					);
 				}
 			}

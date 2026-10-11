@@ -177,6 +177,34 @@ END;
 		expect(db.closeCount).toBe(1);
 	});
 
+	it("installs the busy timeout before switching journal mode", async () => {
+		const root = createTempDir();
+		const base = createNodeSqliteFactory();
+		const execs: string[] = [];
+		const sqlite: SqliteDatabaseFactory = {
+			async open(path) {
+				const db = await base.open(path);
+				return {
+					exec(query) {
+						execs.push(query);
+						db.exec(query);
+					},
+					prepare: (query) => db.prepare(query),
+					transaction: (operation) => db.transaction(operation),
+					close: () => db.close(),
+				};
+			},
+		};
+		await using repository = new SqliteSessionRepository({
+			env: new NodeExecutionEnv({ cwd: root }),
+			sqlite,
+			databasePath: join(root, "sessions.sqlite"),
+		});
+
+		await repository.create({ cwd: root, id: "session-1" });
+		expect(execs.slice(0, 2)).toEqual(["PRAGMA busy_timeout=5000", "PRAGMA journal_mode=WAL"]);
+	});
+
 	it("closes the database when repository setup fails", async () => {
 		const root = createTempDir();
 		const { sqlite, counts } = createSetupFailureSqlite();
@@ -188,6 +216,8 @@ END;
 
 		await expect(repository.create({ cwd: root, id: "session-1" })).rejects.toThrow("setup failed");
 		expect(counts.closes).toBe(1);
+		await expect(repository.create({ cwd: root, id: "session-2" })).rejects.toThrow("setup failed");
+		expect(counts.closes).toBe(2);
 	});
 
 	it("closes active sessions when the repository is disposed", async () => {

@@ -30,7 +30,7 @@ import type {
 	ToolResultMessage,
 } from "../types.ts";
 import { splitDeferredTools } from "../utils/deferred-tools.ts";
-import { safeJsonStringify } from "../utils/error-body.ts";
+import { normalizeProviderError, safeJsonStringify } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { cancelResponseBody } from "../utils/http-response.ts";
@@ -178,10 +178,37 @@ type MessageCreateParamsStreamingWithFallbacks = MessageCreateParamsStreaming & 
 const FINE_GRAINED_TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14";
 const INTERLEAVED_THINKING_BETA = "interleaved-thinking-2025-05-14";
 const SERVER_SIDE_FALLBACK_BETA = "server-side-fallback-2026-07-01";
+const THINKING_BINDING_CONTROLS_BETA = "thinking-binding-controls-2026-08-01";
 
 function shouldUseServerSideFallbackBeta(model: Model<"anthropic-messages">): boolean {
 	return (model.compat?.allowedFallbackModels?.length ?? 0) > 0;
 }
+
+/**
+ * Anthropic signs each thinking block against the conversation that produced it, so a client
+ * that rewrites history it already sent (compaction, retroactive tool-result compression,
+ * branch switches, mid-session image blocking) invalidates every signature minted before the
+ * rewrite and gets a 400 for the whole request. The binding-controls beta makes the API drop
+ * the mismatched blocks itself, which keeps the turn alive and preserves the blocks that are
+ * still valid. First-party only: third-party Anthropic-compatible endpoints may reject the
+ * unknown request field, so those are repaired client-side by
+ * {@link stripSignedThinkingBlocks} instead.
+ */
+function shouldUseThinkingBindingControls(model: Model<"anthropic-messages">): boolean {
+	return model.provider === "anthropic";
+}
+
+/** Error text of the 400 Anthropic returns for a thinking block signed against other content. */
+const INVALID_THINKING_SIGNATURE_PATTERN = /Invalid `signature` in `thinking` block/;
+
+/**
+ * SDK 0.91.1 has no `block_binding` on the thinking config types; the field ships with the
+ * `thinking-binding-controls` beta, which older SDKs predate.
+ */
+type ThinkingBlockBinding = { prefix_mismatch_behavior: "drop_block" };
+type AnthropicThinkingConfig = NonNullable<MessageCreateParamsStreaming["thinking"]> & {
+	block_binding?: ThinkingBlockBinding;
+};
 
 function getAnthropicCompat(
 	model: Model<"anthropic-messages">,
@@ -437,9 +464,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				const created = createClient(
 					model,
 					apiKey,
-					options?.interleavedThinking ?? true,
-					shouldUseFineGrainedToolStreamingBeta(model, context),
-					shouldUseServerSideFallbackBeta(model),
+					resolveBetaFeatures(model, context, options),
 					options?.headers,
 					options?.fetch,
 					copilotDynamicHeaders,
@@ -458,14 +483,26 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 				maxRetries: 0,
 			};
-			response = await retryProviderRequest(
-				() => client.messages.create({ ...params, stream: true }, requestOptions).asResponse(),
-				{
-					maxRetries: options?.maxRetries,
-					maxRetryDelayMs: options?.maxRetryDelayMs,
-					signal: options?.signal,
-				},
-			);
+			const sendRequest = (requestParams: MessageCreateParamsStreaming) =>
+				retryProviderRequest(
+					() => client.messages.create({ ...requestParams, stream: true }, requestOptions).asResponse(),
+					{
+						maxRetries: options?.maxRetries,
+						maxRetryDelayMs: options?.maxRetryDelayMs,
+						signal: options?.signal,
+					},
+				);
+			try {
+				response = await sendRequest(params);
+			} catch (error) {
+				// A stale signature means history the model already saw was rewritten after those
+				// blocks were signed. Endpoints without the binding-control beta have no way to drop
+				// just those blocks, so replay the same turn with them removed instead of failing it.
+				const repaired = isInvalidThinkingSignatureError(error) ? stripSignedThinkingBlocks(params) : undefined;
+				if (!repaired) throw error;
+				params = repaired;
+				response = await sendRequest(params);
+			}
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
@@ -799,27 +836,12 @@ function isOAuthToken(apiKey: string): boolean {
 function createClient(
 	model: Model<"anthropic-messages">,
 	apiKey: string | undefined,
-	interleavedThinking: boolean,
-	useFineGrainedToolStreamingBeta: boolean,
-	useServerSideFallbackBeta: boolean,
+	betaFeatures: string[],
 	optionsHeaders?: ProviderHeaders,
 	fetch?: typeof globalThis.fetch,
 	dynamicHeaders?: Record<string, string>,
 	sessionId?: string,
 ): { client: Anthropic; isOAuthToken: boolean } {
-	// Adaptive thinking models have interleaved thinking built in, so skip the beta header.
-	const needsInterleavedBeta = interleavedThinking && model.compat?.forceAdaptiveThinking !== true;
-	const betaFeatures: string[] = [];
-	if (useFineGrainedToolStreamingBeta) {
-		betaFeatures.push(FINE_GRAINED_TOOL_STREAMING_BETA);
-	}
-	if (needsInterleavedBeta) {
-		betaFeatures.push(INTERLEAVED_THINKING_BETA);
-	}
-	if (useServerSideFallbackBeta) {
-		betaFeatures.push(SERVER_SIDE_FALLBACK_BETA);
-	}
-
 	// Copilot: Bearer auth, selective betas.
 	if (model.provider === "github-copilot") {
 		const client = new Anthropic({
@@ -986,9 +1008,17 @@ function buildParams(
 			// Default to "summarized" so Opus 4.7 and Mythos Preview behave like
 			// older Claude 4 models (whose API default is also "summarized").
 			const display: AnthropicThinkingDisplay = options.thinkingDisplay ?? "summarized";
+			// Signed thinking blocks die whenever history that was already sent gets rewritten;
+			// let the API drop the stale ones instead of rejecting the request. See
+			// shouldUseThinkingBindingControls.
+			const blockBinding = shouldUseThinkingBindingControls(model)
+				? ({ prefix_mismatch_behavior: "drop_block" } satisfies ThinkingBlockBinding)
+				: undefined;
 			if (model.compat?.forceAdaptiveThinking === true) {
 				// Adaptive thinking: Claude decides when and how much to think.
-				params.thinking = { type: "adaptive", display };
+				const adaptiveThinking: AnthropicThinkingConfig = { type: "adaptive", display };
+				if (blockBinding) adaptiveThinking.block_binding = blockBinding;
+				params.thinking = adaptiveThinking;
 				if (options.effort) {
 					// The Anthropic SDK types can lag newly supported effort values such as "xhigh".
 					params.output_config =
@@ -1000,11 +1030,13 @@ function buildParams(
 				}
 			} else {
 				// Budget-based thinking for older models
-				params.thinking = {
+				const budgetThinking: AnthropicThinkingConfig = {
 					type: "enabled",
 					budget_tokens: options.thinkingBudgetTokens || 1024,
 					display,
 				};
+				if (blockBinding) budgetThinking.block_binding = blockBinding;
+				params.thinking = budgetThinking;
 			}
 		} else if (options?.thinkingEnabled === false && model.thinkingLevelMap?.off !== null) {
 			params.thinking = { type: "disabled" };
@@ -1241,8 +1273,82 @@ function convertMessages(
 	return params;
 }
 
+/** True for the 400 Anthropic returns when a replayed thinking block was signed against other content. */
+function isInvalidThinkingSignatureError(error: unknown): boolean {
+	const { status, body, message } = normalizeProviderError(error);
+	if (status !== 400) return false;
+	return INVALID_THINKING_SIGNATURE_PATTERN.test(body ? `${message}\n${body}` : message);
+}
+
+/**
+ * Rebuild request params without the signed thinking blocks, so a request whose history was
+ * rewritten after those blocks were signed can still be answered.
+ *
+ * Signed `thinking` and `redacted_thinking` blocks are dropped: their signature is what makes
+ * them stale, and replaying the reasoning as text would put words in the assistant's mouth.
+ * Unsigned blocks were already sent as text, so they need no repair. Returns undefined when
+ * the request holds no signed block, so the caller can leave the original error alone.
+ */
+function stripSignedThinkingBlocks(
+	params: MessageCreateParamsStreamingWithFallbacks,
+): MessageCreateParamsStreamingWithFallbacks | undefined {
+	let changed = false;
+	const messages: MessageParam[] = [];
+	for (const message of params.messages) {
+		const content = message.content;
+		if (typeof content === "string") {
+			messages.push(message);
+			continue;
+		}
+		const blocks: ContentBlockParam[] = [];
+		for (const block of content) {
+			if (block.type === "redacted_thinking") {
+				changed = true;
+				continue;
+			}
+			// Unsigned blocks were already sent as text; only signed ones need repair.
+			if (block.type === "thinking" && typeof block.signature === "string" && block.signature.length > 0) {
+				changed = true;
+				continue;
+			}
+			blocks.push(block);
+		}
+		// Anthropic rejects empty content; a message whose only blocks were signed thinking disappears.
+		if (blocks.length === 0) continue;
+		messages.push({ ...message, content: blocks });
+	}
+	if (!changed) return undefined;
+	return { ...params, messages };
+}
+
 function shouldUseFineGrainedToolStreamingBeta(model: Model<"anthropic-messages">, context: Context): boolean {
 	return !!context.tools?.length && !getAnthropicCompat(model).supportsEagerToolInputStreaming;
+}
+
+/**
+ * Collect the `anthropic-beta` values for one request. Ordered as sent so the header is
+ * stable across requests of the same shape.
+ */
+function resolveBetaFeatures(
+	model: Model<"anthropic-messages">,
+	context: Context,
+	options: AnthropicOptions | undefined,
+): string[] {
+	const features: string[] = [];
+	if (shouldUseFineGrainedToolStreamingBeta(model, context)) {
+		features.push(FINE_GRAINED_TOOL_STREAMING_BETA);
+	}
+	// Adaptive thinking models have interleaved thinking built in, so skip the beta header.
+	if ((options?.interleavedThinking ?? true) && model.compat?.forceAdaptiveThinking !== true) {
+		features.push(INTERLEAVED_THINKING_BETA);
+	}
+	if (shouldUseServerSideFallbackBeta(model)) {
+		features.push(SERVER_SIDE_FALLBACK_BETA);
+	}
+	if (options?.thinkingEnabled === true && shouldUseThinkingBindingControls(model)) {
+		features.push(THINKING_BINDING_CONTROLS_BETA);
+	}
+	return [...new Set(features)];
 }
 
 function convertTools(

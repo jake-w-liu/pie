@@ -97,7 +97,7 @@ export async function execCommand(
 				if (options?.signal) {
 					options.signal.removeEventListener("abort", killProcess);
 				}
-				resolve({ stdout, stderr, code: code ?? 0, killed });
+				resolve({ stdout, stderr, code: code ?? 1, killed });
 			})
 			.catch((_err) => {
 				if (timeoutId) clearTimeout(timeoutId);

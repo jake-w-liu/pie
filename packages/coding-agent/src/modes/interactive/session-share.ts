@@ -195,7 +195,7 @@ async function shareViaGist(tmpFile: string, context: SessionShareContext): Prom
 	};
 
 	try {
-		const result = await new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve) => {
+		const result = await new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve, reject) => {
 			proc = spawn("gh", ["gist", "create", "--public=false", tmpFile]);
 			let stdout = "";
 			let stderr = "";
@@ -205,6 +205,7 @@ async function shareViaGist(tmpFile: string, context: SessionShareContext): Prom
 			proc.stderr?.on("data", (data) => {
 				stderr += data.toString();
 			});
+			proc.on("error", reject);
 			proc.on("close", (code) => resolve({ stdout, stderr, code }));
 		});
 

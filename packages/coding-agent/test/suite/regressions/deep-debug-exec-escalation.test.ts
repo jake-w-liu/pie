@@ -92,4 +92,18 @@ describe("extension command escalation", () => {
 		expect(missing.code).toBe(1);
 		expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
 	});
+
+	it.skipIf(process.platform === "win32")("reports a non-zero code for a signal-killed child", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const killed = await execCommand("sh", ["-c", "kill -9 $$"], harness.tempDir);
+		expect(killed.code).toBe(1);
+		expect(killed.killed).toBe(false);
+		const exit3 = await execCommand("sh", ["-c", "exit 3"], harness.tempDir);
+		expect(exit3.code).toBe(3);
+		expect(exit3.killed).toBe(false);
+		const exit0 = await execCommand("sh", ["-c", "exit 0"], harness.tempDir);
+		expect(exit0.code).toBe(0);
+		expect(exit0.killed).toBe(false);
+	});
 });

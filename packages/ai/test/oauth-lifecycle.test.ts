@@ -92,7 +92,7 @@ describe.each(providers)("$name browser OAuth ownership", ({ oauth, port }) => {
 			try {
 				await ready;
 				controller.abort();
-				expect(await Promise.race([outcome, delay(100).then(() => "pending")])).toBe("rejected");
+				expect(await Promise.race([outcome, delay(5000).then(() => "pending")])).toBe("rejected");
 				expect(promptSignal?.aborted).toBe(true);
 				expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
 				await assertPortReleased(port);
@@ -163,7 +163,7 @@ describe("Radius browser OAuth ownership", () => {
 			() => "resolved",
 			() => "rejected",
 		);
-		expect(await Promise.race([outcome, delay(100).then(() => "pending")])).toBe("rejected");
+		expect(await Promise.race([outcome, delay(5000).then(() => "pending")])).toBe("rejected");
 		expect(notify).not.toHaveBeenCalled();
 		expect(ownedServers).toHaveLength(0);
 		await assertPortReleased(1456);

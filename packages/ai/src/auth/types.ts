@@ -107,6 +107,8 @@ export interface AuthResult {
 	env?: ProviderEnv;
 	/** Human-readable label for status UI: "ANTHROPIC_API_KEY", "OAuth", "~/.aws/credentials". */
 	source?: string;
+	/** Access token of the stored OAuth credential this result was derived from. Identifies the credential for {@link AuthResolutionOverrides.rejectedOAuthAccess}. */
+	oauthAccess?: string;
 }
 
 export interface AuthCheck {

@@ -20,6 +20,12 @@ export interface AuthResolutionOverrides {
 	env?: ProviderEnv;
 	/** Require this much remaining OAuth-token validity; defaults to five minutes. */
 	minOAuthValidityMs?: number;
+	/**
+	 * Access token a provider just rejected (HTTP 401). A stored OAuth credential still
+	 * holding it is refreshed even if its expiry says it is fresh, while one already
+	 * rotated by another request or process is used as is.
+	 */
+	rejectedOAuthAccess?: string;
 	signal?: AbortSignal;
 }
 
@@ -101,6 +107,7 @@ async function resolveProviderAuthWithSignal(
 				stored,
 				signal,
 				overrides?.minOAuthValidityMs,
+				overrides?.rejectedOAuthAccess,
 			);
 		}
 		if (stored.type === "api_key" && provider.auth.apiKey) {
@@ -154,13 +161,16 @@ async function resolveStoredOAuth(
 	stored: OAuthCredential,
 	signal: AbortSignal,
 	minOAuthValidityMs?: number,
+	rejectedOAuthAccess?: string,
 ): Promise<AuthResult | undefined> {
 	const minimumValidityMs = Math.max(DEFAULT_OAUTH_MINIMUM_VALIDITY_MS, minOAuthValidityMs ?? 0);
 	// A credential whose expiry cannot be evaluated (a hand-edited, migrated, or
 	// partially written auth.json) must be treated as expired, not fresh: the
 	// relational comparison is false for undefined/null/NaN, which would disable
 	// refresh permanently and hand out a dead access token with no re-login prompt.
-	const expiresSoon = (credential: OAuthCredential) => !isCredentialFresh(credential, minimumValidityMs);
+	const expiresSoon = (credential: OAuthCredential) =>
+		!isCredentialFresh(credential, minimumValidityMs) ||
+		(rejectedOAuthAccess !== undefined && credential.access === rejectedOAuthAccess);
 	let credential = stored;
 
 	if (expiresSoon(credential)) {
@@ -199,7 +209,7 @@ async function resolveStoredOAuth(
 	}
 
 	try {
-		return { auth: await oauth.toAuth(credential), source: "OAuth" };
+		return { auth: await oauth.toAuth(credential), source: "OAuth", oauthAccess: credential.access };
 	} catch (error) {
 		throw new ModelsError("oauth", `OAuth auth derivation failed for ${providerId}`, { cause: error });
 	}

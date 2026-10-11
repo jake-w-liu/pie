@@ -1,4 +1,4 @@
-import { lazyStream } from "./api/lazy.ts";
+import { lazyStream, lazyStreamWithOAuthRetry, type OAuthRetryAttempt } from "./api/lazy.ts";
 import { defaultProviderAuthContext as defaultAuthContext } from "./auth/context.ts";
 import { InMemoryCredentialStore } from "./auth/credential-store.ts";
 import {
@@ -662,15 +662,18 @@ class ModelsImpl implements MutableModels {
 	private async applyAuth<TOptions extends ProviderRequestOptions & ModelsRequestTransforms>(
 		model: Model<Api>,
 		options: TOptions | undefined,
+		attempt?: OAuthRetryAttempt,
 	): Promise<{
 		requestModel: Model<Api>;
 		requestOptions: Omit<TOptions, "transformHeaders"> & ProviderRequestOptions;
+		oauthAccess?: string;
 	}> {
 		this.requireProvider(model);
 		const resolution = await this.getAuth(model, {
 			apiKey: options?.apiKey,
 			env: options?.env,
 			signal: options?.signal,
+			rejectedOAuthAccess: attempt?.rejectedOAuthAccess,
 		});
 		if (!resolution) {
 			throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
@@ -687,7 +690,14 @@ class ModelsImpl implements MutableModels {
 		const requestOptions = { ...providerOptions, apiKey, headers, env } as Omit<TOptions, "transformHeaders"> &
 			ProviderRequestOptions;
 
-		return { requestModel, requestOptions };
+		// An explicit apiKey bypasses the stored credential, so there is no OAuth token to retry.
+		const oauthAccess =
+			options?.apiKey === undefined && resolution.source === "OAuth" ? resolution.oauthAccess : undefined;
+		if (attempt && oauthAccess !== undefined) {
+			requestOptions.fetch = attempt.observeFetch(options?.fetch);
+		}
+
+		return { requestModel, requestOptions, oauthAccess };
 	}
 
 	stream<TApi extends Api>(
@@ -695,16 +705,20 @@ class ModelsImpl implements MutableModels {
 		context: Context,
 		options?: ModelsApiStreamOptions<TApi>,
 	): AssistantMessageEventStream {
-		return lazyStream(
+		return lazyStreamWithOAuthRetry(
 			model,
-			async () => {
+			async (attempt) => {
 				const provider = this.requireProvider(model);
-				const { requestModel, requestOptions } = await this.applyAuth(
+				const { requestModel, requestOptions, oauthAccess } = await this.applyAuth(
 					model,
 					options as ModelsApiStreamOptions<Api> | undefined,
+					attempt,
 				);
 				options?.signal?.throwIfAborted();
-				return provider.stream(requestModel as Model<TApi>, context, requestOptions as ApiStreamOptions<TApi>);
+				return {
+					events: provider.stream(requestModel as Model<TApi>, context, requestOptions as ApiStreamOptions<TApi>),
+					oauthAccess,
+				};
 			},
 			options?.signal,
 		);
@@ -719,13 +733,16 @@ class ModelsImpl implements MutableModels {
 	}
 
 	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
-		return lazyStream(
+		return lazyStreamWithOAuthRetry(
 			model,
-			async () => {
+			async (attempt) => {
 				const provider = this.requireProvider(model);
-				const { requestModel, requestOptions } = await this.applyAuth(model, options);
+				const { requestModel, requestOptions, oauthAccess } = await this.applyAuth(model, options, attempt);
 				options?.signal?.throwIfAborted();
-				return provider.streamSimple(requestModel, context, requestOptions as SimpleStreamOptions);
+				return {
+					events: provider.streamSimple(requestModel, context, requestOptions as SimpleStreamOptions),
+					oauthAccess,
+				};
 			},
 			options?.signal,
 		);

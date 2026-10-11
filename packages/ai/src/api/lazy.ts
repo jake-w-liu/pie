@@ -1,4 +1,4 @@
-import type { Api, AssistantMessage, AssistantMessageEvent, Model, ProviderStreams } from "../types.ts";
+import type { Api, AssistantMessage, AssistantMessageEvent, FetchFunction, Model, ProviderStreams } from "../types.ts";
 import { safeJsonStringify } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 
@@ -39,6 +39,17 @@ async function forwardStream(
 	target.end(hasResult(source) ? await source.result() : undefined);
 }
 
+function pushSetupError(
+	target: AssistantMessageEventStream,
+	model: Model<Api>,
+	error: unknown,
+	signal?: AbortSignal,
+): void {
+	const message = createSetupErrorMessage(model, error, signal);
+	target.push({ type: "error", reason: signal?.aborted ? "aborted" : "error", error: message });
+	target.end(message);
+}
+
 /**
  * Returns a stream synchronously while running async setup (auth resolution,
  * lazy module loading) behind it. Setup failures terminate the stream with an
@@ -57,11 +68,119 @@ export function lazyStream(
 			return setup();
 		})
 		.then((inner) => forwardStream(outer, inner))
-		.catch((error) => {
-			const message = createSetupErrorMessage(model, error, signal);
-			outer.push({ type: "error", reason: signal?.aborted ? "aborted" : "error", error: message });
-			outer.end(message);
-		});
+		.catch((error) => pushSetupError(outer, model, error, signal));
+
+	return outer;
+}
+
+export interface OAuthRetryAttempt {
+	/** Set only on the retry: the access token the first attempt was rejected with. */
+	rejectedOAuthAccess?: string;
+	/** Wrap the request's fetch so an HTTP 401 response is observed. */
+	observeFetch(fetch: FetchFunction | undefined): FetchFunction;
+}
+
+export interface OAuthRetrySetupResult {
+	events: AsyncIterable<AssistantMessageEvent>;
+	/** From AuthResult.oauthAccess; undefined disables the retry. */
+	oauthAccess?: string;
+}
+
+/**
+ * Forwards the attempt's events, holding back leading `start` events until the first
+ * non-start event decides the outcome. When `retry` accepts that event, the held
+ * events are discarded and nothing from this attempt reaches the target; otherwise
+ * the held events are pushed and the rest forwards like {@link forwardStream}.
+ */
+async function forwardStreamWithRetry(
+	target: AssistantMessageEventStream,
+	source: AsyncIterable<AssistantMessageEvent>,
+	retry: (event: AssistantMessageEvent) => Promise<boolean>,
+): Promise<void> {
+	const held: AssistantMessageEvent[] = [];
+	const iterator = source[Symbol.asyncIterator]();
+	let decision: AssistantMessageEvent | undefined;
+	try {
+		while (true) {
+			const next = await iterator.next();
+			if (next.done) break;
+			if (next.value.type === "start") {
+				held.push(next.value);
+				continue;
+			}
+			decision = next.value;
+			break;
+		}
+		if (decision !== undefined && (await retry(decision))) {
+			return;
+		}
+		for (const event of held) {
+			target.push(event);
+		}
+		if (decision !== undefined) {
+			target.push(decision);
+		}
+		while (true) {
+			const next = await iterator.next();
+			if (next.done) break;
+			target.push(next.value);
+		}
+	} finally {
+		await iterator.return?.();
+	}
+	target.end(hasResult(source) ? await source.result() : undefined);
+}
+
+/**
+ * Like {@link lazyStream}, but the setup runs the request with a fetch wrapper that
+ * observes HTTP 401 responses. When the first attempt's terminal error follows a 401
+ * and setup reported an OAuth access token, the attempt is discarded (including its
+ * `start` and `error` events) and run once more with the rejected token so auth
+ * resolution can refresh it. The retry forwards normally; it is never retried itself.
+ */
+export function lazyStreamWithOAuthRetry(
+	model: Model<Api>,
+	setup: (attempt: OAuthRetryAttempt) => Promise<OAuthRetrySetupResult>,
+	signal?: AbortSignal,
+): AssistantMessageEventStream {
+	const outer = new AssistantMessageEventStream();
+
+	const createFetchObserver = () => {
+		let unauthorized = false;
+		const observeFetch =
+			(fetch: FetchFunction | undefined): FetchFunction =>
+			async (input, init) => {
+				const response = await (fetch ?? globalThis.fetch)(input, init);
+				if (response.status === 401) unauthorized = true;
+				return response;
+			};
+		return { observeFetch, wasUnauthorized: () => unauthorized };
+	};
+
+	Promise.resolve()
+		.then(async () => {
+			const first = createFetchObserver();
+			signal?.throwIfAborted();
+			const attempt = await setup({ observeFetch: first.observeFetch });
+			await forwardStreamWithRetry(outer, attempt.events, async (event) => {
+				if (
+					event.type !== "error" ||
+					!first.wasUnauthorized() ||
+					attempt.oauthAccess === undefined ||
+					signal?.aborted
+				) {
+					return false;
+				}
+				const second = createFetchObserver();
+				const retried = await setup({
+					rejectedOAuthAccess: attempt.oauthAccess,
+					observeFetch: second.observeFetch,
+				});
+				await forwardStream(outer, retried.events);
+				return true;
+			});
+		})
+		.catch((error) => pushSetupError(outer, model, error, signal));
 
 	return outer;
 }

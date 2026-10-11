@@ -18,6 +18,7 @@ import {
 	type DeferredFetchOptions,
 	type DeferredHandle,
 	lazyStream,
+	lazyStreamWithOAuthRetry,
 	type Model,
 	type Models,
 	type ModelsApiStreamOptions,
@@ -30,6 +31,7 @@ import {
 	type ModelsSimpleStreamOptions,
 	type ModelsStore,
 	type MutableModels,
+	type OAuthRetryAttempt,
 	type Provider,
 	type ProviderHeaders,
 	type ProviderRequestOptions,
@@ -87,6 +89,8 @@ export interface ModelRuntimeAuthOverrides extends AuthOperationOptions {
 	env?: Record<string, string>;
 	/** Require this much remaining OAuth-token validity; defaults to five minutes. */
 	minOAuthValidityMs?: number;
+	/** Access token a provider just rejected (HTTP 401); forces a refresh of the stored credential still holding it. */
+	rejectedOAuthAccess?: string;
 }
 
 export type CredentialSynchronizationOperation = "login" | "logout" | "setRuntimeApiKey" | "removeRuntimeApiKey";
@@ -571,10 +575,12 @@ export class ModelRuntime implements Models {
 	private async prepareRequest<TOptions extends ProviderRequestOptions & ModelsRequestTransforms>(
 		model: Model<Api>,
 		options: TOptions | undefined,
+		attempt?: OAuthRetryAttempt,
 	): Promise<{
 		provider: Provider;
 		model: Model<Api>;
 		options: Omit<TOptions, "transformHeaders"> & ProviderRequestOptions;
+		oauthAccess?: string;
 	}> {
 		const provider = this.models.getProvider(model.provider);
 		if (!provider) throw new ModelsError("provider", `Unknown provider: ${model.provider}`);
@@ -582,6 +588,7 @@ export class ModelRuntime implements Models {
 			apiKey: options?.apiKey,
 			env: options?.env,
 			signal: options?.signal,
+			rejectedOAuthAccess: attempt?.rejectedOAuthAccess,
 		});
 		if (!resolution) throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
 
@@ -593,15 +600,25 @@ export class ModelRuntime implements Models {
 			resolution.env || providerOptions.env
 				? { ...(resolution.env ?? {}), ...(providerOptions.env ?? {}) }
 				: undefined;
+		const requestOptions = {
+			...providerOptions,
+			apiKey: providerOptions.apiKey ?? resolution.auth.apiKey,
+			headers,
+			env,
+		} as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions;
+
+		// An explicit apiKey bypasses the stored credential, so there is no OAuth token to retry.
+		const oauthAccess =
+			options?.apiKey === undefined && resolution.source === "OAuth" ? resolution.oauthAccess : undefined;
+		if (attempt && oauthAccess !== undefined) {
+			requestOptions.fetch = attempt.observeFetch(options?.fetch);
+		}
+
 		return {
 			provider,
 			model: resolution.auth.baseUrl ? { ...model, baseUrl: resolution.auth.baseUrl } : model,
-			options: {
-				...providerOptions,
-				apiKey: providerOptions.apiKey ?? resolution.auth.apiKey,
-				headers,
-				env,
-			} as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions,
+			options: requestOptions,
+			oauthAccess,
 		};
 	}
 
@@ -610,17 +627,25 @@ export class ModelRuntime implements Models {
 		context: Context,
 		options?: ModelsApiStreamOptions<TApi>,
 	): AssistantMessageEventStream {
-		return lazyStream(model, async () => {
-			const prepared = await this.prepareRequest(
-				model,
-				options as (StreamOptions & ModelsRequestTransforms) | undefined,
-			);
-			return prepared.provider.stream(
-				prepared.model as Model<TApi>,
-				context,
-				prepared.options as ApiStreamOptions<TApi>,
-			);
-		});
+		return lazyStreamWithOAuthRetry(
+			model,
+			async (attempt) => {
+				const prepared = await this.prepareRequest(
+					model,
+					options as (StreamOptions & ModelsRequestTransforms) | undefined,
+					attempt,
+				);
+				return {
+					events: prepared.provider.stream(
+						prepared.model as Model<TApi>,
+						context,
+						prepared.options as ApiStreamOptions<TApi>,
+					),
+					oauthAccess: prepared.oauthAccess,
+				};
+			},
+			options?.signal,
+		);
 	}
 
 	complete<TApi extends Api>(
@@ -632,10 +657,17 @@ export class ModelRuntime implements Models {
 	}
 
 	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
-		return lazyStream(model, async () => {
-			const prepared = await this.prepareRequest(model, options);
-			return prepared.provider.streamSimple(prepared.model, context, prepared.options as SimpleStreamOptions);
-		});
+		return lazyStreamWithOAuthRetry(
+			model,
+			async (attempt) => {
+				const prepared = await this.prepareRequest(model, options, attempt);
+				return {
+					events: prepared.provider.streamSimple(prepared.model, context, prepared.options as SimpleStreamOptions),
+					oauthAccess: prepared.oauthAccess,
+				};
+			},
+			options?.signal,
+		);
 	}
 
 	completeSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): Promise<AssistantMessage> {

@@ -85,11 +85,16 @@ echo "Running tests without API keys in isolated home: $test_root/home"
 # on purpose, so build it back when it is missing.
 if [[ "${PI_SKIP_TEST_BUILD:-}" != "1" ]]; then
 	missing_build=false
-	for entry in packages/ai/dist/index.js packages/agent/dist/index.js packages/tui/dist/index.js packages/coding-agent/dist/index.js; do
-		[[ -f "$entry" ]] || missing_build=true
+	for package in ai agent tui coding-agent; do
+		entry="packages/$package/dist/index.js"
+		# A dist/ older than its sources fails the same way as a missing one: spawned
+		# CLIs import exports that the stale build does not have yet.
+		if [[ ! -f "$entry" ]] || [[ -n "$(find "packages/$package/src" -newer "$entry" -type f -print -quit)" ]]; then
+			missing_build=true
+		fi
 	done
 	if [[ "$missing_build" == true ]]; then
-		echo "Workspace dist/ is missing or incomplete; building for tests..."
+		echo "Workspace dist/ is missing, incomplete, or older than its sources; building for tests..."
 		if ! npm run build:offline; then
 			printf '%s\n' \
 				"error: workspace build failed before the tests could run." \

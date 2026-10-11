@@ -371,8 +371,12 @@ export function createEditToolDefinition(
 				throwIfAborted();
 
 				const finalContent = bom + restoreLineEndings(newContent, originalEnding);
+				// From here the edit has already landed. An abort that arrives while the
+				// write is in flight must not turn a committed change into a failure:
+				// the model would read "Operation aborted" as "nothing happened" and
+				// retry, which either errors on text that is already replaced or, worse,
+				// applies a second, unintended replacement.
 				await ops.writeFile(absolutePath, finalContent);
-				throwIfAborted();
 
 				const diffResult = generateDiffString(baseContent, newContent);
 				const patch = generateUnifiedPatch(path, baseContent, newContent);

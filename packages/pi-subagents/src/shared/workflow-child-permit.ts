@@ -35,7 +35,17 @@ interface WorkflowChildPermitRecord {
 	agent: string;
 	expectedProjectionDigest: string;
 	state: "available" | "claimed" | "consumed";
+	/**
+	 * Setup-abort auto-resume launches granted after the first attempt consumed the
+	 * permit. The retry is host-initiated (the workflow script cannot request it)
+	 * and only fires for a child that produced no usage, so it is bounded to one
+	 * per permit: a delegated workflow still cannot spawn unbounded children.
+	 */
+	resumedLaunches: number;
 }
+
+/** One host-initiated setup-abort retry per permit; nothing more. */
+const MAX_AUTO_RESUME_LAUNCHES = 1;
 
 const records = new WeakMap<object, WorkflowChildPermitRecord>();
 
@@ -71,6 +81,7 @@ export function createWorkflowChildPermit(input: WorkflowChildPermitInput): Work
 			runner: "pi",
 		}),
 		state: "available",
+		resumedLaunches: 0,
 	};
 	records.set(permit as object, record);
 	return permit;
@@ -100,13 +111,24 @@ export function consumeWorkflowChildPermit(permit: WorkflowChildPermit, launch: 
 	const record = records.get(permit as object);
 	if (!record) return "Workflow child permit is invalid.";
 	if (record.state === "available") return "Workflow child permit launch was not claimed.";
-	if (record.state === "consumed") return "Workflow child permit is already consumed.";
+	const isAutoResume = record.state === "consumed";
+	if (isAutoResume) {
+		// The first attempt already spawned. Allow the one bounded setup-abort retry
+		// for the same child, and nothing more.
+		if (record.resumedLaunches >= MAX_AUTO_RESUME_LAUNCHES) return "Workflow child permit is already consumed.";
+		if (record.childKey !== launch.childKey) return "Workflow child permit child key mismatch.";
+	}
+	// Every check runs before any state changes, so a launch that is refused for a
+	// mismatched projection cannot burn the single auto-resume allowance.
 	if (record.workflowRunId !== launch.workflowRunId) return "Workflow child permit does not match this workflow root.";
-	record.state = "consumed";
 	if (record.childKey !== launch.childKey) return "Workflow child permit child key mismatch.";
 	if (record.agent !== launch.agent) return "Workflow child permit agent mismatch.";
 	if (launch.runner !== "pi") return "Workflow child permit supports native Pi children only.";
-	if (record.expectedProjectionDigest !== projectionDigest(launch)) return "Workflow child permit does not match the final launch projection.";
+	if (record.expectedProjectionDigest !== projectionDigest(launch)) {
+		return "Workflow child permit does not match the final launch projection.";
+	}
+	if (isAutoResume) record.resumedLaunches++;
+	record.state = "consumed";
 	return undefined;
 }
 

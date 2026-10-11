@@ -149,11 +149,11 @@ describe("workflowScript admits a whole runs.all batch from one message", () => 
 		expect(admitted).toEqual([]);
 	}, 20_000);
 
-	it("keeps the setup-abort result instead of retrying a launch the one-use permit refuses", async () => {
-		// The setup-abort auto-resume re-launches the same key as a retained resume.
-		// A one-use permit covers exactly one native child launch and refuses
-		// retained resume, so the retry could only replace the real failure with a
-		// permit error that reads like a workflow policy decision.
+	it("retries a setup-abort launch through the one-use permit's bounded auto-resume", async () => {
+		// A child aborted during setup produced no usage and no work, so the host
+		// retries it once as a retained resume. The permit grants exactly one such
+		// host-initiated retry; without it the retry failed with a permit error that
+		// read like a policy decision the workflow never made.
 		const permit = createWorkflowChildPermit({
 			issuerPackage: "test",
 			workflowRunId: "wf",
@@ -180,7 +180,10 @@ describe("workflowScript admits a whole runs.all batch from one message", () => 
 			},
 			oneUsePermit: { claim: (key) => claimWorkflowChildPermit(permit, "wf", key) },
 		});
-		expect(launched).toHaveLength(1);
+		// The retry is host-initiated, so it needs no second claim, and the permit
+		// allows exactly one of them.
+		expect(launched).toHaveLength(2);
+		expect(launched[1]).toMatchObject({ resume: "run-1", task: "A" });
 		expect(result.emits).toEqual([{ error: "Run 'a' failed: This operation was aborted" }]);
 	}, 20_000);
 });

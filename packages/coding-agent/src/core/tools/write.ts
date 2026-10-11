@@ -225,8 +225,11 @@ export function createWriteToolDefinition(
 				throwIfAborted();
 
 				// Write the file contents.
+				// From here the write has already landed. An abort that arrives while it
+				// is in flight must not turn a committed write into a failure: the model
+				// would read "Operation aborted" as "nothing was written" and retry the
+				// same write.
 				await ops.writeFile(absolutePath, content);
-				throwIfAborted();
 
 				return {
 					content: [

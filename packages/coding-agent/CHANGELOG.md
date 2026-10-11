@@ -43,6 +43,7 @@
 - Raised the MLX provider local-model context ceiling from 32k to 128k so models with large native windows and a capable local server (e.g. 27B hybrid-attention 4-bit) are reported with up to 131072 tokens; models without a readable local config still default to 32k.
 
 ### Fixed
+- `edit` and `write` report the success they actually achieved when a cancellation lands while the atomic write is in flight. The write has already committed, so reporting "Operation aborted" made the model read it as "nothing happened" and retry into a failed match or a second, unintended replacement. A cancellation that arrives before the write still refuses without touching the file.
 - An extension dialog opened while another is still up disposes the superseded one, so its countdown interval cannot keep driving renders or later cancel whichever dialog is open by then.
 - `RpcClient.stop()` returns immediately when the agent process already exited instead of waiting out its one-second kill timeout after a crash or external kill.
 - `/share` exports each session into its own private temporary directory instead of a fixed, process-shared `$TMPDIR/session.jsonl` and `session.html`, so concurrent shares cannot overwrite each other's upload and another local user cannot pre-create the path as a symlink.

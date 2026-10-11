@@ -215,7 +215,10 @@ describe("built-in edit and write tools", () => {
 		expect(await resolvesWithin(secondWriteStarted.promise, 20)).toBe(false);
 
 		finishFirstWrite.resolve();
-		await expect(firstWrite).rejects.toThrow("Operation aborted");
+		// The write committed before the abort was observed, so the tool reports the
+		// success it actually achieved instead of inviting a retry of a write that
+		// already happened.
+		await expect(firstWrite).resolves.toBeDefined();
 		await secondWrite;
 
 		const content = await readFile(filePath, "utf8");
@@ -269,7 +272,7 @@ describe("built-in edit and write tools", () => {
 		expect(await resolvesWithin(secondWriteStarted.promise, 20)).toBe(false);
 
 		finishFirstWrite.resolve();
-		await expect(firstEdit).rejects.toThrow("Operation aborted");
+		await expect(firstEdit).resolves.toBeDefined();
 		await secondEdit;
 
 		const content = await readFile(filePath, "utf8");

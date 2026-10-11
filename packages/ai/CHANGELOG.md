@@ -51,6 +51,8 @@
 - Fixed fragmented Mistral tool calls splitting when continuation chunks omit the tool-call ID ([#8387](https://github.com/earendil-works/pi/issues/8387)).
 - Fixed DeepSeek V4 API costs being stale and added peak/off-peak time-of-day pricing (peak: 01:00-04:00 and 06:00-10:00 UTC Mon-Fri); model costs now carry `peak` rates and the cost calculator picks the active rate by current time.
 - Fixed model catalog refreshes dropping the Kimi For Coding provider after models.dev renamed its provider key to `kimi-code-plan-global`.
+- Fixed Anthropic turns whose signed thinking blocks went stale after history rewrites (compaction, branch switches) failing with a 400: first-party API requests now drop stale blocks via the thinking-binding-controls beta, and other Anthropic-compatible endpoints retry once with signed thinking removed.
+- Fixed a provider rejecting an OAuth token with HTTP 401 before its stored expiry now triggering one token refresh and retry instead of failing every request until re-login.
 
 ## [0.84.3] - 2026-08-24
 

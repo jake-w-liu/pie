@@ -14,7 +14,7 @@ import * as _bundledPiAiOauth from "@earendil-works/pi-ai/oauth";
 import * as _bundledPiAiProviders from "@earendil-works/pi-ai/providers/all";
 import type { KeyId } from "@earendil-works/pi-tui";
 import * as _bundledPiTui from "@earendil-works/pi-tui";
-import { createJiti } from "jiti/static";
+import type { createJiti } from "jiti/static";
 // Static imports of packages that extensions may use.
 // These MUST be static so Bun bundles them into the compiled binary.
 // The virtualModules option then makes them available to extensions.
@@ -151,6 +151,7 @@ type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 let extensionCacheCwd: string | undefined;
 let extensionCacheGeneration = 0;
 const extensionCache = new Map<string, ExtensionFactory>();
+let jitiFactory: Promise<typeof createJiti> | undefined;
 
 interface ExtensionCacheToken {
 	cwd: string;
@@ -542,7 +543,11 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 		}
 	}
 
-	const jiti = createJiti(import.meta.url, {
+	// jiti/static evaluates its bundled Babel on import and only TypeScript extension loads
+	// need it; the literal specifier keeps it bundled (approved no-dynamic-import exception).
+	jitiFactory ??= import("jiti/static").then((module) => module.createJiti);
+	const createJitiInstance = await jitiFactory;
+	const jiti = createJitiInstance(import.meta.url, {
 		moduleCache: false,
 		// Compiled binaries and the bundled Node distribution use embedded modules.
 		// Source TypeScript reuses host modules and root tsconfig paths. Unbundled

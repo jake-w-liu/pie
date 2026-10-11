@@ -41,6 +41,7 @@
 - Changed the default OpenAI and OpenAI Codex model to GPT-5.6 Sol.
 - Removed upstream application update checks, release notifications, self-update commands, and managed-installer update code; `pie update` now updates installed packages by default.
 - Raised the MLX provider local-model context ceiling from 32k to 128k so models with large native windows and a capable local server (e.g. 27B hybrid-attention 4-bit) are reported with up to 131072 tokens; models without a readable local config still default to 32k.
+- Changed jiti, the native clipboard addon, and syntax-highlight language registration to load on first use instead of at startup.
 
 ### Fixed
 - `edit` and `write` report the success they actually achieved when a cancellation lands while the atomic write is in flight. The write has already committed, so reporting "Operation aborted" made the model read it as "nothing happened" and retry into a failed match or a second, unintended replacement. A cancellation that arrives before the write still refuses without touching the file.
@@ -138,6 +139,8 @@
 - Fixed small-context retention preventing compaction, oversized summary requests and file tags, discarded tool-result tails, and lost or superseded checkpoints. Full file tracking remains in summary metadata.
 - Fixed failed session appends advancing the in-memory branch, and persisted summary usage across retries, cancellation, and incomplete multi-phase compaction without double-counting completed checkpoints.
 - Fixed print mode returning success after a context-limit stop and Perplexity accepting non-object JSON responses.
+- Fixed `pi.exec` reporting exit code 0 when the command was killed by a signal (including its own timeout/abort); it now reports 1.
+- Fixed `/share` via gist crashing on a `gh` launch failure; it now reports the failure.
 
 ## [0.84.3] - 2026-08-24
 

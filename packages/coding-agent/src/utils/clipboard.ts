@@ -1,7 +1,7 @@
 import { spawn } from "child_process";
 import { platform } from "os";
 import { isWaylandSession } from "./clipboard-image.ts";
-import { clipboard } from "./clipboard-native.ts";
+import { getClipboard } from "./clipboard-native.ts";
 
 /** Per-tool timeout: clipboard helpers must never wedge the TUI event loop. */
 const CLIPBOARD_TOOL_TIMEOUT_MS = 5000;
@@ -151,6 +151,7 @@ export async function readClipboardText(): Promise<string | null> {
 		}
 	}
 
+	const clipboard = getClipboard();
 	if (!clipboard) {
 		return null;
 	}
@@ -178,6 +179,7 @@ export async function copyToClipboard(text: string): Promise<void> {
 	// some X11 sessions the call resolves successfully without populating the
 	// clipboard. The platform tools below (wl-copy, xclip, xsel) properly
 	// daemonize and keep ownership.
+	const clipboard = getClipboard();
 	try {
 		if (clipboard && p !== "linux") {
 			await clipboard.setText(text);

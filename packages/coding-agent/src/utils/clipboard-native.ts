@@ -28,6 +28,9 @@ export function loadClipboardNative(
 	return null;
 }
 
-const clipboard = !process.env.TERMUX_VERSION && hasDisplay ? loadClipboardNative() : null;
-
-export { clipboard };
+let cachedClipboard: ClipboardModule | null | undefined;
+export function getClipboard(): ClipboardModule | null {
+	if (cachedClipboard === undefined)
+		cachedClipboard = !process.env.TERMUX_VERSION && hasDisplay ? loadClipboardNative() : null;
+	return cachedClipboard;
+}

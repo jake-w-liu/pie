@@ -44,8 +44,17 @@ const eagerLanguages = {
 	lua,
 };
 
-for (const [name, language] of Object.entries(eagerLanguages)) {
-	hljs.registerLanguage(name, language);
+let eagerLanguagesRegistered = false;
+
+function ensureEagerLanguages(): void {
+	if (eagerLanguagesRegistered) return;
+	eagerLanguagesRegistered = true;
+	// loadAllHighlightLanguages may already have registered the full set into the same core.
+	for (const [name, language] of Object.entries(eagerLanguages)) {
+		if (hljs.getLanguage(name) === undefined) {
+			hljs.registerLanguage(name, language);
+		}
+	}
 }
 
 let allLanguagesPromise: Promise<void> | undefined;
@@ -198,6 +207,7 @@ export function renderHighlightedHtml(html: string, theme: HighlightTheme = {}):
 }
 
 export function highlight(code: string, options: HighlightOptions = {}): string {
+	ensureEagerLanguages();
 	const html = options.language
 		? hljs.highlight(code, {
 				language: options.language,
@@ -208,5 +218,6 @@ export function highlight(code: string, options: HighlightOptions = {}): string 
 }
 
 export function supportsLanguage(name: string): boolean {
+	ensureEagerLanguages();
 	return hljs.getLanguage(name) !== undefined;
 }

@@ -188,6 +188,7 @@ Keep `retry.provider.maxRetries` at `0` unless provider-level retries are explic
 | `terminal.trueColor` | boolean or `"auto"` | `"auto"` | Override truecolor support (advanced, JSON-only) |
 | `images.autoResize` | boolean | `true` | Resize images to 2000x2000 max. Applies to `@file` attachments, `read`, and images returned by tools |
 | `images.blockImages` | boolean | `false` | Block all images from being sent to LLM |
+| `images.visionFallbackModel` | string | - | Model (`provider/id` or a model id) that describes images when the active model has no image input. Unset by default, so nothing is called. Advanced, JSON-only |
 
 ### Shell
 

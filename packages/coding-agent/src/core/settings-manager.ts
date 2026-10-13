@@ -51,6 +51,7 @@ export interface TerminalSettings {
 export interface ImageSettings {
 	autoResize?: boolean; // default: true (resize images to 2000x2000 max for better model compatibility)
 	blockImages?: boolean; // default: false - when true, prevents all images from being sent to LLM providers
+	visionFallbackModel?: string; // default: unset - "provider/id" used to describe images for models without image input
 }
 
 export interface ThinkingBudgetsSettings {
@@ -1304,6 +1305,11 @@ export class SettingsManager {
 		this.globalSettings.images.blockImages = blocked;
 		this.markModified("images", "blockImages");
 		this.save();
+	}
+
+	getImageVisionFallbackModel(): string | undefined {
+		const configured = this.settings.images?.visionFallbackModel;
+		return typeof configured === "string" && configured.trim() !== "" ? configured.trim() : undefined;
 	}
 
 	getEnabledModels(): string[] | undefined {

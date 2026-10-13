@@ -2955,7 +2955,10 @@ export class AgentSession {
 					]),
 				)
 			: createAllToolDefinitions(this._cwd, {
-					read: { autoResizeImages },
+					read: {
+						autoResizeImages,
+						visionFallbackModel: this.settingsManager.getImageVisionFallbackModel(),
+					},
 					bash: { commandPrefix: shellCommandPrefix, shellPath },
 				});
 

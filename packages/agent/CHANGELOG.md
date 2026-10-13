@@ -9,9 +9,17 @@
 
 ### Added
 
+- The harness `read` tool takes an optional `pdfTextExtractor` and a `pages` parameter, so hosts with a PDF parser (the coding-agent CLI injects one) can read PDFs through the same tool. Without an extractor, PDFs are reported as unsupported instead of being dumped as binary text.
+- Added shared read-tool guards in `harness/tools/text-file.ts`: path checks for device files and known binary extensions, content checks for NUL bytes, UTF-16, and image formats models cannot receive, plus `isPdfPath`/`isPdfContent`. They are exported for hosts that implement their own read tool.
 - Added a cross-process writer lease for JSONL sessions: opening a session for writing claims a sibling lock directory, renews a heartbeat while it is held, and can take over a lease whose holder stopped renewing, so two processes can no longer interleave appends into one session file. Read-only opens hold no claim, never repair the file, and refuse mutations.
 
+### Changed
+
+- The harness `read` tool description now documents PDF support and the `pages` parameter.
+
 ### Fixed
+
+- The harness `read` tool no longer returns raw binary text for files it cannot present as text: device files (`/dev/zero`, `/proc/*/fd/0-2`), binary extensions, NUL-byte content, UTF-16 files, and unsupported image formats (animated PNG, TIFF, JPEG 2000/JPEG-LS, ICO, HEIC/AVIF) now fail with an actionable message. The local execution environment already rejects FIFOs and other non-regular files.
 - Revalidated JSONL identities at admission, redirecting only after releasing stale file/directory queues and failing bounded repeated churn. Case-only generation replacement cannot leave a deleted writer unsealed or publish an independent stale-key writer; both-missing retargeted directory-alias deletion now selects the proved current owner without sealing the healthy historical owner.
 - Coordinated canonical JSONL publication with existing-file open/delete, including symlink aliases. Successful deletion now seals live writers without resurrecting headerless logs; failed deletions preserve usable handles and idle publication-queue records are reclaimed.
 - Reserved JSONL IDs by canonical session directory through create/fork publication, rejecting colliding cwd encodings, directory aliases, and occupied destinations without changing filenames or separate-directory namespaces.

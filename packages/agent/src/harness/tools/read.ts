@@ -11,6 +11,13 @@ import {
 } from "../utils/truncate.ts";
 import { detectSupportedImageMimeType, encodeBase64 } from "./image.ts";
 import { resolveReadToolPath } from "./path-utils.ts";
+import {
+	getUnreadableContentReason,
+	getUnreadablePathReason,
+	isPdfContent,
+	isPdfPath,
+	TEXT_SNIFF_BYTES,
+} from "./text-file.ts";
 import type { ExecutionToolContext } from "./tool-context.ts";
 
 const readSchema = Type.Object({
@@ -19,6 +26,7 @@ const readSchema = Type.Object({
 		Type.Number({ minimum: 1, multipleOf: 1, description: "Line number to start reading from (1-indexed)" }),
 	),
 	limit: Type.Optional(Type.Number({ minimum: 1, multipleOf: 1, description: "Maximum number of lines to read" })),
+	pages: Type.Optional(Type.String({ description: 'Page range for PDF files, for example "3", "1-5", or "10-"' })),
 });
 
 export type ReadToolInput = Static<typeof readSchema>;
@@ -37,11 +45,20 @@ export type ReadImageProcessor = (
 	options: { autoResizeImages: boolean },
 ) => Promise<ReadImageProcessorResult>;
 
+/** Extracts model-facing text for a PDF; hosts without a PDF parser omit it. */
+export type ReadPdfTextExtractor = (
+	bytes: Uint8Array,
+	pages: string | undefined,
+	signal?: AbortSignal,
+) => Promise<string>;
+
 export interface ReadToolOptions {
 	/** Whether an injected image processor should resize images. Default: true. */
 	autoResizeImages?: boolean;
 	/** Optional image conversion/resizing implementation. */
 	imageProcessor?: ReadImageProcessor;
+	/** Optional PDF text extraction implementation. PDFs are reported as unsupported without it. */
+	pdfTextExtractor?: ReadPdfTextExtractor;
 }
 
 export function createReadTool<TContext extends ExecutionToolContext = ExecutionToolContext>(
@@ -50,10 +67,12 @@ export function createReadTool<TContext extends ExecutionToolContext = Execution
 	return {
 		name: "read",
 		label: "read",
-		description: `Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.`,
+		description: `Read the contents of a file. Supports text files, images (jpg, png, gif, webp, bmp), and PDFs. Images are sent as attachments; PDFs are converted to text. For text files, output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.`,
 		parameters: readSchema,
-		async execute(_toolCallId, { path, offset, limit }, signal, _onUpdate, { env }) {
+		async execute(_toolCallId, { path, offset, limit, pages }, signal, _onUpdate, { env }) {
 			const absolutePath = await resolveReadToolPath(env, path, signal);
+			const pathReason = getUnreadablePathReason(absolutePath);
+			if (pathReason) throw new Error(pathReason);
 			const bytes = getOrThrow(await env.readBinaryFile(absolutePath, signal));
 			const mimeType = detectSupportedImageMimeType(bytes);
 			if (mimeType) {
@@ -95,6 +114,21 @@ export function createReadTool<TContext extends ExecutionToolContext = Execution
 					details: undefined,
 				};
 			}
+
+			const contentReason = getUnreadableContentReason(absolutePath, bytes.subarray(0, TEXT_SNIFF_BYTES));
+
+			if (isPdfPath(absolutePath) && isPdfContent(bytes.subarray(0, 1024))) {
+				const extractor = options?.pdfTextExtractor;
+				if (!extractor) {
+					throw new Error(`Cannot read ${absolutePath}: PDF support is not available in this environment.`);
+				}
+				return {
+					content: [{ type: "text", text: await extractor(bytes, pages, signal) }],
+					details: undefined,
+				};
+			}
+
+			if (contentReason) throw new Error(contentReason);
 
 			const textContent = new TextDecoder().decode(bytes);
 			const allLines = textContent.split("\n");

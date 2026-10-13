@@ -19,5 +19,14 @@ export {
 	type ReadToolInput,
 	type ReadToolOptions,
 } from "./read.ts";
+export {
+	getUnreadableContentReason,
+	getUnreadableFileKindReason,
+	getUnreadablePathReason,
+	isPdfContent,
+	isPdfPath,
+	type ReadFileKind,
+	TEXT_SNIFF_BYTES,
+} from "./text-file.ts";
 export type { ExecutionToolContext } from "./tool-context.ts";
 export { createWriteTool, type WriteToolInput } from "./write.ts";

@@ -15,6 +15,7 @@ import { getExperimentalToolSampling } from "../core/experimental.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "../core/system-prompt.ts";
 import { bashToolSystemPromptContribution } from "../core/tools/bash.ts";
 import { editToolSystemPromptContribution } from "../core/tools/edit.ts";
+import { extractPdfReadText } from "../core/tools/pdf-read.ts";
 import { readToolSystemPromptContribution } from "../core/tools/read.ts";
 import { writeToolSystemPromptContribution } from "../core/tools/write.ts";
 
@@ -98,10 +99,14 @@ export async function createCodingAgentHarness(options: CreateCodingAgentHarness
 		const metadata = await options.session.getMetadata();
 		const toolContext = { env } satisfies ExecutionToolContext;
 		tools = [
-			createCodingAgentHarnessTool(createReadTool<ExecutionToolContext>(), toolContext, {
-				promptSnippet: readToolSystemPromptContribution.snippet,
-				promptGuidelines: readToolSystemPromptContribution.guidelines,
-			}),
+			createCodingAgentHarnessTool(
+				createReadTool<ExecutionToolContext>({ pdfTextExtractor: extractPdfReadText }),
+				toolContext,
+				{
+					promptSnippet: readToolSystemPromptContribution.snippet,
+					promptGuidelines: readToolSystemPromptContribution.guidelines,
+				},
+			),
 			createCodingAgentHarnessTool(
 				createBashTool<ExecutionToolContext>({
 					commandPrefix: bashCommandPrefix,

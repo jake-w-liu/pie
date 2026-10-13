@@ -248,11 +248,17 @@ describe("formatPdfText", () => {
 });
 
 describe("pdf.js on a runtime without Promise.try", () => {
-	it("loads and extracts text after Promise.try is deleted", () => {
-		// pie supports Node 22, which has no Promise.try. pdf.js installs its own polyfill at load
-		// time; this runs in a child process so the deleted global cannot affect other tests.
+	it("loads and extracts text after the Node 24 helpers are removed", () => {
+		// pie supports Node 22, which lacks Promise.try, Promise.withResolvers,
+		// Map.prototype.getOrInsertComputed, Uint8Array.prototype.toHex, and Math.sumPrecise.
+		// pdf.js installs its own polyfills at load time; this runs in a child process so the
+		// cleared globals cannot affect other tests.
 		const script = [
-			"delete Promise.try;",
+			"Promise.try = undefined;",
+			"Promise.withResolvers = undefined;",
+			"Map.prototype.getOrInsertComputed = undefined;",
+			"Uint8Array.prototype.toHex = undefined;",
+			"Math.sumPrecise = undefined;",
 			'const { getDocumentProxy, getResolvedPDFJS } = await import("unpdf");',
 			"const pdfjs = await getResolvedPDFJS();",
 			"const bytes = new TextEncoder().encode(process.env.PROBE_PDF_TEXT);",
@@ -261,7 +267,7 @@ describe("pdf.js on a runtime without Promise.try", () => {
 			"const content = await page.getTextContent();",
 			"console.log(JSON.stringify({",
 			"  text: content.items.map((item) => item.str ?? '').join(' '),",
-			"  promiseTryAfterLoad: typeof Promise.try,",
+			"  polyfilled: { promiseTry: typeof Promise.try, withResolvers: typeof Promise.withResolvers },",
 			"}));",
 			"await pdf.loadingTask.destroy();",
 		].join("\n");
@@ -272,9 +278,13 @@ describe("pdf.js on a runtime without Promise.try", () => {
 			env: { ...process.env, PROBE_PDF_TEXT: buildPdf(["Promise.try probe"]).toString("utf8") },
 		});
 
-		const parsed = JSON.parse(stdout.trim()) as { text: string; promiseTryAfterLoad: string };
+		const parsed = JSON.parse(stdout.trim()) as {
+			text: string;
+			polyfilled: { promiseTry: string; withResolvers: string };
+		};
 		expect(parsed.text).toContain("Promise.try probe");
-		expect(parsed.promiseTryAfterLoad).toBe("function");
+		expect(parsed.polyfilled.promiseTry).toBe("function");
+		expect(parsed.polyfilled.withResolvers).toBe("function");
 	});
 });
 

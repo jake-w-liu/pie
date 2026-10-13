@@ -15,7 +15,8 @@
 
 ### Changed
 
-- The harness `read` tool description now documents PDF support and the `pages` parameter.
+- The harness `read` tool description now documents PDF support, the `pages` parameter, and its 32MB size limit.
+- The harness `read` tool refuses files above 32MB, directories, and special files (FIFO, socket, device) before reading them, resolving symlinks first so a symlink to a device cannot be opened. It buffers the whole file, so the limit bounds peak memory; the CLI read tool streams instead and has no such limit.
 
 ### Fixed
 

@@ -46,9 +46,42 @@ function sshExec(remote: string, command: string): Promise<Buffer> {
 
 function createRemoteReadOps(remote: string, remoteCwd: string, localCwd: string): ReadOperations {
 	const toRemote = (p: string) => p.replace(localCwd, remoteCwd);
+	const quoted = (p: string) => JSON.stringify(toRemote(p));
 	return {
-		readFile: (p) => sshExec(remote, `cat ${JSON.stringify(toRemote(p))}`),
-		access: (p) => sshExec(remote, `test -r ${JSON.stringify(toRemote(p))}`).then(() => {}),
+		readFile: (p) => sshExec(remote, `cat ${quoted(p)}`),
+		access: (p) => sshExec(remote, `test -r ${quoted(p)}`).then(() => {}),
+		// The optional capabilities let `read` reject FIFOs and oversized PDFs remotely and avoid
+		// reading a misnamed `.pdf` twice; without them only path- and content-based guards apply.
+		fileSize: async (p) => {
+			try {
+				const size = Number.parseInt((await sshExec(remote, `wc -c < ${quoted(p)}`)).toString().trim(), 10);
+				return Number.isSafeInteger(size) ? size : undefined;
+			} catch {
+				return undefined;
+			}
+		},
+		fileKind: async (p) => {
+			try {
+				const kind = (
+					await sshExec(
+						remote,
+						`if [ -d ${quoted(p)} ]; then echo directory; elif [ -f ${quoted(p)} ]; then echo file; else echo other; fi`,
+					)
+				)
+					.toString()
+					.trim();
+				return kind === "file" || kind === "directory" ? kind : "other";
+			} catch {
+				return undefined;
+			}
+		},
+		readHead: async (p, byteCount) => {
+			try {
+				return await sshExec(remote, `head -c ${byteCount} ${quoted(p)}`);
+			} catch {
+				return undefined;
+			}
+		},
 		detectImageMimeType: async (p) => {
 			try {
 				const r = await sshExec(remote, `file --mime-type -b ${JSON.stringify(toRemote(p))}`);

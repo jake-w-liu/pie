@@ -87,6 +87,25 @@ function createGondolinReadOps(vm: VM, localCwd: string): ReadOperations {
 		access: async (filePath) => {
 			await vm.fs.access(toGuestPath(localCwd, filePath));
 		},
+		// Report kind and size so `read` rejects FIFOs and oversized PDFs inside the VM instead of
+		// blocking or buffering them. The head reader is intentionally omitted: the probe falls back
+		// to one full read, so a misnamed `.pdf` is still only read once.
+		fileKind: async (filePath) => {
+			try {
+				const stat = await vm.fs.stat(toGuestPath(localCwd, filePath));
+				if (stat.isDirectory()) return "directory";
+				return stat.isFile() ? "file" : "other";
+			} catch {
+				return undefined;
+			}
+		},
+		fileSize: async (filePath) => {
+			try {
+				return (await vm.fs.stat(toGuestPath(localCwd, filePath))).size;
+			} catch {
+				return undefined;
+			}
+		},
 		detectImageMimeType: async (filePath) => {
 			const ext = path.posix.extname(toGuestPath(localCwd, filePath)).toLowerCase();
 			if (ext === ".png") return "image/png";

@@ -1,4 +1,4 @@
-import { writeFile } from "node:fs/promises";
+import { mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { NodeExecutionEnv } from "../../src/harness/env/nodejs.ts";
@@ -146,5 +146,32 @@ describe("harness read tool", () => {
 		const context = { env: new NodeExecutionEnv({ cwd }) };
 		const result = await createReadTool().execute("t1", { path: "notes.txt" }, undefined, undefined, context);
 		expect(JSON.stringify(result.content)).toContain("hello");
+	});
+
+	it("rejects directories and oversized files before reading them", async () => {
+		const cwd = createTempDir();
+		await mkdir(join(cwd, "nested"));
+		const context = { env: new NodeExecutionEnv({ cwd }) };
+		const tool = createReadTool();
+
+		await expect(tool.execute("s1", { path: "nested" }, undefined, undefined, context)).rejects.toThrow(
+			/is a directory/,
+		);
+
+		// 33 MiB of text is above the 32 MiB buffer limit; the file must be refused, not loaded.
+		const bigPath = join(cwd, "big.txt");
+		await writeFile(bigPath, "x".repeat(33 * 1024 * 1024));
+		await expect(tool.execute("s2", { path: "big.txt" }, undefined, undefined, context)).rejects.toThrow(
+			/size limit/,
+		);
+	});
+
+	it("rejects a symlink that points at a special file", async () => {
+		const cwd = createTempDir();
+		await symlink("/dev/zero", join(cwd, "zero.txt"));
+		const context = { env: new NodeExecutionEnv({ cwd }) };
+		await expect(createReadTool().execute("s3", { path: "zero.txt" }, undefined, undefined, context)).rejects.toThrow(
+			/special file|Unsupported file type/,
+		);
 	});
 });

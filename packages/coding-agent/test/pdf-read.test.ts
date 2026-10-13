@@ -1,6 +1,8 @@
+import { execFileSync } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
 	extractPdfText,
@@ -33,6 +35,21 @@ function buildPdf(pageTexts: string[]): Buffer {
 
 	objects.push(`${fontObjectNumber} 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj`);
 	return Buffer.from(`%PDF-1.4\n${objects.join("\n")}\ntrailer<</Root 1 0 R>>\n%%EOF\n`, "utf8");
+}
+
+/** Build a minimal encrypted PDF (standard security handler, RC4 40-bit, empty user password). */
+function buildEncryptedPdf(): Buffer {
+	const objects = [
+		"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj",
+		"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj",
+		"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents 4 0 R>>endobj",
+		"4 0 obj<</Length 0>>stream\n\nendstream\nendobj",
+		"5 0 obj<</Filter/Standard/V 1/R 2/O <000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f> /U <000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f> /P -44 /Length 40>>endobj",
+	];
+	return Buffer.from(
+		`%PDF-1.4\n${objects.join("\n")}\ntrailer<</Root 1 0 R/Encrypt 5 0 R/ID[<0102030405060708090a0b0c0d0e0f10><0102030405060708090a0b0c0d0e0f10>]>>\n%%EOF\n`,
+		"utf8",
+	);
 }
 
 const THREE_PAGE_PDF = buildPdf(["First page report", "Second page details", "Third page summary"]);
@@ -106,6 +123,13 @@ describe("extractPdfText", () => {
 		expect(result.ok).toBe(false);
 		if (result.ok) return;
 		expect(result.message).toContain("Could not read the PDF");
+	});
+
+	it("reports password-protected PDFs", async () => {
+		const result = await extractPdfText(buildEncryptedPdf());
+		expect(result.ok).toBe(false);
+		if (result.ok) return;
+		expect(result.message).toBe("PDF is password protected and cannot be read.");
 	});
 
 	it("honors an already-aborted signal", async () => {
@@ -220,6 +244,37 @@ describe("formatPdfText", () => {
 		});
 		expect(text.text).toContain("(no extractable text on this page)");
 		expect(text.includedPages).toBe(2);
+	});
+});
+
+describe("pdf.js on a runtime without Promise.try", () => {
+	it("loads and extracts text after Promise.try is deleted", () => {
+		// pie supports Node 22, which has no Promise.try. pdf.js installs its own polyfill at load
+		// time; this runs in a child process so the deleted global cannot affect other tests.
+		const script = [
+			"delete Promise.try;",
+			'const { getDocumentProxy, getResolvedPDFJS } = await import("unpdf");',
+			"const pdfjs = await getResolvedPDFJS();",
+			"const bytes = new TextEncoder().encode(process.env.PROBE_PDF_TEXT);",
+			"const pdf = await getDocumentProxy(bytes, { verbosity: pdfjs.VerbosityLevel.ERRORS });",
+			"const page = await pdf.getPage(1);",
+			"const content = await page.getTextContent();",
+			"console.log(JSON.stringify({",
+			"  text: content.items.map((item) => item.str ?? '').join(' '),",
+			"  promiseTryAfterLoad: typeof Promise.try,",
+			"}));",
+			"await pdf.loadingTask.destroy();",
+		].join("\n");
+
+		const stdout = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+			cwd: fileURLToPath(new URL("../../..", import.meta.url)),
+			encoding: "utf8",
+			env: { ...process.env, PROBE_PDF_TEXT: buildPdf(["Promise.try probe"]).toString("utf8") },
+		});
+
+		const parsed = JSON.parse(stdout.trim()) as { text: string; promiseTryAfterLoad: string };
+		expect(parsed.text).toContain("Promise.try probe");
+		expect(parsed.promiseTryAfterLoad).toBe("function");
 	});
 });
 

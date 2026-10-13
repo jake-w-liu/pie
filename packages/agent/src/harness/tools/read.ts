@@ -1,6 +1,6 @@
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
-import type { AgentHarnessTool } from "../types.ts";
+import type { AgentHarnessTool, ExecutionEnv } from "../types.ts";
 import { getOrThrow } from "../types.ts";
 import {
 	DEFAULT_MAX_BYTES,
@@ -13,12 +13,45 @@ import { detectSupportedImageMimeType, encodeBase64 } from "./image.ts";
 import { resolveReadToolPath } from "./path-utils.ts";
 import {
 	getUnreadableContentReason,
+	getUnreadableFileKindReason,
 	getUnreadablePathReason,
 	isPdfContent,
 	isPdfPath,
 	TEXT_SNIFF_BYTES,
 } from "./text-file.ts";
 import type { ExecutionToolContext } from "./tool-context.ts";
+
+/** Files above this size are rejected: this tool buffers the whole file (the CLI streams instead). */
+const MAX_READ_FILE_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Reject directories, special files, and oversized files before reading. `fileInfo` does not follow
+ * symlinks, so a symlink is resolved first: a symlink to a FIFO or device must never be opened.
+ */
+async function getUnreadableFileReason(
+	env: ExecutionEnv,
+	absolutePath: string,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
+	const info = getOrThrow(await env.fileInfo(absolutePath, signal));
+	// A resolved symlink reports the target's kind and size, which is what a read would use.
+	const target =
+		info.kind === "symlink"
+			? getOrThrow(await env.fileInfo(getOrThrow(await env.canonicalPath(absolutePath, signal)), signal))
+			: info;
+
+	const kindReason = getUnreadableFileKindReason(
+		absolutePath,
+		target.kind === "file" ? "file" : target.kind === "directory" ? "directory" : "other",
+	);
+	if (kindReason) return kindReason;
+
+	if (target.size > MAX_READ_FILE_BYTES) {
+		return `Cannot read ${absolutePath}: the file is ${formatSize(target.size)}, above the read tool's ${formatSize(MAX_READ_FILE_BYTES)} size limit. Use bash (for example \`head\`, \`sed -n\`, or \`rg\`) to inspect it.`;
+	}
+
+	return undefined;
+}
 
 const readSchema = Type.Object({
 	path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
@@ -67,12 +100,14 @@ export function createReadTool<TContext extends ExecutionToolContext = Execution
 	return {
 		name: "read",
 		label: "read",
-		description: `Read the contents of a file. Supports text files, images (jpg, png, gif, webp, bmp), and PDFs. Images are sent as attachments; PDFs are converted to text. For text files, output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.`,
+		description: `Read the contents of a file. Supports text files, images (jpg, png, gif, webp, bmp), and PDFs. Images are sent as attachments; PDFs are converted to text. For text files, output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Files larger than ${MAX_READ_FILE_BYTES / (1024 * 1024)}MB are rejected. Use offset/limit for large files. When you need the full file, continue with offset until complete.`,
 		parameters: readSchema,
 		async execute(_toolCallId, { path, offset, limit, pages }, signal, _onUpdate, { env }) {
 			const absolutePath = await resolveReadToolPath(env, path, signal);
 			const pathReason = getUnreadablePathReason(absolutePath);
 			if (pathReason) throw new Error(pathReason);
+			const fileReason = await getUnreadableFileReason(env, absolutePath, signal);
+			if (fileReason) throw new Error(fileReason);
 			const bytes = getOrThrow(await env.readBinaryFile(absolutePath, signal));
 			const mimeType = detectSupportedImageMimeType(bytes);
 			if (mimeType) {

@@ -76,11 +76,22 @@ export interface ReadOperations {
 	access: (absolutePath: string) => Promise<void>;
 	/** Detect image MIME type, return null or undefined for non-images */
 	detectImageMimeType?: (absolutePath: string) => Promise<string | null | undefined>;
-	/** Report the file size in bytes without reading the file, when the backend can. */
+	/**
+	 * Report the file size in bytes without reading the file, when the backend can. Used to refuse
+	 * oversized PDFs before buffering them.
+	 */
 	fileSize?: (absolutePath: string) => Promise<number | undefined>;
-	/** Classify the path without reading it, when the backend can. */
+	/**
+	 * Classify the path without reading it, when the backend can. Backends whose filesystem can hand
+	 * out FIFOs, sockets, or devices must implement this: without it, the read tool only rejects the
+	 * well-known device paths and cannot stop a blocking read.
+	 */
 	fileKind?: (absolutePath: string) => Promise<ReadFileKind | undefined>;
-	/** Read at most `byteCount` leading bytes, when the backend can. */
+	/**
+	 * Read at most `byteCount` leading bytes, when the backend can. This confirms a PDF header without
+	 * buffering the whole file; without it, a `.pdf` path is read once and reused as text when the
+	 * content turns out not to be a PDF.
+	 */
 	readHead?: (absolutePath: string, byteCount: number) => Promise<Uint8Array | undefined>;
 }
 
@@ -161,21 +172,27 @@ function getNonVisionImageNote(model: Model<Api> | undefined): string | undefine
 }
 
 /**
- * Read a PDF as text. Returns undefined when the path is not a PDF or the file turns out not
- * to be PDF content, so the caller can fall back to reading it as text.
+ * Read a PDF as text.
+ *
+ * Exactly one file read happens in every case. A path that ends in `.pdf` but holds other bytes
+ * reports `{ kind: "not-pdf" }` and the caller reads it as text; when the probe had to read the
+ * whole file anyway (a backend with no size or head capability), it hands that buffer back so the
+ * text path does not read the file a second time.
  */
-async function readPdfContent(
+async function probePdf(
 	ops: ReadOperations,
 	absolutePath: string,
 	pages: string | undefined,
 	signal: AbortSignal | undefined,
-): Promise<(TextContent | ImageContent)[] | undefined> {
+): Promise<
+	{ kind: "pdf"; content: (TextContent | ImageContent)[] } | { kind: "not-pdf"; buffer?: Buffer } | undefined
+> {
 	if (!isPdfPath(absolutePath)) return undefined;
 
-	// Confirm the header from a small read first: a text file that merely ends in `.pdf` stays
-	// readable as text, and an oversized non-PDF is not rejected by the PDF size guard.
+	// A backend that can read a small head confirms the header without a full read, so a misnamed
+	// `.pdf` is streamed as text instead of being buffered or rejected by the PDF size guard.
 	const head = ops.readHead ? await ops.readHead(absolutePath, 1024) : undefined;
-	if (head !== undefined && !isPdfContent(head)) return undefined;
+	if (head !== undefined && !isPdfContent(head)) return { kind: "not-pdf" };
 
 	const size = await ops.fileSize?.(absolutePath);
 	if (size !== undefined && size > MAX_PDF_BYTES) {
@@ -185,9 +202,8 @@ async function readPdfContent(
 	}
 
 	const buffer = await ops.readFile(absolutePath);
-	if (!isPdfContent(buffer)) return undefined;
-
-	return [{ type: "text", text: await extractPdfReadText(buffer, pages, signal) }];
+	if (!isPdfContent(buffer)) return { kind: "not-pdf", buffer };
+	return { kind: "pdf", content: [{ type: "text", text: await extractPdfReadText(buffer, pages, signal) }] };
 }
 
 const VISION_FALLBACK_INSTRUCTION =
@@ -522,7 +538,7 @@ export function createReadToolDefinition(
 							let content: (TextContent | ImageContent)[];
 							let details: ReadToolDetails | undefined;
 							const nonVisionImageNote = getNonVisionImageNote(ctx?.model);
-							const pdfContent = mimeType ? undefined : await readPdfContent(ops, absolutePath, pages, signal);
+							const pdfProbe = mimeType ? undefined : await probePdf(ops, absolutePath, pages, signal);
 							if (aborted) return;
 							if (mimeType) {
 								// Read image as binary.
@@ -572,8 +588,8 @@ export function createReadToolDefinition(
 										}
 									}
 								}
-							} else if (pdfContent) {
-								content = pdfContent;
+							} else if (pdfProbe?.kind === "pdf") {
+								content = pdfProbe.content;
 							} else {
 								// Read only the requested output window while still counting the file's
 								// lines. This keeps memory bounded for large, newline-heavy files.
@@ -582,13 +598,15 @@ export function createReadToolDefinition(
 								const retainedLineLimit = limit ?? DEFAULT_MAX_LINES + 1;
 								let allLines: string[];
 								let totalFileLines: number;
-								if (ops === defaultReadOperations) {
+								// A backend without a head read already has the bytes from the PDF probe.
+								const preloadedBuffer = pdfProbe?.kind === "not-pdf" ? pdfProbe.buffer : undefined;
+								if (ops === defaultReadOperations && preloadedBuffer === undefined) {
 									const window = await readTextWindow(absolutePath, startLine, retainedLineLimit, signal);
 									allLines = window.lines;
 									totalFileLines = window.totalLines || 1;
 									if (window.totalLines === 0 && startLine === 0) allLines = [""];
 								} else {
-									const buffer = await ops.readFile(absolutePath);
+									const buffer = preloadedBuffer ?? (await ops.readFile(absolutePath));
 									const contentReason = getUnreadableContentReason(
 										absolutePath,
 										buffer.subarray(0, TEXT_SNIFF_BYTES),

@@ -249,6 +249,15 @@ function hasSupervisorTool(run: AsyncRunSummary): boolean {
 		|| run.steps.some((step) => step.currentTool === "contact_supervisor" || step.currentTool === "intercom");
 }
 
+/**
+ * A child blocked in contact_supervisor is waiting for this parent's reply, and the request
+ * expires (PI_INTERCOM_ASK_TIMEOUT_MS, 10 minutes by default). It must end the wait on its own:
+ * waiting for a separate needs_attention flag let requests expire unanswered.
+ */
+function awaitsSupervisorReply(run: AsyncRunSummary): boolean {
+	return run.currentTool === "contact_supervisor" || run.steps.some((step) => step.currentTool === "contact_supervisor");
+}
+
 function backgroundWorkIdentity(item: RegisteredBackgroundWorkItem): string {
 	return `${item.provider}\0${item.sessionId}\0${item.id}`;
 }
@@ -560,6 +569,7 @@ export async function waitForSubagents(
 	let attention = active.filter((run) => needsAttention(run));
 
 	const isDone = (): boolean => {
+		if (active.some((run) => initialAsyncIds.has(run.id) && awaitsSupervisorReply(run))) return true;
 		if (attention.some((run) => initialAsyncIds.has(run.id) && (stopOnAttention || hasSupervisorTool(run)))) return true;
 		const activeAsyncIds = new Set(active.map((run) => run.id));
 		const activeProviderIds = new Set(providerActive.map(backgroundWorkIdentity));
@@ -633,7 +643,10 @@ export async function waitForSubagents(
 		return result(error instanceof Error ? error.message : String(error), true);
 	}
 
-	const relevantAttention = attention.filter((run) => initialAsyncIds.has(run.id));
+	const relevantAttention = [
+		...attention,
+		...active.filter((run) => awaitsSupervisorReply(run) && !attention.some((flagged) => flagged.id === run.id)),
+	].filter((run) => initialAsyncIds.has(run.id));
 	const supervisorAttentionHint = relevantAttention.some(hasSupervisorTool)
 		? " Reply to any pending supervisor request. If subagent_supervisor({ action: \"pending\" }) is empty, check intercom({ action: \"pending\" }) because an external intercom tool may own the request."
 		: "";

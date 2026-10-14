@@ -23,6 +23,7 @@ import type {
 	SubagentRunMode,
 } from "../../shared/types.ts";
 import { isAgentContractV1 } from "./agent-contract.ts";
+import { MAX_TIMER_DELAY_MS } from "../../shared/timer-limits.ts";
 import { createOwnedProcessTreeController, terminateSpawnedProcessTree, type OwnedProcessTreeController } from "../background/owned-process-tree.ts";
 import { classifyTaskMutationIntent, stripSeverityCompounds, taskMayMutate } from "./task-intent.ts";
 
@@ -263,8 +264,8 @@ export function validateAcceptanceInput(input: unknown, pathLabel = "acceptance"
 			}
 			if (typeof cmd.id !== "string" || !cmd.id.trim()) errors.push(`${pathLabel}.verify[${index}].id is required.`);
 			if (typeof cmd.command !== "string" || !cmd.command.trim()) errors.push(`${pathLabel}.verify[${index}].command is required.`);
-			if (cmd.timeoutMs !== undefined && (typeof cmd.timeoutMs !== "number" || !Number.isInteger(cmd.timeoutMs) || cmd.timeoutMs < 1)) {
-				errors.push(`${pathLabel}.verify[${index}].timeoutMs must be an integer >= 1.`);
+			if (cmd.timeoutMs !== undefined && (typeof cmd.timeoutMs !== "number" || !Number.isInteger(cmd.timeoutMs) || cmd.timeoutMs < 1 || cmd.timeoutMs > MAX_TIMER_DELAY_MS)) {
+				errors.push(`${pathLabel}.verify[${index}].timeoutMs must be an integer from 1 to ${MAX_TIMER_DELAY_MS}.`);
 			}
 			if (cmd.cwd !== undefined && typeof cmd.cwd !== "string") errors.push(`${pathLabel}.verify[${index}].cwd must be a string.`);
 			if (cmd.env !== undefined) {

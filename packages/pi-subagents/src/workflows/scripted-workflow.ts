@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
+import { MAX_TIMER_DELAY_MS } from "../shared/timer-limits.ts";
 
 const KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
@@ -1543,7 +1544,9 @@ function setupAbortResumeParams(params: Record<string, unknown>, result: Workflo
 
 export async function runWorkflowScript(options: RunWorkflowScriptOptions): Promise<WorkflowScriptResult> {
 	if (!options.script.trim()) throw new Error("workflowScript must not be empty.");
-	if (options.timeoutMs !== undefined && (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 1)) throw new Error("workflow script timeout must be a positive integer.");
+	if (options.timeoutMs !== undefined && (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 1 || options.timeoutMs > MAX_TIMER_DELAY_MS)) {
+		throw new Error(`workflow script timeout must be a positive integer no larger than ${MAX_TIMER_DELAY_MS}.`);
+	}
 
 	let acornPath: string;
 	try {

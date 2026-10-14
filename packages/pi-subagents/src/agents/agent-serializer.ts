@@ -1,5 +1,6 @@
 import { stringify as stringifyYaml } from "yaml";
 import type { AgentConfig } from "./agents.ts";
+import { parseFrontmatter } from "./frontmatter.ts";
 import { frontmatterNameForConfig } from "./identity.ts";
 
 export const KNOWN_FIELDS = new Set([
@@ -60,6 +61,27 @@ function pushYamlScalar(lines: string[], key: string, value: string): void {
 	const [first = "", ...rest] = encoded.split("\n");
 	lines.push(`${key}: ${first}`);
 	for (const line of rest) lines.push(`  ${line}`);
+}
+
+/**
+ * Unknown fields hold parseFrontmatter's text form of the original value: scalars as text,
+ * nested mappings and sequences as YAML. Re-emit that text verbatim when it reads back as
+ * the same string, which keeps numbers, booleans, and nested blocks unchanged for other
+ * tools. Otherwise emit a string scalar: `#ff8800` would read back as a comment (empty)
+ * and `owner: team` as a nested mapping that fails to parse.
+ */
+function pushExtraField(lines: string[], key: string, value: string): void {
+	const verbatim = value.includes("\n")
+		? [`${key}:`, ...value.split("\n").map((line) => `  ${line}`)]
+		: [`${key}: ${value}`];
+	let readsBack = false;
+	try {
+		readsBack = parseFrontmatter(`---\n${verbatim.join("\n")}\n---\n`).frontmatter[key] === value;
+	} catch {
+		// Invalid YAML as written verbatim; fall back to a string scalar below.
+	}
+	if (readsBack) lines.push(...verbatim);
+	else pushYamlScalar(lines, key, value);
 }
 
 interface SerializeAgentOptions {
@@ -168,15 +190,7 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	if (config.extraFields) {
 		for (const [key, value] of Object.entries(config.extraFields)) {
 			if (KNOWN_FIELDS.has(key)) continue;
-			if (typeof value === "string" && value.includes("\n")) {
-				// Multi-line block value (e.g. permission: nested YAML)
-				lines.push(`${key}:`);
-				for (const blockLine of value.split("\n")) {
-					lines.push(`  ${blockLine}`);
-				}
-			} else {
-				lines.push(`${key}: ${value}`);
-			}
+			pushExtraField(lines, key, value);
 		}
 	}
 

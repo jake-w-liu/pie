@@ -218,21 +218,35 @@ export function cleanupOldArtifacts(dir: string, maxAgeDays: number): void {
 	const maxAgeMs = maxAgeDays * 24 * 60 * 60 * 1000;
 	const cutoff = now - maxAgeMs;
 
-	for (const file of fs.readdirSync(dir)) {
-		if (file === CLEANUP_MARKER_FILE) continue;
-		const filePath = path.join(dir, file);
+	removeExpiredArtifacts(dir, cutoff, true);
+
+	fs.writeFileSync(markerPath, String(now));
+}
+
+/**
+ * Artifacts are also written to nested directories (outputs/<run>/, worktree-diffs/<run>/,
+ * permission-audit/, ...), so retention walks the tree. lstat keeps symlinks as entries:
+ * a link is removed by its own age and never followed outside the artifacts directory.
+ */
+function removeExpiredArtifacts(dir: string, cutoff: number, isRoot: boolean): void {
+	for (const name of fs.readdirSync(dir)) {
+		if (isRoot && name === CLEANUP_MARKER_FILE) continue;
+		const entryPath = path.join(dir, name);
 		try {
-			const stat = fs.statSync(filePath);
-			if (stat.mtimeMs < cutoff) {
-				fs.unlinkSync(filePath);
+			const stat = fs.lstatSync(entryPath);
+			if (stat.isDirectory()) {
+				removeExpiredArtifacts(entryPath, cutoff, false);
+				// stat predates the removals above: only a directory that nothing was added to
+				// since the cutoff is dropped, so a freshly created, still-empty one survives.
+				if (stat.mtimeMs < cutoff && fs.readdirSync(entryPath).length === 0) fs.rmdirSync(entryPath);
+			} else if (stat.mtimeMs < cutoff) {
+				fs.unlinkSync(entryPath);
 			}
 		} catch {
-			// Artifact cleanup is best-effort housekeeping. Skip files that disappear
+			// Artifact cleanup is best-effort housekeeping. Skip entries that disappear
 			// or become unreadable while scanning so one bad entry does not block the rest.
 		}
 	}
-
-	fs.writeFileSync(markerPath, String(now));
 }
 
 export function cleanupAllArtifactDirs(maxAgeDays: number): void {

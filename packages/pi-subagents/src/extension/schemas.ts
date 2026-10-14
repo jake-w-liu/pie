@@ -3,6 +3,7 @@
  */
 
 import { Type } from "typebox";
+import { MAX_TIMER_DELAY_MS } from "../shared/timer-limits.ts";
 
 function keepTopLevelParameterDescriptions<T>(schema: T): T {
 	return pruneNestedDescriptions(schema, []) as T;
@@ -322,8 +323,8 @@ const SubagentParamProperties = {
 		description: "'fresh' or 'fork' to branch from parent session, or 'profile' to require the selected agent's declared defaultContext. Explicit fresh/fork overrides every child; profile ignores config defaultSubagentContext and fails when an agent has no defaultContext. If omitted, config defaultSubagentContext wins over each agent defaultContext; implicit fork needs a persisted parent session and leaf, else fresh. Config forkContext may prune resolved forks before spawn without adding another context value.",
 	})),
 	async: Type.Optional(Type.Boolean({ description: "Run in background unless asyncByDefault:false. Set false only when the parent must block until completion. async:true cannot be combined with chatProgress:'live-card': that pair is rejected before any child starts, so pass chatProgress 'auto' or 'off' (or omit it) for async workflows." })),
-	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Timeout. Foreground and single async runs use config timeoutMs, else 30m; async composites have no default parent deadline. Alias maxRuntimeMs." })),
-	maxRuntimeMs: Type.Optional(Type.Integer({ minimum: 1, description: "Alias timeoutMs. Foreground and single async runs use config timeoutMs, else 30m; async composites have no default parent deadline." })),
+	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_TIMER_DELAY_MS, description: "Timeout. Foreground and single async runs use config timeoutMs, else 30m; async composites have no default parent deadline. Alias maxRuntimeMs." })),
+	maxRuntimeMs: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_TIMER_DELAY_MS, description: "Alias timeoutMs. Foreground and single async runs use config timeoutMs, else 30m; async composites have no default parent deadline." })),
 	toolTimeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Optional hard per-tool-call timeout in milliseconds; known-fast built-in tools have a five-minute default." })),
 	turnBudget: Type.Optional(TurnBudgetOverride),
 	toolBudget: Type.Optional(ToolBudgetOverride),

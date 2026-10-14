@@ -8,6 +8,7 @@ import type { ArtifactPaths, TimeoutRecoverySummary, TrackedMutationEvidence, Tr
 const MAX_TRACKED_PATHS = 500;
 const MAX_HASH_BYTES = 1024 * 1024;
 const MAX_TIMEOUT_FILES = 20;
+const MAX_UNAVAILABLE_REASON_CHARS = 200;
 
 function gitArguments(args: string[]): string[] {
 	// Mutation evidence must not block child startup on a stale fsmonitor daemon.
@@ -20,6 +21,20 @@ function gitOutput(cwd: string, args: string[], maxBuffer = MAX_HASH_BYTES): str
 
 function splitNul(output: string): string[] {
 	return output.split("\0").filter((part) => part.length > 0);
+}
+
+/**
+ * One-line reason for a failed git probe. An execFileSync error message embeds the whole
+ * stderr, e.g. git's multi-kilobyte `diff --no-index` usage text outside a repository,
+ * and this reason is shown to the parent in the timeout recovery summary.
+ */
+function describeGitFailure(error: unknown): string {
+	const stderr = (error as { stderr?: unknown } | undefined)?.stderr;
+	const stderrText = typeof stderr === "string" ? stderr : "";
+	if (/not a git repository/i.test(stderrText)) return "not a git repository";
+	const message = error instanceof Error ? error.message : String(error);
+	const line = `${stderrText}\n${message}`.split("\n").map((part) => part.trim()).find((part) => part.length > 0) ?? "git failed";
+	return line.length > MAX_UNAVAILABLE_REASON_CHARS ? `${line.slice(0, MAX_UNAVAILABLE_REASON_CHARS - 3)}...` : line;
 }
 
 function hashLargeDiff(cwd: string, relativePath: string): string {
@@ -71,7 +86,7 @@ export function snapshotTrackedMutations(cwd: string): TrackedMutationSnapshot {
 		for (const file of changed.paths) fingerprints[file] = fingerprintPath(cwd, file);
 		return { source: "tracked-files", trackedOnly: true, cwd, dirtyFiles: changed.paths, fingerprints, truncated: changed.truncated };
 	} catch (error) {
-		return { source: "tracked-files", trackedOnly: true, cwd, dirtyFiles: [], fingerprints: {}, unavailable: error instanceof Error ? error.message : String(error) };
+		return { source: "tracked-files", trackedOnly: true, cwd, dirtyFiles: [], fingerprints: {}, unavailable: describeGitFailure(error) };
 	}
 }
 
@@ -100,7 +115,7 @@ export function collectTrackedMutationEvidence(snapshot: TrackedMutationSnapshot
 			truncated: snapshot.truncated || current.truncated || undefined,
 		};
 	} catch (error) {
-		return { source: "tracked-files", trackedOnly: true, changedFiles: [], attemptedMutation: false, unavailable: error instanceof Error ? error.message : String(error) };
+		return { source: "tracked-files", trackedOnly: true, changedFiles: [], attemptedMutation: false, unavailable: describeGitFailure(error) };
 	}
 }
 

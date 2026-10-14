@@ -1498,6 +1498,13 @@ async function runSingleAttempt(
 					if (lifecycleFinished || processClosed) return;
 					trySignalChild(proc, "SIGTERM");
 				}, 1000).unref?.();
+				// The run deadline was cleared above, so this is the only bound left: a child whose
+				// graceful shutdown hangs ignores later signals (pi print mode does), and the tool
+				// call would stay pending forever. Same schedule as the timeout path.
+				setTimeout(() => {
+					if (lifecycleFinished || processClosed) return;
+					trySignalChild(proc, "SIGKILL");
+				}, 4000).unref?.();
 			};
 			if (options.interruptSignal.aborted) interrupt();
 			else {

@@ -7,7 +7,10 @@ import * as fs from "node:fs";
 import { parse as parseYaml } from "yaml";
 import * as os from "node:os";
 import * as path from "node:path";
+import { withStateFileLock } from "../missions/workflow-state.ts";
+import { writeAtomicJson } from "../shared/atomic-json.ts";
 import { getPackageRoot } from "../shared/package-root.ts";
+import { MAX_TIMER_DELAY_MS } from "../shared/timer-limits.ts";
 import type { AcceptanceInput, AcceptanceRole, AgentRunnerConfig, OutputMode, ToolBudgetConfig, TurnBudgetConfig } from "../shared/types.ts";
 import { CODE_OWNED_EXTERNAL_CLI_ADAPTER_LABEL, isCodeOwnedExternalCliAdapterId, parseExternalCliCapabilityNarrowing, validateCodeOwnedProfileRunner } from "../runs/shared/external-cli-contract.ts";
 import { getAgentDir, getProjectConfigDir } from "../shared/utils.ts";
@@ -849,9 +852,13 @@ function readSettingsFileStrict(filePath: string): Record<string, unknown> {
 	return parsed as Record<string, unknown>;
 }
 
+/**
+ * settings.json is shared with the coding agent and every other session. Callers hold
+ * withStateFileLock across the read-modify-write; tmp+rename means a crash or a concurrent
+ * reader never sees a truncated file. Same format as the coding agent's writer.
+ */
 function writeSettingsFile(filePath: string, settings: Record<string, unknown>): void {
-	fs.mkdirSync(path.dirname(filePath), { recursive: true });
-	fs.writeFileSync(filePath, JSON.stringify(settings, null, 2) + "\n", "utf-8");
+	writeAtomicJson(filePath, settings);
 }
 
 function parseOverrideStringArrayOrFalse(
@@ -1510,24 +1517,26 @@ export function removeBuiltinAgentOverride(cwd: string, name: string, scope: "us
 	if (!filePath) throw new Error("Project override is not available here. No project config root was found.");
 	if (!fs.existsSync(filePath)) return { path: filePath, removed: false };
 
-	const settings = readSettingsFileStrict(filePath);
-	const subagents = settings.subagents;
-	if (!subagents || typeof subagents !== "object" || Array.isArray(subagents)) return { path: filePath, removed: false };
-	const nextSubagents = { ...(subagents as Record<string, unknown>) };
-	const agentOverrides = nextSubagents.agentOverrides;
-	if (!agentOverrides || typeof agentOverrides !== "object" || Array.isArray(agentOverrides)) return { path: filePath, removed: false };
+	return withStateFileLock(filePath, () => {
+		const settings = readSettingsFileStrict(filePath);
+		const subagents = settings.subagents;
+		if (!subagents || typeof subagents !== "object" || Array.isArray(subagents)) return { path: filePath, removed: false };
+		const nextSubagents = { ...(subagents as Record<string, unknown>) };
+		const agentOverrides = nextSubagents.agentOverrides;
+		if (!agentOverrides || typeof agentOverrides !== "object" || Array.isArray(agentOverrides)) return { path: filePath, removed: false };
 
-	const nextOverrides = { ...(agentOverrides as Record<string, unknown>) };
-	if (!Object.prototype.hasOwnProperty.call(nextOverrides, name)) return { path: filePath, removed: false };
-	delete nextOverrides[name];
-	if (Object.keys(nextOverrides).length > 0) nextSubagents.agentOverrides = nextOverrides;
-	else delete nextSubagents.agentOverrides;
+		const nextOverrides = { ...(agentOverrides as Record<string, unknown>) };
+		if (!Object.prototype.hasOwnProperty.call(nextOverrides, name)) return { path: filePath, removed: false };
+		delete nextOverrides[name];
+		if (Object.keys(nextOverrides).length > 0) nextSubagents.agentOverrides = nextOverrides;
+		else delete nextSubagents.agentOverrides;
 
-	if (Object.keys(nextSubagents).length > 0) settings.subagents = nextSubagents;
-	else delete settings.subagents;
+		if (Object.keys(nextSubagents).length > 0) settings.subagents = nextSubagents;
+		else delete settings.subagents;
 
-	writeSettingsFile(filePath, settings);
-	return { path: filePath, removed: true };
+		writeSettingsFile(filePath, settings);
+		return { path: filePath, removed: true };
+	});
 }
 
 export function mergeBuiltinAgentOverride(
@@ -1539,23 +1548,25 @@ export function mergeBuiltinAgentOverride(
 	const filePath = scope === "project" ? getProjectAgentSettingsPath(cwd) : getUserAgentSettingsPath();
 	if (!filePath) throw new Error("Project override is not available here. No project config root was found.");
 
-	const settings = readSettingsFileStrict(filePath);
-	const subagents = settings.subagents && typeof settings.subagents === "object" && !Array.isArray(settings.subagents)
-		? { ...(settings.subagents as Record<string, unknown>) }
-		: {};
-	const agentOverrides = subagents.agentOverrides && typeof subagents.agentOverrides === "object" && !Array.isArray(subagents.agentOverrides)
-		? { ...(subagents.agentOverrides as Record<string, unknown>) }
-		: {};
+	return withStateFileLock(filePath, () => {
+		const settings = readSettingsFileStrict(filePath);
+		const subagents = settings.subagents && typeof settings.subagents === "object" && !Array.isArray(settings.subagents)
+			? { ...(settings.subagents as Record<string, unknown>) }
+			: {};
+		const agentOverrides = subagents.agentOverrides && typeof subagents.agentOverrides === "object" && !Array.isArray(subagents.agentOverrides)
+			? { ...(subagents.agentOverrides as Record<string, unknown>) }
+			: {};
 
-	const existing = agentOverrides[name];
-	const base = existing && typeof existing === "object" && !Array.isArray(existing)
-		? existing as Record<string, unknown>
-		: {};
-	agentOverrides[name] = { ...base, ...cloneOverrideValue(fields) };
-	subagents.agentOverrides = agentOverrides;
-	settings.subagents = subagents;
-	writeSettingsFile(filePath, settings);
-	return filePath;
+		const existing = agentOverrides[name];
+		const base = existing && typeof existing === "object" && !Array.isArray(existing)
+			? existing as Record<string, unknown>
+			: {};
+		agentOverrides[name] = { ...base, ...cloneOverrideValue(fields) };
+		subagents.agentOverrides = agentOverrides;
+		settings.subagents = subagents;
+		writeSettingsFile(filePath, settings);
+		return filePath;
+	});
 }
 
 export function removeBuiltinAgentOverrideFields(
@@ -1568,38 +1579,40 @@ export function removeBuiltinAgentOverrideFields(
 	if (!filePath) throw new Error("Project override is not available here. No project config root was found.");
 	if (!fs.existsSync(filePath)) return { path: filePath, removed: false };
 
-	const settings = readSettingsFileStrict(filePath);
-	const subagents = settings.subagents;
-	if (!subagents || typeof subagents !== "object" || Array.isArray(subagents)) return { path: filePath, removed: false };
-	const agentOverrides = (subagents as Record<string, unknown>).agentOverrides;
-	if (!agentOverrides || typeof agentOverrides !== "object" || Array.isArray(agentOverrides)) return { path: filePath, removed: false };
+	return withStateFileLock(filePath, () => {
+		const settings = readSettingsFileStrict(filePath);
+		const subagents = settings.subagents;
+		if (!subagents || typeof subagents !== "object" || Array.isArray(subagents)) return { path: filePath, removed: false };
+		const agentOverrides = (subagents as Record<string, unknown>).agentOverrides;
+		if (!agentOverrides || typeof agentOverrides !== "object" || Array.isArray(agentOverrides)) return { path: filePath, removed: false };
 
-	const entry = (agentOverrides as Record<string, unknown>)[name];
-	if (!entry || typeof entry !== "object" || Array.isArray(entry)) return { path: filePath, removed: false };
+		const entry = (agentOverrides as Record<string, unknown>)[name];
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) return { path: filePath, removed: false };
 
-	const nextEntry: Record<string, unknown> = { ...(entry as Record<string, unknown>) };
-	let removed = false;
-	for (const field of fields) {
-		if (Object.prototype.hasOwnProperty.call(nextEntry, field)) {
-			delete nextEntry[field];
-			removed = true;
+		const nextEntry: Record<string, unknown> = { ...(entry as Record<string, unknown>) };
+		let removed = false;
+		for (const field of fields) {
+			if (Object.prototype.hasOwnProperty.call(nextEntry, field)) {
+				delete nextEntry[field];
+				removed = true;
+			}
 		}
-	}
-	if (!removed) return { path: filePath, removed: false };
+		if (!removed) return { path: filePath, removed: false };
 
-	const nextSubagents = { ...(subagents as Record<string, unknown>) };
-	if (Object.keys(nextEntry).length > 0) {
-		(nextSubagents.agentOverrides as Record<string, unknown>)[name] = nextEntry;
-	} else {
-		const nextOverrides = { ...(agentOverrides as Record<string, unknown>) };
-		delete nextOverrides[name];
-		if (Object.keys(nextOverrides).length > 0) nextSubagents.agentOverrides = nextOverrides;
-		else delete nextSubagents.agentOverrides;
-	}
-	if (Object.keys(nextSubagents).length > 0) settings.subagents = nextSubagents;
-	else delete settings.subagents;
-	writeSettingsFile(filePath, settings);
-	return { path: filePath, removed: true };
+		const nextSubagents = { ...(subagents as Record<string, unknown>) };
+		if (Object.keys(nextEntry).length > 0) {
+			(nextSubagents.agentOverrides as Record<string, unknown>)[name] = nextEntry;
+		} else {
+			const nextOverrides = { ...(agentOverrides as Record<string, unknown>) };
+			delete nextOverrides[name];
+			if (Object.keys(nextOverrides).length > 0) nextSubagents.agentOverrides = nextOverrides;
+			else delete nextSubagents.agentOverrides;
+		}
+		if (Object.keys(nextSubagents).length > 0) settings.subagents = nextSubagents;
+		else delete settings.subagents;
+		writeSettingsFile(filePath, settings);
+		return { path: filePath, removed: true };
+	});
 }
 
 const DISCOVERY_PRUNED_DIR_NAMES = new Set([".git", "node_modules"]);
@@ -1823,14 +1836,22 @@ function validateExternalRunnerProfile(frontmatter: Record<string, string>, agen
 	}
 }
 
+/**
+ * parseFrontmatter hands nested mappings back as YAML text: the serializer's
+ * `turnBudget: {"maxTurns":10}` arrives as `maxTurns: 10`, which JSON.parse rejects.
+ * YAML is a superset of JSON, so quoted JSON strings still parse.
+ */
+function parseStructuredFrontmatterValue(raw: string, field: string, agentName: string): unknown {
+	try {
+		return parseYaml(raw) as unknown;
+	} catch (error) {
+		throw new Error(`Agent '${agentName}' has invalid ${field} frontmatter: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+	}
+}
+
 function parseAgentAcceptanceFrontmatter(raw: string | undefined, agentName: string): AcceptanceInput | undefined {
 	if (raw === undefined || !raw.trim()) return undefined;
-	let parsed: unknown;
-	try {
-		parsed = parseYaml(raw);
-	} catch (error) {
-		throw new Error(`Agent '${agentName}' has invalid acceptance frontmatter: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
-	}
+	const parsed = parseStructuredFrontmatterValue(raw, "acceptance", agentName);
 	const errors = validateAcceptanceInput(parsed, `Agent '${agentName}' acceptance frontmatter`);
 	if (errors.length > 0) throw new Error(errors.join(" "));
 	return parsed as AcceptanceInput;
@@ -1945,22 +1966,22 @@ function loadAgentsFromDefinitionFiles(files: AgentDefinitionFile[], source: Age
 		let defaultTimeoutMs: number | undefined;
 		if (frontmatter.timeoutMs !== undefined) {
 			const parsed = Number(frontmatter.timeoutMs);
-			if (!Number.isInteger(parsed) || parsed <= 0) {
-				throw new Error(`Agent '${localName}' has invalid timeoutMs frontmatter; expected a positive integer.`);
+			if (!Number.isInteger(parsed) || parsed <= 0 || parsed > MAX_TIMER_DELAY_MS) {
+				throw new Error(`Agent '${localName}' has invalid timeoutMs frontmatter; expected a positive integer no larger than ${MAX_TIMER_DELAY_MS}.`);
 			}
 			defaultTimeoutMs = parsed;
 		}
 		let defaultToolTimeoutMs: number | undefined;
 		if (frontmatter.toolTimeoutMs !== undefined) {
 			const parsed = Number(frontmatter.toolTimeoutMs);
-			if (!Number.isInteger(parsed) || parsed <= 0 || parsed > 2_147_483_647) {
-				throw new Error(`Agent '${localName}' has invalid toolTimeoutMs frontmatter; expected a positive integer no larger than 2147483647.`);
+			if (!Number.isInteger(parsed) || parsed <= 0 || parsed > MAX_TIMER_DELAY_MS) {
+				throw new Error(`Agent '${localName}' has invalid toolTimeoutMs frontmatter; expected a positive integer no larger than ${MAX_TIMER_DELAY_MS}.`);
 			}
 			defaultToolTimeoutMs = parsed;
 		}
 		let defaultTurnBudget: TurnBudgetConfig | undefined;
 		if (frontmatter.turnBudget !== undefined && frontmatter.turnBudget.trim()) {
-			const parsed = JSON.parse(frontmatter.turnBudget) as unknown;
+			const parsed = parseStructuredFrontmatterValue(frontmatter.turnBudget, "turnBudget", localName);
 			const resolved = resolveTurnBudgetConfig(parsed, `Agent '${localName}' turnBudget frontmatter`);
 			if (resolved.error) throw new Error(resolved.error);
 			defaultTurnBudget = resolved.turnBudget;
@@ -2009,7 +2030,7 @@ function loadAgentsFromDefinitionFiles(files: AgentDefinitionFile[], source: Age
 			: undefined;
 		let toolBudget: ToolBudgetConfig | undefined;
 		if (frontmatter.toolBudget !== undefined && frontmatter.toolBudget.trim()) {
-			const parsed = JSON.parse(frontmatter.toolBudget) as unknown;
+			const parsed = parseStructuredFrontmatterValue(frontmatter.toolBudget, "toolBudget", localName);
 			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 				throw new Error(`Agent '${localName}' has invalid toolBudget frontmatter; expected a JSON object.`);
 			}

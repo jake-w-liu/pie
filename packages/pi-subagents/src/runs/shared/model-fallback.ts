@@ -1,6 +1,6 @@
 import { splitKnownThinkingSuffix, type ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts";
 import type { Usage } from "../../shared/types.ts";
-import { filterFallbackCandidates, findModelExclusion, parseModelKey, recordModelFailure } from "./model-exclusions.ts";
+import { filterFallbackCandidates, findModelExclusion, parseModelKey, recordModelFailure, type ModelExclusion } from "./model-exclusions.ts";
 import { checkModelScope, type ModelScopeCheckRule, type ModelScopeViolation, type ModelSource } from "./model-scope.ts";
 import { redactSecretValues } from "./permissions.ts";
 
@@ -406,12 +406,21 @@ export function buildModelCandidates(
 		seen.add(normalized);
 		candidates.push(normalized);
 	}
-	return filterFallbackCandidates(candidates, {
-		onExcluded(candidate, exclusion) {
-			const reason = redactSecretValues((exclusion.reason ?? "runtime-failure").replace(/[\u0000-\u001f\u007f]+/g, " ")).slice(0, 240);
-			console.warn(`[pi-subagents] Skipping model '${candidate}' due to a cached exclusion (reason: ${reason}; expires: ${new Date(exclusion.expiresAt).toISOString()}).`);
-		},
-	});
+	const excluded: Array<{ candidate: string; exclusion: Readonly<ModelExclusion> }> = [];
+	const usable = filterFallbackCandidates(candidates, { onExcluded: (candidate, exclusion) => excluded.push({ candidate, exclusion }) });
+	// Exclusions steer toward a usable alternative. With none left, an empty list makes callers
+	// launch without --model, so the child would silently run the global settings default
+	// instead of the requested or parent model (issue #266). Keep the requested candidates;
+	// the attempt then reports the provider's own error if the model still fails.
+	if (usable.length === 0 && candidates.length > 0) {
+		console.warn(`[pi-subagents] Every model candidate has a cached exclusion (${candidates.join(", ")}); launching with them anyway instead of without a model.`);
+		return candidates;
+	}
+	for (const { candidate, exclusion } of excluded) {
+		const reason = redactSecretValues((exclusion.reason ?? "runtime-failure").replace(/[\u0000-\u001f\u007f]+/g, " ")).slice(0, 240);
+		console.warn(`[pi-subagents] Skipping model '${candidate}' due to a cached exclusion (reason: ${reason}; expires: ${new Date(exclusion.expiresAt).toISOString()}).`);
+	}
+	return usable;
 }
 
 const RETRYABLE_MODEL_FAILURE_PATTERNS = [

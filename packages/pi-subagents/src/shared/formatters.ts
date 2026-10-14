@@ -2,6 +2,7 @@
  * Formatting utilities for display output
  */
 
+import * as path from "node:path";
 import type { Usage, TokenUsage } from "./types.ts";
 import { isDynamicParallelStep, isParallelStep } from "./settings.ts";
 import { previewDisplayText, sanitizeDisplayText } from "./display-text.ts";
@@ -95,8 +96,9 @@ export function formatToolCall(name: string, args: Record<string, unknown>, expa
  * Shorten a path by replacing home directory with ~
  */
 export function shortenPath(p: string): string {
-	const home = process.env.HOME;
-	if (home && p.startsWith(home)) {
+	const home = process.env.HOME?.replace(/[\\/]+$/, "");
+	// Match whole path components only: with HOME=/Users/jake, /Users/jake2/x is not under home.
+	if (home && (p === home || p.startsWith(`${home}/`) || p.startsWith(`${home}${path.sep}`))) {
 		return `~${p.slice(home.length)}`;
 	}
 	return p;

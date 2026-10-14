@@ -39,18 +39,23 @@ function eventError(event: Record<string, unknown>, fallback: string): string {
 export function createCodexExecJsonlParser(finalMessagePath: string): ExternalCliParser {
 	let eventCount = 0;
 	let terminal: ExternalCliParserTerminal | undefined;
+	// codex exec emits `error` for every error notification, including retried ones
+	// ("Reconnecting... 1/5"), and keeps the turn running; only turn.completed and
+	// turn.failed end it. A fatal error is followed by turn.failed (or the stream ends).
+	let lastError: string | undefined;
 	return {
 		parseLine(line): ExternalCliParserProgress {
 			const event = parseExternalCliJsonlEvent(line, "Codex exec", MAX_EVENT_TYPE_LENGTH);
 			if (terminal) throw new Error("Codex exec emitted an event after its terminal state.");
 			eventCount += 1;
 			if (event.type === "turn.completed") terminal = { state: "completed" };
-			else if (event.type === "turn.failed") terminal = { state: "failed", error: eventError(event, "Codex exec reported turn.failed.") };
-			else if (event.type === "error") terminal = { state: "failed", error: eventError(event, "Codex exec reported an error event.") };
+			else if (event.type === "turn.failed") terminal = { state: "failed", error: eventError(event, lastError ?? "Codex exec reported turn.failed.") };
+			else if (event.type === "error") lastError = eventError(event, "Codex exec reported an error event.");
 			return { phase: terminal ? terminal.state : "streaming", eventCount };
 		},
 		finish(): ExternalCliParserTerminal | undefined {
-			if (!terminal || terminal.state === "failed") return terminal;
+			if (!terminal) return lastError === undefined ? undefined : { state: "failed", error: lastError };
+			if (terminal.state === "failed") return terminal;
 			let descriptor: number;
 			try { descriptor = fs.openSync(finalMessagePath, "r"); }
 			catch (error) { throw new Error(`Codex exec did not write its final-message artifact: ${error instanceof Error ? error.message : String(error)}`); }

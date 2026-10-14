@@ -150,6 +150,7 @@ import { buildWorkflowReceipt, resolveWorkflowReceiptResumeEntry, writeWorkflowR
 import { parseWorkflowChildSummary, workflowChildSummary } from "../../workflows/workflow-child-summary.ts";
 import { resolveWorkflowChatProgress, type WorkflowChatProgressProjection } from "../../workflows/chat-progress.ts";
 import { claimWorkflowChildPermit, validateWorkflowChildPermitRoot, type WorkflowChildPermit, type WorkflowChildPermitContext } from "../../shared/workflow-child-permit.ts";
+import { MAX_TIMER_DELAY_MS } from "../../shared/timer-limits.ts";
 import {
 	cleanupWorktrees,
 	createWorktrees,
@@ -2687,15 +2688,6 @@ export const DEFAULT_FOREGROUND_TIMEOUT_MS = 30 * 60 * 1000;
 export { DEFAULT_ASYNC_TIMEOUT_MS };
 
 /**
- * Maximum delay a Node.js timer accepts. Values above the 32-bit signed integer
- * ceiling overflow `setTimeout`, which silently clamps the delay to ~1ms and
- * fires almost immediately — so a run configured with a larger deadline would
- * terminate right away while reporting the long duration. Any timeout destined
- * for a timer must stay within this bound.
- */
-const MAX_TIMER_DELAY_MS = 2_147_483_647;
-
-/**
  * Resolve the optional global default runtime deadline from extension config
  * (`config.timeoutMs`). Returns undefined for unset or invalid values so callers
  * fall back to the built-in defaults. "Invalid" covers non-positive-integer
@@ -2715,8 +2707,8 @@ export function resolveForegroundTimeout(params: SubagentParamsLike, defaultTime
 	}
 	for (const [name, value] of [["timeoutMs", rawTimeout], ["maxRuntimeMs", rawMaxRuntime]] as const) {
 		if (value === undefined) continue;
-		if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
-			return { error: `${name} must be a positive integer.` };
+		if (typeof value !== "number" || !Number.isInteger(value) || value <= 0 || value > MAX_TIMER_DELAY_MS) {
+			return { error: `${name} must be a positive integer no larger than ${MAX_TIMER_DELAY_MS}.` };
 		}
 	}
 	if (rawTimeout !== undefined && rawMaxRuntime !== undefined && rawTimeout !== rawMaxRuntime) {
@@ -4614,49 +4606,67 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						const workflowState = status.state === "complete" ? "completed" : status.state === "failed" || status.state === "rejected" ? "failed" : status.state === "paused" ? "paused" : status.state === "stopped" ? "stopped" : "running";
 						status.workflowChildren = workflowChildSummary({ parentToolCallId: toolCallId, workflowRunId, workflowState, inventoryComplete: workflowState !== "running", trace: status.workflow?.trace, steps: status.steps });
 						status.lastUpdate = Date.now();
-						if (!initialPersistenceComplete) {
-							writeAtomicJson(statusPath, status);
-							initialPersistenceComplete = true;
-							queueActiveRunIndex();
-						} else if (options.tolerateStatusWriteFailure) {
-							try {
-								runPersistence.write(statusPath, status);
-								statusPersistenceDegraded = false;
-							} catch (error) {
-								const message = `Failed to persist async workflow state ${statusPath}: ${error instanceof Error ? error.message : String(error)}`;
-								console.error(message, error);
-								if (!statusPersistenceDegraded) {
-									statusPersistenceDegraded = true;
-									try {
-										appendWorkflowEvent({ type: "subagent.workflow.status_write_failed", error: message });
-									} catch (eventError) {
-										console.error(`Failed to record degraded status persistence for '${statusPath}':`, eventError);
+						try {
+							if (!initialPersistenceComplete) {
+								writeAtomicJson(statusPath, status);
+								initialPersistenceComplete = true;
+								queueActiveRunIndex();
+							} else if (options.tolerateStatusWriteFailure) {
+								try {
+									runPersistence.write(statusPath, status);
+									statusPersistenceDegraded = false;
+								} catch (error) {
+									const message = `Failed to persist async workflow state ${statusPath}: ${error instanceof Error ? error.message : String(error)}`;
+									console.error(message, error);
+									if (!statusPersistenceDegraded) {
+										statusPersistenceDegraded = true;
+										try {
+											appendWorkflowEvent({ type: "subagent.workflow.status_write_failed", error: message });
+										} catch (eventError) {
+											console.error(`Failed to record degraded status persistence for '${statusPath}':`, eventError);
+										}
 									}
 								}
-							}
-						} else {
-							runPersistence.write(statusPath, status);
-						}
-						if (liveJob) {
-							liveJob.status = status.state;
-							liveJob.updatedAt = status.lastUpdate;
-							liveJob.activityState = status.activityState;
-							liveJob.lastActivityAt = status.lastActivityAt;
-							liveJob.currentTool = status.currentTool;
-							liveJob.currentToolStartedAt = status.currentToolStartedAt;
-							liveJob.currentPath = status.currentPath;
-							liveJob.turnCount = status.turnCount;
-							liveJob.toolCount = status.toolCount;
-							liveJob.currentStep = status.currentStep;
-							if (status.steps) {
-								liveJob.steps = status.steps.map((step, index) => ({ ...step, index }));
-								liveJob.agents = status.steps.map((step) => step.agent);
 							} else {
-								delete liveJob.steps;
-								delete liveJob.agents;
+								runPersistence.write(statusPath, status);
 							}
-							liveJob.workflow = status.workflow;
-							liveJob.workflowChildren = status.workflowChildren;
+						} finally {
+							// A fail-fast write that throws must still publish the state to the live job:
+							// waiters and the fleet view read it, and a terminal state is already final.
+							if (liveJob) {
+								liveJob.status = status.state;
+								liveJob.updatedAt = status.lastUpdate;
+								liveJob.activityState = status.activityState;
+								liveJob.lastActivityAt = status.lastActivityAt;
+								liveJob.currentTool = status.currentTool;
+								liveJob.currentToolStartedAt = status.currentToolStartedAt;
+								liveJob.currentPath = status.currentPath;
+								liveJob.turnCount = status.turnCount;
+								liveJob.toolCount = status.toolCount;
+								liveJob.currentStep = status.currentStep;
+								if (status.steps) {
+									liveJob.steps = status.steps.map((step, index) => ({ ...step, index }));
+									liveJob.agents = status.steps.map((step) => step.agent);
+								} else {
+									delete liveJob.steps;
+									delete liveJob.agents;
+								}
+								liveJob.workflow = status.workflow;
+								liveJob.workflowChildren = status.workflowChildren;
+							}
+						}
+					};
+					// Terminal writes stay fail-fast inside persist, but their failure must not decide the
+					// outcome: the result file already records it, a throw from the success path rerouted a
+					// completed workflow into the failure branch, and the failure branch's own throw escaped
+					// the floating workflow promise as an unhandled rejection.
+					const persistTerminal = () => {
+						try {
+							persist();
+						} catch (error) {
+							const message = `Failed to persist terminal async workflow state ${statusPath}: ${error instanceof Error ? error.message : String(error)}`;
+							console.error(message, error);
+							appendWorkflowEvent({ type: "subagent.workflow.status_write_failed", error: message });
 						}
 					};
 					const writeWorkflowResult = (payload: Record<string, unknown>): boolean => {
@@ -4735,6 +4745,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 									}
 									projectedTraceLength = 0;
 								}
+								const journalFrom = projectedTraceLength;
 								for (let index = projectedTraceLength; index < trace.length; index += 1) {
 									const entry = trace[index]!;
 									if (entry.operation !== "run") continue;
@@ -4800,7 +4811,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 								projectedTraceTail = trace.at(-1);
 								projectWorkflowActivity();
 								persist({ tolerateStatusWriteFailure: true });
-								appendWorkflowEvent({ type: "subagent.workflow.trace", trace });
+								// Journal only the entries added since the previous call: appending the whole
+								// trace on every change grew events.jsonl quadratically (800 status calls
+								// appended ~100 MiB). `from: 0` marks a rebuilt trace; status.json keeps it whole.
+								appendWorkflowEvent({ type: "subagent.workflow.trace", from: journalFrom, entries: trace.slice(journalFrom) });
 							};
 							try {
 								const workflow = await runWorkflowScript({
@@ -4931,7 +4945,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 									appendWorkflowEvent({ type: "subagent.workflow.receipt_write_failed", error: `Failed to persist async workflow receipt: ${receiptError instanceof Error ? receiptError.message : String(receiptError)}` });
 								}
 								if (!writeWorkflowResult({ id: workflowRunId, runId: workflowRunId, toolCallId, agent: "workflow", mode: "workflow", success: true, state: "complete", summary: resultSummary, output: resultSummary, workflowChildren, results: workflow.children.map((child) => ({ workflowKey: child.key, ...(child.agent ? { agent: child.agent } : {}), ...(child.runId ? { runId: child.runId } : {}), output: child.output, outputState: child.output.trim() || child.structuredOutput !== undefined ? "present" : "absent", structuredOutput: child.structuredOutput, success: child.ok, ...(child.outputPathMapping ? { outputPathMapping: child.outputPathMapping } : {}), ...(child.stopped ? { stopped: true } : {}), ...(child.interrupted ? { interrupted: true } : {}), ...(child.artifactPaths[0] ? { artifactPaths: { outputPath: child.artifactPaths[0] } } : {}) })), workflow: status.workflow, ...(workflowReceipt ? { workflowReceipt } : {}), asyncDir, cwd: workflowCwd, sessionId: currentSessionId, completionOwnerId, ...(requestParams.scheduleOrigin ? { scheduleOrigin: requestParams.scheduleOrigin } : {}), timestamp: Date.now(), durationMs: Date.now() - startedAt })) return;
-								persist();
+								persistTerminal();
 								persistClosed = true;
 								appendWorkflowEvent({ type: "subagent.workflow.completed", state: status.state, ...(status.error ? { error: status.error } : {}) });
 							} catch (error) {
@@ -4974,7 +4988,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 									appendWorkflowEvent({ type: "subagent.workflow.receipt_write_failed", error: `Failed to persist async workflow receipt: ${receiptError instanceof Error ? receiptError.message : String(receiptError)}` });
 								}
 								if (!writeWorkflowResult({ id: workflowRunId, runId: workflowRunId, toolCallId, agent: "workflow", mode: "workflow", success: status.state === "complete", state: status.state, summary: resultSummary, error: status.state === "complete" ? undefined : status.error, stopped: status.stopped, activityState: status.activityState, workflowChildren, ...(terminalOutcome ? { terminalOutcome } : {}), results: partial.children.map((child) => ({ workflowKey: child.key, ...(child.agent ? { agent: child.agent } : {}), ...(child.runId ? { runId: child.runId } : {}), output: child.output, outputState: child.output.trim() || child.structuredOutput !== undefined ? "present" : "absent", structuredOutput: child.structuredOutput, success: child.ok, ...(child.terminalOutcome ? { terminalOutcome: child.terminalOutcome } : {}), ...(child.outputPathMapping ? { outputPathMapping: child.outputPathMapping } : {}), ...(child.stopped ? { stopped: true } : {}), ...(child.interrupted ? { interrupted: true } : {}), ...(child.detached && status.state !== "complete" ? { detached: true } : {}), ...(child.artifactPaths[0] ? { artifactPaths: { outputPath: child.artifactPaths[0] } } : {}) })), workflow: status.workflow, ...(workflowReceipt ? { workflowReceipt } : {}), asyncDir, cwd: workflowCwd, sessionId: currentSessionId, completionOwnerId, ...(requestParams.scheduleOrigin ? { scheduleOrigin: requestParams.scheduleOrigin } : {}), timestamp: Date.now(), durationMs: Date.now() - startedAt })) return;
-								persist();
+								persistTerminal();
 								persistClosed = true;
 								appendWorkflowEvent({ type: "subagent.workflow.completed", state: status.state, ...(terminalOutcome ? { terminalOutcome } : {}), ...(status.error ? { error: status.error } : {}), ...(status.activityState ? { activityState: status.activityState } : {}) });
 								try {
@@ -4991,6 +5005,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 								deps.state.activeAsyncCapacity = workflowCapacity?.reconcile(new Set(deps.state.workflowControllers?.keys() ?? []))
 									?? deps.state.activeAsyncCapacity;
 							}
+						}).catch((error: unknown) => {
+							// Outcomes are recorded inside the run. Anything escaping here must not become an
+							// unhandled rejection, which crashes an interactive host.
+							console.error(`Async workflow '${workflowRunId}' failed outside its result handling:`, error);
 						});
 						return attachWorkflowMission(startResult);
 					};

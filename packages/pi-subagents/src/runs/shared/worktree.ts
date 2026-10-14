@@ -116,6 +116,9 @@ const DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS = 30000;
 
 function runGit(cwd: string, args: string[]): GitResult {
 	const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf-8", windowsHide: true });
+	// spawnSync reports spawn failures and output beyond maxBuffer (ENOBUFS, git is killed) in
+	// `error` while returning the partial stdout; report the error, never the truncated output.
+	if (result.error) return { stdout: "", stderr: `git ${args.join(" ")} failed: ${result.error.message}`, status: null };
 	return {
 		stdout: result.stdout ?? "",
 		stderr: result.stderr ?? "",
@@ -520,11 +523,13 @@ function captureWorktreeDiff(
 	// "Binary files a/x and b/x differ" for binary content, the handoff patch cannot
 	// be applied, and cleanup still accepts the nonempty patch and deletes the
 	// worktree, so those changes are unrecoverable.
-	const patch = runGitChecked(worktree.path, ["diff", "--cached", "--binary", "--full-index", setup.baseCommit]);
+	// git writes the patch file itself: piping it through spawnSync capped it at the
+	// 1 MiB maxBuffer and re-encoded non-UTF-8 text. The path is resolved because git
+	// runs with -C <worktree>.
+	runGitChecked(worktree.path, ["diff", "--cached", "--binary", "--full-index", `--output=${path.resolve(patchPath)}`, setup.baseCommit]);
 	const numstat = runGitChecked(worktree.path, ["diff", "--cached", "--numstat", setup.baseCommit]);
-	fs.writeFileSync(patchPath, patch, "utf-8");
 
-	if (!patch.trim()) {
+	if (fs.statSync(patchPath).size === 0) {
 		return emptyDiff(worktree.index, agent, worktree.branch, patchPath);
 	}
 

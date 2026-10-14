@@ -35,6 +35,7 @@ import { resolveTurnBudgetConfig } from "../runs/shared/turn-budget.ts";
 import { validateAcceptanceInput } from "../runs/shared/acceptance.ts";
 import { CODE_OWNED_EXTERNAL_CLI_ADAPTER_LABEL, isCodeOwnedExternalCliAdapterId, validateCodeOwnedProfileRunner } from "../runs/shared/external-cli-contract.ts";
 import type { AcceptanceInput, Details, ExtensionConfig, ToolBudgetConfig } from "../shared/types.ts";
+import { MAX_TIMER_DELAY_MS } from "../shared/timer-limits.ts";
 import { getProjectConfigDir } from "../shared/utils.ts";
 import { capabilityCeilingAgentRestrictionSources, isAgentAllowedByCapabilityCeiling, resolveCurrentSubagentCapabilityCeiling } from "../runs/shared/capability-ceiling.ts";
 import { listRuntimeAgentConfigs, mergeRuntimeAgents, type RuntimeAgentOwner } from "./runtime-agent-registry.ts";
@@ -524,8 +525,8 @@ function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): st
 	}
 	if (hasKey(cfg, "timeoutMs")) {
 		if (cfg.timeoutMs === false || cfg.timeoutMs === "") delete target.defaultTimeoutMs;
-		else if (typeof cfg.timeoutMs === "number" && Number.isInteger(cfg.timeoutMs) && cfg.timeoutMs > 0) target.defaultTimeoutMs = cfg.timeoutMs;
-		else return "config.timeoutMs must be a positive integer or false when provided.";
+		else if (typeof cfg.timeoutMs === "number" && Number.isInteger(cfg.timeoutMs) && cfg.timeoutMs > 0 && cfg.timeoutMs <= MAX_TIMER_DELAY_MS) target.defaultTimeoutMs = cfg.timeoutMs;
+		else return `config.timeoutMs must be a positive integer no larger than ${MAX_TIMER_DELAY_MS}, or false when provided.`;
 	}
 	if (hasKey(cfg, "turnBudget")) {
 		if (cfg.turnBudget === false || cfg.turnBudget === "") delete target.defaultTurnBudget;

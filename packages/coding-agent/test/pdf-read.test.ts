@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -86,7 +86,9 @@ describe("extractPdfText", () => {
 
 	it("extracts a single page and an inclusive range", async () => {
 		const single = await extractPdfText(THREE_PAGE_PDF, { pages: "2" });
-		expect(single.ok && single.pages).toEqual([{ pageNumber: 2, text: "Second page details" }]);
+		expect(single.ok && single.pages).toEqual([
+			{ pageNumber: 2, text: "Second page details", width: 612, height: 792 },
+		]);
 
 		const range = await extractPdfText(THREE_PAGE_PDF, { pages: "2-3" });
 		expect(range.ok && range.pages.map((page) => page.pageNumber)).toEqual([2, 3]);
@@ -305,7 +307,9 @@ describe("read tool with PDFs", () => {
 		const read = createReadTool(dir);
 		const result = await read.execute("pdf-1", { path: "report.pdf" });
 		const text = (result.content[0] as { text: string }).text;
-		expect(text).toContain("PDF (3 pages). Text of pages 1-3:");
+		expect(text).toContain(
+			"PDF (3 pages). Text of pages 1-3 (render=true attaches page images for figures and layout):",
+		);
 		expect(text).toContain("Second page details");
 	});
 
@@ -321,5 +325,122 @@ describe("read tool with PDFs", () => {
 		const read = createReadTool(dir);
 		const result = await read.execute("pdf-3", { path: "notes.pdf" });
 		expect((result.content[0] as { text: string }).text).toContain("just text, wrong extension");
+	});
+});
+
+/** Whether `command` can be spawned from PATH. */
+function hasCommand(command: string, args: string[]): boolean {
+	try {
+		execFileSync(command, args, { stdio: "ignore" });
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ENOENT";
+	}
+}
+
+function pngSize(base64: string): { width: number; height: number } {
+	const bytes = Buffer.from(base64, "base64");
+	expect(bytes.subarray(1, 4).toString("latin1")).toBe("PNG");
+	return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
+}
+
+describe("read tool with rendered PDF pages", () => {
+	let dir: string;
+	const originalPath = process.env.PATH;
+	const ghostscript = process.platform === "win32" ? "gswin64c" : "gs";
+	const hasPdftoppm = hasCommand("pdftoppm", ["-v"]);
+	const hasGhostscript = hasCommand(ghostscript, ["--version"]);
+
+	beforeAll(async () => {
+		dir = await mkdtemp(join(tmpdir(), "read-pdf-render-"));
+		await writeFile(join(dir, "report.pdf"), THREE_PAGE_PDF);
+		await writeFile(join(dir, "notes.txt"), "plain text\n");
+	});
+
+	afterAll(async () => {
+		process.env.PATH = originalPath;
+		await rm(dir, { recursive: true, force: true });
+	});
+
+	it("reports a missing renderer instead of returning text only", async () => {
+		const emptyBin = await mkdtemp(join(tmpdir(), "read-pdf-empty-bin-"));
+		process.env.PATH = emptyBin;
+		try {
+			const read = createReadTool(dir);
+			await expect(read.execute("render-missing", { path: "report.pdf", render: true })).rejects.toThrow(
+				/needs Ghostscript or poppler's pdftoppm/,
+			);
+		} finally {
+			process.env.PATH = originalPath;
+			await rm(emptyBin, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects render for files that are not PDFs", async () => {
+		const read = createReadTool(dir);
+		await expect(read.execute("render-text", { path: "notes.txt", render: true })).rejects.toThrow(
+			/render applies only to PDF files/,
+		);
+	});
+
+	it("refuses rendered ranges above the per-read cap", async () => {
+		const read = createReadTool(dir);
+		await expect(read.execute("render-cap", { path: "report.pdf", pages: "1-11", render: true })).rejects.toThrow(
+			/exceeds the maximum of 10 pages per read/,
+		);
+	});
+
+	/** Run `fn` with PATH holding only `command`, so the renderer choice is deterministic. */
+	async function withOnlyOnPath<T>(command: string, fn: () => Promise<T>): Promise<T> {
+		const resolved = execFileSync(process.platform === "win32" ? "where" : "which", [command], { encoding: "utf8" })
+			.split(/\r?\n/)[0]!
+			.trim();
+		const binDir = await mkdtemp(join(tmpdir(), "read-pdf-bin-"));
+		await symlink(resolved, join(binDir, basename(resolved)));
+		process.env.PATH = binDir;
+		try {
+			return await fn();
+		} finally {
+			process.env.PATH = originalPath;
+			await rm(binDir, { recursive: true, force: true });
+		}
+	}
+
+	function expectLetterPageImage(data: string): void {
+		// Letter pages (612x792 pt) render with the long side at the 2000 px inline-image cap.
+		const size = pngSize(data);
+		expect(size.height).toBe(2000);
+		expect(Math.abs(size.width - Math.round((2000 * 612) / 792))).toBeLessThanOrEqual(1);
+	}
+
+	it.skipIf(!hasGhostscript)("attaches one image per requested page with Ghostscript", async () => {
+		const result = await withOnlyOnPath(ghostscript, () =>
+			createReadTool(dir).execute("render-gs", { path: "report.pdf", pages: "2-3", render: true }),
+		);
+		const texts = result.content.filter((block) => block.type === "text").map((block) => block.text);
+		const images = result.content.filter((block) => block.type === "image");
+		expect(texts[0]).toContain("Second page details");
+		expect(texts[0]).not.toContain("First page report");
+		expect(texts.slice(1)).toEqual(["--- rendered page 2 ---", "--- rendered page 3 ---"]);
+		expect(images).toHaveLength(2);
+		for (const image of images) expectLetterPageImage(image.data);
+	});
+
+	it.skipIf(!hasPdftoppm)("falls back to pdftoppm when Ghostscript is absent", async () => {
+		const result = await withOnlyOnPath("pdftoppm", () =>
+			createReadTool(dir).execute("render-pdftoppm", { path: "report.pdf", pages: "1-2", render: true }),
+		);
+		const texts = result.content.filter((block) => block.type === "text").map((block) => block.text);
+		const images = result.content.filter((block) => block.type === "image");
+		expect(texts.slice(1)).toEqual(["--- rendered page 1 ---", "--- rendered page 2 ---"]);
+		expect(images).toHaveLength(2);
+		for (const image of images) expectLetterPageImage(image.data);
+	});
+
+	it("suggests render when a PDF page has no extractable text", async () => {
+		await writeFile(join(dir, "figure.pdf"), buildPdf([""]));
+		const read = createReadTool(dir);
+		const result = await read.execute("render-hint", { path: "figure.pdf" });
+		expect((result.content[0] as { text: string }).text).toContain("use render=true to view them as images");
 	});
 });

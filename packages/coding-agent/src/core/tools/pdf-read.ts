@@ -1,4 +1,5 @@
 import { getDocumentProxy, getResolvedPDFJS } from "unpdf";
+import { MAX_PDF_RENDER_PAGES_PER_READ } from "./pdf-render.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead } from "./truncate.ts";
 
 /** Maximum number of pages extracted by one read, matching the limit models are told about. */
@@ -12,8 +13,15 @@ export interface PdfPageText {
 	text: string;
 }
 
+export interface PdfExtractedPage extends PdfPageText {
+	/** Page width in PDF points, after the page's rotation. */
+	width: number;
+	/** Page height in PDF points, after the page's rotation. */
+	height: number;
+}
+
 export type PdfTextExtraction =
-	| { ok: true; totalPages: number; pages: PdfPageText[]; firstPage: number; lastPage: number }
+	| { ok: true; totalPages: number; pages: PdfExtractedPage[]; firstPage: number; lastPage: number }
 	| { ok: false; message: string };
 
 export interface PdfReadResult {
@@ -53,8 +61,9 @@ export function parsePdfPageRange(spec: string): { firstPage: number; lastPage: 
  */
 export async function extractPdfText(
 	bytes: Uint8Array,
-	options: { pages?: string; signal?: AbortSignal } = {},
+	options: { pages?: string; signal?: AbortSignal; maxPages?: number } = {},
 ): Promise<PdfTextExtraction> {
+	const maxPages = options.maxPages ?? MAX_PDF_PAGES_PER_READ;
 	if (bytes.byteLength > MAX_PDF_BYTES) {
 		return {
 			ok: false,
@@ -71,10 +80,10 @@ export async function extractPdfText(
 				message: `Invalid pages value "${options.pages}". Use "3", "1-5", or "10-" for an open-ended range (pages are 1-indexed).`,
 			};
 		}
-		if (Number.isFinite(parsed.lastPage) && parsed.lastPage - parsed.firstPage + 1 > MAX_PDF_PAGES_PER_READ) {
+		if (Number.isFinite(parsed.lastPage) && parsed.lastPage - parsed.firstPage + 1 > maxPages) {
 			return {
 				ok: false,
-				message: `Page range "${options.pages}" exceeds the maximum of ${MAX_PDF_PAGES_PER_READ} pages per read.`,
+				message: `Page range "${options.pages}" exceeds the maximum of ${maxPages} pages per read.`,
 			};
 		}
 		requested = parsed;
@@ -107,14 +116,15 @@ export async function extractPdfText(
 
 		const firstPage = requested.firstPage;
 		const lastPage = Math.min(requested.lastPage, totalPages);
-		const pageCount = Math.min(lastPage - firstPage + 1, MAX_PDF_PAGES_PER_READ);
-		const pages: PdfPageText[] = [];
+		const pageCount = Math.min(lastPage - firstPage + 1, maxPages);
+		const pages: PdfExtractedPage[] = [];
 
 		for (let pageNumber = firstPage; pageNumber < firstPage + pageCount; pageNumber++) {
 			throwIfAborted();
 			const page = await pdf.getPage(pageNumber);
 			const textContent = await page.getTextContent();
-			pages.push({ pageNumber, text: normalizePageText(textContent.items) });
+			const { width, height } = page.getViewport({ scale: 1 });
+			pages.push({ pageNumber, text: normalizePageText(textContent.items), width, height });
 		}
 
 		return { ok: true, totalPages, pages, firstPage, lastPage: firstPage + pageCount - 1 };
@@ -145,20 +155,31 @@ export async function extractPdfReadText(
 /**
  * Format extracted pages for the model, honoring the read tool's line and byte limits.
  * Pages are added whole; the first page is truncated in place when it alone exceeds a limit.
+ *
+ * `render` tells the text how page images relate to it: `"available"` when the caller's read
+ * tool accepts `render=true`, `"rendered"` when the same pages are attached as images.
  */
 export function formatPdfText(
-	result: Extract<PdfTextExtraction, { ok: true }>,
-	options: { maxLines?: number; maxBytes?: number } = {},
+	result: Omit<Extract<PdfTextExtraction, { ok: true }>, "pages"> & { pages: PdfPageText[] },
+	options: { maxLines?: number; maxBytes?: number; render?: "available" | "rendered" } = {},
 ): PdfReadResult {
 	const maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
 	const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
 	const { totalPages, pages, firstPage, lastPage } = result;
 
-	const header = `PDF (${totalPages} page${totalPages === 1 ? "" : "s"}). Text of pages ${firstPage}-${lastPage}:`;
+	const renderHint =
+		options.render === "available" ? " (render=true attaches page images for figures and layout)" : "";
+	const header = `PDF (${totalPages} page${totalPages === 1 ? "" : "s"}). Text of pages ${firstPage}-${lastPage}${renderHint}:`;
 
 	if (pages.every((page) => page.text.length === 0)) {
 		return {
-			text: `${header}\nNo extractable text in those pages. The PDF likely contains scanned images, which the read tool cannot read.`,
+			text: `${header}\nNo extractable text in those pages. ${
+				options.render === "rendered"
+					? "The rendered page images follow."
+					: options.render === "available"
+						? "The pages likely hold scanned images or vector graphics; use render=true to view them as images."
+						: "The PDF likely contains scanned images, which the read tool cannot read."
+			}`,
 			totalPages,
 			firstPage,
 			lastPage,
@@ -212,10 +233,14 @@ export function formatPdfText(
 
 	const includedLast = included[included.length - 1]?.pageNumber ?? firstPage;
 	if (includedLast < totalPages || included.length < sections.length) {
-		const nextEnd = Math.min(totalPages, includedLast + MAX_PDF_PAGES_PER_READ);
+		const rendered = options.render === "rendered";
+		const nextEnd = Math.min(
+			totalPages,
+			includedLast + (rendered ? MAX_PDF_RENDER_PAGES_PER_READ : MAX_PDF_PAGES_PER_READ),
+		);
 		body.push(
 			"",
-			`[Showing pages ${firstPage}-${includedLast} of ${totalPages}. Use pages="${includedLast + 1}-${nextEnd}" to continue.]`,
+			`[Showing ${rendered ? "text of " : ""}pages ${firstPage}-${includedLast} of ${totalPages}. Use pages="${includedLast + 1}-${nextEnd}"${rendered ? " with render=true" : ""} to continue.]`,
 		);
 	}
 

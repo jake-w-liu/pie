@@ -27,7 +27,8 @@ import { getExperimentalToolSampling } from "../experimental.ts";
 import type { ExtensionContext, ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import { resolveReadPathAsync, resolveToCwd } from "./path-utils.ts";
-import { extractPdfReadText, MAX_PDF_BYTES, MAX_PDF_PAGES_PER_READ } from "./pdf-read.ts";
+import { extractPdfText, formatPdfText, MAX_PDF_BYTES, MAX_PDF_PAGES_PER_READ } from "./pdf-read.ts";
+import { MAX_PDF_RENDER_PAGES_PER_READ, renderPdfPages } from "./pdf-render.ts";
 import { getTextOutput, renderToolPath, replaceTabs, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
@@ -42,7 +43,12 @@ const readSchema = Type.Object({
 	limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum number of lines to read" })),
 	pages: Type.Optional(
 		Type.String({
-			description: `Page range for PDF files, for example "3", "1-5", or "10-" (maximum ${MAX_PDF_PAGES_PER_READ} pages per read)`,
+			description: `Page range for PDF files, for example "3", "1-5", or "10-" (maximum ${MAX_PDF_PAGES_PER_READ} pages per read, ${MAX_PDF_RENDER_PAGES_PER_READ} with render)`,
+		}),
+	),
+	render: Type.Optional(
+		Type.Boolean({
+			description: `PDF files only: also attach the pages as images to inspect figures, plots, and layout visually (maximum ${MAX_PDF_RENDER_PAGES_PER_READ} pages per read)`,
 		}),
 	),
 });
@@ -141,10 +147,19 @@ export interface ReadToolOptions {
 	visionFallbackModel?: string;
 }
 
-type ReadRenderArgs = { path?: string; file_path?: string; offset?: number; limit?: number; pages?: string };
+type ReadRenderArgs = {
+	path?: string;
+	file_path?: string;
+	offset?: number;
+	limit?: number;
+	pages?: string;
+	render?: boolean;
+};
 
 function formatReadLineRange(args: ReadRenderArgs | undefined, theme: Theme): string {
-	if (args?.pages) return theme.fg("warning", ` pages=${args.pages}`);
+	if (args?.pages || args?.render) {
+		return theme.fg("warning", `${args.pages ? ` pages=${args.pages}` : ""}${args.render ? " render" : ""}`);
+	}
 	if (args?.offset === undefined && args?.limit === undefined) return "";
 	const startLine = args.offset ?? 1;
 	const endLine = args.limit !== undefined ? startLine + args.limit - 1 : "";
@@ -172,7 +187,7 @@ function getNonVisionImageNote(model: Model<Api> | undefined): string | undefine
 }
 
 /**
- * Read a PDF as text.
+ * Read a PDF's bytes once its header is confirmed.
  *
  * Exactly one file read happens in every case. A path that ends in `.pdf` but holds other bytes
  * reports `{ kind: "not-pdf" }` and the caller reads it as text; when the probe had to read the
@@ -182,11 +197,7 @@ function getNonVisionImageNote(model: Model<Api> | undefined): string | undefine
 async function probePdf(
 	ops: ReadOperations,
 	absolutePath: string,
-	pages: string | undefined,
-	signal: AbortSignal | undefined,
-): Promise<
-	{ kind: "pdf"; content: (TextContent | ImageContent)[] } | { kind: "not-pdf"; buffer?: Buffer } | undefined
-> {
+): Promise<{ kind: "pdf"; buffer: Buffer } | { kind: "not-pdf"; buffer?: Buffer } | undefined> {
 	if (!isPdfPath(absolutePath)) return undefined;
 
 	// A backend that can read a small head confirms the header without a full read, so a misnamed
@@ -203,7 +214,7 @@ async function probePdf(
 
 	const buffer = await ops.readFile(absolutePath);
 	if (!isPdfContent(buffer)) return { kind: "not-pdf", buffer };
-	return { kind: "pdf", content: [{ type: "text", text: await extractPdfReadText(buffer, pages, signal) }] };
+	return { kind: "pdf", buffer };
 }
 
 const VISION_FALLBACK_INSTRUCTION =
@@ -485,14 +496,20 @@ export function createReadToolDefinition(
 	return {
 		name: "read",
 		label: "read",
-		description: `Read the contents of a file. Supports text files, images (jpg, png, gif, webp, bmp), and PDFs. Images are sent as attachments; PDFs are converted to text (use pages for a page range). For text files, output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.`,
+		description: `Read the contents of a file. Supports text files, images (jpg, png, gif, webp, bmp), and PDFs. Images are sent as attachments; PDFs are converted to text (use pages for a page range, and render=true to also attach page images for visual inspection of figures and layout). For text files, output is truncated to ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.`,
 		promptSnippet: readToolSystemPromptContribution.snippet,
 		promptGuidelines: [...readToolSystemPromptContribution.guidelines],
 		parameters: readSchema,
 		constrainedSampling: getExperimentalToolSampling(),
 		async execute(
 			toolCallId,
-			{ path, offset, limit, pages }: { path: string; offset?: number; limit?: number; pages?: string },
+			{
+				path,
+				offset,
+				limit,
+				pages,
+				render,
+			}: { path: string; offset?: number; limit?: number; pages?: string; render?: boolean },
 			signal?: AbortSignal,
 			_onUpdate?,
 			ctx?,
@@ -538,8 +555,11 @@ export function createReadToolDefinition(
 							let content: (TextContent | ImageContent)[];
 							let details: ReadToolDetails | undefined;
 							const nonVisionImageNote = getNonVisionImageNote(ctx?.model);
-							const pdfProbe = mimeType ? undefined : await probePdf(ops, absolutePath, pages, signal);
+							const pdfProbe = mimeType ? undefined : await probePdf(ops, absolutePath);
 							if (aborted) return;
+							if (render && pdfProbe?.kind !== "pdf") {
+								throw new Error("render applies only to PDF files; read images and text files without it.");
+							}
 							if (mimeType) {
 								// Read image as binary.
 								const buffer = await ops.readFile(absolutePath);
@@ -589,7 +609,45 @@ export function createReadToolDefinition(
 									}
 								}
 							} else if (pdfProbe?.kind === "pdf") {
-								content = pdfProbe.content;
+								const extraction = await extractPdfText(pdfProbe.buffer, {
+									pages,
+									signal,
+									...(render ? { maxPages: MAX_PDF_RENDER_PAGES_PER_READ } : {}),
+								});
+								if (!extraction.ok) throw new Error(extraction.message);
+								const text = formatPdfText(extraction, { render: render ? "rendered" : "available" }).text;
+								content = [{ type: "text", text }];
+								if (render) {
+									const rendered = await renderPdfPages(pdfProbe.buffer, extraction.pages, signal);
+									if (!rendered.ok) throw new Error(rendered.message);
+									for (const page of rendered.pages) {
+										if (aborted) return;
+										const processed = await processImage(page.png, "image/png", { autoResizeImages, signal });
+										let pageNote = `--- rendered page ${page.pageNumber} ---`;
+										if (!processed.ok) {
+											content.push({ type: "text", text: `${pageNote}\n${processed.message}` });
+											continue;
+										}
+										if (processed.hints.length > 0) pageNote += `\n${processed.hints.join("\n")}`;
+										if (nonVisionImageNote && visionFallbackModel) {
+											const described = await describeImageWithFallback({
+												ctx,
+												modelSpec: visionFallbackModel,
+												image: { data: processed.data, mimeType: processed.mimeType },
+												signal,
+											});
+											pageNote += described.ok
+												? `\n${nonVisionImageNote}\n[Page described by ${visionFallbackModel}]\n${described.description}`
+												: `\n${nonVisionImageNote}\n[Vision fallback failed: ${described.error}]`;
+										} else if (nonVisionImageNote) {
+											pageNote += `\n${nonVisionImageNote}`;
+										}
+										content.push(
+											{ type: "text", text: pageNote },
+											{ type: "image", data: processed.data, mimeType: processed.mimeType },
+										);
+									}
+								}
 							} else {
 								// Read only the requested output window while still counting the file's
 								// lines. This keeps memory bounded for large, newline-heavy files.

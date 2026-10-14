@@ -7,7 +7,7 @@ import { InMemoryCredentialStore } from "../src/auth/credential-store.ts";
 import { anthropicOAuth } from "../src/auth/oauth/anthropic.ts";
 import { openaiCodexOAuth } from "../src/auth/oauth/openai-codex.ts";
 import { createRadiusOAuth } from "../src/auth/oauth/radius.ts";
-import type { AuthEvent, OAuthAuth, OAuthCredential } from "../src/auth/types.ts";
+import type { AuthEvent, AuthPrompt, OAuthAuth, OAuthCredential } from "../src/auth/types.ts";
 import { createModels, createProvider } from "../src/models.ts";
 
 const ownedServers = vi.hoisted(() => [] as Http.Server[]);
@@ -348,6 +348,133 @@ describe("busy OAuth callback ports", () => {
 			expect(notify).not.toHaveBeenCalled();
 			expect(fetchMock).toHaveBeenCalledOnce();
 			expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+		} finally {
+			await release();
+		}
+	});
+});
+
+// Every test that binds a fixed, provider-registered callback port lives in this file:
+// vitest runs files in parallel, so a second file binding the same port would race this one.
+function tokenResponse(body: unknown): Response {
+	return new Response(JSON.stringify(body), { headers: { "Content-Type": "application/json" } });
+}
+
+describe("Anthropic manual-code login", () => {
+	it("keeps the localhost redirect_uri for manual callback login", async () => {
+		let authUrl = "";
+		const fetchMock = vi.fn(async (input: unknown, init?: RequestInit): Promise<Response> => {
+			expect(String(input)).toBe("https://platform.claude.com/v1/oauth/token");
+			expect(init?.method).toBe("POST");
+			const body = JSON.parse(String(init?.body)) as Record<string, string>;
+			expect(body.grant_type).toBe("authorization_code");
+			expect(body.code).toBe("manual-code");
+			expect(body.redirect_uri).toBe("http://localhost:53692/callback");
+			return tokenResponse({
+				access_token: "access-token",
+				refresh_token: "refresh-token",
+				expires_in: 3600,
+			});
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const credentials = await anthropicOAuth.login({
+			signal: new AbortController().signal,
+			notify: (event) => {
+				if (event.type === "auth_url") authUrl = event.url;
+			},
+			prompt: async (prompt) => {
+				if (prompt.type !== "manual_code") throw new Error(`Unexpected prompt: ${prompt.type}`);
+				const url = new URL(authUrl);
+				const state = url.searchParams.get("state");
+				const redirectUri = url.searchParams.get("redirect_uri");
+				if (!state || !redirectUri) throw new Error("Missing OAuth state or redirect_uri in auth URL");
+				return `${redirectUri}?code=manual-code&state=${state}`;
+			},
+		});
+
+		expect(credentials.access).toBe("access-token");
+		expect(credentials.refresh).toBe("refresh-token");
+		expect(fetchMock).toHaveBeenCalledOnce();
+	});
+
+	it("anthropicOAuth.login resolves through the manual_code prompt and aborts it after settling", async () => {
+		const fetchMock = vi.fn(async (input: unknown): Promise<Response> => {
+			const url = String(input);
+			if (url.includes("/oauth/token")) {
+				return tokenResponse({ access_token: "access", refresh_token: "refresh", expires_in: 3600 });
+			}
+			throw new Error(`Unexpected fetch: ${url}`);
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const events: AuthEvent[] = [];
+		const prompts: AuthPrompt[] = [];
+		let manualSignal: AbortSignal | undefined;
+
+		const credential = await anthropicOAuth.login({
+			signal: new AbortController().signal,
+			notify: (event) => events.push(event),
+			prompt: async (prompt) => {
+				prompts.push(prompt);
+				if (prompt.type === "manual_code") {
+					manualSignal = prompt.signal;
+					return "the-code";
+				}
+				throw new Error(`Unexpected prompt: ${prompt.type}`);
+			},
+		});
+
+		expect(credential.type).toBe("oauth");
+		expect(credential.access).toBe("access");
+		expect(events.some((e) => e.type === "auth_url")).toBe(true);
+		expect(prompts.some((p) => p.type === "manual_code")).toBe(true);
+		// the prompt's signal is aborted once login settles, so UIs can dismiss it
+		expect(manualSignal?.aborted).toBe(true);
+	});
+
+	it("finishes through a pasted code when the callback port is busy", async () => {
+		const release = await occupyPort(53692);
+		try {
+			const events: AuthEvent[] = [];
+			const fetchMock = vi.fn(async (input: unknown) => {
+				expect(String(input)).toBe("https://platform.claude.com/v1/oauth/token");
+				return tokenResponse({ access_token: "access", refresh_token: "refresh", expires_in: 3600 });
+			});
+			vi.stubGlobal("fetch", fetchMock);
+
+			const credential = await anthropicOAuth.login({
+				signal: new AbortController().signal,
+				notify: (event) => events.push(event),
+				prompt: async () => "pasted-code",
+			});
+
+			expect(credential).toMatchObject({ access: "access", refresh: "refresh" });
+			expect(events).toContainEqual({
+				type: "info",
+				message: expect.stringContaining(
+					"Could not start the OAuth callback server on http://localhost:53692/callback: listen EADDRINUSE",
+				),
+			});
+		} finally {
+			await release();
+		}
+	});
+
+	it("fails with the bind failure when the callback port is busy and no code is pasted", async () => {
+		const release = await occupyPort(53692);
+		try {
+			const fetchMock = vi.fn(async () => {
+				throw new Error("must not exchange tokens");
+			});
+			vi.stubGlobal("fetch", fetchMock);
+
+			await expect(
+				anthropicOAuth.login({ signal: new AbortController().signal, notify: () => {}, prompt: async () => "" }),
+			).rejects.toThrow(
+				/^Could not start the OAuth callback server on http:\/\/localhost:53692\/callback: .*EADDRINUSE/,
+			);
+			expect(fetchMock).not.toHaveBeenCalled();
 		} finally {
 			await release();
 		}

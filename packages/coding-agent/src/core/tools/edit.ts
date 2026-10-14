@@ -121,7 +121,9 @@ function prepareEditArguments(input: unknown): EditToolInput {
 		return input as EditToolInput;
 	}
 
-	const args = input as Record<string, unknown>;
+	// Copy on write: `input` is the tool call's own arguments object inside the assistant message,
+	// which was already persisted, so mutating it would make live and reloaded history differ.
+	let args = input as Record<string, unknown>;
 
 	// Some models (Opus 4.6, GLM-5.1) send edits as a JSON string instead of an array.
 	// Others send a single edit object instead of a one-element edits array.
@@ -129,13 +131,13 @@ function prepareEditArguments(input: unknown): EditToolInput {
 		try {
 			const parsed = JSON.parse(args.edits);
 			if (Array.isArray(parsed)) {
-				args.edits = parsed;
+				args = { ...args, edits: parsed };
 			} else if (isSingleEditInput(parsed)) {
-				args.edits = [parsed];
+				args = { ...args, edits: [parsed] };
 			}
 		} catch {}
 	} else if (isSingleEditInput(args.edits)) {
-		args.edits = [args.edits];
+		args = { ...args, edits: [args.edits] };
 	}
 
 	const legacy = args as LegacyEditToolInput;

@@ -148,6 +148,48 @@ process.stdin.on("data", (chunk) => {
 		});
 		expect(result.status).toBe("failed");
 	}, 20_000);
+
+	it("reports a server that exits after initialize as failed without waiting out the deadline", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "lsp-exit-"));
+		const binDir = path.join(root, "node_modules", ".bin");
+		fs.mkdirSync(binDir, { recursive: true });
+		fs.writeFileSync(path.join(root, "small.ts"), "export const value = 1;\n");
+		const server = path.join(binDir, "typescript-language-server");
+		// Answers initialize, keeps reading (so every notification is written), then exits
+		// without ever publishing diagnostics.
+		fs.writeFileSync(server, `#!/usr/bin/env node
+let buffer = Buffer.alloc(0);
+let answered = false;
+process.stdin.on("data", (chunk) => {
+ buffer = Buffer.concat([buffer, chunk]);
+ if (answered) return;
+ const end = buffer.indexOf("\\r\\n\\r\\n");
+ if (end < 0) return;
+ const length = Number(/content-length:\\s*(\\d+)/i.exec(buffer.subarray(0, end).toString())[1]);
+ if (buffer.length < end + 4 + length) return;
+ const message = JSON.parse(buffer.subarray(end + 4, end + 4 + length));
+ answered = true;
+ const body = JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });
+ process.stdout.write(\`Content-Length: \${Buffer.byteLength(body)}\\r\\n\\r\\n\${body}\`);
+ setTimeout(() => process.exit(0), 300);
+});
+`);
+		fs.chmodSync(server, 0o755);
+		try {
+			const started = Date.now();
+			const result = await collectWatchdogLspDiagnostics({
+				cwd: root,
+				root,
+				changedPaths: ["small.ts"],
+				config: { enabled: true, timeoutMs: 15_000, maxFiles: 5, maxDiagnostics: 50 },
+			});
+			expect(result.status).toBe("failed");
+			expect(result.message).toContain("language server exited");
+			expect(Date.now() - started).toBeLessThan(10_000);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	}, 30_000);
 });
 
 describe("Herdr inspector startup regression", () => {

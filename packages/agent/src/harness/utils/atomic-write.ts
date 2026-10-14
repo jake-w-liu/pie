@@ -114,6 +114,11 @@ export async function atomicWriteFile(
 	const tempPath = join(dirname(target), `.${randomUUID()}.tmp`);
 	try {
 		await writeFile(tempPath, data, {
+			// Owner-only until the final mode is applied, so the new contents of a private target
+			// are never readable by others through the temp file. A new target (no mode to apply)
+			// keeps the default mode an in-place create would have produced.
+			mode: mode === undefined ? 0o666 : 0o600,
+			flag: "wx",
 			...(typeof data === "string" ? { encoding: options?.encoding ?? "utf-8" } : {}),
 			...(options?.signal ? { signal: options.signal } : {}),
 		});

@@ -64,6 +64,22 @@ describe("edit tool prepareArguments", () => {
 		expect(prepared).toBe(input);
 	});
 
+	it("normalizes stringified and single-object edits without mutating the tool call arguments", () => {
+		const definition = createEditToolDefinition(process.cwd());
+		const stringified = { path: "file.txt", edits: JSON.stringify([{ oldText: "a", newText: "b" }]) };
+		const single = { path: "file.txt", edits: { oldText: "a", newText: "b" } };
+		const stringifiedSnapshot = structuredClone(stringified);
+		const singleSnapshot = structuredClone(single);
+		for (const input of [stringified, single]) {
+			expect(definition.prepareArguments!(input)).toEqual({
+				path: "file.txt",
+				edits: [{ oldText: "a", newText: "b" }],
+			});
+		}
+		expect(stringified).toEqual(stringifiedSnapshot);
+		expect(single).toEqual(singleSnapshot);
+	});
+
 	it("passes through non-object input unchanged", () => {
 		const definition = createEditToolDefinition(process.cwd());
 		expect(definition.prepareArguments!(null)).toBe(null);

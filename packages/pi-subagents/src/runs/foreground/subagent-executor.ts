@@ -1648,7 +1648,7 @@ async function resumeExternalJobFollowUp(input: {
 		...input.baseAgentConfig,
 		runner: { type: "external-job", provider: runner.provider, options: runner.options },
 	};
-	const result = executeAsyncSingle(runId, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
+	const result = await executeAsyncSingle(runId, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
 		agent: input.target.agent,
 		task: input.followUp,
 		goal: input.followUp,
@@ -1889,7 +1889,7 @@ async function resumeAsyncRun(input: {
 		const chain = wrapChainTasksForFork(attachChain, contextPolicy);
 		const normalized = normalizeSkillInput(input.params.skill);
 		const parentModel = input.parentModel;
-		const result = executeAsyncChain(runId, compactOptional<Parameters<typeof executeAsyncChain>[1]>({
+		const result = await executeAsyncChain(runId, compactOptional<Parameters<typeof executeAsyncChain>[1]>({
 			chain,
 			task: workflowTask,
 			goal,
@@ -1997,7 +1997,7 @@ async function resumeAsyncRun(input: {
 	const availableModels = input.ctx.modelRegistry.getAvailable().map(toModelInfo);
 	const parentModel = input.parentModel;
 	const revivalAsyncDir = path.join(DIRS.async, runId);
-	const result = executeAsyncSingle(runId, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
+	const result = await executeAsyncSingle(runId, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
 		agent: target.agent,
 		task: buildRevivedAsyncTask(target as Parameters<typeof buildRevivedAsyncTask>[0], effectiveFollowUp),
 		goal: effectiveFollowUp,
@@ -3180,7 +3180,7 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 			? params.model ?? (externalRunnerWithoutExplicitModel ? undefined : a.model)
 			: resolveEffectiveSubagentModel(params.model as string | undefined, a.model, parentModel, availableModels, a.modelProvider ?? currentProvider, modelScopes.length === 0 ? {} : { scope: modelScopes });
 		const modelOverrideFromParent = inheritsParentModel(params.model as string | undefined, a.model, parentModel);
-		const asyncResult = executeAsyncSingle(id, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
+		const asyncResult = await executeAsyncSingle(id, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
 			agent: params.agent!,
 			task: shouldForkAgent(contextPolicy, params.agent!) ? wrapForkTask(params.task ?? "") : (params.task ?? ""),
 			goal: params.task ?? "",

@@ -52,18 +52,19 @@ export interface EditToolDetails {
 
 function prepareEditArguments(input: unknown): EditToolInput {
 	if (!input || typeof input !== "object") return input as EditToolInput;
-	const args = input as Record<string, unknown>;
+	// Copy on write: `input` is the tool call's own arguments object inside the assistant message.
+	let args = input as Record<string, unknown>;
 	if (typeof args.edits === "string") {
 		try {
 			const parsed: unknown = JSON.parse(args.edits);
 			if (Array.isArray(parsed)) {
-				args.edits = parsed;
+				args = { ...args, edits: parsed };
 			} else if (isSingleEditInput(parsed)) {
-				args.edits = [parsed];
+				args = { ...args, edits: [parsed] };
 			}
 		} catch {}
 	} else if (isSingleEditInput(args.edits)) {
-		args.edits = [args.edits];
+		args = { ...args, edits: [args.edits] };
 	}
 
 	const legacy = args as LegacyEditToolInput;

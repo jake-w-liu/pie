@@ -262,6 +262,7 @@ class JsonRpcLspClient {
 	private exited = false;
 	private terminating = false;
 	private transportError: Error | undefined;
+	private exitError: Error | undefined;
 	private readonly exitWaiters: Array<() => void> = [];
 
 	constructor(child: ChildProcessWithoutNullStreams) {
@@ -276,12 +277,14 @@ class JsonRpcLspClient {
 		});
 		child.on("error", (error) => {
 			this.exited = true;
+			this.exitError ??= error;
 			this.rejectPending(error);
 			this.resolveExitWaiters();
 		});
 		child.on("exit", (code, signal) => {
 			this.exited = true;
-			this.rejectPending(new Error(`language server exited${code === null ? "" : ` with code ${code}`}${signal ? ` signal ${signal}` : ""}`));
+			this.exitError ??= new Error(`language server exited${code === null ? "" : ` with code ${code}`}${signal ? ` signal ${signal}` : ""}`);
+			this.rejectPending(this.exitError);
 			this.resolveExitWaiters();
 		});
 	}
@@ -321,6 +324,11 @@ class JsonRpcLspClient {
 		if (this.exited || this.terminating) return;
 		this.terminating = true;
 		this.child.kill("SIGTERM");
+	}
+
+	/** Why the server can no longer deliver diagnostics, once its transport failed or it exited. */
+	deadReason(): Error | undefined {
+		return this.transportError ?? this.exitError;
 	}
 
 	stderrTail(): string {
@@ -447,6 +455,9 @@ async function waitForDiagnostics(client: JsonRpcLspClient, targets: TargetFile[
 	const started = Date.now();
 	while (!signal?.aborted && Date.now() - started < timeoutMs) {
 		if (targets.every((target) => client.diagnostics.has(target.uri))) return true;
+		// A dead server will never publish the rest; report it instead of waiting out the deadline.
+		const dead = client.deadReason();
+		if (dead) throw dead;
 		await new Promise((resolve) => setTimeout(resolve, Math.min(50, Math.max(1, timeoutMs - (Date.now() - started)))));
 	}
 	return targets.every((target) => client.diagnostics.has(target.uri));

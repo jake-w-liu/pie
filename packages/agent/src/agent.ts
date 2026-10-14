@@ -508,6 +508,9 @@ export class Agent {
 			await executor(abortController.signal);
 		} catch (error) {
 			await this.handleRunFailure(error, abortController.signal);
+			// The failed run is over: stop whatever it still has in flight (a provider stream
+			// whose consumer threw, running tools) instead of letting it run to completion.
+			abortController.abort();
 		} finally {
 			this.finishRun();
 		}

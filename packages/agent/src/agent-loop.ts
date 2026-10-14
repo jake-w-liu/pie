@@ -152,7 +152,9 @@ export async function runAgentLoopContinue(
 	}
 
 	const newMessages: AgentMessage[] = [];
-	const currentContext: AgentContext = { ...context };
+	// Copy the array as runAgentLoop does: the loop appends to it, and the caller's history
+	// must only change through the returned messages and emitted events.
+	const currentContext: AgentContext = { ...context, messages: [...context.messages] };
 
 	await emit({ type: "agent_start" });
 	await emit({ type: "turn_start" });
@@ -219,7 +221,8 @@ async function runLoop(
 				// Preparation (for example, compaction) can decide the run must stop before the
 				// next provider request, e.g. when required compaction is cancelled or context
 				// still overflows. Re-check the stop condition so no request is made in that case.
-				if (await config.shouldStopAfterTurn?.(lastCompletedTurn)) {
+				// An abort during preparation must not start another provider request.
+				if (signal?.aborted || (await config.shouldStopAfterTurn?.(lastCompletedTurn))) {
 					await emit({ type: "agent_end", messages: newMessages });
 					return;
 				}
@@ -403,7 +406,59 @@ async function streamAssistantResponse(
 		throw error;
 	}
 
-	return completeAssistantResponse(await response.result(), addedPartial, context, emit);
+	// The iterator ended without a done/error event. A conforming stream resolved its result
+	// before ending; one that never will must not hang the run past an abort.
+	const result = await resultUnlessAborted(response.result(), signal);
+	return completeAssistantResponse(
+		result ?? abortedAssistantMessage(partialMessage, config.model),
+		addedPartial,
+		context,
+		emit,
+	);
+}
+
+/** Resolve with the stream result, or undefined once `signal` aborts first. */
+function resultUnlessAborted(
+	result: Promise<AssistantMessage>,
+	signal: AbortSignal | undefined,
+): Promise<AssistantMessage | undefined> {
+	if (!signal) return result;
+	if (signal.aborted) return Promise.race([result, Promise.resolve(undefined)]);
+	return new Promise((resolve, reject) => {
+		const onAbort = () => resolve(undefined);
+		signal.addEventListener("abort", onAbort, { once: true });
+		result.then(
+			(message) => {
+				signal.removeEventListener("abort", onAbort);
+				resolve(message);
+			},
+			(error: unknown) => {
+				signal.removeEventListener("abort", onAbort);
+				reject(error);
+			},
+		);
+	});
+}
+
+function abortedAssistantMessage(partial: AssistantMessage | null, model: AgentLoopConfig["model"]): AssistantMessage {
+	return {
+		role: "assistant",
+		content: partial?.content ?? [],
+		api: partial?.api ?? model.api,
+		provider: partial?.provider ?? model.provider,
+		model: partial?.model ?? model.id,
+		usage: partial?.usage ?? {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "aborted",
+		errorMessage: "Operation aborted",
+		timestamp: Date.now(),
+	};
 }
 
 async function completeAssistantResponse(
@@ -849,7 +904,18 @@ async function executePreparedToolCall(
 				);
 			},
 		);
-		outcome = { kind: "executed", result, isError: false };
+		// Untyped (JS) tools can return nothing; without a result object there is no content to
+		// publish, and destructuring it later would fail the whole run and drop sibling results.
+		outcome =
+			result !== null && typeof result === "object"
+				? { kind: "executed", result, isError: false }
+				: {
+						kind: "executed",
+						result: createErrorToolResult(
+							`Tool "${prepared.toolCall.name}" returned ${result === null ? "null" : typeof result} instead of a result object.`,
+						),
+						isError: true,
+					};
 	} catch (error) {
 		outcome = {
 			kind: "executed",

@@ -31,6 +31,12 @@ describe("image processing pipeline", () => {
 		expect(detectSupportedImageMimeType(createTinyBmp1x1Red24bpp())).toBe("image/bmp");
 	});
 
+	it('requires a full GIF signature, so text that starts with "GIF" stays text', () => {
+		expect(detectSupportedImageMimeType(Buffer.from("GIF89a\x01\x00\x01\x00", "latin1"))).toBe("image/gif");
+		expect(detectSupportedImageMimeType(Buffer.from("GIF87a\x01\x00\x01\x00", "latin1"))).toBe("image/gif");
+		expect(detectSupportedImageMimeType(Buffer.from("GIF export notes\n", "utf8"))).toBeNull();
+	});
+
 	it("converts BMP files to PNG attachments when auto-resize is disabled", async () => {
 		const result = await processImage(createTinyBmp1x1Red24bpp(), "image/bmp", { autoResizeImages: false });
 

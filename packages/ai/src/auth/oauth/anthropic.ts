@@ -9,6 +9,7 @@ import type { Server } from "node:http";
 import { raceWithAbortSignal } from "../../utils/abort.ts";
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
+import { OAuthCallbackServerError } from "./callback-server.ts";
 import { oauthErrorHtml, oauthSuccessHtml } from "./oauth-page.ts";
 import { generatePKCE } from "./pkce.ts";
 import { parseOAuthTokenResponse } from "./token-response.ts";
@@ -152,11 +153,21 @@ async function startCallbackServer(expectedState: string): Promise<CallbackServe
 			}
 		});
 
+		let listening = false;
 		server.on("error", (err) => {
-			reject(err);
+			// Once handed to the caller, end the wait so the manual-paste fallback takes over.
+			settleWait?.(null);
+			if (listening) return;
+			try {
+				server.close();
+			} catch {
+				// The server never started listening; nothing to release.
+			}
+			reject(new OAuthCallbackServerError(REDIRECT_URI, err));
 		});
 
 		server.listen(CALLBACK_PORT, CALLBACK_HOST, () => {
+			listening = true;
 			resolve({
 				server,
 				redirectUri: REDIRECT_URI,
@@ -238,11 +249,20 @@ async function exchangeAuthorizationCode(
 async function loginAnthropic(interaction: ProviderAuthInteraction): Promise<OAuthCredential> {
 	interaction.signal.throwIfAborted();
 	const { verifier, challenge } = await generatePKCE();
-	const server = await startCallbackServer(verifier);
+	// A bind failure (e.g. another login holds the fixed port) is reported, not fatal:
+	// the flow still finishes through a pasted redirect URL or authorization code.
+	let server: CallbackServerInfo | undefined;
+	let serverError: OAuthCallbackServerError | undefined;
+	try {
+		server = await startCallbackServer(verifier);
+	} catch (error) {
+		if (!(error instanceof OAuthCallbackServerError)) throw error;
+		serverError = error;
+	}
 	const manualAbort = new AbortController();
 	const onAbort = () => {
 		manualAbort.abort(interaction.signal.reason);
-		server.cancelWait();
+		server?.cancelWait();
 	};
 	interaction.signal.addEventListener("abort", onAbort, { once: true });
 	if (interaction.signal.aborted) onAbort();
@@ -253,6 +273,12 @@ async function loginAnthropic(interaction: ProviderAuthInteraction): Promise<OAu
 
 	try {
 		interaction.signal.throwIfAborted();
+		if (serverError) {
+			interaction.notify({
+				type: "info",
+				message: `${serverError.message} Paste the redirect URL or authorization code to finish signing in.`,
+			});
+		}
 		const authParams = new URLSearchParams({
 			code: "true",
 			client_id: CLIENT_ID,
@@ -279,14 +305,14 @@ async function loginAnthropic(interaction: ProviderAuthInteraction): Promise<OAu
 			})
 			.then((input) => {
 				manualInput = input;
-				server.cancelWait();
+				server?.cancelWait();
 			})
 			.catch((error) => {
 				manualError = error instanceof Error ? error : new Error(String(error));
-				server.cancelWait();
+				server?.cancelWait();
 			});
 
-		const result = await server.waitForCode();
+		const result = server ? await server.waitForCode() : null;
 		interaction.signal.throwIfAborted();
 		if (manualError) throw manualError;
 		if (result?.code) {
@@ -310,14 +336,14 @@ async function loginAnthropic(interaction: ProviderAuthInteraction): Promise<OAu
 			}
 		}
 
-		if (!code) throw new Error("Missing authorization code");
+		if (!code) throw serverError ?? new Error("Missing authorization code");
 		if (!state) throw new Error("Missing OAuth state");
 		interaction.notify({ type: "progress", message: "Exchanging authorization code for tokens..." });
 		return exchangeAuthorizationCode(code, state, verifier, REDIRECT_URI, interaction.signal);
 	} finally {
 		interaction.signal.removeEventListener("abort", onAbort);
 		manualAbort.abort();
-		server.server.close();
+		server?.server.close();
 	}
 }
 

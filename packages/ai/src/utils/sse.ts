@@ -15,7 +15,7 @@ export async function* iterateSseMessages(
 	idleTimeoutMs?: number,
 ): AsyncGenerator<ServerSentEvent> {
 	const reader = body.getReader();
-	const read = (): Promise<ReadableStreamReadResult<Uint8Array>> => {
+	const read = (): ReturnType<typeof reader.read> => {
 		if (idleTimeoutMs === undefined || !(idleTimeoutMs > 0)) return reader.read();
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const idle = new Promise<never>((_resolve, reject) => {

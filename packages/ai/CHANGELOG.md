@@ -59,6 +59,7 @@
 - Fixed Codex SSE and Mistral streams being aborted `timeoutMs` after the request started even while events kept arriving; `timeoutMs` now bounds the wait for headers and each idle gap.
 - Fixed generated Gemini tool-call ids repeating across processes, which produced duplicate `tool_use` ids after switching a resumed session to Anthropic.
 - Fixed `start` events exposing content the provider filled in later, which made consumers relayed through lazy providers see text twice.
+- Fixed the OpenCode Go provider not registering the Google Generative AI API, which failed the package build once models.dev listed a Gemini model for OpenCode Go.
 
 ## [0.84.3] - 2026-08-24
 

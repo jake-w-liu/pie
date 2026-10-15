@@ -1346,10 +1346,11 @@ export function sliceWithWidth(
 		const ansi = extractAnsiCode(line, i);
 		if (ansi) {
 			if (currentCol >= startCol && currentCol < endCol) {
-				result += ansi.code;
-				// A reset cancels opens seen before the slice started; drop them so
-				// they cannot leak back onto later content via pendingAnsi.
-				if (isFullStyleReset(ansi.code)) pendingAnsi = "";
+				// Codes seen before the slice started must precede this one, or the
+				// older style overrides the newer one at the slice start. A reset
+				// cancels them instead, so they cannot leak onto later content.
+				result += isFullStyleReset(ansi.code) ? ansi.code : pendingAnsi + ansi.code;
+				pendingAnsi = "";
 			} else if (currentCol < startCol) pendingAnsi += ansi.code;
 			else if (currentCol === endCol && resultWidth > 0 && isStyleCloseSequence(ansi.code)) {
 				// A reset exactly at the slice end still terminates styles opened

@@ -794,6 +794,51 @@ function renderLayout(source: string, nodes: readonly LayoutNode[]): Layout {
 	};
 }
 
+/**
+ * Groups, arguments, and environments nested deeper than this make the expression
+ * unsupported (rendered raw) instead of recursing until the stack overflows. Real
+ * formulas nest a handful of levels.
+ */
+const MAX_NESTING_DEPTH = 100;
+
+/**
+ * Output of one parse level. Appends are O(1) and the trailing edits only touch the
+ * last pieces, so long formulas do not re-copy the whole result on every `_`, `^`,
+ * or `=`. Operator and layout markers are always appended as one piece.
+ */
+class LatexOutput {
+	private readonly pieces: string[] = [];
+
+	append(text: string): void {
+		if (text) {
+			this.pieces.push(text);
+		}
+	}
+
+	trimEnd(): void {
+		for (let last = this.pieces.pop(); last !== undefined; last = this.pieces.pop()) {
+			const trimmed = last.trimEnd();
+			if (trimmed) {
+				this.pieces.push(trimmed);
+				return;
+			}
+		}
+	}
+
+	last(): string {
+		return this.pieces[this.pieces.length - 1] ?? "";
+	}
+
+	replaceLast(text: string): void {
+		this.pieces.pop();
+		this.append(text);
+	}
+
+	toString(): string {
+		return this.pieces.join("");
+	}
+}
+
 class LatexParser {
 	private readonly source: string;
 	private readonly layoutNodes: LayoutNode[];
@@ -801,11 +846,13 @@ class LatexParser {
 	private position = 0;
 	private supported = true;
 	private stackFractions = true;
+	private depth: number;
 
-	constructor(source: string, layoutNodes: LayoutNode[], display: boolean) {
+	constructor(source: string, layoutNodes: LayoutNode[], display: boolean, depth = 0) {
 		this.source = source;
 		this.layoutNodes = layoutNodes;
 		this.display = display;
+		this.depth = depth;
 	}
 
 	render(): string | undefined {
@@ -817,57 +864,61 @@ class LatexParser {
 	}
 
 	private parseSequence(endCharacter?: string): string {
-		let result = "";
-		while (this.position < this.source.length) {
+		const result = new LatexOutput();
+		// An unsupported expression renders raw, so stop parsing at the first failure.
+		while (this.supported && this.position < this.source.length) {
 			const character = this.source[this.position];
 			if (endCharacter && character === endCharacter) {
 				this.position++;
-				return result;
+				return result.toString();
 			}
 
 			if (character === "}") {
 				this.supported = false;
-				return result;
+				return result.toString();
 			}
 
 			if (character === "{") {
 				this.position++;
-				result += this.parseSequence("}");
+				result.append(this.parseNested(() => this.parseSequence("}")));
 				continue;
 			}
 
 			if (character === "\\") {
 				const command = this.parseCommand();
 				if (command === NEGATIVE_SPACE) {
-					result = result.trimEnd();
-					if (result.endsWith(NAMED_OPERATOR_END)) {
-						result = result.slice(0, -NAMED_OPERATOR_END.length);
+					result.trimEnd();
+					const last = result.last();
+					if (last.endsWith(NAMED_OPERATOR_END)) {
+						result.replaceLast(last.slice(0, -NAMED_OPERATOR_END.length));
 					}
 				} else {
-					result += command;
+					result.append(command);
 				}
 				continue;
 			}
 
 			if (character === "^" || character === "_") {
 				this.position++;
-				result = result.trimEnd();
+				result.trimEnd();
 				const script = formatScript(this.parseRequiredArgument(false), character === "_" ? "sub" : "sup");
-				if (result.endsWith(NAMED_OPERATOR_END)) {
-					result = `${result.slice(0, -NAMED_OPERATOR_END.length)}${script}${NAMED_OPERATOR_END}`;
+				const last = result.last();
+				if (last.endsWith(NAMED_OPERATOR_END)) {
+					result.replaceLast(`${last.slice(0, -NAMED_OPERATOR_END.length)}${script}${NAMED_OPERATOR_END}`);
 				} else {
-					result += script;
+					result.append(script);
 				}
 				continue;
 			}
 
 			if (/\s/.test(character)) {
-				result += this.parseWhitespace();
+				result.append(this.parseWhitespace());
 				continue;
 			}
 
 			if (character === "=" || character === "<" || character === ">") {
-				result = `${result.trimEnd()} ${character} `;
+				result.trimEnd();
+				result.append(` ${character} `);
 				this.position++;
 				continue;
 			}
@@ -879,12 +930,12 @@ class LatexParser {
 
 			if (character === "~") {
 				this.position++;
-				result += " ";
+				result.append(" ");
 				continue;
 			}
 
 			if (character === ".") {
-				const marker = TRAILING_LAYOUT_MARKER_PATTERN.exec(result);
+				const marker = TRAILING_LAYOUT_MARKER_PATTERN.exec(result.last());
 				const node = marker ? this.layoutNodes[Number(marker[1])] : undefined;
 				if (node?.type === "matrix") {
 					const lastLine = node.lines.length - 1;
@@ -894,14 +945,25 @@ class LatexParser {
 				}
 			}
 
-			result += character;
+			result.append(character);
 			this.position++;
 		}
 
 		if (endCharacter) {
 			this.supported = false;
 		}
-		return result;
+		return result.toString();
+	}
+
+	private parseNested(parse: () => string): string {
+		if (this.depth >= MAX_NESTING_DEPTH) {
+			this.supported = false;
+			return "";
+		}
+		this.depth++;
+		const value = parse();
+		this.depth--;
+		return value;
 	}
 
 	private parseWhitespace(): string {
@@ -1161,10 +1223,10 @@ class LatexParser {
 		}
 		if (this.source[this.position] === "{") {
 			this.position++;
-			return this.parseSequence("}");
+			return this.parseNested(() => this.parseSequence("}"));
 		}
 		if (this.source[this.position] === "\\") {
-			return this.parseCommand();
+			return this.parseNested(() => this.parseCommand());
 		}
 		const value = this.source[this.position] ?? "";
 		this.position++;
@@ -1341,7 +1403,10 @@ class LatexParser {
 	}
 
 	private renderNested(source: string, stackFractions = true): string {
-		const rendered = new LatexParser(source, this.layoutNodes, this.display && stackFractions).render();
+		const rendered =
+			this.depth < MAX_NESTING_DEPTH
+				? new LatexParser(source, this.layoutNodes, this.display && stackFractions, this.depth + 1).render()
+				: undefined;
 		if (rendered === undefined) {
 			this.supported = false;
 			return source;

@@ -2649,6 +2649,11 @@ export class Editor implements Component, Focusable {
 					? this.state.cursorCol + 1
 					: this.state.cursorCol - 1
 				: undefined;
+			// Nothing precedes column 0; lastIndexOf would clamp -1 to 0 and match the
+			// character under the cursor instead of searching earlier lines.
+			if (searchFrom !== undefined && searchFrom < 0) {
+				continue;
+			}
 
 			const idx = isForward ? line.indexOf(char, searchFrom) : line.lastIndexOf(char, searchFrom);
 

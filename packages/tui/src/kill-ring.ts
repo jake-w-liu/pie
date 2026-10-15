@@ -1,4 +1,11 @@
 /**
+ * Entries kept for yank-pop (GNU Readline's default). Kills store their full
+ * text, including expanded pastes of up to 1M characters, so an unbounded ring
+ * would retain every kill of a long session.
+ */
+const MAX_KILL_RING_ENTRIES = 10;
+
+/**
  * Ring buffer for Emacs-style kill/yank operations.
  *
  * Tracks killed (deleted) text entries. Consecutive kills can accumulate
@@ -24,6 +31,9 @@ export class KillRing {
 			this.ring.push(opts.prepend ? text + last : last + text);
 		} else {
 			this.ring.push(text);
+			if (this.ring.length > MAX_KILL_RING_ENTRIES) {
+				this.ring.shift();
+			}
 		}
 	}
 

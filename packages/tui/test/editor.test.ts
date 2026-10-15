@@ -3120,6 +3120,19 @@ describe("Editor component", () => {
 			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 0 });
 		});
 
+		it("jumps backward from column 0 to an earlier line", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+
+			editor.setText("xay\nabc");
+			editor.handleInput("\x01"); // Ctrl+A - start of line 2, on its 'a'
+			assert.deepStrictEqual(editor.getCursor(), { line: 1, col: 0 });
+
+			editor.handleInput("\x1b\x1d"); // Ctrl+Alt+]
+			editor.handleInput("a"); // The 'a' under the cursor is skipped
+
+			assert.deepStrictEqual(editor.getCursor(), { line: 0, col: 1 });
+		});
+
 		it("does nothing when character is not found (forward)", () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
 

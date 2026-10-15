@@ -34,6 +34,10 @@ const MAX_BRACKETED_PASTE_CHARS = 1_000_000;
  * sequence. A truncated mouse report ends within a few bytes; the cap keeps a
  * stream that never sends the terminator from swallowing real keystrokes. */
 const MAX_ABANDONED_SEQUENCE_SWALLOW = 32;
+/** Idle sequence timeouts after which an abandoned SGR mouse report's tail is no
+ * longer expected. The tail is often read late, when a scroll blocks the render,
+ * and digits followed by M/m are rarely typed right after scrolling. */
+const MOUSE_TAIL_IDLE_TIMEOUTS = 4;
 
 /**
  * Check if a string is a complete escape sequence or needs more data
@@ -472,14 +476,9 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		const consumedAbandonedTail = hadAbandonedInput && str.length === 0;
 
 		if (str.length === 0 && this.buffer.length === 0 && this.pendingBytes.length === 0) {
-			// A candidate mouse tail needs a bounded wait for its next byte. If it
-			// never becomes a mouse report, flush returns the held typed characters.
-			if (this.abandonedCsi?.kind === "mouse-after-escape" && this.abandonedCsi.candidate.length > 0) {
-				this.timeout = setTimeout(() => {
-					const flushed = this.flush();
-					for (const sequence of flushed) this.emitDataSequence(sequence);
-				}, this.timeoutMs);
-			}
+			// Resynchronization continues only while the tail keeps arriving; if it
+			// never completes, flush returns any held candidate as typed characters.
+			if (this.abandonedCsi) this.scheduleResyncExpiry();
 			// Preserve the explicit empty-chunk contract, but do not synthesize an
 			// empty key event when resynchronization consumed a real input chunk.
 			if (!consumedAbandonedTail) this.emitDataSequence("");
@@ -692,6 +691,21 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.emit("data", sequence);
 	}
 
+	/**
+	 * End resynchronization once input stays idle. The tail of a split sequence
+	 * arrives as a burst (already queued when a stalled event loop fires the
+	 * flush), so bytes after an idle gap are typed input.
+	 */
+	private scheduleResyncExpiry(): void {
+		const mouseTail = this.abandonedCsi?.kind === "csi-tail" && this.abandonedCsi.final !== undefined;
+		this.timeout = setTimeout(
+			() => {
+				for (const sequence of this.flush()) this.emitDataSequence(sequence);
+			},
+			mouseTail ? MOUSE_TAIL_IDLE_TIMEOUTS * this.timeoutMs : this.timeoutMs,
+		);
+	}
+
 	flush(): string[] {
 		if (this.timeout) {
 			clearTimeout(this.timeout);
@@ -712,8 +726,10 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		if (this.buffer.length === 0) {
 			if (this.abandonedCsi?.kind === "mouse-after-escape" && this.abandonedCsi.candidate.length > 0) {
 				sequences.push(this.abandonedCsi.candidate);
-				this.abandonedCsi = undefined;
 			}
+			// Bytes after an idle timeout are new input, not the abandoned sequence's
+			// tail: without this, Escape followed later by "[Meet" lost that text.
+			this.abandonedCsi = undefined;
 			return sequences;
 		}
 
@@ -732,6 +748,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				candidate: "",
 				budget: MAX_ABANDONED_SEQUENCE_SWALLOW,
 			};
+			this.scheduleResyncExpiry();
 			return sequences;
 		}
 		if (isCsiParameterPhase(held)) {
@@ -744,6 +761,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				final: isSgrMouseParameterPhase(held) ? "Mm" : undefined,
 				budget: MAX_ABANDONED_SEQUENCE_SWALLOW,
 			};
+			this.scheduleResyncExpiry();
 			return sequences;
 		}
 

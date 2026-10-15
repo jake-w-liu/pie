@@ -147,6 +147,26 @@ describe("CombinedAutocompleteProvider", () => {
 			assert.deepStrictEqual(values, ["@README.md", "@src/"].sort());
 		});
 
+		test("passes a query starting with - to fd as a pattern, not an option", async () => {
+			setupFolder(baseDir, {
+				files: {
+					"-config.json": "{}",
+					"my-config.json": "{}",
+					"alpha.txt": "alpha",
+				},
+			});
+
+			const provider = new CombinedAutocompleteProvider([], baseDir, requireFdPath());
+			const line = "@-conf";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+			assert.deepStrictEqual(result?.items.map((item) => item.value).sort(), ["@-config.json", "@my-config.json"]);
+
+			// Parsed as an option, "-h" made fd print its help text as completions.
+			const helpLine = "@-h";
+			const helpResult = await getSuggestions(provider, [helpLine], 0, helpLine.length);
+			assert.deepStrictEqual(helpResult?.items ?? [], []);
+		});
+
 		test("matches file with extension in query", async () => {
 			setupFolder(baseDir, {
 				files: {

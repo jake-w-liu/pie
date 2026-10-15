@@ -347,6 +347,31 @@ describe("AssistantMessageComponent", () => {
 		]);
 	});
 
+	test("keeps partial math raw only while streaming", () => {
+		initTheme("dark");
+		const component = new AssistantMessageComponent();
+		const partial = "Map $a*b + c*d";
+
+		// The closing `$` may still arrive, so the `*` pair must not become emphasis.
+		component.updateContent(
+			createAssistantMessage([
+				{ type: "thinking", thinking: partial },
+				{ type: "text", text: partial },
+			]),
+			true,
+		);
+		const streamed = stripAnsi(component.render(80).join("\n")).split("\n");
+		expect(streamed.filter((line) => line.includes(partial))).toHaveLength(2);
+
+		// A finished message cannot gain a closing `$`: lone dollars stay literal text
+		// and the surrounding Markdown is rendered.
+		component.updateContent(
+			createAssistantMessage([{ type: "text", text: "It costs $5. Run `ls -la` and **check** it." }]),
+			false,
+		);
+		expect(stripAnsi(component.render(80).join("\n"))).toContain("It costs $5. Run ls -la and check it.");
+	});
+
 	test("uses configured output padding for user messages", () => {
 		initTheme("dark");
 

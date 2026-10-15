@@ -493,4 +493,27 @@ R\left(\frac{\pi}{4}\right)
 			assert.strictEqual(renderLatex(source), undefined);
 		}
 	});
+
+	it("returns undefined for pathologically deep nesting instead of overflowing the stack", () => {
+		const deep = [
+			`${"{".repeat(50_000)}x${"}".repeat(50_000)}`,
+			`${"x^{".repeat(20_000)}y${"}".repeat(20_000)}`,
+			`${String.raw`\sqrt`.repeat(20_000)}{x}`,
+		];
+		for (const source of deep) {
+			assert.strictEqual(renderLatex(source), undefined);
+		}
+		assert.strictEqual(renderLatex(`${"{".repeat(40)}x${"}".repeat(40)}`), "x");
+	});
+
+	it("renders long formulas without re-copying the result per operator", () => {
+		// Trimming the whole accumulated result on every `_` and `=` made this
+		// input take over 20s; it takes well under a second when linear.
+		const source = `${Array.from({ length: 40_000 }, (_, i) => `x_${i} =`).join(" ")} 0`;
+		const started = performance.now();
+		const rendered = renderLatex(source);
+		const elapsed = performance.now() - started;
+		assert.ok(rendered?.startsWith("x₀ = x₁ = x₂ = "), JSON.stringify(rendered?.slice(0, 20)));
+		assert.ok(elapsed < 4000, `rendering took ${Math.round(elapsed)}ms`);
+	});
 });

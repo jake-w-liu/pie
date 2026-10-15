@@ -99,6 +99,13 @@ describe("slice style-reset boundaries", () => {
 		assert.strictEqual(sliceByColumn("\x1b[31mab\x1b[0mcd", 2, 2, true), "\x1b[0mcd");
 	});
 
+	it("keeps codes seen before the slice ahead of codes at its start", () => {
+		// Reversed order lets the older style win: " normal" would stay red and
+		// "cd" red instead of green.
+		assert.strictEqual(sliceByColumn("\x1b[31mabc\x1b[39m normal", 3, 20, true), "\x1b[31m\x1b[39m normal");
+		assert.strictEqual(sliceByColumn("\x1b[31mab\x1b[32mcd\x1b[39m", 2, 2, true), "\x1b[31m\x1b[32mcd\x1b[39m");
+	});
+
 	it("closes the after segment at its end", () => {
 		const segments = extractSegments("\x1b[31mHelloWorld\x1b[0m!!", 0, 0, 5);
 		assert.strictEqual(segments.after, "\x1b[31mHello\x1b[0m");

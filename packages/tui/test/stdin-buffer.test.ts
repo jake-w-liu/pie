@@ -512,6 +512,42 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(buffer.flush(), ["["]);
 		});
 
+		it("should stop resynchronizing once input idles after a flushed lone ESC", async () => {
+			processInput("\x1b");
+			assert.deepStrictEqual(buffer.flush(), ["\x1b"]);
+
+			// The resync expiry armed by flush() (10ms) fires before this wait ends.
+			await wait(30);
+			processInput("[Meeting notes");
+
+			// "[Meet" would otherwise be swallowed as an X10 mouse report tail.
+			assert.deepStrictEqual(typed(), [..."[Meeting notes"]);
+		});
+
+		it("should stop resynchronizing once input idles after an abandoned legacy ESC [", async () => {
+			processInput("\x1b[");
+			await wait(30);
+			// The timeout abandoned the sequence and armed the resync expiry.
+			assert.deepStrictEqual(typed(), ["\x1b["]);
+			await wait(30);
+			processInput("12 apples");
+
+			// "12 a" would otherwise be swallowed as the CSI's parameters and final byte.
+			assert.deepStrictEqual(typed(), ["\x1b[", ..."12 apples"]);
+		});
+
+		it("should stop resynchronizing an abandoned mouse report once input idles", async () => {
+			processInput("\x1b[<64;58;");
+			await wait(30);
+			// The timeout abandoned the report and armed the longer mouse-tail expiry.
+			assert.deepStrictEqual(typed(), []);
+			await wait(100);
+			processInput("1. make");
+
+			// "1. m" would otherwise be swallowed as the report's parameters and final byte.
+			assert.deepStrictEqual(typed(), [..."1. make"]);
+		});
+
 		it("should return empty array if nothing to flush", () => {
 			const flushed = buffer.flush();
 			assert.deepStrictEqual(flushed, []);

@@ -7,7 +7,37 @@ import { normalizeCount } from "./stack.ts";
 
 const STRICT_STRIKETHROUGH_REGEX = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
 
-class StrictStrikethroughTokenizer extends Tokenizer {
+/**
+ * Blockquotes and lists nested deeper than this are lexed as plain text. Real
+ * documents nest far less, while a pasted `>>>>` banner would make marked recurse
+ * once per level (stack overflow on a few KB of `>` or `- `) and the renderer
+ * re-wrap every line once per level.
+ */
+const MAX_CONTAINER_NESTING = 16;
+
+class MarkdownTokenizer extends Tokenizer {
+	private containerDepth = 0;
+
+	override blockquote(src: string): Tokens.Blockquote | undefined {
+		return this.tokenizeContainer(() => super.blockquote(src));
+	}
+
+	override list(src: string): Tokens.List | undefined {
+		return this.tokenizeContainer(() => super.list(src));
+	}
+
+	private tokenizeContainer<T>(tokenize: () => T | undefined): T | undefined {
+		if (this.containerDepth >= MAX_CONTAINER_NESTING) {
+			return undefined;
+		}
+		this.containerDepth++;
+		try {
+			return tokenize();
+		} finally {
+			this.containerDepth--;
+		}
+	}
+
 	override del(src: string): Tokens.Del | undefined {
 		const match = STRICT_STRIKETHROUGH_REGEX.exec(src);
 		if (!match) {
@@ -50,7 +80,7 @@ function looksLikePendingDollarMath(source: string): boolean {
 	return /\\[A-Za-z]+|[_^=+*/<>()[\]|±≤≥≠≈∈→⇒∞∫∑√-]/.test(source);
 }
 
-function tokenizeInlineLatex(source: string): LatexToken | undefined {
+function tokenizeInlineLatex(source: string, streaming: boolean): LatexToken | undefined {
 	let opening = "";
 	let closing = "";
 	if (source.startsWith("$$")) {
@@ -83,6 +113,12 @@ function tokenizeInlineLatex(source: string): LatexToken | undefined {
 	}
 
 	if (closingIndex < 0) {
+		// Only streamed text can still receive the closing delimiter. In complete text
+		// an unclosed `$5` or `$HOME` is literal, and a pending token would keep the
+		// rest of the paragraph as raw Markdown.
+		if (!streaming) {
+			return undefined;
+		}
 		const pendingSource = source.slice(opening.length);
 		if (opening.startsWith("\\") || looksLikePendingDollarMath(pendingSource)) {
 			return { type: "latex", raw: source, text: pendingSource, pending: true };
@@ -99,7 +135,7 @@ function tokenizeInlineLatex(source: string): LatexToken | undefined {
 	return { type: "latex", raw, text };
 }
 
-function tokenizeBlockLatex(source: string): LatexToken | undefined {
+function tokenizeBlockLatex(source: string, streaming: boolean): LatexToken | undefined {
 	const dollarMatch = /^ {0,3}\$\$[ \t]*(?:\n)?([\s\S]*?)\$\$[ \t]*(?:\n|$)/.exec(source);
 	if (dollarMatch?.[1]) {
 		return { type: "latexBlock", raw: dollarMatch[0], text: dollarMatch[1].trim() };
@@ -110,6 +146,11 @@ function tokenizeBlockLatex(source: string): LatexToken | undefined {
 		return { type: "latexBlock", raw: bracketMatch[0], text: bracketMatch[1].trim() };
 	}
 
+	// A pending block consumes the rest of the document, so only streamed text,
+	// whose closing delimiter may still arrive, gets one.
+	if (!streaming) {
+		return undefined;
+	}
 	const pendingBracket = /^ {0,3}\\\[[ \t]*(?:\n)?([\s\S]*)$/.exec(source);
 	if (pendingBracket) {
 		return { type: "latexBlock", raw: pendingBracket[0], text: pendingBracket[1], pending: true };
@@ -121,28 +162,30 @@ function tokenizeBlockLatex(source: string): LatexToken | undefined {
 	return undefined;
 }
 
-const LATEX_MARKDOWN_EXTENSIONS: readonly TokenizerExtension[] = [
-	{
-		name: "latexBlock",
-		level: "block",
-		start(source) {
-			const match = /(?:^|\n) {0,3}(?:\$\$|\\\[)/.exec(source);
-			return match ? match.index + (match[0].startsWith("\n") ? 1 : 0) : undefined;
+function createLatexExtensions(streaming: boolean): TokenizerExtension[] {
+	return [
+		{
+			name: "latexBlock",
+			level: "block",
+			start(source) {
+				const match = /(?:^|\n) {0,3}(?:\$\$|\\\[)/.exec(source);
+				return match ? match.index + (match[0].startsWith("\n") ? 1 : 0) : undefined;
+			},
+			tokenizer: (source) => tokenizeBlockLatex(source, streaming),
 		},
-		tokenizer: tokenizeBlockLatex,
-	},
-	{
-		name: "latex",
-		level: "inline",
-		start(source) {
-			const indices = [source.indexOf("$"), source.indexOf("\\("), source.indexOf("\\[")].filter(
-				(index) => index >= 0,
-			);
-			return indices.length > 0 ? Math.min(...indices) : undefined;
+		{
+			name: "latex",
+			level: "inline",
+			start(source) {
+				const indices = [source.indexOf("$"), source.indexOf("\\("), source.indexOf("\\[")].filter(
+					(index) => index >= 0,
+				);
+				return indices.length > 0 ? Math.min(...indices) : undefined;
+			},
+			tokenizer: (source) => tokenizeInlineLatex(source, streaming),
 		},
-		tokenizer: tokenizeInlineLatex,
-	},
-];
+	];
+}
 
 function trimPartialClosingFences(tokens: readonly Token[]): void {
 	const token = tokens[tokens.length - 1];
@@ -177,11 +220,17 @@ function isPlainMarkdown(source: string): boolean {
 	return !BLOCK_MARKDOWN_PATTERN.test(source) && !INLINE_MARKDOWN_PATTERN.test(source);
 }
 
-const markdownParser = new Marked();
-markdownParser.setOptions({
-	tokenizer: new StrictStrikethroughTokenizer(),
-});
-markdownParser.use({ extensions: [...LATEX_MARKDOWN_EXTENSIONS] });
+function createMarkdownParser(streaming: boolean): Marked {
+	const parser = new Marked();
+	parser.setOptions({
+		tokenizer: new MarkdownTokenizer(),
+	});
+	parser.use({ extensions: createLatexExtensions(streaming) });
+	return parser;
+}
+
+const markdownParser = createMarkdownParser(false);
+const streamingMarkdownParser = createMarkdownParser(true);
 
 /**
  * Default text styling for markdown content.
@@ -235,11 +284,18 @@ export interface MarkdownOptions {
 	transform?: (markdown: string, availableWidth: number) => string;
 	/** Render supported LaTeX math expressions as Unicode text (default: true). */
 	renderLatex?: boolean;
+	/**
+	 * The text is still being streamed (default: false). Unclosed math delimiters then
+	 * stay raw until their closing delimiter arrives; in complete text they are literal.
+	 */
+	streaming?: boolean;
 }
 
 interface InlineStyleContext {
 	applyText: (text: string) => string;
 	stylePrefix: string;
+	/** Set inside a blockquote, whose outermost level styles all nested lines. */
+	insideQuote?: boolean;
 }
 
 export class Markdown implements Component {
@@ -316,7 +372,8 @@ export class Markdown implements Component {
 			for (const line of normalizedText.split(/\r\n|\r|\n/)) renderedLines.push(this.applyDefaultStyle(line));
 		} else {
 			// Parse markdown to HTML-like tokens only when Markdown syntax is present.
-			const tokens = markdownParser.lexer(normalizedText);
+			const parser = this.options.streaming ? streamingMarkdownParser : markdownParser;
+			const tokens = parser.lexer(normalizedText);
 			trimPartialClosingFences(tokens);
 			for (let i = 0; i < tokens.length; i++) {
 				const token = tokens[i];
@@ -557,16 +614,18 @@ export class Markdown implements Component {
 			}
 
 			case "list": {
-				const listLines = this.renderList(token as Tokens.List, 0, width, styleContext);
-				lines.push(...listLines);
+				// Loops instead of push(...lines): spreading a 125k+ element array
+				// throws RangeError.
+				for (const line of this.renderList(token as Tokens.List, 0, width, styleContext)) lines.push(line);
 				// Don't add spacing after lists if a space token follows
 				// (the space token will handle it)
 				break;
 			}
 
 			case "table": {
-				const tableLines = this.renderTable(token as Tokens.Table, width, nextTokenType, styleContext);
-				lines.push(...tableLines);
+				for (const line of this.renderTable(token as Tokens.Table, width, nextTokenType, styleContext)) {
+					lines.push(line);
+				}
 				break;
 			}
 
@@ -586,9 +645,15 @@ export class Markdown implements Component {
 					);
 					return quoteStyle(lineWithReappliedStyle);
 				};
+				// The outermost quote styles every nested line once. Restyling at each level
+				// would grow a line's ANSI codes quadratically with the nesting depth.
+				const styleLines = !styleContext?.insideQuote;
 
-				// Calculate available width for quote content (subtract border "│ " = 2 chars)
-				const quoteContentWidth = Math.max(1, width - 2);
+				// The "│ " border needs two columns plus one for content. Narrower (deeply
+				// nested) quotes drop it: re-wrapping 3-column bordered child lines at one
+				// column would multiply the line count at every further level.
+				const border = width > 2 ? this.theme.quoteBorder("│ ") : "";
+				const quoteContentWidth = border ? width - 2 : width;
 
 				// Blockquotes contain block-level tokens (paragraph, list, code, etc.), so render
 				// children with renderToken() instead of renderInlineTokens().
@@ -596,15 +661,21 @@ export class Markdown implements Component {
 				const quoteInlineStyleContext: InlineStyleContext = {
 					applyText: (text: string) => text,
 					stylePrefix: quoteStylePrefix,
+					insideQuote: true,
 				};
 				const quoteTokens = token.tokens || [];
 				const renderedQuoteLines: string[] = [];
 				for (let i = 0; i < quoteTokens.length; i++) {
 					const quoteToken = quoteTokens[i];
 					const nextQuoteToken = quoteTokens[i + 1];
-					renderedQuoteLines.push(
-						...this.renderToken(quoteToken, quoteContentWidth, nextQuoteToken?.type, quoteInlineStyleContext),
-					);
+					for (const line of this.renderToken(
+						quoteToken,
+						quoteContentWidth,
+						nextQuoteToken?.type,
+						quoteInlineStyleContext,
+					)) {
+						renderedQuoteLines.push(line);
+					}
 				}
 
 				// Avoid rendering an extra empty quote line before the outer blockquote spacing.
@@ -613,10 +684,10 @@ export class Markdown implements Component {
 				}
 
 				for (const quoteLine of renderedQuoteLines) {
-					const styledLine = applyQuoteStyle(quoteLine);
+					const styledLine = styleLines ? applyQuoteStyle(quoteLine) : quoteLine;
 					const wrappedLines = wrapTextWithAnsi(styledLine, quoteContentWidth);
 					for (const wrappedLine of wrappedLines) {
-						lines.push(this.theme.quoteBorder("│ ") + wrappedLine);
+						lines.push(border + wrappedLine);
 					}
 				}
 				if (nextTokenType && nextTokenType !== "space") {
@@ -778,7 +849,7 @@ export class Markdown implements Component {
 	 */
 	private renderList(token: Tokens.List, depth: number, width: number, styleContext?: InlineStyleContext): string[] {
 		const lines: string[] = [];
-		const indent = "    ".repeat(depth);
+		const nestingIndent = 4 * depth;
 		// Use the list's start property (defaults to 1 for ordered lists)
 		const startNumber = typeof token.start === "number" ? token.start : 1;
 
@@ -793,15 +864,21 @@ export class Markdown implements Component {
 					? (this.getUnorderedListMarker(item) ?? "- ")
 					: "- ";
 			const taskMarker = item.task ? `[${item.checked ? "x" : " "}] ` : "";
-			const marker = bullet + taskMarker;
-			const firstPrefix = indent + this.theme.listBullet(marker);
-			const continuationPrefix = indent + " ".repeat(visibleWidth(marker));
-			const itemWidth = Math.max(1, width - visibleWidth(firstPrefix));
+			// Keep one column for content: narrow widths drop indentation, then clip the
+			// (ASCII) marker. A line wider than `width` would be re-wrapped by every
+			// enclosing quote or list, multiplying lines at each nesting level.
+			const marker = (bullet + taskMarker).slice(0, Math.max(0, width - 1));
+			const indentWidth = Math.max(0, Math.min(nestingIndent, width - 1 - marker.length));
+			const firstPrefix = " ".repeat(indentWidth) + this.theme.listBullet(marker);
+			const continuationPrefix = " ".repeat(indentWidth + marker.length);
+			const itemWidth = Math.max(1, width - indentWidth - marker.length);
 			let renderedAnyLine = false;
 
 			for (const itemToken of item.tokens) {
 				if (itemToken.type === "list") {
-					lines.push(...this.renderList(itemToken as Tokens.List, depth + 1, width, styleContext));
+					for (const line of this.renderList(itemToken as Tokens.List, depth + 1, width, styleContext)) {
+						lines.push(line);
+					}
 					renderedAnyLine = true;
 					continue;
 				}

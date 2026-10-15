@@ -158,6 +158,7 @@ export class AssistantMessageComponent extends Container {
 			if (group.kind === "text") {
 				component = new Markdown(group.text, this.outputPad, 0, this.markdownTheme, undefined, {
 					transform: createMarkdownTransform("assistant", true, this.markdownTransformers),
+					streaming: true,
 				});
 			} else if (this.hideThinkingBlock) {
 				// Thinking is meant to be hidden: keep a single compact label for the
@@ -180,6 +181,7 @@ export class AssistantMessageComponent extends Container {
 					},
 					{
 						transform: createMarkdownTransform("assistant-thinking", true, this.markdownTransformers),
+						streaming: true,
 					},
 				);
 			}

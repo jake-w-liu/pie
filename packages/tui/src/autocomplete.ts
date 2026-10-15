@@ -174,7 +174,8 @@ async function walkDirectoryWithFd(
 	}
 
 	if (query) {
-		args.push(buildFdPathQuery(query));
+		// "--" ends option parsing: a query such as "-h" or "-conf" is a pattern.
+		args.push("--", buildFdPathQuery(query));
 	}
 
 	return await new Promise((resolve) => {

@@ -914,13 +914,15 @@ A=
 		});
 
 		it("preserves incomplete backslash delimiters while streaming", () => {
-			const inline = new Markdown(String.raw`Map \(\mathbb{C}^3`, 0, 0, defaultMarkdownTheme);
+			const inline = new Markdown(String.raw`Map \(\mathbb{C}^3`, 0, 0, defaultMarkdownTheme, undefined, {
+				streaming: true,
+			});
 			assert.deepStrictEqual(
 				inline.render(80).map((line) => stripAnsi(line).trimEnd()),
 				[String.raw`Map \(\mathbb{C}^3`],
 			);
 
-			const display = new Markdown("\\[\nx^2", 0, 0, defaultMarkdownTheme);
+			const display = new Markdown("\\[\nx^2", 0, 0, defaultMarkdownTheme, undefined, { streaming: true });
 			assert.deepStrictEqual(
 				display.render(80).map((line) => stripAnsi(line).trimEnd()),
 				["\\[", "x^2"],
@@ -953,8 +955,54 @@ A=
 			);
 		});
 
+		it("keeps unclosed math raw only while streaming", () => {
+			const source = "Map $a*b + c*d";
+			const streamed = new Markdown(source, 0, 0, defaultMarkdownTheme, undefined, { streaming: true });
+			assert.deepStrictEqual(
+				streamed.render(80).map((line) => stripAnsi(line).trimEnd()),
+				[source],
+			);
+
+			// Complete text cannot gain a closing `$`, so the `*` pair is emphasis.
+			const complete = new Markdown(source, 0, 0, defaultMarkdownTheme);
+			assert.deepStrictEqual(
+				complete.render(80).map((line) => stripAnsi(line).trimEnd()),
+				["Map $ab + cd"],
+			);
+		});
+
+		it("renders Markdown around unclosed delimiters in complete text", () => {
+			const cases = [
+				{
+					source: "It costs $5 (approx). Run `ls -la` and **check** the output.",
+					expected: ["It costs $5 (approx). Run ls -la and check the output."],
+				},
+				{
+					source: "Set $HOME first, then run `make -j4` and **verify**.",
+					expected: ["Set $HOME first, then run make -j4 and verify."],
+				},
+				{
+					source: "Done.\n\n$$ is the shell PID.\n\n## Next steps\n\n- run `npm test`\n- **ship** it",
+					expected: ["Done.", "", "$$ is the shell PID.", "", "Next steps", "", "- run npm test", "- ship it"],
+				},
+				{ source: String.raw`Map \(\mathbb{C}^3 and **bold**`, expected: [String.raw`Map (\mathbb{C}^3 and bold`] },
+				{ source: "\\[\nx^2 and **bold**", expected: ["[", "x^2 and bold"] },
+			];
+
+			for (const { source, expected } of cases) {
+				const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+				assert.deepStrictEqual(
+					markdown.render(80).map((line) => stripAnsi(line).trimEnd()),
+					expected,
+					JSON.stringify(source),
+				);
+			}
+		});
+
 		it("switches from raw to rendered math when a streamed delimiter closes", () => {
-			const markdown = new Markdown(String.raw`Map $\mathbb{C}^3`, 0, 0, defaultMarkdownTheme);
+			const markdown = new Markdown(String.raw`Map $\mathbb{C}^3`, 0, 0, defaultMarkdownTheme, undefined, {
+				streaming: true,
+			});
 			assert.deepStrictEqual(
 				markdown.render(80).map((line) => stripAnsi(line).trimEnd()),
 				[String.raw`Map $\mathbb{C}^3`],

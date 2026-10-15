@@ -99,4 +99,13 @@ describe("formatPromptTemplateInvocation", () => {
 			"hello world test hello world test",
 		);
 	});
+
+	it("inserts argument text literally, without expanding placeholders or replacement patterns in it", () => {
+		const format = (content: string, args: string[]) => formatPromptTemplateInvocation({ name: "t", content }, args);
+		expect(format("Run: $1", ['echo "$@"'])).toBe('Run: echo "$@"');
+		expect(format("$1 then $" + "{@:2}", ["a$" + "{@:1}", "b"])).toBe("a$" + "{@:1} then b");
+		expect(format("Explain: $ARGUMENTS", ["costs $$5"])).toBe("Explain: costs $$5");
+		expect(format("A $@ B", ["x$'y"])).toBe("A x$'y B");
+		expect(format("A $ARGUMENTS B", ["x$&y"])).toBe("A x$&y B");
+	});
 });

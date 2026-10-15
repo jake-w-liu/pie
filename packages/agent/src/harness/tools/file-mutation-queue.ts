@@ -46,11 +46,28 @@ export async function withFileMutationQueue<T>(env: ExecutionEnv, path: string, 
 	);
 
 	const { key, currentQueue, chainedQueue, releaseNext } = await registration;
+	const release = (): void => {
+		releaseNext();
+		if (state.queues.get(key) === chainedQueue) state.queues.delete(key);
+	};
 	await currentQueue;
+	// The path may have been repointed (symlink flip) or replaced while this operation waited.
+	// Re-resolve and move to the current key's queue rather than run alongside operations that
+	// registered against the new target. A swap after this check is still racy.
+	let freshKey: string;
+	try {
+		freshKey = await getMutationQueueKey(env, path);
+	} catch (error) {
+		release();
+		throw error;
+	}
+	if (freshKey !== key) {
+		release();
+		return withFileMutationQueue(env, path, fn);
+	}
 	try {
 		return await fn();
 	} finally {
-		releaseNext();
-		if (state.queues.get(key) === chainedQueue) state.queues.delete(key);
+		release();
 	}
 }

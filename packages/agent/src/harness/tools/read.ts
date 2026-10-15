@@ -167,6 +167,8 @@ export function createReadTool<TContext extends ExecutionToolContext = Execution
 
 			const textContent = new TextDecoder().decode(bytes);
 			const allLines = textContent.split("\n");
+			// A trailing newline terminates the last line; it does not start another one.
+			if (allLines.length > 1 && allLines.at(-1) === "") allLines.pop();
 			const totalFileLines = allLines.length;
 			const startLine = offset === undefined ? 0 : Math.max(0, offset - 1);
 			const startLineDisplay = startLine + 1;

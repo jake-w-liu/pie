@@ -243,20 +243,25 @@ export function parseCommandArgs(argsString: string): string[] {
 	return args;
 }
 
-/** Substitute prompt template placeholders (`$1`, `$@`, `$ARGUMENTS`, `${@:N}`, `${@:N:L}`) with command arguments. */
+/**
+ * Substitute prompt template placeholders (`$1`, `$@`, `$ARGUMENTS`, `${@:N}`, `${@:N:L}`) with command arguments.
+ * One pass over the template with a replacer function, so inserted argument text is never rescanned for
+ * placeholders and `$` replacement patterns (`$$`, `$&`, `$'`) in it stay literal.
+ */
 export function substituteArgs(content: string, args: string[]): string {
-	let result = content;
-	result = result.replace(/\$(\d+)/g, (_, num: string) => args[parseInt(num, 10) - 1] ?? "");
-	result = result.replace(/\$\{@:(\d+)(?::(\d+))?\}/g, (_, startStr: string, lengthStr?: string) => {
-		let start = parseInt(startStr, 10) - 1;
-		if (start < 0) start = 0;
-		if (lengthStr) return args.slice(start, start + parseInt(lengthStr, 10)).join(" ");
-		return args.slice(start).join(" ");
-	});
 	const allArgs = args.join(" ");
-	result = result.replace(/\$ARGUMENTS/g, allArgs);
-	result = result.replace(/\$@/g, allArgs);
-	return result;
+	return content.replace(
+		/\$\{@:(\d+)(?::(\d+))?\}|\$(ARGUMENTS|@|\d+)/g,
+		(_match, sliceStart?: string, sliceLength?: string, simple = "") => {
+			if (sliceStart !== undefined) {
+				const start = Math.max(0, parseInt(sliceStart, 10) - 1);
+				if (sliceLength !== undefined) return args.slice(start, start + parseInt(sliceLength, 10)).join(" ");
+				return args.slice(start).join(" ");
+			}
+			if (simple === "ARGUMENTS" || simple === "@") return allArgs;
+			return args[parseInt(simple, 10) - 1] ?? "";
+		},
+	);
 }
 
 /** Format a prompt template invocation with positional arguments. */

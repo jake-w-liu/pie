@@ -20,6 +20,7 @@ import {
 	type JsonlSessionRepoOptions,
 	Session,
 } from "../../../src/harness/session/index.ts";
+import { acquireJsonlWriterLease } from "../../../src/harness/session/jsonl/lease.ts";
 import { loadJsonlSessionStorage } from "../../../src/harness/session/jsonl/repo.ts";
 import { FileError } from "../../../src/harness/types.ts";
 
@@ -42,6 +43,50 @@ async function readEntryIds(options: JsonlSessionRepoOptions, metadata: JsonlSes
 afterEach(() => {
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+	let resolve = () => {};
+	const promise = new Promise<void>((resolvePromise) => {
+		resolve = resolvePromise;
+	});
+	return { promise, resolve };
+}
+
+/** Pause the first call of `method` until released, as if the process were descheduled right before it. */
+function pauseFirstCall(
+	fs: NodeExecutionEnv,
+	method: "renameFile" | "writeFile",
+): { fs: JsonlSessionRepoFileSystem; reached: Promise<void>; release: () => void } {
+	const reached = deferred();
+	const released = deferred();
+	let paused = false;
+	const pausedFs = new Proxy(fs, {
+		get(target, property, receiver) {
+			if (property === method) {
+				return async (...args: unknown[]) => {
+					if (!paused) {
+						paused = true;
+						reached.resolve();
+						await released.promise;
+					}
+					return Reflect.apply(target[method], target, args);
+				};
+			}
+			const value: unknown = Reflect.get(target, property, receiver);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}) as JsonlSessionRepoFileSystem;
+	return { fs: pausedFs, reached: reached.promise, release: released.resolve };
+}
+
+function isUsable(lease: { assertUsable(): void }): boolean {
+	try {
+		lease.assertUsable();
+		return true;
+	} catch {
+		return false;
+	}
+}
 
 describe("JSONL writer lease", () => {
 	it("steals an expired foreign-host lease and removes it on close", async () => {
@@ -129,6 +174,71 @@ describe("JSONL writer lease", () => {
 			"after-missing-owner",
 			"after-torn-owner",
 		]);
+	});
+
+	it("does not steal a fresh lease that replaced the stale lease it judged", async () => {
+		const { root, fs } = fixture();
+		const sessionPath = join(root, "session.jsonl");
+		writeFileSync(sessionPath, "");
+		const lockPath = `${sessionPath}.lock`;
+		mkdirSync(lockPath);
+		writeFileSync(
+			join(lockPath, "owner.json"),
+			`${JSON.stringify({
+				ownerId: "stale-owner",
+				pid: 999_999_999,
+				hostname: `${hostname()}-foreign`,
+				acquiredAt: 1,
+				renewedAt: 1,
+			})}\n`,
+		);
+
+		// B judges the lease stale, then stalls just before moving it away.
+		const stalled = pauseFirstCall(fs, "renameFile");
+		const leaseB = acquireJsonlWriterLease(stalled.fs, sessionPath);
+		void leaseB.catch(() => {});
+		await stalled.reached;
+		// A steals the same stale lease and publishes a fresh one.
+		const leaseA = await acquireJsonlWriterLease(fs, sessionPath);
+		const ownerA = JSON.parse(readFileSync(join(lockPath, "owner.json"), "utf8")).ownerId;
+		stalled.release();
+
+		await expect(leaseB).rejects.toMatchObject({ code: "already_exists" });
+		expect(isUsable(leaseA)).toBe(true);
+		expect(JSON.parse(readFileSync(join(lockPath, "owner.json"), "utf8")).ownerId).toBe(ownerA);
+		expect(readdirSync(root).filter((name) => name.includes(".lock.stale-"))).toEqual([]);
+		await leaseA.close();
+		expect(existsSync(lockPath)).toBe(false);
+	});
+
+	it("does not steal a fresh lease whose owner record is not yet published", async () => {
+		const { root, fs } = fixture();
+		const sessionPath = join(root, "session.jsonl");
+		writeFileSync(sessionPath, "");
+		const lockPath = `${sessionPath}.lock`;
+		// An abandoned lock directory that never got an owner record.
+		mkdirSync(lockPath);
+		const stale = new Date(Date.now() - 60_000);
+		utimesSync(lockPath, stale, stale);
+
+		const stalledB = pauseFirstCall(fs, "renameFile");
+		const leaseB = acquireJsonlWriterLease(stalledB.fs, sessionPath);
+		void leaseB.catch(() => {});
+		await stalledB.reached;
+		// A steals the abandoned lock and claims a fresh directory, but stalls before publishing its owner.
+		const stalledA = pauseFirstCall(fs, "writeFile");
+		const leaseA = acquireJsonlWriterLease(stalledA.fs, sessionPath);
+		await stalledA.reached;
+		stalledB.release();
+
+		await expect(leaseB).rejects.toMatchObject({ code: "already_exists" });
+		stalledA.release();
+		const holder = await leaseA;
+		expect(isUsable(holder)).toBe(true);
+		expect(existsSync(join(lockPath, "owner.json"))).toBe(true);
+		expect(readdirSync(root).filter((name) => name.includes(".lock.stale-"))).toEqual([]);
+		await holder.close();
+		expect(existsSync(lockPath)).toBe(false);
 	});
 
 	it("keeps a fresh unreadable lease locked while its holder may still publish it", async () => {

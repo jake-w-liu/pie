@@ -10,7 +10,7 @@ import { createWriteTool } from "../../src/harness/tools/write.ts";
 import {
 	ExecutionError,
 	err,
-	type FileError,
+	FileError,
 	getOrThrow,
 	ok,
 	type Result,
@@ -100,6 +100,34 @@ class LateOutputExecutionEnv extends NodeExecutionEnv {
 		options?.onStdout?.("before\n");
 		setTimeout(() => options?.onStdout?.("late\n"), 0);
 		return ok({ stdout: "before\n", stderr: "", exitCode: 0 });
+	}
+}
+
+/** The full-output spill file cannot be created. */
+class SpillCreateFailureExecutionEnv extends NodeExecutionEnv {
+	override async createTempFile(): Promise<Result<string, FileError>> {
+		return err(new FileError("permission_denied", "EACCES: permission denied, mkdtemp"));
+	}
+}
+
+/** The full-output spill file is created, but writing it fails, leaving it incomplete. */
+class SpillWriteFailureExecutionEnv extends NodeExecutionEnv {
+	spillPath: string | undefined;
+
+	override async createTempFile(options?: { prefix?: string; suffix?: string }): Promise<Result<string, FileError>> {
+		const created = await super.createTempFile(options);
+		if (created.ok) this.spillPath = created.value;
+		return created;
+	}
+
+	override async appendFile(
+		path: string,
+		content: string | Uint8Array,
+		abortSignal?: AbortSignal,
+		options?: { flush?: boolean },
+	): Promise<Result<void, FileError>> {
+		if (path === this.spillPath) return err(new FileError("unknown", "ENOSPC: no space left on device", path));
+		return super.appendFile(path, content, abortSignal, options);
 	}
 }
 
@@ -195,6 +223,19 @@ describe("AgentHarness tools", () => {
 
 			expect(result.details).toBeUndefined();
 			expect(textOutput(result)).not.toContain("Use offset=");
+		});
+
+		it("does not report the empty string after a trailing newline as a remaining line", async () => {
+			const context = createContext();
+			getOrThrow(await context.env.writeFile("two.txt", "line1\nline2\n"));
+			const tool = createReadTool();
+
+			const limited = await tool.execute("read-limit", { path: "two.txt", limit: 2 }, undefined, undefined, context);
+
+			expect(textOutput(limited)).toBe("line1\nline2");
+			await expect(
+				tool.execute("read-past-end", { path: "two.txt", offset: 3 }, undefined, undefined, context),
+			).rejects.toThrow("Offset 3 is beyond end of file (2 lines total)");
 		});
 
 		it("rejects offsets beyond the file", async () => {
@@ -715,6 +756,58 @@ describe("AgentHarness tools", () => {
 			const fullOutput = getOrThrow(await context.env.readTextFile(result.details!.fullOutputPath!));
 			expect(fullOutput).toContain("line-1\nline-2");
 			expect(fullOutput).toContain("line-2999\nline-3000");
+		});
+
+		const LONG_OUTPUT_COMMAND = "i=1; while [ $i -le 3000 ]; do echo line-$i; i=$((i + 1)); done";
+
+		it("keeps a successful command's result when the full-output file cannot be created", async () => {
+			const context = { env: new SpillCreateFailureExecutionEnv({ cwd: createTempDir() }) };
+
+			const result = await createBashTool().execute(
+				"bash-spill-create",
+				{ command: LONG_OUTPUT_COMMAND },
+				undefined,
+				undefined,
+				context,
+			);
+
+			const output = textOutput(result);
+			expect(output).toContain("line-3000");
+			expect(output).toContain("[Showing lines 1001-3000 of 3000. Full output could not be saved: EACCES");
+			expect(result.details?.truncation).toMatchObject({ truncated: true, totalLines: 3000 });
+			expect(result.details?.fullOutputPath).toBeUndefined();
+		});
+
+		it("keeps a failed command's exit code when the full-output file cannot be created", async () => {
+			const context = { env: new SpillCreateFailureExecutionEnv({ cwd: createTempDir() }) };
+
+			await expect(
+				createBashTool().execute(
+					"bash-spill-exit",
+					{ command: `${LONG_OUTPUT_COMMAND}; exit 3` },
+					undefined,
+					undefined,
+					context,
+				),
+			).rejects.toThrow(/line-3000[\s\S]*Full output could not be saved: EACCES[\s\S]*Command exited with code 3$/);
+		});
+
+		it("does not advertise a full-output file that could not be completely written", async () => {
+			const env = new SpillWriteFailureExecutionEnv({ cwd: createTempDir() });
+
+			const result = await createBashTool().execute(
+				"bash-spill-write",
+				{ command: LONG_OUTPUT_COMMAND },
+				undefined,
+				undefined,
+				{ env },
+			);
+
+			expect(env.spillPath).toBeDefined();
+			const output = textOutput(result);
+			expect(output).toContain("Full output could not be saved: ENOSPC");
+			expect(output).not.toContain(env.spillPath!);
+			expect(result.details?.fullOutputPath).toBeUndefined();
 		});
 	});
 });

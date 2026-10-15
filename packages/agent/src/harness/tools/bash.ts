@@ -131,13 +131,16 @@ export function createBashTool<TContext extends ExecutionToolContext = Execution
 					details = { truncation: capture.truncation, fullOutputPath: capture.fullOutputPath };
 					const startLine = capture.truncation.totalLines - capture.truncation.outputLines + 1;
 					const endLine = capture.truncation.totalLines;
+					const fullOutput = capture.fullOutputError
+						? `Full output could not be saved: ${capture.fullOutputError.message}`
+						: `Full output: ${capture.fullOutputPath}`;
 					if (capture.truncation.lastLinePartial) {
 						const lastLineSize = formatSize(capture.lastLineBytes);
-						outputText += `\n\n[Showing last ${formatSize(capture.truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). Full output: ${capture.fullOutputPath}]`;
+						outputText += `\n\n[Showing last ${formatSize(capture.truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). ${fullOutput}]`;
 					} else if (capture.truncation.truncatedBy === "lines") {
-						outputText += `\n\n[Showing lines ${startLine}-${endLine} of ${capture.truncation.totalLines}. Full output: ${capture.fullOutputPath}]`;
+						outputText += `\n\n[Showing lines ${startLine}-${endLine} of ${capture.truncation.totalLines}. ${fullOutput}]`;
 					} else {
-						outputText += `\n\n[Showing lines ${startLine}-${endLine} of ${capture.truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Full output: ${capture.fullOutputPath}]`;
+						outputText += `\n\n[Showing lines ${startLine}-${endLine} of ${capture.truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). ${fullOutput}]`;
 					}
 				}
 

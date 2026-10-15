@@ -4,7 +4,9 @@
  * - a tool that returned `undefined` failed the whole run and dropped sibling results;
  * - a stream that ended without a terminal event hung the run even after abort;
  * - `agentLoopContinue` appended to the caller's `context.messages`;
- * - a listener that threw mid-stream left the provider request running.
+ * - a listener that threw mid-stream left the provider request running;
+ * - `message_start` shared the provider's live content array, so a listener that serialized it
+ *   after an await saw text that the following deltas delivered again.
  */
 import {
 	type AssistantMessage,
@@ -17,7 +19,7 @@ import {
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { Agent } from "../src/agent.ts";
-import { agentLoopContinue } from "../src/agent-loop.ts";
+import { agentLoopContinue, runAgentLoop } from "../src/agent-loop.ts";
 import type { AgentContext, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.ts";
 
 class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -234,5 +236,63 @@ describe("agent loop lifecycle regressions", () => {
 		await agent.prompt("hello");
 		expect(agent.state.errorMessage).toBe("listener boom");
 		expect(signal?.aborted).toBe(true);
+	});
+
+	it("emits message_start with the content as of start, not the provider's live content", async () => {
+		let releaseListener = () => {};
+		const listenerReleased = new Promise<void>((resolve) => {
+			releaseListener = resolve;
+		});
+		let reportStartSeen = () => {};
+		const startSeen = new Promise<void>((resolve) => {
+			reportStartSeen = resolve;
+		});
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: (messages: AgentMessage[]) => messages as Message[],
+		};
+		const context: AgentContext = { systemPrompt: "", messages: [], tools: [] };
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			const output = createAssistantMessage([]);
+			stream.push({ type: "start", partial: output });
+			// Like a provider parsing already-buffered chunks: keep filling the same object while
+			// the message_start listener is still running.
+			void startSeen.then(() => {
+				const block = { type: "text" as const, text: "" };
+				output.content.push(block);
+				stream.push({ type: "text_start", contentIndex: 0, partial: output });
+				block.text += "reply";
+				stream.push({ type: "text_delta", contentIndex: 0, delta: "reply", partial: output });
+				stream.push({ type: "text_end", contentIndex: 0, content: "reply", partial: output });
+				stream.push({ type: "done", reason: "stop", message: output });
+				releaseListener();
+			});
+			return stream;
+		};
+		const serializedStarts: string[] = [];
+		const deltas: string[] = [];
+
+		await runAgentLoop(
+			[createUserMessage("hi")],
+			context,
+			config,
+			async (event) => {
+				if (event.type === "message_start" && event.message.role === "assistant") {
+					reportStartSeen();
+					// Serialize after an await, as an async output writer does.
+					await listenerReleased;
+					serializedStarts.push(JSON.stringify(event.message.content));
+				}
+				if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+					deltas.push(event.assistantMessageEvent.delta);
+				}
+			},
+			undefined,
+			streamFn,
+		);
+
+		expect(serializedStarts).toEqual(["[]"]);
+		expect(deltas).toEqual(["reply"]);
 	});
 });

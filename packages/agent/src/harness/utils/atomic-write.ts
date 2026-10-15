@@ -8,7 +8,10 @@ export interface AtomicWriteOptions {
 	mode?: number;
 	/** Encoding used when `data` is a string. */
 	encoding?: BufferEncoding;
-	/** Cancels the write. Checked before the temp file is created and honored during the write. */
+	/**
+	 * Cancels the write. Checked before writing starts and honored while the temp file is written. An
+	 * in-place fallback write, once started, is not aborted: that would leave the target truncated.
+	 */
 	signal?: AbortSignal;
 }
 
@@ -68,6 +71,16 @@ async function resolveMode(path: string): Promise<number | undefined> {
 	}
 }
 
+/**
+ * Error codes meaning atomic replacement is impossible here, not that the data cannot be written. Creating
+ * the sibling temp file is refused (no directory write permission, a sandbox), or replacing the target is
+ * refused (a sticky directory, a busy or bind-mounted file, a different device).
+ */
+const REPLACEMENT_BLOCKED_CODES = {
+	create: new Set(["EACCES", "EPERM"]),
+	rename: new Set(["EACCES", "EPERM", "EBUSY", "EXDEV"]),
+};
+
 /** Report a failure against the target the caller asked for, never the temp file. */
 function retargetError(error: unknown, targetPath: string): unknown {
 	if (error && typeof error === "object" && "path" in error) {
@@ -86,6 +99,12 @@ function retargetError(error: unknown, targetPath: string): unknown {
  * content with nothing to recover from. This never truncates the target: the
  * original stays intact until the rename succeeds, and a failure leaves no temp
  * file behind.
+ *
+ * The one exception is an existing target that cannot be replaced atomically at
+ * all, because its directory refuses the temp file or the rename (see
+ * {@link REPLACEMENT_BLOCKED_CODES}). It is then written in place, as a plain
+ * write would, instead of failing a write that `fs.writeFile` allows. The
+ * read-only check below still applies first.
  *
  * Durability caveat: the temp file is fsynced but its directory is not, so a power
  * loss can still lose the rename itself. This is the same guarantee the existing
@@ -110,8 +129,11 @@ export async function atomicWriteFile(
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw retargetError(error, target);
 	}
 
-	const mode = options?.mode ?? (await resolveMode(target));
+	const existingMode = await resolveMode(target);
+	const mode = options?.mode ?? existingMode;
 	const tempPath = join(dirname(target), `.${randomUUID()}.tmp`);
+	const encoding = typeof data === "string" ? { encoding: options?.encoding ?? "utf-8" } : {};
+	let phase: keyof typeof REPLACEMENT_BLOCKED_CODES | undefined = "create";
 	try {
 		await writeFile(tempPath, data, {
 			// Owner-only until the final mode is applied, so the new contents of a private target
@@ -119,9 +141,10 @@ export async function atomicWriteFile(
 			// keeps the default mode an in-place create would have produced.
 			mode: mode === undefined ? 0o666 : 0o600,
 			flag: "wx",
-			...(typeof data === "string" ? { encoding: options?.encoding ?? "utf-8" } : {}),
+			...encoding,
 			...(options?.signal ? { signal: options.signal } : {}),
 		});
+		phase = undefined;
 		// Apply the mode after creation: open(2) intersects it with the umask, chmod does not.
 		if (mode !== undefined) await chmod(tempPath, mode);
 		// fsync requires a write-capable handle on Windows ("r" fails with EPERM).
@@ -131,6 +154,7 @@ export async function atomicWriteFile(
 		} finally {
 			await handle.close();
 		}
+		phase = "rename";
 		await rename(tempPath, target);
 	} catch (error) {
 		try {
@@ -138,6 +162,16 @@ export async function atomicWriteFile(
 		} catch {
 			// Best effort: a stray temp file is harmless and never read back.
 		}
-		throw retargetError(error, target);
+		const code = (error as NodeJS.ErrnoException).code;
+		const replacementBlocked =
+			existingMode !== undefined &&
+			phase !== undefined &&
+			code !== undefined &&
+			REPLACEMENT_BLOCKED_CODES[phase].has(code);
+		if (!replacementBlocked) throw retargetError(error, target);
+		// The existing target passed the write check but cannot be replaced, so write it in place. It keeps
+		// its inode, and with it its mode, owner, and links.
+		if (options?.signal?.aborted) throw new Error("Operation aborted");
+		await writeFile(target, data, { ...encoding, flush: true });
 	}
 }

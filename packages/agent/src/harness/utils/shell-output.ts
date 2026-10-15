@@ -19,6 +19,8 @@ export interface ShellCaptureResult extends ShellCaptureProgress {
 	cancelled: boolean;
 	truncated: boolean;
 	executionError?: ExecutionError;
+	/** Why the full output could not be saved. `fullOutputPath` is then undefined; the tail output is still valid. */
+	fullOutputError?: ExecutionError;
 }
 
 function toExecutionError(error: unknown): ExecutionError {
@@ -157,14 +159,18 @@ export async function executeShellWithCapture(
 		let progress = createProgress();
 		if (progress.truncation.truncated && !fullOutputRequested) ensureFullOutputFile(tailOutput);
 		const writeResult = await writeChain;
-		if (!writeResult.ok) return err(writeResult.error);
 		if (captureError) return err(captureError);
 		progress = createProgress();
+		// A failed spill loses only the full-output copy. The command already ran, so its exit code and
+		// tail output are still reported; the missing or incomplete file is never advertised.
+		const captured = writeResult.ok
+			? progress
+			: { ...progress, fullOutputPath: undefined, fullOutputError: writeResult.error };
 
 		if (!result.ok) {
 			if (result.error.code === "aborted" || options?.abortSignal?.aborted) {
 				return ok({
-					...progress,
+					...captured,
 					exitCode: undefined,
 					cancelled: true,
 					truncated: progress.truncation.truncated,
@@ -172,7 +178,7 @@ export async function executeShellWithCapture(
 			}
 			if (options?.returnExecutionErrors) {
 				return ok({
-					...progress,
+					...captured,
 					exitCode: undefined,
 					cancelled: false,
 					truncated: progress.truncation.truncated,
@@ -183,7 +189,7 @@ export async function executeShellWithCapture(
 		}
 		const cancelled = options?.abortSignal?.aborted ?? false;
 		return ok({
-			...progress,
+			...captured,
 			exitCode: cancelled ? undefined : result.value.exitCode,
 			cancelled,
 			truncated: progress.truncation.truncated,

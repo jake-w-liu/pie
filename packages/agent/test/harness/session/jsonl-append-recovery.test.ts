@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,6 +31,50 @@ function gate() {
 afterEach(() => {
 	vi.restoreAllMocks();
 	for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+describe("JSONL append prefix verification", () => {
+	it("does not reread the session file to verify a prefix this writer just wrote", async () => {
+		const { root, env, repo } = fixture();
+		const session = await repo.create({ id: "append-cost", cwd: root });
+		await session.appendCustomEntry("first");
+		const readTextFile = vi.spyOn(env, "readTextFile");
+
+		for (let index = 0; index < 5; index++) await session.appendCustomEntry(`entry-${index}`);
+
+		expect(readTextFile).not.toHaveBeenCalled();
+		const reopened = await new JsonlSessionRepo({ fs: env, sessionsRoot: root }).open(await session.getMetadata());
+		expect((await reopened.getLog()).map((item) => item.seq)).toEqual([1, 2, 3, 4, 5, 6]);
+	});
+
+	it("verifies an opened file once, then appends without rereading it", async () => {
+		const { root, env, repo } = fixture();
+		const created = await repo.create({ id: "open-cost", cwd: root });
+		await created.appendCustomEntry("first");
+		const metadata = await created.getMetadata();
+		await created.close();
+		const session = await new JsonlSessionRepo({ fs: env, sessionsRoot: root }).open(metadata);
+		const readTextFile = vi.spyOn(env, "readTextFile");
+
+		for (let index = 0; index < 5; index++) await session.appendCustomEntry(`entry-${index}`);
+
+		expect(readTextFile).toHaveBeenCalledTimes(1);
+	});
+
+	it("still refuses to append after a same-size rewrite of the acknowledged prefix", async () => {
+		const { root, repo } = fixture();
+		const session = await repo.create({ id: "same-size-rewrite", cwd: root });
+		await session.appendCustomEntry("anchor");
+		const metadata = await session.getMetadata();
+		const rewritten = readFileSync(metadata.path, "utf8").replace("anchor", "broken");
+		writeFileSync(metadata.path, rewritten);
+		// A rewrite always moves mtime; pin a distinct one so coarse timestamp resolution cannot hide it.
+		const past = new Date(Date.now() - 60_000);
+		utimesSync(metadata.path, past, past);
+
+		await expect(session.appendCustomEntry("must not write")).rejects.toMatchObject({ code: "invalid_entry" });
+		expect(readFileSync(metadata.path, "utf8")).toBe(rewritten);
+	});
 });
 
 describe("JSONL append acknowledgement recovery", () => {

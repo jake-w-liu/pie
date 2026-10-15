@@ -360,7 +360,9 @@ async function streamAssistantResponse(
 					partialMessage = event.partial;
 					context.messages.push(partialMessage);
 					addedPartial = true;
-					await emit({ type: "message_start", message: { ...partialMessage } });
+					// The provider keeps filling the live partial while listeners run. A snapshot keeps
+					// content that later deltas will deliver out of message_start.
+					await emit({ type: "message_start", message: structuredClone(partialMessage) });
 					break;
 
 				case "text_start":

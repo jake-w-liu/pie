@@ -125,6 +125,9 @@ class ExclusiveJsonlWriterLease implements JsonlWriterLease {
 
 type OwnerRead = { kind: "owner"; owner: LeaseOwner } | { kind: "missing" } | { kind: "error"; error: SessionError };
 
+/** The lease instance an acquisition judged stale: its owner record, or for an unreadable record, the lock's mtime. */
+type JudgedStaleLease = { kind: "owner"; ownerId: string; renewedAt: number } | { kind: "unreadable"; mtimeMs: number };
+
 function fileFailure(operation: string, path: string, error: Error): SessionError {
 	return new SessionError("storage", `${operation} ${path}: ${error.message}`, error);
 }
@@ -170,6 +173,29 @@ async function readOwner(fs: JsonlSessionRepoFileSystem, ownerPath: string): Pro
 			),
 		};
 	}
+}
+
+/**
+ * Whether the lock moved to `movedPath` is the instance that was judged stale. Renaming the lock path moves
+ * whatever lock exists by then, which can be a fresh lease another process claimed after the judgment.
+ */
+async function isJudgedStaleLease(
+	fs: JsonlSessionRepoFileSystem,
+	movedPath: string,
+	judged: JudgedStaleLease,
+): Promise<boolean> {
+	const ownerPath = await fs.joinPath([movedPath, OWNER_FILE]);
+	if (!ownerPath.ok) throw fileFailure("Failed to resolve JSONL writer lease owner", movedPath, ownerPath.error);
+	const moved = await readOwner(fs, ownerPath.value);
+	if (judged.kind === "owner") {
+		return (
+			moved.kind === "owner" && moved.owner.ownerId === judged.ownerId && moved.owner.renewedAt === judged.renewedAt
+		);
+	}
+	// A published owner, or a lock directory created or written since the judgment, is a live acquisition.
+	if (moved.kind === "owner") return false;
+	const info = await fs.fileInfo(movedPath);
+	return info.ok && info.value.mtimeMs === judged.mtimeMs;
 }
 
 function delay(milliseconds: number): Promise<void> {
@@ -241,6 +267,7 @@ export async function acquireJsonlWriterLease(
 		}
 
 		const now = Date.now();
+		let judged: JudgedStaleLease;
 		if (ownerRead.kind === "owner") {
 			const sameHostLive =
 				ownerRead.owner.hostname === hostIdentity.hostname && hostIdentity.isProcessAlive(ownerRead.owner.pid);
@@ -251,6 +278,7 @@ export async function acquireJsonlWriterLease(
 					`Session already has a writer: ${holderDescription(ownerRead.owner, now)}`,
 				);
 			}
+			judged = { kind: "owner", ownerId: ownerRead.owner.ownerId, renewedAt: ownerRead.owner.renewedAt };
 		} else {
 			// A holder publishes its owner record just after claiming the directory, so a missing or torn
 			// record is normally a concurrent acquisition. A crash in that window leaves a lock that no
@@ -265,6 +293,7 @@ export async function acquireJsonlWriterLease(
 				if (ownerRead.kind === "error") throw ownerRead.error;
 				throw new SessionError("already_exists", `JSONL writer lease acquisition is in progress: ${lockPath}`);
 			}
+			judged = { kind: "unreadable", mtimeMs: lockInfo.value.mtimeMs };
 		}
 
 		const stalePath = `${lockPath}.stale-${hostIdentity.pid}-${uuidv7()}`;
@@ -272,6 +301,21 @@ export async function acquireJsonlWriterLease(
 		if (!renamed.ok) {
 			if (renamed.error.code === "not_found") continue;
 			throw fileFailure("Failed to steal stale JSONL writer lease", lockPath, renamed.error);
+		}
+		if (!(await isJudgedStaleLease(fs, stalePath, judged))) {
+			// Another acquisition replaced the judged lease first. Return its lease, then re-evaluate the lock.
+			const restored = await fs.renameFile(stalePath, lockPath);
+			if (!restored.ok) {
+				if (restored.error.code !== "already_exists") {
+					throw fileFailure("Failed to restore JSONL writer lease", lockPath, restored.error);
+				}
+				// A third acquisition claimed the lock path meanwhile; the displaced lease cannot be returned.
+				const discarded = await fs.remove(stalePath, { recursive: true, force: true });
+				if (!discarded.ok && discarded.error.code !== "not_found") {
+					throw fileFailure("Failed to remove displaced JSONL writer lease", stalePath, discarded.error);
+				}
+			}
+			continue;
 		}
 		const removed = await fs.remove(stalePath, { recursive: true, force: true });
 		if (!removed.ok && removed.error.code !== "not_found") {

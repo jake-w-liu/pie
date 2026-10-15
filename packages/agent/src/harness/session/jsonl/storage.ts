@@ -70,6 +70,13 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 	private state = new SessionState();
 	private tail: Promise<void> = Promise.resolve();
 	private acknowledgedContent: string;
+	/** UTF-8 byte length of `acknowledgedContent`, maintained so an append does not re-encode the whole file. */
+	private acknowledgedSize: number;
+	/**
+	 * File mtime at which the file was last written by this writer or verified to hold exactly
+	 * `acknowledgedContent`; undefined until then. While size and mtime both match, the file is unchanged.
+	 */
+	private acknowledgedMtimeMs: number | undefined;
 	private recoveryError: SessionError | undefined;
 	private deleted = false;
 	private closed = false;
@@ -85,6 +92,7 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 		this.fs = fs;
 		this.metadata = structuredClone(metadata);
 		this.acknowledgedContent = content;
+		this.acknowledgedSize = byteLength(content);
 		this.lease = lease;
 	}
 
@@ -99,7 +107,14 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 			const content = encodeHeader(header);
 			fileResult(await fs.writeFile(path, content), `Failed to initialize session ${path}`);
 			const fileInfo = fileResult(await fs.fileInfo(path), `Failed to read session metadata ${path}`);
-			return new JsonlSessionStorage(fs, metadataFromHeader(header, path, fileInfo.mtimeMs), content, ownedLease);
+			const storage = new JsonlSessionStorage(
+				fs,
+				metadataFromHeader(header, path, fileInfo.mtimeMs),
+				content,
+				ownedLease,
+			);
+			storage.acknowledgedMtimeMs = fileInfo.mtimeMs;
+			return storage;
 		} catch (error) {
 			if (!lease) await ownedLease.close();
 			throw error;
@@ -180,6 +195,7 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 						});
 					}
 					storage.acknowledgedContent = validPrefix;
+					storage.acknowledgedSize = byteLength(validPrefix);
 					return storage;
 				}
 				throw invalidFile(path, index + 1, mutationResult.error);
@@ -199,6 +215,7 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 		if (repair && !content.endsWith("\n")) {
 			fileResult(await fs.appendFile(path, "\n"), `Failed to repair unterminated session tail ${path}`);
 			storage.acknowledgedContent += "\n";
+			storage.acknowledgedSize += byteLength("\n");
 		}
 		return storage;
 	}
@@ -207,11 +224,7 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 	reopen(fs: JsonlSessionRepoFileSystem = this.fs): Promise<void> {
 		return this.enqueue(async () => {
 			try {
-				const loaded = await JsonlSessionStorage.load(fs, this.metadata.path, this.acknowledgedContent, this.lease);
-				this.state = loaded.state;
-				Object.assign(this.metadata, loaded.metadata);
-				this.acknowledgedContent = loaded.acknowledgedContent;
-				this.recoveryError = undefined;
+				this.adopt(await JsonlSessionStorage.load(fs, this.metadata.path, this.acknowledgedContent, this.lease));
 			} catch (error) {
 				// Once an open has observed damage, old handles cannot safely append.
 				this.recoveryError =
@@ -433,8 +446,10 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 		await this.adoptExternalGrowth(mutation);
 
 		const encoded = encodeMutation(mutation);
+		const expectedSize = this.acknowledgedSize + byteLength(encoded);
 		await this.appendEncoded(encoded);
-		if (!(await this.appendHasExpectedSize(encoded))) {
+		const info = fileResult(await this.fs.fileInfo(path), `Failed to verify session append ${path}`);
+		if (info.size !== expectedSize) {
 			this.recoveryError = new SessionError(
 				"storage",
 				`Session size changed during append; refusing whole-file repair: ${path}`,
@@ -442,17 +457,24 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 			throw this.recoveryError;
 		}
 		this.acknowledgedContent += encoded;
+		this.acknowledgedSize = expectedSize;
+		this.acknowledgedMtimeMs = info.mtimeMs;
 	}
 
 	private async adoptExternalGrowth(mutation: SessionMutation): Promise<void> {
 		const path = this.metadata.path;
 		const info = fileResult(await this.fs.fileInfo(path), `Failed to inspect session ${path}`);
-		const acknowledgedSize = byteLength(this.acknowledgedContent);
-		if (info.size === acknowledgedSize) {
+		if (info.size === this.acknowledgedSize) {
+			// Reading the whole file on every append makes appends quadratic in session size. The lease
+			// excludes other writers, so an unchanged size and mtime since this writer's last write or
+			// verification is accepted as unchanged; any other same-size state is compared in full.
+			if (info.mtimeMs === this.acknowledgedMtimeMs) return;
 			const content = fileResult(await this.fs.readTextFile(path), `Failed to verify session prefix ${path}`);
 			if (content !== this.acknowledgedContent) {
 				throw new SessionError("invalid_entry", `Acknowledged session prefix changed: ${path}`);
 			}
+			// Stat precedes the read: a change after it moves mtime and is compared in full next time.
+			this.acknowledgedMtimeMs = info.mtimeMs;
 			return;
 		}
 		const loaded = await JsonlSessionStorage.load(this.fs, path, this.acknowledgedContent, this.lease);
@@ -490,12 +512,6 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 			}
 			throw error;
 		}
-	}
-
-	private async appendHasExpectedSize(encoded: string): Promise<boolean> {
-		const path = this.metadata.path;
-		const info = fileResult(await this.fs.fileInfo(path), `Failed to verify session append ${path}`);
-		return info.size === byteLength(this.acknowledgedContent + encoded);
 	}
 
 	private async recoverFailedAppend(encoded: string): Promise<void> {
@@ -543,6 +559,8 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 		this.state = loaded.state;
 		Object.assign(this.metadata, loaded.metadata);
 		this.acknowledgedContent = loaded.acknowledgedContent;
+		this.acknowledgedSize = loaded.acknowledgedSize;
+		this.acknowledgedMtimeMs = loaded.acknowledgedMtimeMs;
 		this.recoveryError = undefined;
 	}
 

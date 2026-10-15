@@ -71,22 +71,6 @@ describe("atomicWriteFile", () => {
 		expect(await fs.readFile(c, "utf-8")).toBe("via chain");
 	});
 
-	it("reports a failure against the target path, not the temp file", async () => {
-		if (typeof process.getuid === "function" && process.getuid() === 0) return;
-		const target = path.join(dir, "reported.txt");
-		await fs.writeFile(target, "original");
-		await fs.chmod(dir, 0o500);
-
-		try {
-			// realpath, because the target is resolved through symlinks (macOS /var -> /private/var).
-			await expect(atomicWriteFile(target, "replacement")).rejects.toMatchObject({
-				path: await fs.realpath(target),
-			});
-		} finally {
-			await fs.chmod(dir, 0o700);
-		}
-	});
-
 	it("honors an already-aborted signal without writing", async () => {
 		const target = path.join(dir, "aborted.txt");
 		await fs.writeFile(target, "original");
@@ -136,17 +120,35 @@ describe("atomicWriteFile", () => {
 		expect((await fs.lstat(link)).isSymbolicLink()).toBe(true);
 	});
 
-	it("preserves the target when the write fails, and removes its temp file", async () => {
+	it("writes a writable file in place when its directory forbids a temp file", async () => {
 		if (typeof process.getuid === "function" && process.getuid() === 0) return; // root bypasses directory permissions
 		const target = path.join(dir, "guarded.txt");
 		await fs.writeFile(target, "original", { mode: 0o600 });
-		await fs.chmod(dir, 0o500); // read + execute: existing files stay readable, new ones cannot be created
+		await fs.chmod(dir, 0o500); // read + execute: existing files stay writable, new ones cannot be created
 
 		try {
-			await expect(atomicWriteFile(target, "replacement")).rejects.toThrow();
-			// The original content must survive the failed write.
-			expect(await fs.readFile(target, "utf-8")).toBe("original");
+			// No sibling temp file can exist, so atomic replacement is impossible; a plain write still works.
+			await atomicWriteFile(target, "replacement");
+			expect(await fs.readFile(target, "utf-8")).toBe("replacement");
+			expect((await fs.stat(target)).mode & 0o777).toBe(0o600);
 			expect(await tempFiles()).toEqual([]);
+		} finally {
+			await fs.chmod(dir, 0o700);
+		}
+	});
+
+	it("still refuses a read-only file in a directory that forbids a temp file", async () => {
+		if (typeof process.getuid === "function" && process.getuid() === 0) return;
+		const target = path.join(dir, "locked.txt");
+		await fs.writeFile(target, "original", { mode: 0o444 });
+		await fs.chmod(dir, 0o500);
+
+		try {
+			await expect(atomicWriteFile(target, "replacement")).rejects.toMatchObject({
+				code: "EACCES",
+				path: await fs.realpath(target),
+			});
+			expect(await fs.readFile(target, "utf-8")).toBe("original");
 		} finally {
 			await fs.chmod(dir, 0o700);
 		}

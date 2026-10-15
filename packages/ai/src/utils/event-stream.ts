@@ -117,6 +117,15 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 			},
 		);
 	}
+
+	/**
+	 * Providers keep filling the partial they pushed with `start`, and relays deliver events later, so a
+	 * live `start` partial could already hold content that the following deltas deliver again. Snapshot
+	 * it at push time; later events carry the live partial by design.
+	 */
+	override push(event: AssistantMessageEvent): void {
+		super.push(event.type === "start" ? { ...event, partial: structuredClone(event.partial) } : event);
+	}
 }
 
 /** Factory function for AssistantMessageEventStream (for use in extensions) */

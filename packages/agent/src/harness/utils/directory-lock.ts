@@ -12,6 +12,11 @@ export interface DirectoryLockOptions {
 	staleMs?: number;
 	/** Delays between attempts while a live lock is held; running off the end fails. */
 	retryDelaysMs: readonly number[];
+	/**
+	 * Other errors that count as contention and are retried on the same schedule, for example
+	 * the transient EPERM/EBUSY Windows reports while a directory is being removed.
+	 */
+	isRetryableError?: (error: unknown) => boolean;
 }
 
 /** Thrown when the lock stays held by another writer for the whole retry schedule. */
@@ -49,8 +54,11 @@ function isStale(path: string, staleMs: number): boolean {
  * of `<lock>.reclaim` removes, and it re-checks staleness inside that critical section.
  *
  * The reclaim mutex is held for microseconds. If its holder crashed inside that window, the
- * mutex itself goes stale and is removed with rmdir, which only succeeds on the empty directory
- * it always is.
+ * mutex itself goes stale after `staleMs` and is removed. That removal is a check-then-remove,
+ * which mkdir/rmdir/rename cannot make atomic: if two writers judge the same crashed mutex stale
+ * at once, one can remove the other's fresh mutex and both can enter. This needs a crash inside
+ * the microsecond window followed by near-simultaneous reclaims; without such a crash, reclaims
+ * are fully serialized.
  */
 function reclaimStaleLock(lockPath: string, staleMs: number): boolean {
 	const mutexPath = `${lockPath}.reclaim`;
@@ -108,7 +116,14 @@ export function acquireDirectoryLockSync(lockPath: string, options: DirectoryLoc
 				}
 			};
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+				if (!options.isRetryableError?.(error)) throw error;
+				const delayMs = options.retryDelaysMs[waits];
+				if (delayMs === undefined) throw error;
+				waits++;
+				sleepSync(delayMs);
+				continue;
+			}
 		}
 		// After a completed reclaim, retry at once; otherwise (live lock, or another writer is
 		// reclaiming) wait per the schedule, so a stuck reclaim never spins.

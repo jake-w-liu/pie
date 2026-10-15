@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { acquireDirectoryLockSync } from "@earendil-works/pi-agent-core/node";
+// The narrow entry: the full "/node" entry loads the whole agent core into every subagent runner.
+import { acquireDirectoryLockSync } from "@earendil-works/pi-agent-core/directory-lock";
 import {
 	DEFAULT_FILE_SYSTEM_RETRY_DELAYS_MS,
 	isRetryableFileSystemError,
 	runFileSystemOperationWithRetry,
-	waitForFileSystemRetry,
 } from "./file-system-retry.ts";
 
 // settings.json belongs to the coding agent (FileSettingsStorage in
@@ -15,7 +15,10 @@ import {
 
 /** Take the coding agent's settings lock (shared helper: same on-disk protocol, serialized reclaim). */
 function acquireSettingsLock(filePath: string): () => void {
-	return acquireDirectoryLockSync(`${filePath}.lock`, { retryDelaysMs: DEFAULT_FILE_SYSTEM_RETRY_DELAYS_MS });
+	return acquireDirectoryLockSync(`${filePath}.lock`, {
+		retryDelaysMs: DEFAULT_FILE_SYSTEM_RETRY_DELAYS_MS,
+		isRetryableError: isRetryableFileSystemError,
+	});
 }
 
 /**

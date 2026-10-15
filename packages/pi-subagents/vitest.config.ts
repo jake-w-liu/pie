@@ -6,6 +6,7 @@ const aiSrcIndex = fileURLToPath(new URL("../ai/src/index.ts", import.meta.url))
 const aiSrcCompat = fileURLToPath(new URL("../ai/src/compat.ts", import.meta.url));
 const agentSrcIndex = fileURLToPath(new URL("../agent/src/index.ts", import.meta.url));
 const agentSrcNode = fileURLToPath(new URL("../agent/src/node.ts", import.meta.url));
+const agentSrcDirectoryLock = fileURLToPath(new URL("../agent/src/harness/utils/directory-lock.ts", import.meta.url));
 
 export default defineConfig({
 	test: {
@@ -20,6 +21,7 @@ export default defineConfig({
 			{ find: /^@earendil-works\/pi-telemetry$/, replacement: telemetrySrcIndex },
 			{ find: /^@earendil-works\/pi-agent-core$/, replacement: agentSrcIndex },
 			{ find: /^@earendil-works\/pi-agent-core\/node$/, replacement: agentSrcNode },
+			{ find: /^@earendil-works\/pi-agent-core\/directory-lock$/, replacement: agentSrcDirectoryLock },
 			{ find: /^@earendil-works\/pi-ai$/, replacement: aiSrcIndex },
 			{ find: /^@earendil-works\/pi-ai\/compat$/, replacement: aiSrcCompat },
 		],

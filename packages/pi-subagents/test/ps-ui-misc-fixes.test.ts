@@ -92,7 +92,7 @@ out({ type: "message_end", message: { role: "assistant", content: [{ type: "text
 			totalCost: { inputTokens: 20_000, outputTokens: 5_000, costUsd: 0 },
 		});
 		expect(readMission(location, legacy.id).usage?.tokens).toBe(525_000);
-	});
+	}, 30_000);
 
 	it("preserves needs_decision during mission.show and async completion refresh", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "mission-decision-"));

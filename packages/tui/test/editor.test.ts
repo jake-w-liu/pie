@@ -1413,14 +1413,14 @@ describe("Editor component", () => {
 			editor.handleInput("\x19"); // Ctrl+Y - yanks "third"
 			editor.handleInput("\x1by"); // Alt+Y - cycles to "second", ring rotates
 
-			// Now ring is: [third, first, second]
+			// Ring keeps [first, second, third]; "second" is now current
 			assert.strictEqual(editor.getText(), "second");
 
 			// Do something else
 			editor.handleInput("x");
 			editor.setText("");
 
-			// New yank should get "second" (now at end after rotation)
+			// New yank should get "second" (still current after rotation)
 			editor.handleInput("\x19"); // Ctrl+Y
 			assert.strictEqual(editor.getText(), "second");
 		});

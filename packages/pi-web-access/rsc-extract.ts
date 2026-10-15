@@ -15,6 +15,7 @@ export interface RSCExtractResult {
 // is spent; real pages stay far below both.
 const MAX_RENDERED_NODES = 500_000;
 const MAX_RENDERED_CHARS = 2_000_000;
+const TRUNCATION_MARKER = "[Content truncated: the page's RSC payload exceeds the extraction budget]";
 
 export function extractRSCContent(html: string): RSCExtractResult | null {
   if (!html.includes("self.__next_f.push")) {
@@ -88,13 +89,23 @@ export function extractRSCContent(html: string): RSCExtractResult | null {
   const visitedRefs = new Set<string>();
   let renderedNodes = 0;
   let renderedChars = 0;
-  const budgetSpent = (): boolean => ++renderedNodes > MAX_RENDERED_NODES || renderedChars >= MAX_RENDERED_CHARS;
+  /** Set once a node or text is skipped for the budget, so the result can say it is incomplete. */
+  let truncated = false;
+  const budgetSpent = (): boolean => {
+    if (++renderedNodes > MAX_RENDERED_NODES || renderedChars >= MAX_RENDERED_CHARS) truncated = true;
+    return truncated;
+  };
   /** Count text copied from the payload against the output budget. */
   const emit = (text: string): string => {
-    if (renderedChars >= MAX_RENDERED_CHARS) return "";
+    if (renderedChars >= MAX_RENDERED_CHARS) {
+      truncated = true;
+      return "";
+    }
     renderedChars += text.length;
     return text;
   };
+  const withTruncationMarker = (content: string): string =>
+    truncated ? `${content}\n\n${TRUNCATION_MARKER}` : content;
 
   function extractNode(node: Node, ctx = { inTable: false, inCode: false }): string {
     if (node === null || node === undefined) return "";
@@ -154,7 +165,10 @@ export function extractRSCContent(html: string): RSCExtractResult | null {
       }
 
       const children = props.children;
-      const content = children ? extractNode(children as Node, ctx) : "";
+      // code, pre, and table render their children themselves; rendering them here as well
+      // would count the same text against the budget again (four times for pre > code).
+      const rendersOwnChildren = tag === "code" || tag === "pre" || tag === "table";
+      const content = children && !rendersOwnChildren ? extractNode(children as Node, ctx) : "";
 
       switch (tag) {
         case "h1": return `# ${content.trim()}\n\n`;
@@ -315,7 +329,7 @@ export function extractRSCContent(html: string): RSCExtractResult | null {
       const cleaned = content
         .replace(/\n{3,}/g, "\n\n")
         .trim();
-      return { title, content: cleaned };
+      return { title, content: withTruncationMarker(cleaned) };
     }
   }
 
@@ -352,5 +366,5 @@ export function extractRSCContent(html: string): RSCExtractResult | null {
   }
 
   const content = uniqueParts.join("\n\n").replace(/\n{3,}/g, "\n\n").trim();
-  return content.length > 100 ? { title, content } : null;
+  return content.length > 100 ? { title, content: withTruncationMarker(content) } : null;
 }

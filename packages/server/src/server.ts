@@ -252,19 +252,12 @@ export class PiServer {
 
 		const snapshot = await this.snapshots.get();
 		if (this.closing || state.disconnected || state.stage !== "handshaking" || state.connection.closed) return;
-		const helloFrame = this.encodeMessage({
+		const sent = await this.sendMessage(state, {
 			type: "hello",
 			version: PROTOCOL_VERSION,
 			connectionId: state.id,
 			snapshot,
 		} satisfies ServerHello);
-		if (!helloFrame) {
-			// No handshake is possible without a hello, so close now instead of at the timeout.
-			await this.closeConnection(state.connection);
-			await this.disconnect(state);
-			return;
-		}
-		const sent = await this.sendFrame(state, helloFrame);
 		if (sent && !state.disconnected && state.stage === "handshaking") {
 			state.handshakeComplete = true;
 			state.stage = "ready";
@@ -287,18 +280,26 @@ export class PiServer {
 		} catch (error) {
 			response = { type: "response", id: envelope.id, ok: false, error: this.toProtocolError(error) };
 		}
+		if (response.ok) {
+			// The command was applied (e.g. attach registered this connection), so a result that
+			// cannot be encoded must not become an error response; sendMessage closes instead.
+			await this.sendMessage(state, response);
+			return;
+		}
 		if (state.disconnected || state.connection.closed) return;
-		// A response that cannot be encoded (e.g. a snapshot over maxFrameLength) still
-		// answers the request, so the client is not left waiting on a live connection.
-		const frame =
-			this.encodeMessage(response) ??
-			this.encodeMessage({
-				type: "response",
-				id: envelope.id,
-				ok: false,
-				error: { code: "internal_error", message: INTERNAL_SERVER_ERROR_MESSAGE },
-			});
-		if (frame) await this.sendFrame(state, frame);
+		// The command failed either way, so an error that cannot be encoded (e.g. over
+		// maxFrameLength) is answered with a generic one that still reports the failure.
+		const frame = this.encodeMessage(response);
+		if (frame) {
+			await this.sendFrame(state, frame);
+			return;
+		}
+		await this.sendMessage(state, {
+			type: "response",
+			id: envelope.id,
+			ok: false,
+			error: { code: "internal_error", message: INTERNAL_SERVER_ERROR_MESSAGE },
+		});
 	}
 
 	private transportClosed(connection: ConnectionState): void {
@@ -323,17 +324,21 @@ export class PiServer {
 		if (!this.closing && handshakeComplete) void this.snapshots.broadcast();
 	}
 
+	/**
+	 * Send one message, closing the connection when it cannot be encoded (e.g. over
+	 * maxFrameLength): skipping it would leave the client's state silently stale, such as
+	 * a lost session_snapshot. The close detaches the connection and makes the client resync.
+	 */
 	private async sendMessage(connection: ConnectionState, message: ServerMessage): Promise<boolean> {
 		if (connection.disconnected || connection.connection.closed) return false;
 		const frame = this.encodeMessage(message);
-		return frame !== undefined && (await this.sendFrame(connection, frame));
+		if (frame) return this.sendFrame(connection, frame);
+		await this.closeConnection(connection.connection);
+		await this.disconnect(connection);
+		return false;
 	}
 
-	/**
-	 * Encode one outgoing message, or report it and return undefined. A message the server
-	 * cannot encode (e.g. over maxFrameLength) says nothing about the connection, so it is
-	 * not closed for it; a request still gets an error response instead.
-	 */
+	/** Encode one outgoing message, or report why it cannot be encoded and return undefined. */
 	private encodeMessage(message: ServerMessage): Uint8Array | undefined {
 		try {
 			// Protocol text must be Unicode scalar values, but a string cut inside a

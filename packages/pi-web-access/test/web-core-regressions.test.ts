@@ -77,6 +77,20 @@ describe("content finding", () => {
 		expect(result.text).toContain("The Needle sits here.");
 	});
 
+	it("folds case the same under a Turkish host locale", () => {
+		// Under tr or az, toLocaleLowerCase() folds "I" to dotless "ı" (V8 does so in strings
+		// with non-Latin-1 text such as "—"), which no lowercase query contains.
+		const toLocaleLowerCase = String.prototype.toLocaleLowerCase;
+		vi.spyOn(String.prototype, "toLocaleLowerCase").mockImplementation(function (this: string, locales) {
+			return toLocaleLowerCase.call(this, locales ?? "tr");
+		});
+		const page = "Installation guide — run the installer. It’s free.";
+		expect(findContent(page, ["installation", "it’s free"], "case-insensitive").queryResults).toEqual([
+			{ query: "installation", matchCount: 1 },
+			{ query: "it’s free", matchCount: 1 },
+		]);
+	});
+
 	it("splits fuzzy paragraphs at CRLF and whitespace-only blank lines", () => {
 		const lf = "Alpha beta section.\n\nGamma delta section.\n\nEpsilon alpha again.";
 		for (const text of [lf, lf.replace(/\n/g, "\r\n"), lf.replace(/\n\n/g, "\n \t\n")]) {
@@ -115,6 +129,7 @@ describe("inline data URI sanitization", () => {
 			"The response (data: the payload, meta: paging info) is JSON.",
 			"if (url.startsWith('data:')) return;",
 			"call(data:Buffer,encoding)",
+			"call(data:Buffer)",
 		]) {
 			expect(sanitizeInlineDataUris(text, "content")).toEqual({ text, omissions: [] });
 		}
@@ -131,6 +146,23 @@ describe("inline data URI sanitization", () => {
 		]);
 		expect(result.text).toContain('(data: Buffer, src="[pi-ext-web-access inline data URI omitted; ordinal=4;');
 		expect(result.text).not.toContain("iVBORw0KGgo=");
+	});
+
+	it("replaces JSON-escaped, header-less, and Gradio @file data URIs", () => {
+		const payload = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+		const text = [
+			// PHP's json_encode, and so the WordPress REST API, escapes the slash.
+			`{"src":"data:image\\/png;base64,${payload}"}`,
+			`<img src="data:${payload}">`,
+			`{"data":"data:@file/octet-stream;base64,${payload}"}`,
+		].join("\n");
+		const result = sanitizeInlineDataUris(text, "content");
+		expect(result.omissions.map(({ mimeType, encoding, decodeError }) => [mimeType, encoding, decodeError])).toEqual([
+			["application/octet-stream", "base64", undefined],
+			["application/octet-stream", "percent-encoded", "missing-comma"],
+			["application/octet-stream", "base64", undefined],
+		]);
+		expect(result.text).not.toContain(payload.slice(0, 16));
 	});
 });
 
@@ -154,6 +186,50 @@ describe("RSC extraction", () => {
 		expect(shallow).toMatch(/^hello world,\n\nhello world,/);
 		expect(deep.length).toBeLessThanOrEqual(shallow.length * 1.1);
 		expect(shallow.length).toBeLessThan(3_000_000);
+		// The cut-off is stated instead of passing the partial page off as complete.
+		expect(shallow).toMatch(/\n\n\[Content truncated: [^\]]*extraction budget\]$/);
+		expect(deep).toMatch(/\n\n\[Content truncated: [^\]]*extraction budget\]$/);
+	});
+
+	/** A page whose main chunk is `article` with the given children. */
+	function rscPage(children: unknown[]): string {
+		const flight = `23:${JSON.stringify(["$", "article", null, { children }])}\n`;
+		return `<html><head><title>Docs</title></head><body><script>self.__next_f.push([1,${JSON.stringify(flight)}])</script></body></html>`;
+	}
+
+	it("counts a pre > code listing once against the character budget", () => {
+		// 36,000 lines of 21 chars: 756K chars, within the 2M budget once but not four times.
+		const listing = Array.from({ length: 36_000 }, (_, line) => `line ${String(line).padStart(5, "0")}: value();`).join("\n");
+		const content =
+			extractRSCContent(
+				rscPage([
+					["$", "h1", null, { children: "Generated reference" }],
+					["$", "p", null, { children: "An introduction that is long enough for the main chunk to count as content." }],
+					["$", "pre", null, { children: ["$", "code", null, { children: listing }] }],
+					["$", "p", null, { children: "Closing notes." }],
+				]),
+			)?.content ?? "";
+		expect(content).toContain("```\nline 00000: value();\n");
+		expect(content).toContain("line 35999: value();\n```\n\nClosing notes.");
+		expect(content).not.toContain("[Content truncated");
+	});
+
+	it("counts highlighted code tokens once against the node budget", () => {
+		// 80,000 highlighted tokens are 2 nodes each (span and text), well within the 500K
+		// node budget once but not when pre and code each render their children twice.
+		const tokens = Array.from({ length: 10 }, (_, token) => ["$", "span", null, { children: `t${token}${token === 9 ? "\n" : " "}` }]);
+		const lines = Array.from({ length: 8_000 }, () => ["$", "span", null, { children: tokens }]);
+		const content =
+			extractRSCContent(
+				rscPage([
+					["$", "h1", null, { children: "SDK reference with one long highlighted example" }],
+					["$", "pre", null, { children: ["$", "code", null, { children: lines }] }],
+					["$", "p", null, { children: "End of reference." }],
+				]),
+			)?.content ?? "";
+		expect(content.match(/^t0 t1 t2 t3 t4 t5 t6 t7 t8 t9$/gm)).toHaveLength(8_000);
+		expect(content).toMatch(/\n```\n\nEnd of reference\.$/);
+		expect(content).not.toContain("[Content truncated");
 	});
 });
 

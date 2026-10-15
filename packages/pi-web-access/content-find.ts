@@ -50,8 +50,8 @@ function editDistanceWithin(left: string, right: string, maximum: number): boole
  * Case-fold `text` for a case-insensitive search while keeping a map from every folded
  * UTF-16 index back to the original one.
  *
- * Folding the whole string at once (`text.toLocaleLowerCase()`) changes its length:
- * `"İ".toLocaleLowerCase()` is two code units, so a folded offset no longer points at
+ * Folding the whole string at once (`text.toLowerCase()`) changes its length:
+ * `"İ".toLowerCase()` is two code units, so a folded offset no longer points at
  * the same place in the original text and slicing the original with it returned
  * unrelated snippets. Folding per code point keeps `map` exact.
  */
@@ -63,9 +63,10 @@ interface FoldedText {
 
 function foldWithOffsets(text: string): FoldedText {
 	// Fast path: one native call instead of ~1 µs of work per code point. Lowercasing
-	// either only grows code points (İ, Lithuanian accents) or only shrinks them (Turkish
-	// and Azeri dotted I), so an unchanged total length means no offset moved.
-	const wholeFolded = text.toLocaleLowerCase().replace(/ς/g, "σ");
+	// only grows code points (İ), so an unchanged total length means no offset moved.
+	// toLowerCase() ignores the host locale: under Turkish or Azeri, toLocaleLowerCase()
+	// folds "I" to dotless "ı" in some strings, so text and query could fold apart.
+	const wholeFolded = text.toLowerCase().replace(/ς/g, "σ");
 	if (wholeFolded.length === text.length) return { folded: wholeFolded, starts: null, ends: null };
 	let folded = "";
 	let starts: number[] | null = null;
@@ -73,7 +74,7 @@ function foldWithOffsets(text: string): FoldedText {
 	let originalIndex = 0;
 	for (const char of text) {
 		// Final and ordinary sigma have the same case-insensitive identity.
-		const lowered = char.toLocaleLowerCase().replace(/ς/g, "σ");
+		const lowered = char.toLowerCase().replace(/ς/g, "σ");
 		if (lowered.length !== char.length && starts === null) {
 			starts = Array.from({ length: folded.length }, (_, index) => index);
 			ends = Array.from({ length: folded.length }, (_, index) => index + 1);

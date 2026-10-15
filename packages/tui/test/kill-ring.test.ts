@@ -22,6 +22,25 @@ describe("KillRing", () => {
 		);
 	});
 
+	it("evicts the oldest kill after yank-pop, keeping kill order", () => {
+		const ring = new KillRing();
+		for (const kill of ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]) {
+			ring.push(kill, { prepend: false });
+		}
+		ring.rotate(); // yank-pop from "j" to "i"
+		assert.strictEqual(ring.peek(), "i");
+		ring.push("k", { prepend: false });
+
+		// The new kill is yanked first, then yank-pop visits the earlier kills newest first.
+		const cycled: string[] = [];
+		for (let i = 0; i < ring.length; i++) {
+			cycled.push(ring.peek() ?? "");
+			ring.rotate();
+		}
+		assert.deepStrictEqual(cycled, ["k", "j", "i", "h", "g", "f", "e", "d", "c", "b"]);
+		assert.strictEqual(ring.peek(), "k");
+	});
+
 	it("accumulates consecutive kills into the newest entry", () => {
 		const ring = new KillRing();
 		for (let i = 0; i < 20; i++) {

@@ -13,7 +13,10 @@ const MAX_KILL_RING_ENTRIES = 10;
  * (cycle through older entries).
  */
 export class KillRing {
+	/** Entries in kill order, newest last, so the cap always evicts the oldest kill. */
 	private ring: string[] = [];
+	/** How many entries yank-pop has stepped back from the newest; a new kill resets it. */
+	private yankOffset = 0;
 
 	/**
 	 * Add text to the kill ring.
@@ -35,23 +38,27 @@ export class KillRing {
 				this.ring.shift();
 			}
 		}
+		this.yankOffset = 0;
 	}
 
-	/** Get most recent entry without modifying the ring. */
+	/** Get the entry to yank (the most recent kill until yank-pop) without modifying the ring. */
 	peek(): string | undefined {
-		return this.ring.length > 0 ? this.ring[this.ring.length - 1] : undefined;
+		return this.ring[this.ring.length - 1 - this.yankOffset];
 	}
 
 	/** Remove all retained killed text. */
 	clear(): void {
 		this.ring.length = 0;
+		this.yankOffset = 0;
 	}
 
-	/** Move last entry to front (for yank-pop cycling). */
+	/**
+	 * Step the entry to yank to the next older one, wrapping from the oldest back to the
+	 * newest (for yank-pop cycling). Entries keep their kill order, as in GNU Readline.
+	 */
 	rotate(): void {
 		if (this.ring.length > 1) {
-			const last = this.ring.pop()!;
-			this.ring.unshift(last);
+			this.yankOffset = (this.yankOffset + 1) % this.ring.length;
 		}
 	}
 

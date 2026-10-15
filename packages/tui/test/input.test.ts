@@ -336,7 +336,7 @@ describe("Input component", () => {
 			input.handleInput("x");
 			input.setValue("");
 
-			// New yank should get "second" (now at end after rotation)
+			// New yank should get "second" (still current after rotation)
 			input.handleInput("\x19"); // Ctrl+Y
 			assert.strictEqual(input.getValue(), "second");
 		});

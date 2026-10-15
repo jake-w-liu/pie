@@ -2510,13 +2510,13 @@ export class Editor implements Component, Focusable {
 
 		this.pushUndoSnapshot();
 
-		// Delete the previously yanked text (still at end of ring before rotation)
+		// Delete the previously yanked text (still the ring's current entry before rotation)
 		this.deleteYankedText();
 
-		// Rotate the ring: move end to front
+		// Rotate the ring: step to the next older entry
 		this.killRing.rotate();
 
-		// Insert the new most recent entry (now at end after rotation)
+		// Insert the entry that is current after rotation
 		const text = this.killRing.peek()!;
 		this.insertYankedText(text);
 
@@ -2567,7 +2567,7 @@ export class Editor implements Component, Focusable {
 
 	/**
 	 * Delete the previously yanked text (used by yank-pop).
-	 * The yanked text is derived from killRing[end] since it hasn't been rotated yet.
+	 * The yanked text is the ring's current entry since it hasn't been rotated yet.
 	 */
 	private deleteYankedText(): void {
 		const yankedText = this.killRing.peek();

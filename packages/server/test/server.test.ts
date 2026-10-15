@@ -2,6 +2,7 @@ import { lstat, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	type Command,
 	encodeClientMessage,
 	PROTOCOL_VERSION,
 	type ServerMessage,
@@ -10,7 +11,7 @@ import {
 } from "@earendil-works/pi-protocol";
 import { afterEach, expect, test, vi } from "vitest";
 import type { ByteConnection } from "../src/connection.ts";
-import { PiServer } from "../src/index.ts";
+import { PiServer, PiServerError } from "../src/index.ts";
 import { TestServerService } from "../src/testing/index.ts";
 import { createUnixServer } from "../src/transports/unix/index.ts";
 
@@ -103,28 +104,26 @@ class MemoryConnection implements ByteConnection {
 	}
 }
 
+function setTranscriptText(service: TestServerService, text: string): void {
+	const item: UserTranscriptItem = { id: "u1", role: "user", content: [{ type: "text", text }], timestamp: 1 };
+	const stored = service.sessions.get("s1")!;
+	stored.snapshot = { ...stored.snapshot, transcript: [item] };
+}
+
 /** Connects to a seeded session whose transcript holds `text` and requests an attach. */
 async function attachToTranscriptText(text: string, maxFrameLength?: number) {
 	const seeded = new TestServerService();
 	seeded.seed("s1");
-	const item: UserTranscriptItem = { id: "u1", role: "user", content: [{ type: "text", text }], timestamp: 1 };
-	const stored = seeded.sessions.get("s1")!;
-	stored.snapshot = { ...stored.snapshot, transcript: [item] };
+	setTranscriptText(seeded, text);
 	const errors: Error[] = [];
 	server = new PiServer(seeded, { listeners: [], maxFrameLength, onError: (error) => errors.push(error) });
 	const connection = new MemoryConnection();
 	const handler = server.accept(connection);
 	handler.onData(encodeClientMessage({ type: "hello", version: PROTOCOL_VERSION }));
 	await vi.waitFor(() => expect(connection.messages.some((message) => message.type === "hello")).toBe(true));
-	const request = (id: string, command: "attach" | "list") => {
-		handler.onData(
-			encodeClientMessage({
-				type: "request",
-				id,
-				request: command === "attach" ? { command, sessionId: "s1" } : { command },
-			}),
-		);
-		// Settles on the response, or on the close that previously replaced it.
+	const request = (id: string, command: Command) => {
+		handler.onData(encodeClientMessage({ type: "request", id, request: command }));
+		// Settles on the response, or on the close that replaces an unencodable result.
 		return vi.waitFor(
 			() => {
 				const response = connection.messages.find((message) => message.type === "response" && message.id === id);
@@ -134,7 +133,8 @@ async function attachToTranscriptText(text: string, maxFrameLength?: number) {
 			{ timeout: 4_000 },
 		);
 	};
-	return { connection, errors, attached: await request("r1", "attach"), request };
+	const attached = await request("r1", { command: "attach", sessionId: "s1" });
+	return { seeded, connection, errors, attached, request };
 }
 
 test("replaces lone surrogates instead of dropping the client", async () => {
@@ -151,19 +151,47 @@ test("replaces lone surrogates instead of dropping the client", async () => {
 	expect(connection.closed).toBe(false);
 });
 
-test("answers a request whose result cannot be encoded and keeps the connection", async () => {
-	const { connection, errors, attached, request } = await attachToTranscriptText("x".repeat(4_096), 2_048);
-	expect(attached).toEqual({
-		type: "response",
-		id: "r1",
-		ok: false,
-		error: { code: "internal_error", message: "Internal server error" },
-	});
+test("closes and detaches instead of reporting an applied command whose result cannot be encoded as failed", async () => {
+	// The attach registered this connection, so an error response would leave the client
+	// believing it is not attached while the server keeps the session pinned to it.
+	const { seeded, connection, errors, attached } = await attachToTranscriptText("x".repeat(4_096), 2_048);
+	expect(attached).toBeUndefined();
+	expect(connection.closed).toBe(true);
 	expect(errors.map((error) => error.message)).toContainEqual(
 		expect.stringContaining("Unable to encode server protocol message"),
 	);
+	// Detaching the only connection releases the session runtime.
+	await vi.waitFor(() => expect(seeded.latestRuntime("s1").disposeCount).toBe(1), { timeout: 4_000 });
+});
+
+test("closes and detaches instead of dropping an event that cannot be encoded", async () => {
+	const { seeded, connection, errors, attached } = await attachToTranscriptText("small", 2_048);
+	expect(attached).toMatchObject({ ok: true });
+	// The session grows past maxFrameLength, so its session_snapshot event cannot be sent;
+	// skipping it would leave the client showing the old transcript with no signal.
+	setTranscriptText(seeded, "x".repeat(4_096));
+	seeded.latestRuntime("s1").emitSnapshot();
+	await vi.waitFor(() => expect(connection.closed).toBe(true), { timeout: 4_000 });
+	expect(errors.map((error) => error.message)).toContainEqual(
+		expect.stringContaining("Unable to encode server protocol message"),
+	);
+	await vi.waitFor(() => expect(seeded.latestRuntime("s1").disposeCount).toBe(1), { timeout: 4_000 });
+});
+
+test("answers a failed command whose error cannot be encoded with a generic error", async () => {
+	const { seeded, connection, attached, request } = await attachToTranscriptText("small", 2_048);
+	expect(attached).toMatchObject({ ok: true });
+	seeded.openSession = async () => {
+		throw new PiServerError("not_found", "x".repeat(4_096));
+	};
+	expect(await request("r2", { command: "attach", sessionId: "s2" })).toEqual({
+		type: "response",
+		id: "r2",
+		ok: false,
+		error: { code: "internal_error", message: "Internal server error" },
+	});
 	expect(connection.closed).toBe(false);
-	expect(await request("r2", "list")).toMatchObject({ ok: true, result: { command: "list" } });
+	expect(await request("r3", { command: "list" })).toMatchObject({ ok: true, result: { command: "list" } });
 });
 
 test("rejects timeout values above Node's maximum timer delay", () => {

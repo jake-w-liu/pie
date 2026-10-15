@@ -1,0 +1,181 @@
+/**
+ * Regression tests for the native supervisor channel: a parent that answers after the child
+ * stopped blocking got "No pending supervisor request found" and the answer was lost, although
+ * the child was still running. Pid-tagged requests now stay answerable while the asking process
+ * lives, and the child delivers the late reply to its session as a steering message.
+ */
+import { spawnSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const tempRoot = vi.hoisted(() => {
+	const nodeFs = require("node:fs") as typeof import("node:fs");
+	const nodeOs = require("node:os") as typeof import("node:os");
+	const nodePath = require("node:path") as typeof import("node:path");
+	const root = nodeFs.mkdtempSync(nodePath.join(nodeOs.tmpdir(), "pi-supervisor-late-"));
+	process.env.PI_SUBAGENTS_TEMP_ROOT = root;
+	return root;
+});
+
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	createNativeSupervisorChannel,
+	ensureSupervisorChannelDir,
+	registerNativeSupervisorClient,
+} from "../src/intercom/native-supervisor-channel.ts";
+import {
+	SUBAGENT_CHILD_AGENT_ENV,
+	SUBAGENT_CHILD_INDEX_ENV,
+	SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV,
+	SUBAGENT_RUN_ID_ENV,
+	SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV,
+} from "../src/runs/shared/pi-args.ts";
+import type { SubagentState } from "../src/shared/types.ts";
+
+const SESSION_ID = "parent-session";
+const RUN_ID = "run-late-reply";
+const channelDir = path.join(tempRoot, "supervisor-channels", "late-reply");
+
+type SentMessage = { message: { content: string; customType: string }; options: unknown };
+type ToolLike = { name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> };
+
+function fakePi(sent: SentMessage[] = []) {
+	const tools: ToolLike[] = [];
+	const pi = {
+		registerTool: (tool: ToolLike) => tools.push(tool),
+		getAllTools: () => tools,
+		sendMessage: (message: SentMessage["message"], options: unknown) => sent.push({ message, options }),
+		events: { emit: () => {}, on: () => () => {} },
+	};
+	return { pi: pi as unknown as ExtensionAPI, tools, sent };
+}
+
+function parentState(): SubagentState {
+	return {
+		currentSessionId: SESSION_ID,
+		asyncJobs: new Map(),
+		foregroundControls: new Map([[RUN_ID, {}]]),
+		lastUiContext: { sessionManager: { getSessionId: () => SESSION_ID } },
+	} as unknown as SubagentState;
+}
+
+async function until<T>(read: () => T | undefined, timeoutMs = 10_000): Promise<T> {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const value = read();
+		if (value !== undefined) return value;
+		if (Date.now() > deadline) throw new Error("condition not met in time");
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+}
+
+const envKeys = [
+	SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV,
+	SUBAGENT_RUN_ID_ENV,
+	SUBAGENT_CHILD_AGENT_ENV,
+	SUBAGENT_CHILD_INDEX_ENV,
+	SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV,
+	"PI_INTERCOM_ASK_TIMEOUT_MS",
+];
+const savedEnv = new Map(envKeys.map((key) => [key, process.env[key]]));
+
+beforeEach(() => {
+	process.env[SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV] = channelDir;
+	process.env[SUBAGENT_RUN_ID_ENV] = RUN_ID;
+	process.env[SUBAGENT_CHILD_AGENT_ENV] = "worker";
+	process.env[SUBAGENT_CHILD_INDEX_ENV] = "0";
+	process.env[SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV] = SESSION_ID;
+	process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "400";
+});
+
+afterEach(() => {
+	for (const [key, value] of savedEnv) {
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+	fs.rmSync(channelDir, { recursive: true, force: true });
+});
+
+afterAll(() => {
+	fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+describe("native supervisor late replies", () => {
+	it("delivers a reply sent after the child stopped blocking as a steering message", async () => {
+		const child = fakePi();
+		registerNativeSupervisorClient(child.pi);
+		const contact = child.tools.find((tool) => tool.name === "contact_supervisor");
+		expect(contact).toBeDefined();
+
+		const parentSent: SentMessage[] = [];
+		const parent = fakePi(parentSent);
+		const channel = createNativeSupervisorChannel(parent.pi, parentState(), { platform: "win32" });
+		channel.start();
+		try {
+			const ask = contact!.execute("call-1", { reason: "need_decision", message: "Which branch?" }, undefined);
+			const notice = await until(() => parentSent.find((sent) => sent.message.customType === "subagent_supervisor_request"));
+			expect(notice.message.content).toContain("then continues on its own assumption");
+
+			await expect(ask).rejects.toThrow(/No supervisor reply within .*If the supervisor answers later, the reply arrives/);
+			const requestId = [...channel.pending.keys()][0]!;
+
+			// The child stopped blocking; its request must still be answerable.
+			const supervisor = parent.tools.find((tool) => tool.name === "subagent_supervisor")!;
+			const replied = await supervisor.execute("call-2", { action: "reply", replyTo: requestId, message: "Use main." });
+			expect(replied.content[0]!.text).toContain("receives the reply as a steering message");
+
+			const delivered = await until(() =>
+				child.sent.find((sent) => sent.message.customType === "subagent_supervisor_late_reply"),
+			);
+			expect(delivered.message.content).toContain("Use main.");
+			expect(delivered.options).toEqual({ triggerTurn: true, deliverAs: "steer" });
+			expect(fs.readdirSync(path.join(channelDir, "requests"))).toEqual([]);
+			expect(fs.readdirSync(path.join(channelDir, "replies"))).toEqual([]);
+		} finally {
+			channel.dispose();
+		}
+	}, 30_000);
+
+	it("drops a pid-tagged request once the asking process has exited", async () => {
+		const exited = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], {
+			encoding: "utf8",
+		});
+		const deadPid = Number(exited.stdout);
+		expect(Number.isSafeInteger(deadPid) && deadPid > 0).toBe(true);
+
+		ensureSupervisorChannelDir(channelDir);
+		const requestFile = path.join(channelDir, "requests", "dead-child.json");
+		const now = Date.now();
+		fs.writeFileSync(
+			requestFile,
+			JSON.stringify({
+				type: "subagent.supervisor.request",
+				id: "dead-child",
+				createdAt: now,
+				expiresAt: now + 60_000,
+				reason: "need_decision",
+				message: "Anyone there?",
+				expectsReply: true,
+				orchestratorSessionId: SESSION_ID,
+				runId: RUN_ID,
+				agent: "worker",
+				childIndex: 0,
+				childPid: deadPid,
+			}),
+		);
+
+		const parentSent: SentMessage[] = [];
+		const parent = fakePi(parentSent);
+		const channel = createNativeSupervisorChannel(parent.pi, parentState(), { platform: "win32" });
+		channel.start();
+		try {
+			expect(channel.pending.size).toBe(0);
+			expect(parentSent).toHaveLength(0);
+			expect(fs.existsSync(requestFile)).toBe(false);
+		} finally {
+			channel.dispose();
+		}
+	});
+});
+

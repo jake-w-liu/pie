@@ -44,6 +44,12 @@ interface SupervisorRequest {
 	childIndex: number;
 	childTarget?: string;
 	interview?: unknown;
+	/**
+	 * Pid of the asking child process. When present, the request stays answerable for as long as
+	 * that process lives: the child stops blocking at `expiresAt` but keeps watching for a late
+	 * reply and delivers it to its session as a steering message.
+	 */
+	childPid?: number;
 }
 
 interface PendingSupervisorRequest extends SupervisorRequest {
@@ -231,10 +237,74 @@ async function waitForReply(channelDir: string, requestId: string, deadline: num
 		}
 		await delay(250, signal);
 	}
-	throw new Error("Timed out waiting for supervisor reply.");
+	throw new SupervisorReplyTimeoutError();
 }
 
-async function sendSupervisorRequest(params: ContactSupervisorParams, signal?: AbortSignal): Promise<AgentToolResult<Record<string, unknown>>> {
+class SupervisorReplyTimeoutError extends Error {
+	constructor() {
+		super("Timed out waiting for supervisor reply.");
+		this.name = "SupervisorReplyTimeoutError";
+	}
+}
+
+function processAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		// EPERM: the process exists but belongs to another user.
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+function formatAskTimeout(ms: number): string {
+	const minutes = ms / 60_000;
+	return Number.isInteger(minutes) ? `${minutes} minute${minutes === 1 ? "" : "s"}` : `${Math.round(ms / 1000)} seconds`;
+}
+
+const LATE_REPLY_POLL_MS = 1000;
+
+/**
+ * After the blocking wait gave up, keep watching for the supervisor's reply for the rest of
+ * this process's life and hand it to the session as a steering message. The request file stays
+ * in place so the parent can still answer; the parent drops it once this process is gone.
+ */
+function watchForLateReply(pi: ExtensionAPI, channelDir: string, requestId: string): void {
+	const file = replyPath(channelDir, requestId);
+	const timer = setInterval(() => {
+		let reply: Partial<SupervisorReply>;
+		try {
+			if (!fs.existsSync(file)) {
+				// The parent can no longer answer once the request is gone (run ended, cleaned up).
+				if (!fs.existsSync(requestPath(channelDir, requestId))) clearInterval(timer);
+				return;
+			}
+			reply = JSON.parse(fs.readFileSync(file, "utf-8")) as Partial<SupervisorReply>;
+		} catch {
+			return; // A partially visible write is retried on the next tick.
+		}
+		if (reply.type !== "subagent.supervisor.reply" || reply.requestId !== requestId || typeof reply.message !== "string") return;
+		clearInterval(timer);
+		removeRequestFile(file);
+		removeRequestFile(requestPath(channelDir, requestId));
+		try {
+			pi.sendMessage(
+				{
+					customType: "subagent_supervisor_late_reply",
+					content: `**Late reply from supervisor** to your earlier contact_supervisor request ${requestId}:\n${reply.message}\n\nRe-check any assumption you made while waiting against this reply.`,
+					display: true,
+					details: { requestId },
+				},
+				{ triggerTurn: true, deliverAs: "steer" },
+			);
+		} catch (error) {
+			console.error(`Failed to deliver late supervisor reply ${requestId}:`, error);
+		}
+	}, LATE_REPLY_POLL_MS);
+	timer.unref?.();
+}
+
+async function sendSupervisorRequest(pi: ExtensionAPI, params: ContactSupervisorParams, signal?: AbortSignal): Promise<AgentToolResult<Record<string, unknown>>> {
 	const metadata = readChildMetadata();
 	if (!metadata) throw new Error("Native supervisor channel is not available for this subagent.");
 	if (params.reason !== "progress_update" && !params.message?.trim() && params.reason !== "interview_request") {
@@ -244,7 +314,8 @@ async function sendSupervisorRequest(params: ContactSupervisorParams, signal?: A
 	const requestId = randomUUID();
 	const expectsReply = params.reason !== "progress_update";
 	const createdAt = Date.now();
-	const replyDeadline = createdAt + askTimeoutMs();
+	const timeoutMs = askTimeoutMs();
+	const replyDeadline = createdAt + timeoutMs;
 	const expiresAt = expectsReply ? replyDeadline : undefined;
 	const message = formatChildMessage({ ...metadata, reason: params.reason, message: params.message, interview: params.interview });
 	const request: SupervisorRequest = {
@@ -262,6 +333,7 @@ async function sendSupervisorRequest(params: ContactSupervisorParams, signal?: A
 		childIndex: metadata.childIndex,
 		...(metadata.childTarget ? { childTarget: metadata.childTarget } : {}),
 		...(params.interview !== undefined ? { interview: params.interview } : {}),
+		...(expectsReply ? { childPid: process.pid } : {}),
 	};
 	const serialized = JSON.stringify(request, null, "\t");
 	if (Buffer.byteLength(serialized, "utf-8") > MAX_MESSAGE_BYTES) throw new Error("Supervisor request is too large.");
@@ -287,11 +359,17 @@ async function sendSupervisorRequest(params: ContactSupervisorParams, signal?: A
 			details,
 		};
 	} catch (error) {
-		// A reply may have landed just as we gave up; remove it too so a late
-		// parent write cannot orphan a reply file nobody will ever consume.
-		removeRequestFile(requestPath(metadata.channelDir, requestId));
-		removeRequestFile(replyPath(metadata.channelDir, requestId));
-		throw error;
+		if (signal?.aborted || !(error instanceof SupervisorReplyTimeoutError)) {
+			// Cancelled: nobody will consume a reply. Remove a reply that landed meanwhile too,
+			// so a late parent write cannot orphan a file.
+			removeRequestFile(requestPath(metadata.channelDir, requestId));
+			removeRequestFile(replyPath(metadata.channelDir, requestId));
+			throw error;
+		}
+		watchForLateReply(pi, metadata.channelDir, requestId);
+		throw new Error(
+			`No supervisor reply within ${formatAskTimeout(timeoutMs)} (request ${requestId}). Continue with your best judgment and state the assumption you made. If the supervisor answers later, the reply arrives as a message in this conversation.`,
+		);
 	}
 }
 
@@ -308,10 +386,10 @@ export function registerNativeSupervisorClient(pi: ExtensionAPI): void {
 	const tool: ToolDefinition<typeof ContactSupervisorParamsSchema, Record<string, unknown>> = {
 		name: "contact_supervisor",
 		label: "Contact Supervisor",
-		description: "Contact the parent/supervisor session for a blocking decision, structured interview, or progress update.",
+		description: `Contact the parent/supervisor session for a blocking decision, structured interview, or progress update. Decisions and interviews block for up to ${formatAskTimeout(askTimeoutMs())}; a later reply still arrives as a message.`,
 		parameters: ContactSupervisorParamsSchema,
 		execute(_id, params, signal) {
-			return sendSupervisorRequest(params as ContactSupervisorParams, signal);
+			return sendSupervisorRequest(pi, params as ContactSupervisorParams, signal);
 		},
 	};
 	pi.registerTool(tool);
@@ -325,6 +403,7 @@ function parseRequestFile(file: string, channelDir: string): PendingSupervisorRe
 		if (parsed.reason !== "need_decision" && parsed.reason !== "interview_request" && parsed.reason !== "progress_update") return undefined;
 		if (typeof parsed.message !== "string" || !parsed.message) return undefined;
 		if (typeof parsed.runId !== "string" || typeof parsed.agent !== "string" || typeof parsed.childIndex !== "number") return undefined;
+		if (parsed.childPid !== undefined && !(Number.isSafeInteger(parsed.childPid) && parsed.childPid > 0)) return undefined;
 		return { ...parsed as SupervisorRequest, channelDir, requestFile: file };
 	} catch {
 		return undefined;
@@ -449,6 +528,16 @@ function reapOrphanedSupervisorFiles(channelDir: string, nowMs: number): void {
 			continue;
 		}
 		if (parsed.type !== "subagent.supervisor.request" || parsed.expectsReply !== true) continue;
+		if (typeof parsed.childPid === "number") {
+			// Answerable while the asking process lives (it watches for late replies).
+			if (processAlive(parsed.childPid)) continue;
+			try {
+				fs.rmSync(file, { force: true });
+			} catch {
+				// Opportunistic; retried on the next pass.
+			}
+			continue;
+		}
 		const expiresAt = typeof parsed.expiresAt === "number" && Number.isFinite(parsed.expiresAt)
 			? parsed.expiresAt
 			: typeof parsed.createdAt === "number" && Number.isFinite(parsed.createdAt)
@@ -578,7 +667,11 @@ function requestLifecycle(request: PendingSupervisorRequest, state: SubagentStat
 	if (ctx && !requestMatchesContext(request, state, ctx)) return "wrong-session";
 	if (!fs.existsSync(request.requestFile)) return "missing";
 	if (request.expectsReply && fs.existsSync(replyPath(request.channelDir, request.id))) return "resolved";
-	if (request.expectsReply && now > requestExpiresAt(request, now)) return "expired";
+	if (request.expectsReply && request.childPid !== undefined) {
+		if (!processAlive(request.childPid)) return "inactive";
+	} else if (request.expectsReply && now > requestExpiresAt(request, now)) {
+		return "expired";
+	}
 	if (request.expectsReply && requestRunInactive(request, state)) return "inactive";
 	return "pending";
 }
@@ -597,14 +690,28 @@ function refreshPendingRequests(pending: Map<string, PendingSupervisorRequest>, 
 	}
 }
 
+function stoppedWaiting(request: SupervisorRequest, now = Date.now()): boolean {
+	return request.expiresAt !== undefined && now > request.expiresAt;
+}
+
 function formatPendingLine(request: PendingSupervisorRequest): string {
 	const replyHint = request.expectsReply ? ` Reply: ${NATIVE_SUPERVISOR_TOOL_NAME}({ action: "reply", replyTo: "${request.id}", message: "..." })` : "";
-	return `- ${request.id}: ${request.agent} [${request.runId}#${request.childIndex}] ${request.reason}.${replyHint}`;
+	const late = request.expectsReply && stoppedWaiting(request) ? " (stopped blocking; a reply is delivered as a message)" : "";
+	return `- ${request.id}: ${request.agent} [${request.runId}#${request.childIndex}] ${request.reason}${late}.${replyHint}`;
 }
 
 function requestVisibleText(request: PendingSupervisorRequest): string {
 	const lines = [request.message];
 	if (request.expectsReply) {
+		if (request.expiresAt !== undefined) {
+			const until = new Date(request.expiresAt).toLocaleTimeString();
+			lines.push(
+				"",
+				request.childPid !== undefined
+					? `The subagent blocks on this until ${until}, then continues on its own assumption; a later reply is still delivered while it runs.`
+					: `The subagent waits for this reply until ${until}.`,
+			);
+		}
 		lines.push("", `Reply with: ${NATIVE_SUPERVISOR_TOOL_NAME}({ action: "reply", replyTo: "${request.id}", message: "..." })`);
 	}
 	return lines.join("\n");
@@ -673,10 +780,14 @@ function buildParentSupervisorTool(pending: Map<string, PendingSupervisorRequest
 			}
 			if (input.action === "reply") {
 				const request = resolvePendingRequest(pending, input);
+				const late = stoppedWaiting(request);
 				writeReply(request, input.message ?? "");
 				pending.delete(request.id);
 				clearForegroundSupervisorAttention(request, pending, state);
-				return { content: [{ type: "text", text: `Replied to supervisor request ${request.id}.` }], details: { replyTo: request.id, runId: request.runId, agent: request.agent } };
+				const text = late
+					? `Replied to supervisor request ${request.id}. The subagent had stopped blocking on it, so it receives the reply as a steering message.`
+					: `Replied to supervisor request ${request.id}.`;
+				return { content: [{ type: "text", text }], details: { replyTo: request.id, runId: request.runId, agent: request.agent, late } };
 			}
 			if (input.action === "send" || input.action === "ask") {
 				throw new Error("The native subagent supervisor handles replies only. Child agents initiate asks with contact_supervisor.");

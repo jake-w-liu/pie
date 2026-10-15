@@ -177,3 +177,64 @@ out({ type: "message_end", message: { role: "assistant", content: [{ type: "text
 		await exited;
 	}
 }, 40_000);
+
+it("does not treat a flagged run's progress update as a pending supervisor request", async () => {
+	const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-attention-progress-"));
+	roots.push(base);
+	const asyncRoot = path.join(base, "async");
+	const resultsDir = path.join(base, "results");
+	const sessionId = "/sessions/parent.jsonl";
+	const runId = "aaaaaaaa-bbbb-4ccc-8ddd-000000000043";
+	const asyncDir = path.join(asyncRoot, runId);
+	fs.mkdirSync(asyncDir, { recursive: true });
+	fs.mkdirSync(resultsDir, { recursive: true });
+	const now = Date.now();
+	fs.writeFileSync(
+		path.join(asyncDir, "status.json"),
+		JSON.stringify({
+			runId,
+			sessionId,
+			mode: "single",
+			state: "running",
+			pid: process.pid,
+			startedAt: now,
+			lastUpdate: now,
+			currentStep: 0,
+			// needs_attention for another reason (an idle step) while a progress update is open.
+			activityState: "needs_attention",
+			steps: [
+				{
+					agent: "worker",
+					status: "running",
+					startedAt: now,
+					activityState: "needs_attention",
+					currentTool: "contact_supervisor",
+					currentToolBlocksSupervisor: false,
+				},
+			],
+		}),
+	);
+	fs.writeFileSync(path.join(asyncDir, "events.jsonl"), "");
+	updateActiveRunIndex(asyncDir, "running");
+
+	let clock = 0;
+	const result = await waitForSubagents({ id: runId, timeoutMs: 5_000, stopOnAttention: false }, undefined, {
+		state: {
+			currentSessionId: sessionId,
+			asyncJobs: new Map(),
+			foregroundControls: new Map(),
+			cleanupTimers: new Map(),
+			completionSeen: new Map(),
+		} as unknown as SubagentState,
+		asyncDirRoot: asyncRoot,
+		resultsDir,
+		now: () => clock,
+		pollIntervalMs: 1_000,
+		sleep: async (ms) => {
+			clock += ms;
+		},
+	});
+	const text = result.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+	expect(clock).toBe(5_000);
+	expect(text).toContain("Wait timed out");
+});

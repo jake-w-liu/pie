@@ -244,9 +244,9 @@ function needsAttention(run: AsyncRunSummary): boolean {
 }
 
 function hasSupervisorTool(run: AsyncRunSummary): boolean {
-	return run.currentTool === "contact_supervisor"
+	return awaitsSupervisorReply(run)
 		|| run.currentTool === "intercom"
-		|| run.steps.some((step) => step.currentTool === "contact_supervisor" || step.currentTool === "intercom");
+		|| run.steps.some((step) => step.currentTool === "intercom");
 }
 
 /**

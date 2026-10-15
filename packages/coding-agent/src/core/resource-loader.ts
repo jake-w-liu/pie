@@ -592,6 +592,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	private addExtensionConflictDiagnostics(extensionsResult: LoadExtensionsResult): void {
+		this.dropYieldedTools(extensionsResult.extensions);
 		// Detect extension conflicts (tools, commands, flags with same names from different extensions)
 		// Keep all extensions loaded. Conflicts are reported as diagnostics, and precedence is handled by load order.
 		const conflicts = this.detectExtensionConflicts(extensionsResult.extensions);
@@ -924,6 +925,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			try {
 				const extension = await loadExtensionFromFactory(factory, this.cwd, this.eventBus, runtime, extensionPath);
 				extension.hidden = isNamed && input.hidden;
+				extension.yieldsTools = isNamed && input.yieldsTools;
 				extensions.push(extension);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : "failed to load extension";
@@ -1022,6 +1024,18 @@ export class DefaultResourceLoader implements ResourceLoader {
 		}
 		const prefix = normalizedRoot.endsWith(sep) ? normalizedRoot : `${normalizedRoot}${sep}`;
 		return target.startsWith(prefix);
+	}
+
+	/** Remove tools of yielding extensions that another extension also registers. */
+	private dropYieldedTools(extensions: Extension[]): void {
+		for (const ext of extensions) {
+			if (!ext.yieldsTools) continue;
+			for (const toolName of [...ext.tools.keys()]) {
+				if (extensions.some((other) => other !== ext && !other.yieldsTools && other.tools.has(toolName))) {
+					ext.tools.delete(toolName);
+				}
+			}
+		}
 	}
 
 	private detectExtensionConflicts(extensions: Extension[]): Array<{ path: string; message: string }> {

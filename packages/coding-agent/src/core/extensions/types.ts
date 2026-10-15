@@ -1594,6 +1594,11 @@ export type InlineExtension =
 			factory: ExtensionFactory;
 			/** Omit this extension from the startup Extensions list. */
 			hidden?: boolean;
+			/**
+			 * Tools this extension registers give way to a same-named tool from another extension
+			 * instead of conflicting, so a user's own tool replaces a built-in one.
+			 */
+			yieldsTools?: boolean;
 	  };
 
 // ============================================================================
@@ -1765,6 +1770,8 @@ export interface Extension {
 	path: string;
 	resolvedPath: string;
 	hidden?: boolean;
+	/** Its tools give way to same-named tools from other extensions (see InlineExtension). */
+	yieldsTools?: boolean;
 	sourceInfo: SourceInfo;
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool>;

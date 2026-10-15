@@ -31,7 +31,7 @@ function lazyBuiltIn(loader: () => Promise<{ default: ExtensionFactory }>): Exte
 export const builtInExtensions: InlineExtension[] = [
 	{ name: "subagents", factory: lazyBuiltIn(() => import("@earendil-works/pi-ext-subagents")) },
 	{ name: "web-access", factory: lazyBuiltIn(() => import("@earendil-works/pi-ext-web-access")) },
-	{ name: "ask-user", factory: askUserExtension, hidden: true },
+	{ name: "ask-user", factory: askUserExtension, hidden: true, yieldsTools: true },
 	{ name: "import-repro", factory: importReproExtension, hidden: true },
 	{ name: "llama.cpp", factory: llamaExtension, hidden: true },
 	{ name: "mlx", factory: mlxExtension, hidden: true },

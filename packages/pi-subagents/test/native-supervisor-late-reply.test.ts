@@ -279,29 +279,73 @@ describe("native supervisor late replies", () => {
 		}
 	}, 30_000);
 
-	it("routes '/subagent-reply <agent> <answer>' to that agent's request", async () => {
+	it("parses /subagent-reply targets without eating answers or misrouting the agent's reply", async () => {
 		process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "20000";
-		const child = fakePi();
-		registerNativeSupervisorClient(child.pi);
-		const contact = child.tools.find((tool) => tool.name === "contact_supervisor")!;
 		const parentSent: SentMessage[] = [];
 		const parent = fakePi(parentSent);
 		const channel = createNativeSupervisorChannel(parent.pi, parentState(), { platform: "win32" });
 		channel.start();
+		const notices: string[] = [];
+		const inputs: string[] = [];
+		const ui = {
+			hasUI: true,
+			sessionManager: { getSessionId: () => SESSION_ID },
+			ui: {
+				notify: (message: string) => notices.push(message),
+				input: async (title: string) => {
+					inputs.push(title);
+					return "Typed in the dialog.";
+				},
+			},
+		};
+		const reply = parent.commands.get("subagent-reply")!;
+		const ask = (agent: string, question: string) => {
+			process.env[SUBAGENT_CHILD_AGENT_ENV] = agent;
+			const child = fakePi();
+			registerNativeSupervisorClient(child.pi);
+			return child.tools.find((tool) => tool.name === "contact_supervisor")!.execute(
+				"call",
+				{ reason: "need_decision", message: question },
+				undefined,
+			);
+		};
+		const requestFor = (agent: string) =>
+			until(() => [...channel.pending.values()].find((request) => request.agent === agent));
 		try {
-			const ask = contact.execute("call-1", { reason: "need_decision", message: "Which DB?" }, undefined);
-			const notice = await until(() => parentSent.find((sent) => sent.message.customType === "subagent_supervisor_request"));
-			expect(notice.message.content).not.toContain("ask_user");
-			const notices: string[] = [];
-			await parent.commands.get("subagent-reply")!.handler("worker  Postgres, version 17", {
-				hasUI: true,
-				sessionManager: { getSessionId: () => SESSION_ID },
-				ui: { notify: (message: string) => notices.push(message) },
-			});
-			expect(notices).toEqual(["Sent your answer to worker."]);
-			expect((await ask).content[0]!.text).toContain("Postgres, version 17");
+			// One waiting subagent: the whole text is the answer, even when it starts like a target.
+			const first = ask("worker", "How many retries?");
+			await requestFor("worker");
+			await reply.handler("1 more retries are fine", ui);
+			expect((await first).content[0]!.text).toContain("1 more retries are fine");
+
+			// A request id alone asks for the answer in a dialog.
+			const second = ask("worker", "Which branch?");
+			const secondRequest = await requestFor("worker");
+			await reply.handler(secondRequest.id.slice(0, 8), ui);
+			expect(inputs).toEqual(["Answer worker: Which branch?"]);
+			expect((await second).content[0]!.text).toContain("Typed in the dialog.");
+
+			// Two waiting: the agent name picks one; the agent is told about the user's answer.
+			const third = ask("worker", "Which database?");
+			const reviewer = ask("reviewer", "Strict or lenient?");
+			await requestFor("worker");
+			await requestFor("reviewer");
+			await reply.handler("worker Postgres", ui);
+			expect((await third).content[0]!.text).toContain("Postgres");
+			const told = parentSent.filter((sent) => sent.message.customType === "subagent_supervisor_user_reply");
+			expect(told.at(-1)).toMatchObject({ options: { deliverAs: "steer" } });
+			expect(told.at(-1)!.message.content).toContain("No reply from you is needed");
+
+			// The agent, unaware, answers the worker by name: it must not reach the reviewer.
+			const supervisor = parent.tools.find((tool) => tool.name === "subagent_supervisor")!;
+			await expect(supervisor.execute("call", { action: "reply", to: "worker", message: "MySQL" })).rejects.toThrow(
+				/No pending supervisor request matches 'worker'\. Request .* from worker was already answered by the user/,
+			);
+			expect([...channel.pending.values()].map((request) => request.agent)).toEqual(["reviewer"]);
+			await reply.handler("reviewer Lenient.", ui);
+			expect((await reviewer).content[0]!.text).toContain("Lenient.");
 		} finally {
 			channel.dispose();
 		}
-	}, 30_000);
+	}, 60_000);
 });

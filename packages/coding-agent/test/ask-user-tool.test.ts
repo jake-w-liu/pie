@@ -1,5 +1,10 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext } from "../src/core/extensions/types.ts";
+import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
+import { SettingsManager } from "../src/core/settings-manager.ts";
 import askUserExtension, { ASK_USER_OWN_ANSWER, type AskUserDetails } from "../src/extensions/ask-user/index.ts";
 import { builtInExtensions } from "../src/extensions/index.ts";
 
@@ -147,5 +152,52 @@ describe("ask_user tool", () => {
 		await expect(
 			tool.execute("call", { question: "Pick", allowFreeText: false }, undefined, undefined, ui),
 		).rejects.toThrow("Provide options");
+	});
+});
+
+describe("ask_user next to a user extension that defines the same tool", () => {
+	const roots: string[] = [];
+	afterEach(() => {
+		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	});
+
+	async function load(yieldsTools: boolean) {
+		const root = mkdtempSync(join(tmpdir(), "pi-ask-user-conflict-"));
+		roots.push(root);
+		const userExtension = join(root, "my-ask.ts");
+		writeFileSync(
+			userExtension,
+			`export default function (pi) {
+	pi.registerTool({ name: "ask_user", label: "Mine", description: "mine", parameters: { type: "object", properties: {} }, execute: async () => ({ content: [], details: {} }) });
+}
+`,
+		);
+		const loader = new DefaultResourceLoader({
+			cwd: root,
+			agentDir: join(root, "agent"),
+			settingsManager: SettingsManager.inMemory(),
+			additionalExtensionPaths: [userExtension],
+			extensionFactories: [{ name: "ask-user", factory: askUserExtension, hidden: true, yieldsTools }],
+			noSkills: true,
+			noPromptTemplates: true,
+			noThemes: true,
+			noContextFiles: true,
+		});
+		await loader.reload();
+		return { loaded: loader.getExtensions(), userExtension };
+	}
+
+	it("lets the user's tool replace the built-in instead of failing startup", async () => {
+		const { loaded, userExtension } = await load(true);
+		expect(loaded.errors).toEqual([]);
+		const owners = loaded.extensions.filter((extension) => extension.tools.has("ask_user"));
+		expect(owners.map((extension) => extension.path)).toEqual([userExtension]);
+	});
+
+	it("still reports the conflict for an inline extension that does not yield", async () => {
+		const { loaded } = await load(false);
+		expect(loaded.errors).toEqual([
+			{ path: "<inline:ask-user>", error: expect.stringContaining('Tool "ask_user" conflicts with') },
+		]);
 	});
 });

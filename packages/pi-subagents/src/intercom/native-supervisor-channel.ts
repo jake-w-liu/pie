@@ -737,30 +737,46 @@ function writeReply(request: PendingSupervisorRequest, message: string): void {
 }
 
 /** Who answered recently resolved requests, so a second answer gets a precise error. Bounded. */
-type AnsweredRequests = Map<string, "user" | "agent">;
+type AnsweredRequests = Map<string, { by: "user" | "agent"; agent: string }>;
 const MAX_REMEMBERED_ANSWERS = 256;
+/**
+ * Shortest request-id prefix accepted as a target: the length the notice shows. Shorter prefixes
+ * (a single digit matches about one id in sixteen) would capture the first word of an answer.
+ */
+const MIN_REQUEST_ID_PREFIX = 8;
 
-function rememberAnswer(answered: AnsweredRequests, requestId: string, by: "user" | "agent"): void {
-	answered.set(requestId, by);
+function rememberAnswer(answered: AnsweredRequests, request: PendingSupervisorRequest, by: "user" | "agent"): void {
+	answered.set(request.id, { by, agent: request.agent });
 	if (answered.size > MAX_REMEMBERED_ANSWERS) answered.delete(answered.keys().next().value!);
 }
 
-/** Requests matching a request-id prefix, agent name, or child intercom target. */
+/** Requests matching a request-id prefix (8+ characters), agent name, or child intercom target. */
 function matchPendingRequests(requests: PendingSupervisorRequest[], target: string): PendingSupervisorRequest[] {
 	const normalized = target.toLowerCase();
 	return requests.filter((request) =>
-		request.id.toLowerCase().startsWith(normalized)
+		(normalized.length >= MIN_REQUEST_ID_PREFIX && request.id.toLowerCase().startsWith(normalized))
 		|| request.agent.toLowerCase() === normalized
 		|| request.childTarget?.toLowerCase() === normalized,
 	);
+}
+
+/** A precise reason why nothing is waiting for `target`, when the user already answered it. */
+function alreadyAnsweredNote(answered: AnsweredRequests, target: string): string {
+	const normalized = target.toLowerCase();
+	for (const [id, entry] of answered) {
+		if (id.toLowerCase() === normalized || (normalized.length >= MIN_REQUEST_ID_PREFIX && id.toLowerCase().startsWith(normalized)) || entry.agent.toLowerCase() === normalized) {
+			return ` Request ${id} from ${entry.agent} was already answered by the ${entry.by}.`;
+		}
+	}
+	return "";
 }
 
 function resolvePendingRequest(pending: Map<string, PendingSupervisorRequest>, params: IntercomParams, answered: AnsweredRequests): PendingSupervisorRequest {
 	if (params.replyTo) {
 		const request = pending.get(params.replyTo);
 		if (!request) {
-			const by = answered.get(params.replyTo);
-			if (by) throw new Error(`Supervisor request '${params.replyTo}' was already answered by the ${by}; no further reply is needed.`);
+			const entry = answered.get(params.replyTo);
+			if (entry) throw new Error(`Supervisor request '${params.replyTo}' was already answered by the ${entry.by}; no further reply is needed.`);
 			throw new Error(`No pending supervisor request found for replyTo '${params.replyTo}'.`);
 		}
 		return request;
@@ -770,6 +786,8 @@ function resolvePendingRequest(pending: Map<string, PendingSupervisorRequest>, p
 		const matches = matchPendingRequests(requests, params.to);
 		if (matches.length === 1) return matches[0]!;
 		if (matches.length > 1) throw new Error(`Multiple pending supervisor requests match '${params.to}'. Use replyTo.`);
+		// Never fall back to some other request: that would deliver this answer to the wrong subagent.
+		throw new Error(`No pending supervisor request matches '${params.to}'.${alreadyAnsweredNote(answered, params.to)}`);
 	}
 	if (requests.length === 1) return requests[0]!;
 	if (requests.length === 0) throw new Error("No pending supervisor requests need a reply.");
@@ -788,7 +806,7 @@ function answerPendingRequest(
 	const late = stoppedWaiting(request);
 	writeReply(request, message);
 	pending.delete(request.id);
-	rememberAnswer(answered, request.id, by);
+	rememberAnswer(answered, request, by);
 	clearForegroundSupervisorAttention(request, pending, state);
 	return { late };
 }
@@ -846,6 +864,7 @@ function questionSummary(request: PendingSupervisorRequest): string {
 }
 
 async function answerAsUser(
+	pi: ExtensionAPI,
 	args: string,
 	ctx: ExtensionContext,
 	pending: Map<string, PendingSupervisorRequest>,
@@ -867,22 +886,31 @@ async function answerAsUser(
 	let message: string | undefined;
 	const trimmed = args.trim();
 	if (trimmed) {
-		// "<request-id|agent> <answer>", or just "<answer>" when only one subagent is waiting.
-		const first = trimmed.split(/\s+/, 1)[0]!;
-		const matches = matchPendingRequests(open, first);
+		// "<request-id> <answer>" always; "<agent> <answer>" only to choose among several waiting
+		// subagents. With one waiting, the whole text is the answer, so it may start with any word.
+		const first = trimmed.split(/\s+/, 1)[0]!.toLowerCase();
 		const rest = trimmed.slice(first.length).trim();
-		if (matches.length === 1 && rest) {
-			request = matches[0];
-			message = rest;
-		} else if (matches.length > 1 && rest) {
-			notify(`Several waiting subagents match '${first}'; use the request id instead.`, "warning");
-			return;
+		const idMatches = first.length >= MIN_REQUEST_ID_PREFIX ? open.filter((candidate) => candidate.id.toLowerCase().startsWith(first)) : [];
+		const nameMatches = open.filter(
+			(candidate) => candidate.agent.toLowerCase() === first || candidate.childTarget?.toLowerCase() === first,
+		);
+		if (idMatches.length === 1) {
+			request = idMatches[0];
+			message = rest || undefined;
 		} else if (open.length === 1) {
 			request = open[0];
 			message = trimmed;
+		} else if (nameMatches.length === 1) {
+			request = nameMatches[0];
+			message = rest || undefined;
 		} else {
 			const ids = open.map((candidate) => `${candidate.id.slice(0, 8)} (${candidate.agent})`).join(", ");
-			notify(`Several subagents are waiting (${ids}); start with a request id or agent name.`, "warning");
+			notify(
+				nameMatches.length > 1
+					? `Several waiting subagents are named '${first}'; start with a request id: ${ids}.`
+					: `Several subagents are waiting (${ids}); start with a request id or agent name.`,
+				"warning",
+			);
 			return;
 		}
 	} else {
@@ -898,18 +926,35 @@ async function answerAsUser(
 			if (picked === undefined) return;
 			request = open[labels.indexOf(picked)];
 		}
-		if (!request) return;
+	}
+	if (!request) return;
+	if (!message?.trim()) {
+		// A target without an answer: ask for the answer.
+		if (!ctx.hasUI) {
+			notify(`Usage: /${USER_REPLY_COMMAND} [request-id|agent] <answer>`, "warning");
+			return;
+		}
 		message = await ctx.ui.input(`Answer ${request.agent}: ${questionSummary(request)}`, "Your answer");
 	}
-	if (!request || !message?.trim()) return;
+	if (!message?.trim()) return;
 	// The request may have been answered or dropped while the dialog was open.
 	refreshPendingRequests(pending, state, ctx);
 	if (!pending.has(request.id)) {
-		const by = answered.get(request.id);
-		notify(by ? `That question was already answered by the ${by}.` : "That subagent is no longer waiting for an answer.", "warning");
+		const entry = answered.get(request.id);
+		notify(entry ? `That question was already answered by the ${entry.by}.` : "That subagent is no longer waiting for an answer.", "warning");
 		return;
 	}
 	const { late } = answerPendingRequest(request, message, "user", pending, answered, state);
+	// The agent saw the question; tell it the user answered so it does not answer again.
+	pi.sendMessage(
+		{
+			customType: "subagent_supervisor_user_reply",
+			content: `The user answered ${request.agent}'s question (request ${request.id}) directly: ${message.trim()}\nNo reply from you is needed for that request.`,
+			display: false,
+			details: { requestId: request.id, runId: request.runId, agent: request.agent },
+		},
+		{ deliverAs: "steer" },
+	);
 	notify(
 		late
 			? `Sent your answer to ${request.agent}; it had stopped waiting and receives it as a message.`
@@ -945,7 +990,7 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 	// Registered at load, so command listings and autocomplete include it from the start.
 	pi.registerCommand(USER_REPLY_COMMAND, {
 		description: "Answer a subagent's question yourself: /subagent-reply [request-id|agent] <answer>",
-		handler: (args, ctx) => answerAsUser(args, ctx, pending, answered, state),
+		handler: (args, ctx) => answerAsUser(pi, args, ctx, pending, answered, state),
 	});
 
 	const cleanupStaleChannelsIfDue = (): void => {

@@ -51,15 +51,23 @@ describe("execCommand", () => {
 						stdio: ["ignore", "inherit", "inherit"],
 					}).unref();`,
 				);
-				const started = Date.now();
-				const result = await execCommand(
+				// Timeout while the command runs: the shell is killed, the writer escaped the group.
+				let started = Date.now();
+				const killed = await execCommand(
 					"sh",
 					["-c", `${JSON.stringify(process.execPath)} launch.cjs; sleep 30`],
 					directory,
 					{ timeout: 500 },
 				);
-				expect(result.killed).toBe(true);
+				expect(killed.killed).toBe(true);
 				// Waiting for the pipes to go idle would last as long as the writer keeps writing.
+				expect(Date.now() - started).toBeLessThan(5_000);
+
+				// Timeout after the command already exited: only the writer's pipe keeps the call open.
+				started = Date.now();
+				const exited = await execCommand(process.execPath, ["launch.cjs"], directory, { timeout: 500 });
+				expect(exited.code).toBe(0);
+				expect(exited.stdout).toContain("tick");
 				expect(Date.now() - started).toBeLessThan(5_000);
 			} finally {
 				rmSync(directory, { recursive: true, force: true });

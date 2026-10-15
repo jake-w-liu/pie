@@ -51,9 +51,11 @@ export async function execCommand(
 		let killed = false;
 		let timeoutId: NodeJS.Timeout | undefined;
 		let forceKillId: NodeJS.Timeout | undefined;
-		// Once the command is cancelled, stop reading after a fixed pipe deadline: a descendant that
-		// left the process group can keep writing to the inherited pipe forever.
+		// After a cancelled command has exited (or been force-killed), stop reading after a fixed
+		// pipe deadline: a descendant that left the process group can keep writing to the inherited
+		// pipe forever. Not earlier, so a command that handles SIGTERM keeps its grace period.
 		const cancellation = new AbortController();
+		const stopWaitingForPipes = () => cancellation.abort();
 
 		const sendSignal = (signal: NodeJS.Signals) => {
 			if (useProcessGroup && proc.pid !== undefined) {
@@ -68,9 +70,14 @@ export async function execCommand(
 		};
 
 		const killProcess = () => {
-			cancellation.abort();
-			if (!killed && proc.exitCode === null && proc.signalCode === null) {
+			if (proc.exitCode !== null || proc.signalCode !== null) {
+				// Only pipes held open by descendants remain.
+				stopWaitingForPipes();
+				return;
+			}
+			if (!killed) {
 				killed = true;
+				proc.once("exit", stopWaitingForPipes);
 				sendSignal("SIGTERM");
 				// Force kill after 5 seconds if SIGTERM doesn't work
 				forceKillId = setTimeout(() => {
@@ -78,6 +85,7 @@ export async function execCommand(
 					if (proc.exitCode === null && proc.signalCode === null) {
 						sendSignal("SIGKILL");
 					}
+					stopWaitingForPipes();
 				}, 5000);
 			}
 		};

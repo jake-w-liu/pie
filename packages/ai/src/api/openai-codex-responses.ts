@@ -20,7 +20,7 @@ import type {
 	Usage,
 } from "../types.ts";
 import { operationSignal } from "../utils/abort.ts";
-import { combineAbortSignals } from "../utils/abort-signals.ts";
+import { clearableTimeoutSignal, combineAbortSignals } from "../utils/abort-signals.ts";
 import { splitDeferredTools } from "../utils/deferred-tools.ts";
 import {
 	appendAssistantMessageDiagnostic,
@@ -384,12 +384,13 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					throw new Error("Request was aborted");
 				}
 
-				// The timeout has to stay armed while the body streams, not just until
-				// headers arrive: a body that stalls after a 200 waited forever because the
-				// combined signal was cleaned up before `processStream` started reading.
-				const headerTimeoutSignal =
-					httpTimeoutMs !== undefined && httpTimeoutMs > 0 ? AbortSignal.timeout(httpTimeoutMs) : undefined;
-				const combinedSignal = combineAbortSignals([options?.signal, headerTimeoutSignal]);
+				// `timeoutMs` bounds the wait for headers and for a rejected response's error
+				// body. An accepted body is bounded per chunk by the SSE idle timeout instead
+				// (like the WebSocket path): a stalled body still fails, but an active stream
+				// is never cut off mid-response. The caller signal stays attached throughout.
+				const headerTimeout =
+					httpTimeoutMs !== undefined && httpTimeoutMs > 0 ? clearableTimeoutSignal(httpTimeoutMs) : undefined;
+				const combinedSignal = combineAbortSignals([options?.signal, headerTimeout?.signal]);
 				activeStreamSignal = combinedSignal;
 				let terminalHttpError: Error | undefined;
 				try {
@@ -401,17 +402,19 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 							signal: combinedSignal.signal,
 						});
 					} catch (error) {
-						if (headerTimeoutSignal?.aborted && !options?.signal?.aborted) {
+						if (headerTimeout?.signal.aborted && !options?.signal?.aborted) {
 							throw new Error(`Codex SSE response headers timed out after ${httpTimeoutMs}ms`);
 						}
 						throw error;
 					}
 
 					if (response.ok) {
+						headerTimeout?.clear();
 						break;
 					}
 
 					const errorText = await response.text();
+					headerTimeout?.clear();
 					combinedSignal.cleanup();
 					activeStreamSignal = undefined;
 					if (attempt < maxRetries && isRetryableError(response.status, errorText)) {
@@ -434,6 +437,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					terminalHttpError = new Error(info.friendlyMessage || info.message);
 					throw terminalHttpError;
 				} catch (error) {
+					headerTimeout?.clear();
 					combinedSignal.cleanup();
 					activeStreamSignal = undefined;
 					await cancelResponseBody(response);
@@ -477,9 +481,8 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				startEmitted = true;
 				stream.push({ type: "start", partial: output });
 			}
-			await processStream(response, output, stream, model, grammarToolInputProperties, {
+			await processStream(response, output, stream, model, grammarToolInputProperties, httpTimeoutMs, {
 				...(options ?? {}),
-				// Keep `timeoutMs` effective for the body as well as the headers.
 				signal: activeStreamSignal?.signal ?? options?.signal,
 			});
 
@@ -684,9 +687,11 @@ async function processStream(
 	stream: AssistantMessageEventStream,
 	model: Model<"openai-codex-responses">,
 	grammarToolInputProperties: ReadonlyMap<string, string>,
+	idleTimeoutMs: number | undefined,
 	options?: OpenAICodexResponsesOptions,
 ): Promise<void> {
-	await processResponsesStream(mapCodexEvents(parseSSE(response, options?.signal), output), output, stream, model, {
+	const events = mapCodexEvents(parseSSE(response, options?.signal, idleTimeoutMs), output);
+	await processResponsesStream(events, output, stream, model, {
 		onResponseFailed: throwCodexResponseFailed,
 		serviceTier: options?.serviceTier,
 		grammarToolInputProperties,
@@ -790,10 +795,14 @@ function normalizeCodexStatus(status: unknown): CodexResponseStatus | undefined 
 // SSE Parsing
 // ============================================================================
 
-async function* parseSSE(response: Response, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {
+async function* parseSSE(
+	response: Response,
+	signal: AbortSignal | undefined,
+	idleTimeoutMs: number | undefined,
+): AsyncGenerator<Record<string, unknown>> {
 	if (!response.body) return;
 
-	for await (const sse of iterateSseMessages(response.body, signal)) {
+	for await (const sse of iterateSseMessages(response.body, signal, idleTimeoutMs)) {
 		const data = sse.data.trim();
 		if (!data || data === "[DONE]") continue;
 		try {

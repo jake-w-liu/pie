@@ -72,6 +72,17 @@ function findNextDataScheme(text: string, from: number): number {
 	return -1;
 }
 
+// RFC 2397 header: optional type/subtype, then ;parameters (one may be ;base64).
+// Tokens use RFC 2045 token characters except the backtick, which delimits Markdown code.
+const DATA_URI_HEADER_PATTERN = /(?:[!#$%&'*+.^_{|}~0-9A-Za-z-]+\/[!#$%&'*+.^_{|}~0-9A-Za-z-]+)?(?:;[^\s;,]*)*/y;
+
+/** True when a non-empty header, or the comma of an empty one, directly follows `data:`. */
+function startsWithDataUriHeader(text: string, headerStart: number): boolean {
+	DATA_URI_HEADER_PATTERN.lastIndex = headerStart;
+	const header = DATA_URI_HEADER_PATTERN.exec(text)?.[0] ?? "";
+	return header.length > 0 || text[headerStart] === ",";
+}
+
 type DataUriEnclosure =
 	| { kind: "quote"; close: "\"" | "'" | "`" }
 	| { kind: "parentheses" }
@@ -312,16 +323,18 @@ function sanitizeTextInternal(text: string, sourcePath: string, state: Sanitizat
 	while (scanFrom < text.length) {
 		const start = findNextDataScheme(text, scanFrom);
 		if (start < 0) break;
-		const candidate = scanDataUriCandidate(text, start);
-		const end = candidate.end;
 		const headerStart = start + 5;
-		const missingComma = candidate.comma < 0;
-		// A bare prose label such as "data: value" is not an inline URI. Enclosed
-		// or non-empty comma-less candidates are malformed URIs and are removed.
-		if (missingComma && end === headerStart && candidate.enclosure === null) {
-			scanFrom = end;
+		// Prose labels ("data: value") and code such as `send(data: Buffer, enc)` or
+		// `startsWith("data:")` have no header after the scheme and are not URIs; an
+		// enclosure scan would otherwise replace the whole parameter list.
+		if (!startsWithDataUriHeader(text, headerStart)) {
+			scanFrom = headerStart;
 			continue;
 		}
+		const candidate = scanDataUriCandidate(text, start);
+		const end = candidate.end;
+		const missingComma = candidate.comma < 0;
+		// Enclosed or non-empty comma-less candidates are malformed URIs and are removed.
 		const headerEnd = missingComma ? end : candidate.comma;
 		const headerLength = headerEnd - headerStart;
 		const encoding: DataUriEncoding = headerEndsWithBase64(text, headerStart, headerEnd)

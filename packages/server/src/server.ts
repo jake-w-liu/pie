@@ -36,6 +36,28 @@ import type { PiServerOptions, PiServerService } from "./types.ts";
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 5_000;
 const MAX_UINT32 = 0xffff_ffff;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+const LONE_SURROGATES = new RegExp(LONE_SURROGATE.source, "g");
+
+function wellFormedText(text: string): string {
+	return LONE_SURROGATE.test(text) ? text.replace(LONE_SURROGATES, "\uFFFD") : text;
+}
+
+/** Replace lone UTF-16 surrogates with U+FFFD, copying only the containers that change. */
+function replaceLoneSurrogates(value: unknown): unknown {
+	if (typeof value === "string") return wellFormedText(value);
+	if (typeof value !== "object" || value === null) return value;
+	const entries = Object.entries(value);
+	const replaced = entries.map(([key, entry]) => [wellFormedText(key), replaceLoneSurrogates(entry)] as const);
+	if (replaced.every(([key, entry], index) => key === entries[index][0] && entry === entries[index][1])) return value;
+	if (Array.isArray(value)) return replaced.map(([, entry]) => entry);
+	const copy: Record<string, unknown> = {};
+	for (const [key, entry] of replaced) {
+		// defineProperty keeps an own "__proto__" key as data instead of a prototype change.
+		Object.defineProperty(copy, key, { value: entry, enumerable: true, writable: true, configurable: true });
+	}
+	return copy;
+}
 
 export class PiServer {
 	readonly id: string;
@@ -230,12 +252,19 @@ export class PiServer {
 
 		const snapshot = await this.snapshots.get();
 		if (this.closing || state.disconnected || state.stage !== "handshaking" || state.connection.closed) return;
-		const sent = await this.sendMessage(state, {
+		const helloFrame = this.encodeMessage({
 			type: "hello",
 			version: PROTOCOL_VERSION,
 			connectionId: state.id,
 			snapshot,
 		} satisfies ServerHello);
+		if (!helloFrame) {
+			// No handshake is possible without a hello, so close now instead of at the timeout.
+			await this.closeConnection(state.connection);
+			await this.disconnect(state);
+			return;
+		}
+		const sent = await this.sendFrame(state, helloFrame);
 		if (sent && !state.disconnected && state.stage === "handshaking") {
 			state.handshakeComplete = true;
 			state.stage = "ready";
@@ -251,22 +280,25 @@ export class PiServer {
 	}
 
 	private async handleRequest(state: ConnectionState, envelope: RequestEnvelope): Promise<void> {
+		let response: ResponseEnvelope;
 		try {
 			const result = await this.sessions.executeCommand(state, envelope.request);
-			await this.sendMessage(state, {
-				type: "response",
-				id: envelope.id,
-				ok: true,
-				result,
-			} satisfies ResponseEnvelope);
+			response = { type: "response", id: envelope.id, ok: true, result };
 		} catch (error) {
-			await this.sendMessage(state, {
+			response = { type: "response", id: envelope.id, ok: false, error: this.toProtocolError(error) };
+		}
+		if (state.disconnected || state.connection.closed) return;
+		// A response that cannot be encoded (e.g. a snapshot over maxFrameLength) still
+		// answers the request, so the client is not left waiting on a live connection.
+		const frame =
+			this.encodeMessage(response) ??
+			this.encodeMessage({
 				type: "response",
 				id: envelope.id,
 				ok: false,
-				error: this.toProtocolError(error),
-			} satisfies ResponseEnvelope);
-		}
+				error: { code: "internal_error", message: INTERNAL_SERVER_ERROR_MESSAGE },
+			});
+		if (frame) await this.sendFrame(state, frame);
 	}
 
 	private transportClosed(connection: ConnectionState): void {
@@ -293,15 +325,29 @@ export class PiServer {
 
 	private async sendMessage(connection: ConnectionState, message: ServerMessage): Promise<boolean> {
 		if (connection.disconnected || connection.connection.closed) return false;
-		let frame: Uint8Array;
+		const frame = this.encodeMessage(message);
+		return frame !== undefined && (await this.sendFrame(connection, frame));
+	}
+
+	/**
+	 * Encode one outgoing message, or report it and return undefined. A message the server
+	 * cannot encode (e.g. over maxFrameLength) says nothing about the connection, so it is
+	 * not closed for it; a request still gets an error response instead.
+	 */
+	private encodeMessage(message: ServerMessage): Uint8Array | undefined {
 		try {
-			frame = encodeServerMessage(message, { maxFrameLength: this.maxFrameLength });
+			// Protocol text must be Unicode scalar values, but a string cut inside a
+			// surrogate pair (e.g. a truncated emoji in a transcript) is a valid JS string.
+			const wellFormed = replaceLoneSurrogates(message) as ServerMessage;
+			return encodeServerMessage(wellFormed, { maxFrameLength: this.maxFrameLength });
 		} catch (error) {
 			this.reportError(error);
-			await this.closeConnection(connection.connection);
-			await this.disconnect(connection);
-			return false;
+			return undefined;
 		}
+	}
+
+	private async sendFrame(connection: ConnectionState, frame: Uint8Array): Promise<boolean> {
+		if (connection.disconnected || connection.connection.closed) return false;
 		try {
 			await connection.connection.send(frame);
 			return true;
@@ -318,13 +364,7 @@ export class PiServer {
 		connection.stage = "closing";
 		clearTimeout(connection.handshakeTimeout);
 		const message: ServerHelloError = { type: "hello_error", error };
-		let finalFrame: Uint8Array | undefined;
-		try {
-			finalFrame = encodeServerMessage(message, { maxFrameLength: this.maxFrameLength });
-		} catch (encodeError) {
-			this.reportError(encodeError);
-		}
-		await this.closeConnection(connection.connection, finalFrame);
+		await this.closeConnection(connection.connection, this.encodeMessage(message));
 		await this.disconnect(connection);
 	}
 

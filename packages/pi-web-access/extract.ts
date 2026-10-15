@@ -745,7 +745,8 @@ export async function extractContent(
 	let parallelMcpError: string | null = null;
 	let brightdataError: string | null = null;
 
-	if (remoteUrl && providerOrder[0] !== "http") {
+	const httpGateRan = remoteUrl !== null && providerOrder[0] !== "http";
+	if (httpGateRan) {
 		const httpGateResult = await runHttpProvider();
 		if (httpGateResult) return httpGateResult;
 	}
@@ -754,6 +755,9 @@ export async function extractContent(
 		if (signal?.aborted) return abortedResult(url);
 
 		if (provider === "http") {
+			// The remote-URL gate above already ran this provider and got a recoverable
+			// error; fetching again would only repeat the request and its timeout.
+			if (httpGateRan) continue;
 			const result = await runHttpProvider();
 			if (result) return result;
 			continue;

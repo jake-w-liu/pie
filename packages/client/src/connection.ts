@@ -196,7 +196,13 @@ export class Connection {
 			return;
 		}
 		if (lifecycle.state !== "connected") return;
-		if (message.type === "hello" || message.type === "hello_error") {
+		// The server also reports protocol failures after the handshake (e.g. an undecodable
+		// frame) with hello_error before closing; keep its code and message.
+		if (message.type === "hello_error") {
+			this.#failAndClose(new PiServerError(message.error));
+			return;
+		}
+		if (message.type === "hello") {
 			this.#failAndClose(new ProtocolValidationError("Unexpected handshake message"));
 			return;
 		}

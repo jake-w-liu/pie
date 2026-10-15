@@ -10,6 +10,12 @@ export interface RSCExtractResult {
   content: string;
 }
 
+// References are re-rendered at every use, so a few hundred bytes of chunks that each
+// reference the next one twice expand 2^depth times. Rendering stops once either budget
+// is spent; real pages stay far below both.
+const MAX_RENDERED_NODES = 500_000;
+const MAX_RENDERED_CHARS = 2_000_000;
+
 export function extractRSCContent(html: string): RSCExtractResult | null {
   if (!html.includes("self.__next_f.push")) {
     return null;
@@ -80,9 +86,19 @@ export function extractRSCContent(html: string): RSCExtractResult | null {
   // Extract markdown from nodes, resolving refs on the fly
   type Node = unknown;
   const visitedRefs = new Set<string>();
+  let renderedNodes = 0;
+  let renderedChars = 0;
+  const budgetSpent = (): boolean => ++renderedNodes > MAX_RENDERED_NODES || renderedChars >= MAX_RENDERED_CHARS;
+  /** Count text copied from the payload against the output budget. */
+  const emit = (text: string): string => {
+    if (renderedChars >= MAX_RENDERED_CHARS) return "";
+    renderedChars += text.length;
+    return text;
+  };
 
   function extractNode(node: Node, ctx = { inTable: false, inCode: false }): string {
     if (node === null || node === undefined) return "";
+    if (budgetSpent()) return "";
     
     if (typeof node === "string") {
       // Check if it's a reference like "$L30"
@@ -98,10 +114,10 @@ export function extractRSCContent(html: string): RSCExtractResult | null {
       }
       // Filter out RSC-specific artifacts, but preserve content inside code blocks
       if (!ctx.inCode && (node === "$undefined" || node === "$" || /^\$[A-Z]/.test(node))) return "";
-      return node.trim() ? node : "";
+      return node.trim() ? emit(node) : "";
     }
     
-    if (typeof node === "number") return String(node);
+    if (typeof node === "number") return emit(String(node));
     if (typeof node === "boolean") return "";
     if (!Array.isArray(node)) return "";
 
@@ -122,7 +138,7 @@ export function extractRSCContent(html: string): RSCExtractResult | null {
         
         // Check for heading components with baseId
         if (props.baseId && props.children) {
-          return `## ${String(props.children)}\n\n`;
+          return `## ${emit(String(props.children))}\n\n`;
         }
         
         visitedRefs.add(refId);
@@ -171,7 +187,7 @@ export function extractRSCContent(html: string): RSCExtractResult | null {
           return content;
         case "a": {
           const href = props.href as string | undefined;
-          return href && !href.startsWith("#") ? `[${content}](${href})` : content;
+          return href && !href.startsWith("#") ? `[${content}](${emit(href)})` : content;
         }
         default: return content;
       }
@@ -188,6 +204,7 @@ export function extractRSCContent(html: string): RSCExtractResult | null {
 
     function walkTable(node: unknown, isHeader = false): void {
       if (node === null || node === undefined) return;
+      if (budgetSpent()) return;
       
       // Handle string refs
       if (typeof node === "string") {
@@ -236,6 +253,7 @@ export function extractRSCContent(html: string): RSCExtractResult | null {
 
     function walkCells(node: unknown, cells: string[]): void {
       if (node === null || node === undefined) return;
+      if (budgetSpent()) return;
       
       // Handle string refs
       if (typeof node === "string") {

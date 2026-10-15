@@ -181,7 +181,10 @@ function hasPolarityMarker(value: string, markers: string[], allowNegated = fals
 	return markers.some((marker) => containsPhrase(value, marker) && (allowNegated || !markerIsNegated(value, marker)));
 }
 
-const CLAUSE_SPLIT_PATTERN = /(?:[^.!?\n]|[.!?]+(?!\s|$))+(?:[.!?]+(?=\s|$)|$)/g;
+// An in-clause punctuation run must be followed by a non-punctuation character, so
+// each run has exactly one parse. Allowing partial runs (`[.!?]+(?!\s|$)`) split a
+// run of n dots 2^(n-1) ways and froze the event loop on lines like "Intro.....1\n".
+const CLAUSE_SPLIT_PATTERN = /(?:[^.!?\n]|[.!?]+(?![.!?\s]|$))+(?:[.!?]+(?=\s|$)|$)/g;
 const NEGATION_WINDOW_CHARS = 48;
 const NEGATION_CUES = [
 	"not", "isn't", "aren't", "wasn't", "weren't", "cannot", "can't", "no longer", "never",

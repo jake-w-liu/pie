@@ -4,12 +4,26 @@ export interface ServerSentEvent {
 	raw: string[];
 }
 
-/** Decode SSE incrementally. A CR ends a line; its optional LF may arrive in the next chunk. */
+/**
+ * Decode SSE incrementally. A CR ends a line; its optional LF may arrive in the next chunk.
+ * `idleTimeoutMs` bounds each wait for the next body chunk, never the whole stream: an
+ * active stream may outlast it, while a body that stalls fails instead of hanging.
+ */
 export async function* iterateSseMessages(
 	body: ReadableStream<Uint8Array>,
 	signal?: AbortSignal,
+	idleTimeoutMs?: number,
 ): AsyncGenerator<ServerSentEvent> {
 	const reader = body.getReader();
+	const read = (): Promise<ReadableStreamReadResult<Uint8Array>> => {
+		if (idleTimeoutMs === undefined || !(idleTimeoutMs > 0)) return reader.read();
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const idle = new Promise<never>((_resolve, reject) => {
+			timer = setTimeout(() => reject(new Error(`SSE stream idle timeout after ${idleTimeoutMs}ms`)), idleTimeoutMs);
+		});
+		// The finally block below cancels the reader, which settles a read abandoned here.
+		return Promise.race([reader.read(), idle]).finally(() => clearTimeout(timer));
+	};
 	const decoder = new TextDecoder();
 	let line = "";
 	let skipLF = false;
@@ -43,7 +57,7 @@ export async function* iterateSseMessages(
 	try {
 		while (true) {
 			if (signal?.aborted) throw new Error("Request was aborted");
-			const { value, done } = await reader.read();
+			const { value, done } = await read();
 			if (signal?.aborted) throw new Error("Request was aborted");
 			const text = done ? decoder.decode() : decoder.decode(value, { stream: true });
 			let start = 0;

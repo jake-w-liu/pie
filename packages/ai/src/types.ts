@@ -158,6 +158,9 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 	headers?: ProviderHeaders;
 	/**
 	 * HTTP request timeout in milliseconds for providers/SDKs that support it.
+	 * It bounds the wait for response headers and, where an adapter reads the stream
+	 * itself, each idle gap between streamed chunks or events; it never caps the total
+	 * duration of a stream that keeps producing data.
 	 * For example, OpenAI and Anthropic SDK clients default to 10 minutes.
 	 */
 	timeoutMs?: number;

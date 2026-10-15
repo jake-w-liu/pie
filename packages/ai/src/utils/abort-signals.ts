@@ -3,6 +3,23 @@ export interface CombinedAbortSignal {
 	cleanup: () => void;
 }
 
+export interface ClearableTimeoutSignal {
+	signal: AbortSignal;
+	clear: () => void;
+}
+
+/**
+ * An `AbortSignal.timeout` deadline that `clear()` disarms once it no longer applies,
+ * e.g. after response headers arrive. The signal aborts with the timeout's reason.
+ */
+export function clearableTimeoutSignal(timeoutMs: number): ClearableTimeoutSignal {
+	const controller = new AbortController();
+	const timeout = AbortSignal.timeout(timeoutMs);
+	const abort = () => controller.abort(timeout.reason);
+	timeout.addEventListener("abort", abort, { once: true });
+	return { signal: controller.signal, clear: () => timeout.removeEventListener("abort", abort) };
+}
+
 export function combineAbortSignals(signals: readonly (AbortSignal | undefined)[]): CombinedAbortSignal {
 	const activeSignals = signals.filter((signal): signal is AbortSignal => signal !== undefined);
 	if (activeSignals.length === 0) {

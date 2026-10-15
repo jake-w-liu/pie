@@ -62,6 +62,11 @@ interface FoldedText {
 }
 
 function foldWithOffsets(text: string): FoldedText {
+	// Fast path: one native call instead of ~1 µs of work per code point. Lowercasing
+	// either only grows code points (İ, Lithuanian accents) or only shrinks them (Turkish
+	// and Azeri dotted I), so an unchanged total length means no offset moved.
+	const wholeFolded = text.toLocaleLowerCase().replace(/ς/g, "σ");
+	if (wholeFolded.length === text.length) return { folded: wholeFolded, starts: null, ends: null };
 	let folded = "";
 	let starts: number[] | null = null;
 	let ends: number[] | null = null;
@@ -112,10 +117,12 @@ function fuzzyMatches(text: string, query: string): Match[] {
 	const queryTokens = normalize(query).match(/[\p{L}\p{N}]+/gu) ?? [];
 	if (queryTokens.length === 0) return [];
 	const matches: Match[] = [];
-	const paragraphs = /[^\n]+(?:\n(?!\n)[^\n]+)*/g;
+	// Paragraphs are runs of non-blank lines. CRLF/CR breaks and whitespace-only lines
+	// separate them too; `\n(?!\n)` saw the CR of "\r\n\r\n" and merged paragraphs.
+	const paragraphs = /\S[^\r\n]*(?:(?:\r\n?|\n)[^\S\r\n]*\S[^\r\n]*)*/g;
 	for (const paragraph of text.matchAll(paragraphs)) {
 		const paragraphText = paragraph[0];
-		if (paragraphText.trim().length === 0 || paragraph.index === undefined) continue;
+		if (paragraph.index === undefined) continue;
 		const tokens = [...paragraphText.matchAll(/[\p{L}\p{N}]+/gu)];
 		const matched = queryTokens.filter(queryToken => tokens.some(token => {
 			const candidate = normalize(token[0]);

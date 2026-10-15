@@ -203,6 +203,23 @@ describe("PiClient", () => {
 		expect(server.clientCloseCount).toBe(1);
 	});
 
+	test("surfaces the server error that ends an established connection", async () => {
+		// The server reports post-handshake protocol failures (e.g. an undecodable frame)
+		// with hello_error before closing; its code and message must reach the caller.
+		const server = new MemoryByteServer();
+		const client = await connectClient(server);
+		const errors: Array<Error | undefined> = [];
+		client.onConnectionStateChange(({ error }) => errors.push(error));
+		const pending = client.listSessions();
+		const serverError = { code: "invalid_request", message: "Invalid client protocol frame: bad CBOR" } as const;
+		server.send({ type: "hello_error", error: serverError });
+
+		await expect(pending).rejects.toMatchObject({ name: "PiServerError", ...serverError });
+		expect(errors).toEqual([expect.objectContaining({ name: "PiServerError", ...serverError })]);
+		expect(client.connectionState).toBe("disconnected");
+		expect(server.clientCloseCount).toBe(1);
+	});
+
 	test("rejects pending requests on close and reconnects through a fresh factory result", async () => {
 		const first = new MemoryByteServer();
 		const second = new MemoryByteServer();

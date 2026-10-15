@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import http from "node:http";
 import net from "node:net";
+import { parseHTML } from "linkedom";
+import { sanitizeInlineDataUris } from "../data-uri-sanitize.ts";
+import { discoverDeclaredWebLinks } from "../declared-web-links.ts";
+import { extractRSCContent } from "../rsc-extract.ts";
 import { isYouTubeURL } from "../youtube-extract.ts";
 import { normalizeFetchContentParams } from "../fetch-params.ts";
 import { findContent } from "../content-find.ts";
@@ -61,6 +65,95 @@ describe("content finding", () => {
 		expect(one.text).toContain("İstanbul τέλος");
 		expect(many.matchCount).toBe(1);
 		expect(manyElapsed).toBeLessThan(Math.max(oneElapsed * 4, 250));
+	});
+
+	it("folds case for a large text in one native pass", () => {
+		// Folding per code point cost about 1 µs per character (2 s for this text).
+		const text = `${"Lorem ipsum dolor sit amet. ".repeat(70_000)}The Needle sits here. ${"z".repeat(100)}`;
+		const started = performance.now();
+		const result = findContent(text, ["NEEDLE SITS"], "case-insensitive");
+		expect(performance.now() - started).toBeLessThan(1_000);
+		expect(result.matchCount).toBe(1);
+		expect(result.text).toContain("The Needle sits here.");
+	});
+
+	it("splits fuzzy paragraphs at CRLF and whitespace-only blank lines", () => {
+		const lf = "Alpha beta section.\n\nGamma delta section.\n\nEpsilon alpha again.";
+		for (const text of [lf, lf.replace(/\n/g, "\r\n"), lf.replace(/\n\n/g, "\n \t\n")]) {
+			expect(findContent(text, ["alpha gamma"], "fuzzy").matchCount).toBe(0);
+			expect(findContent(text, ["alpha"], "fuzzy").matchCount).toBe(2);
+		}
+	});
+});
+
+describe("declared web links", () => {
+	const { document } = parseHTML("<!doctype html><html><head></head><body></body></html>");
+	const page = document as unknown as Document;
+
+	it("rejects a malformed quoted Link parameter in linear time", () => {
+		// Trailing junk after a quoted backslash run used to backtrack with Fibonacci growth.
+		const header = `<https://example.com/api>; rel="service-desc"; x="${"\\".repeat(36)}" y`;
+		const started = performance.now();
+		expect(discoverDeclaredWebLinks(page, header, "https://example.com/")).toEqual([]);
+		expect(performance.now() - started).toBeLessThan(1_000);
+	});
+
+	it("keeps escaped quotes and backslashes in quoted Link parameters", () => {
+		const header = '<https://example.com/api>; rel="service-desc"; type="a \\"b\\" \\\\ c"';
+		expect(discoverDeclaredWebLinks(page, header, "https://example.com/")).toEqual([
+			{ url: "https://example.com/api", relations: ["service-desc"], type: 'a "b" \\ c' },
+		]);
+	});
+});
+
+describe("inline data URI sanitization", () => {
+	it("leaves code and prose that only use a data: label untouched", () => {
+		for (const text of [
+			"function send(data: Buffer, encoding: BufferEncoding): void",
+			"socket.on('message', (data: RawData, isBinary: boolean) => {})",
+			"func upload(data: Data, to url: URL) async throws",
+			"The response (data: the payload, meta: paging info) is JSON.",
+			"if (url.startsWith('data:')) return;",
+			"call(data:Buffer,encoding)",
+		]) {
+			expect(sanitizeInlineDataUris(text, "content")).toEqual({ text, omissions: [] });
+		}
+	});
+
+	it("still replaces real and malformed inline data URIs", () => {
+		const text = '![x](data:image/png;base64,iVBORw0KGgo=) <a href="data:,Hi">x</a> "data:image/png;base64" (data: Buffer, src="data:;base64,SGk=")';
+		const result = sanitizeInlineDataUris(text, "content");
+		expect(result.omissions.map(({ mimeType, encoding, decodeError }) => [mimeType, encoding, decodeError])).toEqual([
+			["image/png", "base64", undefined],
+			["text/plain", "percent-encoded", undefined],
+			["image/png", "base64", "missing-comma"],
+			["text/plain", "base64", undefined],
+		]);
+		expect(result.text).toContain('(data: Buffer, src="[pi-ext-web-access inline data URI omitted; ordinal=4;');
+		expect(result.text).not.toContain("iVBORw0KGgo=");
+	});
+});
+
+describe("RSC extraction", () => {
+	/** A flight payload whose chunks each reference the next chunk twice. */
+	function doublingChain(depth: number): string {
+		const lines: string[] = [];
+		for (let level = 0; level < depth; level++) {
+			const next = (0x24 + level).toString(16);
+			lines.push(`${(0x23 + level).toString(16)}:["$L${next}","$L${next}"]`);
+		}
+		lines.push(`${(0x23 + depth).toString(16)}:["$","p",null,{"children":"hello world, "}]`);
+		const payload = JSON.stringify(lines.join("\n")).slice(1, -1);
+		return `<html><head><title>x</title></head><body><script>self.__next_f.push([1,"${payload}"])</script></body></html>`;
+	}
+
+	it("bounds shared-reference expansion instead of doubling per level", () => {
+		// Full rendering doubles with every level (3.7M chars at depth 18, 7.3M at 19).
+		const shallow = extractRSCContent(doublingChain(18))?.content ?? "";
+		const deep = extractRSCContent(doublingChain(19))?.content ?? "";
+		expect(shallow).toMatch(/^hello world,\n\nhello world,/);
+		expect(deep.length).toBeLessThanOrEqual(shallow.length * 1.1);
+		expect(shallow.length).toBeLessThan(3_000_000);
 	});
 });
 

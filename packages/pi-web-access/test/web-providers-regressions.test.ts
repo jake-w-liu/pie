@@ -67,6 +67,26 @@ describe("source-check passage extraction", () => {
 		artifactFor("文".repeat(40_000), "default timeout");
 		expect(performance.now() - started).toBeLessThan(500);
 	});
+
+	it("splits claim clauses around dot leaders in linear time", () => {
+		// Each table-of-contents dot run is followed by a page number, so it stays inside
+		// the cited passage; the clause splitter used to try 2^(n-1) splits of every run.
+		const content = [
+			"Project Foo documentation.",
+			"",
+			"Contents",
+			`Introduction${".".repeat(22)}1`,
+			`Installing foo${".".repeat(22)}5`,
+			"",
+			"Foo supports Linux and macOS.",
+		].join("\n");
+		const started = performance.now();
+		const artifact = artifactFor(content, "Foo supports Linux");
+		expect(performance.now() - started).toBeLessThan(1_000);
+		expect(artifact.passages).toHaveLength(1);
+		expect(artifact.passages[0]?.text).toContain("Foo supports Linux and macOS.");
+		expect(artifact.claims?.[0]?.status).toBe("unclear");
+	});
 });
 
 describe("model completion stop reasons", () => {

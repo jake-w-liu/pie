@@ -172,7 +172,15 @@ async function renderWithGhostscript(
 			signal,
 		);
 		if (result.kind !== "ok") return result;
-		rendered.push({ pageNumber: page.pageNumber, png: await readFile(outputPath) });
+		let png: Buffer;
+		try {
+			png = await readFile(outputPath);
+		} catch (error) {
+			// Ghostscript can exit 0 without output (for example "No pages will be processed").
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			return { kind: "failed", message: `${command} produced no image for page ${page.pageNumber}` };
+		}
+		rendered.push({ pageNumber: page.pageNumber, png });
 	}
 	return { kind: "ok", pages: rendered };
 }

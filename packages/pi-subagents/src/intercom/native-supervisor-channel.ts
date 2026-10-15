@@ -276,7 +276,10 @@ function watchForLateReply(pi: ExtensionAPI, channelDir: string, requestId: stri
 		try {
 			if (!fs.existsSync(file)) {
 				// The parent can no longer answer once the request is gone (run ended, cleaned up).
-				if (!fs.existsSync(requestPath(channelDir, requestId))) clearInterval(timer);
+				// writeReply writes the reply before removing the request, so check the reply again
+				// after seeing the request gone: both steps can land between the two checks above.
+				if (fs.existsSync(requestPath(channelDir, requestId)) || fs.existsSync(file)) return;
+				clearInterval(timer);
 				return;
 			}
 			reply = JSON.parse(fs.readFileSync(file, "utf-8")) as Partial<SupervisorReply>;

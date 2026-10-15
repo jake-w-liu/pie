@@ -457,6 +457,30 @@ describe("read tool with rendered PDF pages", () => {
 		for (const image of images) expectLetterPageImage(image.data);
 	});
 
+	it.skipIf(!hasPdftoppm || process.platform === "win32")(
+		"falls back to pdftoppm when Ghostscript exits without writing the page",
+		async () => {
+			const pdftoppmPath = execFileSync("which", ["pdftoppm"], { encoding: "utf8" }).trim();
+			const binDir = await mkdtemp(join(tmpdir(), "read-pdf-silent-gs-"));
+			await symlink(pdftoppmPath, join(binDir, "pdftoppm"));
+			await writeFile(join(binDir, "gs"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+			process.env.PATH = binDir;
+			try {
+				const result = await createReadTool(dir).execute("render-silent-gs", {
+					path: "report.pdf",
+					pages: "1",
+					render: true,
+				});
+				const images = result.content.filter((block) => block.type === "image");
+				expect(images).toHaveLength(1);
+				expectLetterPageImage(images[0]!.data);
+			} finally {
+				process.env.PATH = originalPath;
+				await rm(binDir, { recursive: true, force: true });
+			}
+		},
+	);
+
 	it("suggests render when a PDF page has no extractable text", async () => {
 		await writeFile(join(dir, "figure.pdf"), buildPdf([""]));
 		const read = createReadTool(dir);

@@ -108,6 +108,7 @@ import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.t
 import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
 import { agentDefinitionDigest, launchBindingDigest } from "../../shared/launch-contract.ts";
 import { consumeWorkflowChildPermit } from "../../shared/workflow-child-permit.ts";
+import { isBlockingSupervisorTool } from "../shared/supervisor-tool.ts";
 import { createBoundedByteTail, createBoundedLineReader, formatProtocolOutputLimit, MAX_CHILD_STDERR_BYTES, PI_AGGREGATE_EVENT_PROJECTOR, projectChildLifecycle, type ChildLifecycleAction, type ChildLifecycleState, type ProtocolOutputLimit } from "../shared/child-protocol.ts";
 import {
 	acceptChildWatchdogEvent,
@@ -838,7 +839,7 @@ async function runSingleAttempt(
 
 		let activeLongRunningNotified = false;
 		let pendingToolResult: { tool: string; path?: string; mutates: boolean; startedAt?: number } | undefined;
-		type ActiveToolCall = { key: string; tool: string; args: string; startedAt: number; path?: string };
+		type ActiveToolCall = { key: string; tool: string; args: string; startedAt: number; path?: string; blocksSupervisor: boolean };
 		let activeToolSequence = 0;
 		const activeToolCalls = new Map<string, ActiveToolCall>();
 		const activeToolKeysByName = new Map<string, string[]>();
@@ -848,12 +849,14 @@ async function runSingleAttempt(
 			if (!active) {
 				progress.currentTool = undefined;
 				progress.currentToolArgs = undefined;
+				progress.currentToolBlocksSupervisor = undefined;
 				progress.currentToolStartedAt = undefined;
 				progress.currentPath = undefined;
 				return;
 			}
 			progress.currentTool = active.tool;
 			progress.currentToolArgs = active.args;
+			progress.currentToolBlocksSupervisor = active.blocksSupervisor;
 			progress.currentToolStartedAt = active.startedAt;
 			progress.currentPath = active.path;
 		};
@@ -865,6 +868,7 @@ async function runSingleAttempt(
 				tool: event.toolName,
 				args: extractToolArgsPreview(args),
 				startedAt: now,
+				blocksSupervisor: isBlockingSupervisorTool(event.toolName, args),
 				...(path !== undefined ? { path } : {}),
 			};
 			activeToolCalls.set(key, active);

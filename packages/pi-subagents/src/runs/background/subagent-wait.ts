@@ -255,7 +255,11 @@ function hasSupervisorTool(run: AsyncRunSummary): boolean {
  * waiting for a separate needs_attention flag let requests expire unanswered.
  */
 function awaitsSupervisorReply(run: AsyncRunSummary): boolean {
-	return run.currentTool === "contact_supervisor" || run.steps.some((step) => step.currentTool === "contact_supervisor");
+	// A progress_update does not wait for a reply. Status written before this flag existed has no
+	// value; treat it as blocking, as before.
+	const blocking = (tool: string | undefined, blocks: boolean | undefined) => tool === "contact_supervisor" && blocks !== false;
+	return blocking(run.currentTool, run.currentToolBlocksSupervisor)
+		|| run.steps.some((step) => blocking(step.currentTool, step.currentToolBlocksSupervisor));
 }
 
 function backgroundWorkIdentity(item: RegisteredBackgroundWorkItem): string {

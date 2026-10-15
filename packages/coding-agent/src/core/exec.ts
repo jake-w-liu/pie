@@ -71,7 +71,12 @@ export async function execCommand(
 
 		const killProcess = () => {
 			if (proc.exitCode !== null || proc.signalCode !== null) {
-				// Only pipes held open by descendants remain.
+				// The command exited but descendants still hold its pipes. Those in the command's own
+				// process group are still ours to stop; ones that left the group are only abandoned.
+				if (!killed) {
+					killed = true;
+					if (useProcessGroup) sendSignal("SIGKILL");
+				}
 				stopWaitingForPipes();
 				return;
 			}

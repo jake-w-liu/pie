@@ -32,6 +32,35 @@ describe("execCommand", () => {
 	});
 
 	it.skipIf(process.platform === "win32")(
+		"kills its own process group when the timeout fires after the command exited",
+		async () => {
+			// The background loop stays in the command's process group and ignores SIGPIPE.
+			const result = await execCommand(
+				"sh",
+				["-c", "(trap '' PIPE; while :; do echo tick; sleep 0.05; done) & echo pid=$!; exit 0"],
+				process.cwd(),
+				{ timeout: 500 },
+			);
+			const loopPid = Number(/pid=(\d+)/.exec(result.stdout)?.[1]);
+			expect(loopPid).toBeGreaterThan(0);
+			expect(result.killed).toBe(true);
+			// SIGKILL is sent before the call settles; allow the orphan's reaper a moment.
+			const deadline = Date.now() + 3_000;
+			const alive = () => {
+				try {
+					process.kill(loopPid, 0);
+					return true;
+				} catch {
+					return false;
+				}
+			};
+			while (alive() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+			expect(alive()).toBe(false);
+		},
+		15_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
 		"settles a timeout while a descendant outside the process group keeps writing",
 		async () => {
 			const directory = mkdtempSync(join(tmpdir(), "pi-exec-timeout-"));

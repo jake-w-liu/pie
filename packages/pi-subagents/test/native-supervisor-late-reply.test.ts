@@ -6,6 +6,7 @@
  */
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import * as path from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -134,6 +135,51 @@ describe("native supervisor late replies", () => {
 			expect(fs.readdirSync(path.join(channelDir, "replies"))).toEqual([]);
 		} finally {
 			channel.dispose();
+		}
+	}, 30_000);
+
+	it("delivers a late reply written between the watcher's reply and request checks", async () => {
+		const child = fakePi();
+		registerNativeSupervisorClient(child.pi);
+		const contact = child.tools.find((tool) => tool.name === "contact_supervisor")!;
+		const error = await contact.execute("call-1", { reason: "need_decision", message: "Which DB?" }, undefined).then(
+			() => undefined,
+			(caught: unknown) => caught as Error,
+		);
+		const requestId = /request ([0-9a-f-]{36})/.exec(error?.message ?? "")?.[1];
+		expect(requestId).toBeDefined();
+		const requestFile = path.join(channelDir, "requests", `${requestId}.json`);
+		const replyFile = path.join(channelDir, "replies", `${requestId}.json`);
+		expect(fs.existsSync(requestFile)).toBe(true);
+
+		// Land the parent's writeReply (reply first, then request removal) right after the watcher
+		// found no reply, so it sees the request gone on its next check.
+		const cjsFs = createRequire(import.meta.url)("node:fs") as typeof fs;
+		const realExists = cjsFs.existsSync;
+		let injected = false;
+		cjsFs.existsSync = (candidate: fs.PathLike) => {
+			const result = realExists(candidate);
+			if (!injected && candidate === replyFile && !result) {
+				injected = true;
+				cjsFs.writeFileSync(
+					replyFile,
+					JSON.stringify({ type: "subagent.supervisor.reply", requestId, createdAt: Date.now(), message: "Use Postgres" }),
+				);
+				cjsFs.rmSync(requestFile, { force: true });
+			}
+			return result;
+		};
+		syncBuiltinESMExports();
+		try {
+			const delivered = await until(() =>
+				child.sent.find((sent) => sent.message.customType === "subagent_supervisor_late_reply"),
+			);
+			expect(injected).toBe(true);
+			expect(delivered.message.content).toContain("Use Postgres");
+			expect(fs.existsSync(replyFile)).toBe(false);
+		} finally {
+			cjsFs.existsSync = realExists;
+			syncBuiltinESMExports();
 		}
 	}, 30_000);
 

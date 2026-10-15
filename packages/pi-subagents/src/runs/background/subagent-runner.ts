@@ -161,6 +161,7 @@ import {
 	resolveChildWatchdogConfig,
 	type ChildWatchdogStateSnapshot,
 } from "../../watchdog/child-status.ts";
+import { isBlockingSupervisorTool } from "../shared/supervisor-tool.ts";
 
 const INTERCOM_DETACH_RECEIPT = "Detached for intercom coordination before task completion.";
 
@@ -373,14 +374,6 @@ function shouldPersistChildEvent(event: Record<string, unknown>): boolean {
 	return event.type !== "message_update";
 }
 
-function isBlockingSupervisorTool(toolName: string | undefined, args: unknown): boolean {
-	if (!args || typeof args !== "object" || Array.isArray(args)) return false;
-	if (toolName === "contact_supervisor") {
-		const reason = (args as Record<string, unknown>).reason;
-		return reason === "need_decision" || reason === "interview_request";
-	}
-	return toolName === "intercom" && (args as Record<string, unknown>).action === "ask";
-}
 
 function findLatestSessionFile(sessionDir: string): string | null {
 	try {
@@ -3219,12 +3212,14 @@ async function runSubagent(
 		if (!active) {
 			delete step.currentTool;
 			delete step.currentToolArgs;
+			delete step.currentToolBlocksSupervisor;
 			delete step.currentToolStartedAt;
 			delete step.currentPath;
 			return;
 		}
 		step.currentTool = active.tool;
 		step.currentToolArgs = active.args;
+		step.currentToolBlocksSupervisor = active.blocksSupervisor;
 		step.currentToolStartedAt = active.startedAt;
 		setOptionalProperty(step, "currentPath", active.path);
 	};

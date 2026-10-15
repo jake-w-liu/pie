@@ -753,6 +753,8 @@ export interface AgentProgress {
 	lastActivityAt?: number;
 	currentTool?: string;
 	currentToolArgs?: string;
+	/** False while the current tool is a non-blocking supervisor call such as a progress update. */
+	currentToolBlocksSupervisor?: boolean;
 	currentToolStartedAt?: number;
 	currentPath?: string;
 	recentTools: Array<{ tool: string; args: string; endMs: number }>;
@@ -1566,6 +1568,8 @@ export interface AsyncStatus {
 	activityState?: ActivityState;
 	lastActivityAt?: number;
 	currentTool?: string;
+	/** False while the current tool is a non-blocking supervisor call such as a progress update. */
+	currentToolBlocksSupervisor?: boolean;
 	currentToolStartedAt?: number;
 	currentPath?: string;
 	turnCount?: number;
@@ -1639,6 +1643,8 @@ export interface AsyncStatus {
 		lastActivityAt?: number;
 		currentTool?: string;
 		currentToolArgs?: string;
+		/** False while the current tool is a non-blocking supervisor call such as a progress update. */
+		currentToolBlocksSupervisor?: boolean;
 		currentToolStartedAt?: number;
 		currentPath?: string;
 		recentTools?: Array<{ tool: string; args: string; endMs: number }>;

@@ -16,9 +16,16 @@ afterEach(() => {
  * Regression: a workflow child blocked in contact_supervisor did not end subagent_wait unless some
  * step was also flagged needs_attention, so the request expired unanswered while the parent waited.
  */
-it.each([true, false])(
-	"returns as soon as a child awaits a supervisor reply (stopOnAttention: %s)",
-	async (stopOnAttention) => {
+it.each([
+	{ stopOnAttention: true, blocks: true, returns: true },
+	{ stopOnAttention: false, blocks: true, returns: true },
+	// Status written before the flag existed: treated as blocking, as before.
+	{ stopOnAttention: false, blocks: undefined, returns: true },
+	// A progress update does not wait for a reply.
+	{ stopOnAttention: false, blocks: false, returns: false },
+])(
+	"returns on a pending supervisor reply only (%o)",
+	async ({ stopOnAttention, blocks, returns }) => {
 		const base = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-supervisor-"));
 		roots.push(base);
 		const asyncRoot = path.join(base, "async");
@@ -48,6 +55,7 @@ it.each([true, false])(
 						startedAt: now,
 						activityState: "active_long_running",
 						currentTool: "contact_supervisor",
+						...(blocks === undefined ? {} : { currentToolBlocksSupervisor: blocks }),
 					},
 				],
 			}),
@@ -56,7 +64,7 @@ it.each([true, false])(
 		updateActiveRunIndex(asyncDir, "running");
 
 		let clock = 0;
-		const result = await waitForSubagents({ id: runId, timeoutMs: 600_000, stopOnAttention }, undefined, {
+		const result = await waitForSubagents({ id: runId, timeoutMs: 5_000, stopOnAttention }, undefined, {
 			state: {
 				currentSessionId: sessionId,
 				asyncJobs: new Map(),
@@ -73,8 +81,13 @@ it.each([true, false])(
 			},
 		});
 
-		expect(clock).toBe(0);
 		const text = result.content.map((block) => (block.type === "text" ? block.text : "")).join("");
-		expect(text).toContain("Reply to any pending supervisor request");
+		if (returns) {
+			expect(clock).toBe(0);
+			expect(text).toContain("Reply to any pending supervisor request");
+		} else {
+			expect(clock).toBe(5_000);
+			expect(text).toContain("Wait timed out");
+		}
 	},
 );

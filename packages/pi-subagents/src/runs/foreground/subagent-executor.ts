@@ -4693,6 +4693,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 							: runningSteps.some((step) => step.activityState === "active_long_running") ? "active_long_running" : undefined;
 						status.lastActivityAt = lastActivityAt;
 						status.currentTool = activeToolStep?.currentTool;
+						status.currentToolBlocksSupervisor = activeToolStep?.currentToolBlocksSupervisor;
 						status.currentToolStartedAt = activeToolStep?.currentToolStartedAt;
 						status.currentPath = activeToolStep?.currentPath;
 						const turnCounts = steps.flatMap((step) => step.turnCount === undefined ? [] : [step.turnCount]);
@@ -4880,6 +4881,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 												step.lastActivityAt = progress.lastActivityAt;
 												step.currentTool = progress.currentTool;
 												step.currentToolArgs = progress.currentToolArgs;
+												step.currentToolBlocksSupervisor = progress.currentToolBlocksSupervisor;
 												step.currentToolStartedAt = progress.currentToolStartedAt;
 												step.currentPath = progress.currentPath;
 												step.recentTools = progress.recentTools.map((tool) => ({ ...tool }));

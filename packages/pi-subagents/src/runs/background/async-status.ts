@@ -36,6 +36,7 @@ interface AsyncRunStepSummary {
 	lastActivityAt?: number;
 	currentTool?: string;
 	currentToolArgs?: string;
+	currentToolBlocksSupervisor?: boolean;
 	currentToolStartedAt?: number;
 	currentPath?: string;
 	recentTools?: Array<{ tool: string; args: string; endMs: number }>;
@@ -82,6 +83,7 @@ export interface AsyncRunSummary {
 	activityState?: ActivityState;
 	lastActivityAt?: number;
 	currentTool?: string;
+	currentToolBlocksSupervisor?: boolean;
 	currentToolStartedAt?: number;
 	currentPath?: string;
 	turnCount?: number;
@@ -276,6 +278,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			...(stepLastActivityAt ? { lastActivityAt: stepLastActivityAt } : {}),
 			...(step.currentTool ? { currentTool: step.currentTool } : {}),
 			...(step.currentToolArgs ? { currentToolArgs: step.currentToolArgs } : {}),
+			...(step.currentToolBlocksSupervisor !== undefined ? { currentToolBlocksSupervisor: step.currentToolBlocksSupervisor } : {}),
 			...(step.currentToolStartedAt ? { currentToolStartedAt: step.currentToolStartedAt } : {}),
 			...(step.currentPath ? { currentPath: step.currentPath } : {}),
 			...(step.recentTools ? { recentTools: step.recentTools.map((tool) => ({ ...tool })) } : {}),
@@ -327,6 +330,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 		activityState,
 		lastActivityAt,
 		currentTool: status.currentTool,
+		...(status.currentToolBlocksSupervisor !== undefined ? { currentToolBlocksSupervisor: status.currentToolBlocksSupervisor } : {}),
 		currentToolStartedAt: status.currentToolStartedAt,
 		currentPath: status.currentPath,
 		turnCount: status.turnCount,

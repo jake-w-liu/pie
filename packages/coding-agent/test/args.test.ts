@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { normalizeSessionName, parseArgs } from "../src/cli/args.ts";
+import { normalizeSessionName, parseArgs, restoreBooleanFlagValues } from "../src/cli/args.ts";
 
 describe("parseArgs", () => {
 	describe("--version flag", () => {
@@ -473,6 +473,33 @@ describe("parseArgs", () => {
 		test("captures unknown long flags with equals syntax", () => {
 			const result = parseArgs(["--unknown-flag=value"]);
 			expect(result.unknownFlags.get("unknown-flag")).toBe("value");
+		});
+
+		test("returns arguments consumed by boolean extension flags to the messages in order", () => {
+			const result = parseArgs([
+				"-p",
+				"--plan",
+				"Refactor the auth module",
+				"--label",
+				"auth",
+				"then test",
+				"--fast",
+				"x",
+			]);
+			expect(result.messages).toEqual(["then test"]);
+
+			restoreBooleanFlagValues(result, new Set(["plan", "fast"]));
+
+			expect(result.messages).toEqual(["Refactor the auth module", "then test", "x"]);
+			// String flags keep their values.
+			expect(result.unknownFlags.get("label")).toBe("auth");
+			expect(result.unknownFlagValues).toEqual([{ flag: "label", value: "auth", messageIndex: 0 }]);
+		});
+
+		test("does not treat an explicit --flag=value as a positional argument", () => {
+			const result = parseArgs(["--plan=yes", "prompt"]);
+			restoreBooleanFlagValues(result, new Set(["plan"]));
+			expect(result.messages).toEqual(["prompt"]);
 		});
 	});
 

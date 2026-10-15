@@ -54,6 +54,11 @@ export interface Args {
 	fileArgs: string[];
 	/** Unknown flags (potentially extension flags) - map of flag name to value */
 	unknownFlags: Map<string, boolean | string>;
+	/**
+	 * Arguments that unknown flags consumed as values, with the `messages` index they were taken from.
+	 * Flag types are known only once extensions load; see restoreBooleanFlagValues().
+	 */
+	unknownFlagValues: Array<{ flag: string; value: string; messageIndex: number }>;
 	diagnostics: Array<{ type: "warning" | "error"; message: string }>;
 }
 
@@ -68,11 +73,28 @@ export function normalizeSessionName(value: string): string | undefined {
 	return name.length > 0 ? name : undefined;
 }
 
+/**
+ * Return the arguments that boolean extension flags consumed as values to `messages`, at their
+ * original positions. `--plan "Refactor"` parses "Refactor" as the value of the unknown flag, but
+ * a boolean flag takes no value, so it is a prompt.
+ */
+export function restoreBooleanFlagValues(parsed: Args, booleanFlags: ReadonlySet<string>): void {
+	// Insert from the last capture back so earlier indices stay valid.
+	for (let i = parsed.unknownFlagValues.length - 1; i >= 0; i--) {
+		const { flag, value, messageIndex } = parsed.unknownFlagValues[i];
+		if (booleanFlags.has(flag)) {
+			parsed.messages.splice(messageIndex, 0, value);
+		}
+	}
+	parsed.unknownFlagValues = parsed.unknownFlagValues.filter(({ flag }) => !booleanFlags.has(flag));
+}
+
 export function parseArgs(args: string[]): Args {
 	const result: Args = {
 		messages: [],
 		fileArgs: [],
 		unknownFlags: new Map(),
+		unknownFlagValues: [],
 		diagnostics: [],
 	};
 
@@ -277,6 +299,7 @@ export function parseArgs(args: string[]): Args {
 				const next = args[i + 1];
 				if (next !== undefined && !next.startsWith("-") && !next.startsWith("@")) {
 					result.unknownFlags.set(flagName, next);
+					result.unknownFlagValues.push({ flag: flagName, value: next, messageIndex: result.messages.length });
 					i++;
 				} else {
 					result.unknownFlags.set(flagName, true);

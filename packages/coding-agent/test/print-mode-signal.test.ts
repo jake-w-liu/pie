@@ -112,3 +112,17 @@ test("exits with the real signal status and flushed stdout when disposal rejects
 	expect(failure?.stdout ?? "").toContain("context_limit");
 	expect(failure?.stderr ?? "").toContain("Failed to dispose runtime during SIGINT: dispose failed");
 });
+
+test("exits on a repeated signal while shutdown waits for work that ignores abort", async () => {
+	const failure = await execFileAsync(process.execPath, [fixture], {
+		env: { ...process.env, TEST_DISPOSE_HANGS: "1", TEST_REAL_EXIT: "1", TEST_SIGNAL: "SIGINT" },
+		// The child handles SIGTERM itself, so a hung child must be killed outright.
+		killSignal: "SIGKILL",
+		timeout: 30_000,
+	}).then(
+		() => undefined,
+		(error: { code?: number | string; killed?: boolean }) => error,
+	);
+	expect(failure?.killed).toBe(false);
+	expect(failure?.code).toBe(130);
+}, 40_000);

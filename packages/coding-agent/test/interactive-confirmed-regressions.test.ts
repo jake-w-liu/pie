@@ -1,5 +1,5 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai/compat";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { stripAnsi } from "../src/utils/ansi.ts";
 import { createInteractiveHarness, deferred } from "./tui-audit-helpers.ts";
 
@@ -36,6 +36,33 @@ describe("interactive confirmed regressions", () => {
 			await expect(prompt).rejects.toThrow("Prompt cancelled");
 			expect(harness.getPendingResponseCount()).toBe(1);
 			expect(harness.session.messages.some((message) => message.role === "assistant")).toBe(false);
+		} finally {
+			harness.cleanup();
+		}
+	}, 30_000);
+
+	it("shuts down at once when an extension shortcut requests shutdown while idle", async () => {
+		const harness = await createInteractiveHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.registerShortcut("alt+y", {
+						description: "Quit",
+						handler: (ctx) => {
+							ctx.shutdown();
+						},
+					});
+				},
+			],
+		});
+		try {
+			const shutdown = vi.fn(async () => {});
+			Reflect.set(harness.mode, "shutdown", shutdown);
+			await callPrivate(harness.mode, "bindCurrentSessionExtensions");
+			expect(harness.session.isIdle).toBe(true);
+
+			expect(harness.editor.onExtensionShortcut?.("\x1by")).toBe(true);
+
+			expect(shutdown).toHaveBeenCalledTimes(1);
 		} finally {
 			harness.cleanup();
 		}

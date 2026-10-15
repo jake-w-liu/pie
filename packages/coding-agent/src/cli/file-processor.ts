@@ -8,7 +8,7 @@ import chalk from "chalk";
 import { resolve } from "path";
 import { resolveReadPath } from "../core/tools/path-utils.ts";
 import { processImage } from "../utils/image-process.ts";
-import { detectSupportedImageMimeTypeFromFile } from "../utils/mime.ts";
+import { detectSupportedImageMimeType, detectSupportedImageMimeTypeFromFile } from "../utils/mime.ts";
 import { stripBom } from "../utils/text.ts";
 
 export interface ProcessedFiles {
@@ -19,6 +19,12 @@ export interface ProcessedFiles {
 export interface ProcessFileOptions {
 	/** Whether to auto-resize images to 2000x2000 max. Default: true */
 	autoResizeImages?: boolean;
+}
+
+function exitWithReadError(path: string, error: unknown): never {
+	const message = error instanceof Error ? error.message : String(error);
+	console.error(chalk.red(`Error: Could not read file ${path}: ${message}`));
+	process.exit(1);
 }
 
 /** Process @file arguments into text content and image attachments */
@@ -39,18 +45,37 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 			process.exit(1);
 		}
 
-		// Check if file is empty
 		const stats = await stat(absolutePath);
-		if (stats.size === 0) {
+		if (stats.isDirectory()) {
+			console.error(chalk.red(`Error: Not a file: ${absolutePath} is a directory`));
+			process.exit(1);
+		}
+
+		// Check if file is empty. Pipes report no size; they are checked once read.
+		if (!stats.isFIFO() && stats.size === 0) {
 			// Skip empty files
 			continue;
 		}
 
-		const mimeType = await detectSupportedImageMimeTypeFromFile(absolutePath);
+		// A pipe (e.g. `@<(cmd)`) cannot be read at an offset, so read it once in full and detect
+		// the type from that buffer.
+		let streamed: Buffer | undefined;
+		let mimeType: string | null;
+		try {
+			streamed = stats.isFIFO() ? await readFile(absolutePath) : undefined;
+			mimeType = streamed
+				? detectSupportedImageMimeType(streamed)
+				: await detectSupportedImageMimeTypeFromFile(absolutePath);
+		} catch (error: unknown) {
+			exitWithReadError(absolutePath, error);
+		}
+		if (streamed?.length === 0) {
+			continue;
+		}
 
 		if (mimeType) {
 			// Handle image file
-			const content = await readFile(absolutePath);
+			const content = streamed ?? (await readFile(absolutePath));
 			const processed = await processImage(content, mimeType, { autoResizeImages });
 
 			if (!processed.ok) {
@@ -74,12 +99,10 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 		} else {
 			// Handle text file
 			try {
-				const content = stripBom(await readFile(absolutePath, "utf-8"));
+				const content = stripBom(streamed ? streamed.toString("utf-8") : await readFile(absolutePath, "utf-8"));
 				text += `<file name="${absolutePath}">\n${content}\n</file>\n`;
 			} catch (error: unknown) {
-				const message = error instanceof Error ? error.message : String(error);
-				console.error(chalk.red(`Error: Could not read file ${absolutePath}: ${message}`));
-				process.exit(1);
+				exitWithReadError(absolutePath, error);
 			}
 		}
 	}

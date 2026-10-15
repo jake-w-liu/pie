@@ -294,6 +294,18 @@ interface ToolDefinitionEntry {
 	sourceInfo: SourceInfo;
 }
 
+/** A queued user message and its display text. Texts can repeat or be empty (image-only input). */
+interface QueuedUserMessage {
+	text: string;
+	message: AgentMessage;
+}
+
+/** A custom message whose triggered turn waits for manual compaction or tree navigation to finish. */
+interface DeferredTurnMessage {
+	message: CustomMessage;
+	deliverAs?: "steer" | "followUp";
+}
+
 function estimateMessagesTokens(messages: AgentMessage[]): number {
 	let tokens = 0;
 	for (const message of messages) {
@@ -328,9 +340,11 @@ export class AgentSession {
 	private _resolveIdleWait: (() => void) | undefined;
 
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
-	private _steeringMessages: string[] = [];
+	private _steeringMessages: QueuedUserMessage[] = [];
 	/** Tracks pending follow-up messages for UI display. Removed when delivered. */
-	private _followUpMessages: string[] = [];
+	private _followUpMessages: QueuedUserMessage[] = [];
+	/** Triggered custom messages received while manual compaction or tree navigation held the session. */
+	private _deferredTurnMessages: DeferredTurnMessage[] = [];
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 	/** Context-only custom messages queued during a run, flushed once the current turn's tool results are in. */
@@ -683,8 +697,8 @@ export class AgentSession {
 	private _emitQueueUpdate(): void {
 		this._emit({
 			type: "queue_update",
-			steering: [...this._steeringMessages],
-			followUp: [...this._followUpMessages],
+			steering: this.getSteeringMessages(),
+			followUp: this.getFollowUpMessages(),
 		});
 	}
 
@@ -724,7 +738,8 @@ export class AgentSession {
 
 	private async _emitAgentSettled(): Promise<void> {
 		// The settling run owns the wait promise created when it started. A run that begins while the
-		// extension handler is awaited installs its own, which this one must neither resolve nor clear.
+		// extension handler is awaited installs its own, which this one must not clear. The settling
+		// run's own promise is always resolved: its waiters re-check whether another run is active.
 		const resolveAgentRunWait = this._resolveAgentRunWait;
 		this._isAgentRunActive = false;
 		this._runAbortController = undefined;
@@ -736,8 +751,8 @@ export class AgentSession {
 			if (this._resolveAgentRunWait === resolveAgentRunWait) {
 				this._agentRunWaitPromise = undefined;
 				this._resolveAgentRunWait = undefined;
-				resolveAgentRunWait?.();
 			}
+			resolveAgentRunWait?.();
 			this._resolveIdleWaitIfIdle();
 		}
 	}
@@ -751,20 +766,17 @@ export class AgentSession {
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
-			const messageText = contentText(event.message.content, "");
-			if (messageText) {
-				// Check steering queue first
-				const steeringIndex = this._steeringMessages.indexOf(messageText);
-				if (steeringIndex !== -1) {
-					this._steeringMessages.splice(steeringIndex, 1);
+			// The agent delivers the queued object itself. Match by identity: texts can repeat, and
+			// image-only messages have no text.
+			const steeringIndex = this._steeringMessages.findIndex((entry) => entry.message === event.message);
+			if (steeringIndex !== -1) {
+				this._steeringMessages.splice(steeringIndex, 1);
+				this._emitQueueUpdate();
+			} else {
+				const followUpIndex = this._followUpMessages.findIndex((entry) => entry.message === event.message);
+				if (followUpIndex !== -1) {
+					this._followUpMessages.splice(followUpIndex, 1);
 					this._emitQueueUpdate();
-				} else {
-					// Check follow-up queue
-					const followUpIndex = this._followUpMessages.indexOf(messageText);
-					if (followUpIndex !== -1) {
-						this._followUpMessages.splice(followUpIndex, 1);
-						this._emitQueueUpdate();
-					}
 				}
 			}
 		}
@@ -1292,11 +1304,7 @@ export class AgentSession {
 				}
 			}
 
-			if (this._compactionAbortController || this._branchSummaryAbortController) {
-				throw new Error(
-					"Cannot submit a prompt while compaction or branch summarization is in progress. Wait for it to finish and retry.",
-				);
-			}
+			this._throwIfSessionOperationInProgress();
 
 			// Emit input event for extension interception (before skill/template expansion)
 			let currentText = text;
@@ -1324,6 +1332,9 @@ export class AgentSession {
 				expandedText = this._expandSkillCommand(expandedText);
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 			}
+
+			// Input handlers are awaited, so an operation may have started since the check above.
+			this._throwIfSessionOperationInProgress();
 
 			// If streaming, queue via steer() or followUp() based on option
 			if (this.isStreaming) {
@@ -1563,34 +1574,68 @@ export class AgentSession {
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
 	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
-		this._steeringMessages.push(text);
-		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.steer({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
+		this._steeringMessages.push({ text, message });
+		this._emitQueueUpdate();
+		this.agent.steer(message);
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
 	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
-		this._followUpMessages.push(text);
-		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.followUp({
-			role: "user",
-			content,
-			timestamp: Date.now(),
+		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
+		this._followUpMessages.push({ text, message });
+		this._emitQueueUpdate();
+		this.agent.followUp(message);
+	}
+
+	/** Queue custom messages into the agent; the active or next run delivers them. */
+	private _queueCustomMessages(entries: DeferredTurnMessage[]): void {
+		for (const { message, deliverAs } of entries) {
+			if (deliverAs === "followUp") {
+				this.agent.followUp(message);
+			} else {
+				this.agent.steer(message);
+			}
+		}
+	}
+
+	/**
+	 * Start the turn for custom messages deferred while manual compaction or tree navigation held
+	 * the session. Called when the operation finishes.
+	 */
+	private _startDeferredTurn(): void {
+		if (this._deferredTurnMessages.length === 0 || this.isCompacting || this._disposed) return;
+		const deferred = this._deferredTurnMessages.splice(0);
+		if (this._isAgentRunActive) {
+			this._queueCustomMessages(deferred);
+			return;
+		}
+		this._runAgentPrompt(deferred.map((entry) => entry.message)).catch((error: unknown) => {
+			this._extensionRunner.emitError({
+				extensionPath: "<runtime>",
+				event: "send_message",
+				error: error instanceof Error ? error.message : String(error),
+			});
 		});
+	}
+
+	/** Reject new prompts while manual compaction or tree navigation owns the session. */
+	private _throwIfSessionOperationInProgress(): void {
+		if (this._compactionAbortController || this._branchSummaryAbortController) {
+			throw new Error(
+				"Cannot submit a prompt while compaction or branch summarization is in progress. Wait for it to finish and retry.",
+			);
+		}
 	}
 
 	/**
@@ -1611,7 +1656,9 @@ export class AgentSession {
 	/**
 	 * Send a custom message to the session. Creates a CustomMessageEntry.
 	 *
-	 * Handles four cases:
+	 * Handles five cases:
+	 * - Manual compaction or tree navigation in progress + triggerTurn: deferred, then starts a turn
+	 *   when the operation finishes (abort() leaves the message queued for the next run instead)
 	 * - Streaming: queues message, processed when loop pulls from queue
 	 * - Streaming + triggerTurn false: appended to state/session once the current turn ends
 	 * - Not streaming + triggerTurn: appends to state/session, starts new turn
@@ -1636,12 +1683,12 @@ export class AgentSession {
 		} satisfies CustomMessage<T>;
 		if (options?.deliverAs === "nextTurn") {
 			this._pendingNextTurnMessages.push(appMessage);
+		} else if (options?.triggerTurn && (this._compactionAbortController || this._branchSummaryAbortController)) {
+			// A run started now would write to the session while the operation does, or be aborted by
+			// manual compaction. Start the turn once the operation finishes.
+			this._deferredTurnMessages.push({ message: appMessage, deliverAs: options.deliverAs });
 		} else if (this.isStreaming && options?.triggerTurn !== false) {
-			if (options?.deliverAs === "followUp") {
-				this.agent.followUp(appMessage);
-			} else {
-				this.agent.steer(appMessage);
-			}
+			this._queueCustomMessages([{ message: appMessage, deliverAs: options?.deliverAs }]);
 		} else if (options?.triggerTurn) {
 			await this._runAgentPrompt(appMessage);
 		} else if (this.isStreaming) {
@@ -1727,8 +1774,8 @@ export class AgentSession {
 	 * @returns Object with steering and followUp arrays
 	 */
 	clearQueue(): { steering: string[]; followUp: string[] } {
-		const steering = [...this._steeringMessages];
-		const followUp = [...this._followUpMessages];
+		const steering = this._steeringMessages.map((entry) => entry.text);
+		const followUp = this._followUpMessages.map((entry) => entry.text);
 		this._steeringMessages = [];
 		this._followUpMessages = [];
 		this.agent.clearAllQueues();
@@ -1741,14 +1788,14 @@ export class AgentSession {
 		return this._steeringMessages.length + this._followUpMessages.length;
 	}
 
-	/** Get pending steering messages (read-only) */
+	/** Get pending steering message texts (read-only snapshot) */
 	getSteeringMessages(): readonly string[] {
-		return this._steeringMessages;
+		return this._steeringMessages.map((entry) => entry.text);
 	}
 
-	/** Get pending follow-up messages (read-only) */
+	/** Get pending follow-up message texts (read-only snapshot) */
 	getFollowUpMessages(): readonly string[] {
-		return this._followUpMessages;
+		return this._followUpMessages.map((entry) => entry.text);
 	}
 
 	get resourceLoader(): ResourceLoader {
@@ -1760,7 +1807,11 @@ export class AgentSession {
 	 */
 	async abort(): Promise<void> {
 		this._runAbortController?.abort();
+		// Abort also cancels deferred turns. Their messages stay queued for the next run, as messages
+		// queued during a streaming run do.
+		this._queueCustomMessages(this._deferredTurnMessages.splice(0));
 		this.abortCompaction();
+		this.abortBranchSummary();
 		this.abortRetry();
 		this.agent.abort();
 		await this.waitForIdle();
@@ -2092,12 +2143,16 @@ export class AgentSession {
 		let fromExtension = false;
 
 		try {
-			this._runAbortController?.abort();
-			this.abortRetry();
-			this.agent.abort();
-			if (this._isAgentRunActive) {
-				await this._agentRunWaitPromise;
-			}
+			// A settling run resolves its wait promise even if another run was claimed meanwhile, so
+			// abort and wait again until no run is active.
+			do {
+				this._runAbortController?.abort();
+				this.abortRetry();
+				this.agent.abort();
+				if (this._isAgentRunActive) {
+					await this._agentRunWaitPromise;
+				}
+			} while (this._isAgentRunActive);
 			this._compactionAbortController.signal.throwIfAborted();
 			this._emit({ type: "compaction_start", reason: "manual" });
 			if (!this.model) {
@@ -2245,6 +2300,7 @@ export class AgentSession {
 			throw error;
 		} finally {
 			this._compactionAbortController = undefined;
+			this._startDeferredTurn();
 			this._resolveIdleWaitIfIdle();
 		}
 	}
@@ -3514,6 +3570,7 @@ export class AgentSession {
 			return { editorText, cancelled: false, summaryEntry };
 		} finally {
 			this._branchSummaryAbortController = undefined;
+			this._startDeferredTurn();
 			this._resolveIdleWaitIfIdle();
 		}
 	}

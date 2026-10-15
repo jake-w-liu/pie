@@ -116,7 +116,7 @@ Use `--offline` or `PI_OFFLINE=1` to disable startup package checks, model catal
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `compaction.enabled` | boolean | `true` | Enable auto-compaction at the earlier of 87% context usage or the response-token reserve boundary |
-| `compaction.reserveTokens` | number | `16384` | Tokens reserved for the LLM response; a larger reserve can trigger before 87% |
+| `compaction.reserveTokens` | number | `16384` | Tokens reserved for the LLM response, capped at half the context window; a larger reserve can trigger before 87% |
 | `compaction.keepRecentTokens` | number | `20000` | Recent tokens to keep (not summarized) |
 
 ```json

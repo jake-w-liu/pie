@@ -5,6 +5,7 @@ if (!signal) throw new Error("TEST_SIGNAL required");
 const disposeRejects = process.env.TEST_DISPOSE_REJECTS === "1";
 const signalDuringDispose = process.env.TEST_SIGNAL_DURING_DISPOSE === "1";
 const realExit = process.env.TEST_REAL_EXIT === "1";
+const disposeHangs = process.env.TEST_DISPOSE_HANGS === "1";
 
 const originalWrite = process.stdout.write;
 const originalExit = process.exit;
@@ -58,6 +59,7 @@ const session = {
 			await new Promise((resolve) => setTimeout(resolve, 10));
 		}
 	},
+	waitForIdle: async () => {},
 	reload: async () => {},
 };
 const runtime = {
@@ -72,6 +74,12 @@ const runtime = {
 			if (signalDuringDispose) {
 				process.kill(process.pid, signal);
 				await new Promise((resolve) => setTimeout(resolve, 200));
+			}
+			if (disposeHangs) {
+				// Like an aborted tool that ignores its signal: disposal cannot finish in time, and the
+				// user signals again.
+				process.kill(process.pid, signal);
+				await new Promise((resolve) => setTimeout(resolve, 60_000));
 			}
 			if (disposeRejects) throw new Error("dispose failed");
 		} finally {

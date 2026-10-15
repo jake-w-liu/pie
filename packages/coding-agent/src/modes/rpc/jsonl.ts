@@ -20,31 +20,37 @@ export function serializeJsonLine(value: unknown): string {
  */
 export function attachJsonlLineReader(stream: Readable, onLine: (line: string) => void): () => void {
 	const decoder = new StringDecoder("utf8");
-	let buffer = "";
+	// Pieces of the current, unterminated line. Only new chunks are searched for LF, so a record
+	// split across many chunks (e.g. a prompt with images) costs linear time, not quadratic.
+	let pending: string[] = [];
 
 	const emitLine = (line: string) => {
 		onLine(line.endsWith("\r") ? line.slice(0, -1) : line);
 	};
 
 	const onData = (chunk: string | Buffer) => {
-		buffer += typeof chunk === "string" ? chunk : decoder.write(chunk);
-
-		while (true) {
-			const newlineIndex = buffer.indexOf("\n");
-			if (newlineIndex === -1) {
-				return;
-			}
-
-			emitLine(buffer.slice(0, newlineIndex));
-			buffer = buffer.slice(newlineIndex + 1);
+		const text = typeof chunk === "string" ? chunk : decoder.write(chunk);
+		let start = 0;
+		let newlineIndex = text.indexOf("\n");
+		while (newlineIndex !== -1) {
+			pending.push(text.slice(start, newlineIndex));
+			const line = pending.join("");
+			pending = [];
+			emitLine(line);
+			start = newlineIndex + 1;
+			newlineIndex = text.indexOf("\n", start);
+		}
+		if (start < text.length) {
+			pending.push(text.slice(start));
 		}
 	};
 
 	const onEnd = () => {
-		buffer += decoder.end();
-		if (buffer.length > 0) {
-			emitLine(buffer);
-			buffer = "";
+		pending.push(decoder.end());
+		const line = pending.join("");
+		pending = [];
+		if (line.length > 0) {
+			emitLine(line);
 		}
 	};
 

@@ -98,7 +98,13 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 		for (const signal of signals) {
 			const handler = () => {
-				if (signalShutdown) return;
+				if (signalShutdown) {
+					// Graceful shutdown waits for the aborted run, which a tool that ignores abort can hold
+					// indefinitely. A repeated signal exits now.
+					killTrackedDetachedChildren();
+					process.exit(signal === "SIGHUP" ? 129 : signal === "SIGINT" ? 130 : 143);
+					return;
+				}
 				signalShutdown = (async () => {
 					killTrackedDetachedChildren();
 					try {
@@ -187,12 +193,22 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 		await rebindSession();
 
+		const prompts: Array<() => Promise<void>> = [];
 		if (initialMessage) {
-			await session.prompt(initialMessage, { images: initialImages });
+			prompts.push(() => session.prompt(initialMessage, { images: initialImages }));
+		}
+		for (const message of messages) {
+			prompts.push(() => session.prompt(message));
 		}
 
-		for (const message of messages) {
-			await session.prompt(message);
+		for (const sendPrompt of prompts) {
+			await sendPrompt();
+			// An extension command can start a run without awaiting it (pi.sendUserMessage). Let it finish
+			// before reading the result, sending the next prompt, or disposing the runtime.
+			await session.waitForIdle();
+			// Do not build later prompts on a failed response; it is reported below.
+			const last = session.state.messages[session.state.messages.length - 1];
+			if (last?.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted")) break;
 		}
 
 		const state = session.state;

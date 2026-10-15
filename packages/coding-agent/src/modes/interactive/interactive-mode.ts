@@ -2052,10 +2052,7 @@ export class InteractiveMode {
 				},
 			},
 			shutdownHandler: () => {
-				this.shutdownRequested = true;
-				if (this.session.isIdle) {
-					void this.shutdown();
-				}
+				this.requestShutdown();
 			},
 			onError: (error) => {
 				this.showExtensionError(error.extensionPath, error.error, error.stack);
@@ -2192,7 +2189,7 @@ export class InteractiveMode {
 			},
 			hasPendingMessages: () => this.session.pendingMessageCount > 0,
 			shutdown: () => {
-				this.shutdownRequested = true;
+				this.requestShutdown();
 			},
 			getContextUsage: () => this.session.getContextUsage(),
 			compact: (options) => {
@@ -4265,6 +4262,17 @@ export class InteractiveMode {
 		console.error(`${APP_NAME} exiting due to uncaughtException:`);
 		console.error(error);
 		process.exit(1);
+	}
+
+	/**
+	 * Extension `ctx.shutdown()`: shut down now when idle, otherwise once the session settles
+	 * (checked on agent_settled).
+	 */
+	private requestShutdown(): void {
+		this.shutdownRequested = true;
+		if (this.session.isIdle) {
+			void this.shutdown();
+		}
 	}
 
 	/**

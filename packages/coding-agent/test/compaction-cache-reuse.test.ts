@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { generateSummaryWithUsage } from "../src/core/compaction/index.ts";
 
 // Capture the context and request options passed to the LLM so tests can assert
-// the cache-reusing request shape.
+// the replay request shape.
 let capturedContext:
 	| {
 			systemPrompt?: string;
@@ -14,8 +14,8 @@ let capturedContext:
 	| undefined;
 let capturedOptions: Record<string, unknown> | undefined;
 
-describe("generateSummaryWithUsage cache-reuse path", () => {
-	it("replays the live system prompt, tools, and messages with a trailing instruction as a prefix", async () => {
+describe("generateSummaryWithUsage replay path", () => {
+	it("replays the live system prompt, tools, and messages with a trailing instruction", async () => {
 		const messages: AgentMessage[] = [
 			{ role: "user", content: "Please check the foo module", timestamp: 1 } as AgentMessage,
 			{ role: "assistant", content: [{ type: "text", text: "On it." }], timestamp: 2 } as AgentMessage,
@@ -67,7 +67,7 @@ describe("generateSummaryWithUsage cache-reuse path", () => {
 		);
 
 		expect(result.text).toBe("## Goal\nCache test summary");
-		// Cache-reuse path: context uses the provided system prompt, not the summarizer default.
+		// Replay path: context uses the provided system prompt, not the summarizer default.
 		expect(capturedContext?.systemPrompt).toBe("live system prompt for the coding agent");
 		// The conversation messages are replayed as real messages (not a serialized blob).
 		expect(capturedContext?.messages.length).toBe(3); // 2 conversation + 1 trailing instruction
@@ -78,9 +78,9 @@ describe("generateSummaryWithUsage cache-reuse path", () => {
 		expect(finalMessage.role).toBe("user");
 		expect(JSON.stringify(finalMessage.content)).not.toContain("<conversation>");
 		expect(JSON.stringify(finalMessage.content)).toContain("compaction engine");
-		// Tools are forwarded for prefix alignment.
+		// Tools are replayed with the system prompt.
 		expect(capturedContext?.tools).toEqual(tools);
-		// Summarization must never write a cache entry (only reuse the existing warm prefix).
+		// Summaries are one-off requests and must not write prompt-cache entries.
 		expect(capturedOptions?.cacheRetention).toBe("none");
 	});
 });

@@ -49,6 +49,12 @@ export interface ModelInfo {
 
 export type RpcEventListener = (event: JsonAgentSessionEvent) => void;
 
+/**
+ * Most recent child stderr kept for error messages and getStderr(). RPC mode routes stray
+ * stdout writes to stderr, so a long-lived client must not keep all of it.
+ */
+const MAX_STDERR_CHARS = 64 * 1024;
+
 // ============================================================================
 // RPC Client
 // ============================================================================
@@ -99,9 +105,9 @@ export class RpcClient {
 		});
 		this.process = childProcess;
 
-		// Collect stderr for debugging
+		// Collect recent stderr for debugging
 		childProcess.stderr?.on("data", (data) => {
-			this.stderr += data.toString();
+			this.stderr = (this.stderr + data.toString()).slice(-MAX_STDERR_CHARS);
 			process.stderr.write(data);
 		});
 
@@ -193,7 +199,7 @@ export class RpcClient {
 	}
 
 	/**
-	 * Get collected stderr output (useful for debugging).
+	 * Get the most recent stderr output, at most MAX_STDERR_CHARS characters (useful for debugging).
 	 */
 	getStderr(): string {
 		return this.stderr;

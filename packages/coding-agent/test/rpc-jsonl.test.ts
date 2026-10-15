@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { Readable } from "node:stream";
 import { describe, expect, test } from "vitest";
 import { attachJsonlLineReader, serializeJsonLine } from "../src/modes/rpc/jsonl.ts";
@@ -61,5 +62,35 @@ describe("RPC JSONL framing", () => {
 		await done;
 
 		expect(lines).toEqual(['{"a":1}']);
+	});
+
+	test("scans a record split across many chunks in linear time", () => {
+		const record = serializeJsonLine({ type: "prompt", message: "x".repeat(1024 * 1024) });
+		const chunkSize = 1024;
+		const stream = new EventEmitter();
+		const lines: string[] = [];
+		attachJsonlLineReader(stream as Readable, (line) => {
+			lines.push(line);
+		});
+
+		// Count the characters LF searches cover. Rescanning the buffered prefix on every chunk
+		// makes this grow with the square of the record length.
+		const originalIndexOf = String.prototype.indexOf;
+		let scanned = 0;
+		String.prototype.indexOf = function (this: string, searchString: string, position?: number): number {
+			scanned += this.length - Math.min(this.length, Math.max(0, position ?? 0));
+			return originalIndexOf.call(this, searchString, position);
+		};
+		try {
+			for (let offset = 0; offset < record.length; offset += chunkSize) {
+				stream.emit("data", Buffer.from(record.slice(offset, offset + chunkSize)));
+			}
+		} finally {
+			String.prototype.indexOf = originalIndexOf;
+		}
+		stream.emit("end");
+
+		expect(lines).toEqual([record.slice(0, -1)]);
+		expect(scanned).toBeLessThanOrEqual(2 * record.length);
 	});
 });

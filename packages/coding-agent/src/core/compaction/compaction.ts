@@ -259,11 +259,25 @@ export function shouldCompact(contextTokens: number, contextWindow: number, sett
 }
 
 function compactionThreshold(contextWindow: number, settings: CompactionSettings): number {
-	const reserveTokens = Number.isFinite(settings.reserveTokens) ? Math.max(0, settings.reserveTokens) : 0;
 	return Math.max(
 		1,
-		Math.min(Math.floor(contextWindow * DEFAULT_COMPACTION_TRIGGER_RATIO), contextWindow - reserveTokens),
+		Math.min(
+			Math.floor(contextWindow * DEFAULT_COMPACTION_TRIGGER_RATIO),
+			contextWindow - effectiveReserveTokens(contextWindow, settings.reserveTokens),
+		),
 	);
+}
+
+/**
+ * The reserve is an absolute token count, and the default equals a whole 16k window. Cap it at
+ * half the window so small-context models keep room for history below the trigger and for the
+ * summary. Windows of at least twice the reserve are unaffected.
+ */
+function effectiveReserveTokens(contextWindow: number, reserveTokens: number): number {
+	const reserve = Number.isFinite(reserveTokens) ? Math.max(0, reserveTokens) : 0;
+	return Number.isFinite(contextWindow) && contextWindow > 0
+		? Math.min(reserve, Math.floor(contextWindow / 2))
+		: reserve;
 }
 
 // ============================================================================
@@ -510,11 +524,9 @@ export function findCutPoint(
 // ============================================================================
 
 /**
- * Cache-reusing compaction directive, delivered as the FINAL user message after
- * the replayed conversation prefix. Mirrors DeepSeek Harness's compaction-basic
- * `COMPACTION_INSTRUCTION`: keeping the conversation's own system prompt, tools,
- * and messages in front of it makes the auxiliary summarization call a genuine
- * prefix of the last routed request, so the provider's warm prefix cache is reused.
+ * Compaction directive, delivered as the final user message after the replayed
+ * conversation messages. Modeled on DeepSeek Harness's compaction-basic
+ * `COMPACTION_INSTRUCTION`.
  */
 const SUMMARIZATION_INSTRUCTION = `You are now acting as a compaction engine for this AI coding assistant. Condense the conversation ABOVE into a structured checkpoint that lets another model resume the work with no loss of essential context.
 
@@ -787,24 +799,24 @@ function buildSummarizationContext(promptText: string): Context {
 }
 
 /**
- * Build a cache-reusing summarization context, mirroring DeepSeek Harness's
- * compaction-basic design. Instead of serializing the conversation to a flat
- * text blob under a dedicated summarizer system prompt (which invalidates the
- * provider's prefix cache), we replay the conversation's own system prompt and
- * tool schemas verbatim, append the conversation messages as an LLM prefix, and
- * deliver the compaction instruction as the FINAL user message.
+ * Build a summarization context that replays the conversation's own system
+ * prompt, tool schemas, and messages as native LLM messages, with the compaction
+ * instruction as the final user message (modeled on DeepSeek Harness's
+ * compaction-basic design) instead of a serialized transcript under a dedicated
+ * summarizer prompt.
  *
- * Because this request is a genuine prefix of the last routed request, the
- * provider's warm prefix cache is reused instead of being invalidated; the
- * compaction instruction is the only novel input.
+ * This is not a cache prefix of the last provider request: it replays raw
+ * session history while ordinary requests send a Headroom-projected context,
+ * and completeSummarization() sends it with cacheRetention "none" and, unless
+ * the caller passes one, a fresh routing session ID.
  *
  * @param systemPrompt - The live conversation's system prompt (already set on the
  *   agent state). When omitted, callers fall back to the serialized-text builder.
- * @param tools - The live conversation's tool schemas, reused for prefix alignment.
+ * @param tools - The live conversation's tool schemas.
  * @param instruction - The finalized compaction instruction (final user message).
  * @param messages - The conversation span to condense, as LLM messages.
  */
-function buildCacheReusingSummarizationContext(
+function buildReplaySummarizationContext(
 	systemPrompt: string,
 	tools: readonly Tool[] | undefined,
 	instruction: string,
@@ -826,7 +838,7 @@ function buildCacheReusingSummarizationContext(
 		context.tools = [...tools];
 	}
 	// Raw history can be much larger than the Headroom-projected ordinary request.
-	// Prefer prefix replay only when it fits; the existing serialized path bounds
+	// Prefer replay only when it fits; the existing serialized path bounds
 	// tool results and preserves their true head/tail before the final budget check.
 	if (estimateSummarizationInputTokens(context) > inputBudget) {
 		return buildSummarizationContext(
@@ -837,10 +849,10 @@ function buildCacheReusingSummarizationContext(
 }
 
 /**
- * Build the compaction instruction that the cache-reusing summarization path
- * delivers as the FINAL user message (replacing the standalone system-prompt
- * approach). Keeps the structured-format directive plus any prior summary and
- * custom focus, so a prior checkpoint is merged rather than copied verbatim.
+ * Build the compaction instruction that the replay summarization path delivers
+ * as the final user message (replacing the standalone system-prompt approach).
+ * Keeps the structured-format directive plus any prior summary and custom focus,
+ * so a prior checkpoint is merged rather than copied verbatim.
  */
 function buildCompactionInstruction(
 	previousSummary: string | undefined,
@@ -873,19 +885,18 @@ export async function generateSummaryWithUsage(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
-	/** Live conversation system prompt; when provided, enables KV-cache reuse. */
+	/** Live conversation system prompt; when provided, the conversation is replayed as native messages. */
 	systemPrompt?: string,
-	/** Live conversation tool schemas, for KV-cache prefix alignment. */
-	tools?: readonly import("@earendil-works/pi-ai").Tool[],
+	/** Live conversation tool schemas, replayed with the system prompt. */
+	tools?: readonly Tool[],
 ): Promise<{ text: string; usage: Usage }> {
 	const maxTokens = getSummarizationTokenBudget(reserveTokens, 0.8, model.maxTokens);
 
 	// Convert to LLM messages first (handles custom types like bashExecution, custom, etc.).
 	const llmMessages = convertToLlm(currentMessages);
 
-	// Cache-reusing path: replay the live system prompt + messages as a prefix and
-	// append the compaction instruction as the final user message, so the provider's
-	// warm prefix cache is reused instead of invalidated (DeepSeek Harness design).
+	// Replay path: send the live system prompt, tools, and messages as native
+	// messages, with the compaction instruction as the final user message.
 	if (systemPrompt !== undefined) {
 		const instruction = buildCompactionInstruction(previousSummary, customInstructions);
 		const completionOptions = createSummarizationOptions(
@@ -900,7 +911,7 @@ export async function generateSummaryWithUsage(
 		);
 		const response = await completeSummarization(
 			model,
-			buildCacheReusingSummarizationContext(
+			buildReplaySummarizationContext(
 				systemPrompt,
 				tools,
 				instruction,
@@ -1033,7 +1044,11 @@ export function prepareCompaction(
 		contextWindow !== undefined && Number.isFinite(contextWindow) && contextWindow > 0
 			? Math.min(
 					settings.keepRecentTokens,
-					Math.max(0, compactionThreshold(contextWindow, settings) - settings.reserveTokens),
+					Math.max(
+						0,
+						compactionThreshold(contextWindow, settings) -
+							effectiveReserveTokens(contextWindow, settings.reserveTokens),
+					),
 				)
 			: settings.keepRecentTokens;
 	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, keepRecentTokens);
@@ -1129,9 +1144,9 @@ export async function compact(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
-	/** Live conversation system prompt; when provided, enables KV-cache reuse. */
+	/** Live conversation system prompt; when provided, the conversation is replayed as native messages. */
 	systemPrompt?: string,
-	/** Live conversation tool schemas, for KV-cache prefix alignment. */
+	/** Live conversation tool schemas, replayed with the system prompt. */
 	tools?: readonly Tool[],
 ): Promise<CompactionResult<CompactionDetails>> {
 	const {
@@ -1144,6 +1159,8 @@ export async function compact(
 		fileOps,
 		settings,
 	} = preparation;
+	// Size the summary output from the same capped reserve as the trigger, so it fits small windows.
+	const reserveTokens = effectiveReserveTokens(model.contextWindow, settings.reserveTokens);
 
 	// Generate summaries and merge into one
 	let summary: string;
@@ -1156,7 +1173,7 @@ export async function compact(
 			const historyResult = await generateSummaryWithUsage(
 				messagesToSummarize,
 				model,
-				settings.reserveTokens,
+				reserveTokens,
 				apiKey,
 				headers,
 				signal,
@@ -1177,7 +1194,7 @@ export async function compact(
 		const turnPrefixResult = await generateTurnPrefixSummary(
 			turnPrefixMessages,
 			model,
-			settings.reserveTokens,
+			reserveTokens,
 			apiKey,
 			headers,
 			env,
@@ -1198,7 +1215,7 @@ export async function compact(
 		const result = await generateSummaryWithUsage(
 			messagesToSummarize,
 			model,
-			settings.reserveTokens,
+			reserveTokens,
 			apiKey,
 			headers,
 			signal,
@@ -1221,7 +1238,7 @@ export async function compact(
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	// Use the same four-characters-per-token estimate as context budgeting.
 	// Full file tracking remains in details even when visible tags do not fit.
-	summary += formatFileOperations(readFiles, modifiedFiles, Math.max(0, settings.reserveTokens * 4 - summary.length));
+	summary += formatFileOperations(readFiles, modifiedFiles, Math.max(0, reserveTokens * 4 - summary.length));
 
 	if (!firstKeptEntryId) {
 		throw new Error("First kept entry has no UUID - session may need migration");
@@ -1252,10 +1269,10 @@ async function generateTurnPrefixSummary(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
-	/** Live conversation system prompt; when provided, enables KV-cache reuse. */
+	/** Live conversation system prompt; when provided, the conversation is replayed as native messages. */
 	systemPrompt?: string,
-	/** Live conversation tool schemas, for KV-cache prefix alignment. */
-	tools?: readonly import("@earendil-works/pi-ai").Tool[],
+	/** Live conversation tool schemas, replayed with the system prompt. */
+	tools?: readonly Tool[],
 ): Promise<{ text: string; usage: Usage }> {
 	const maxTokens = getSummarizationTokenBudget(reserveTokens, 0.5, model.maxTokens);
 	const llmMessages = convertToLlm(messages);
@@ -1263,7 +1280,7 @@ async function generateTurnPrefixSummary(
 	const response = await completeSummarization(
 		model,
 		systemPrompt !== undefined
-			? buildCacheReusingSummarizationContext(
+			? buildReplaySummarizationContext(
 					systemPrompt,
 					tools,
 					TURN_PREFIX_SUMMARIZATION_PROMPT,

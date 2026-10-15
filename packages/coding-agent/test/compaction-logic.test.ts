@@ -64,6 +64,17 @@ describe("shouldCompact", () => {
 		expect(shouldCompact(86_000, 100_000, loose)).toBe(false);
 		expect(shouldCompact(87_000, 100_000, loose)).toBe(true);
 	});
+
+	it("caps the default reserve at half of a small context window", () => {
+		// The default 16384-token reserve would leave no room at all in 8k and 16k windows.
+		expect(shouldCompact(4_095, 8_192, settings)).toBe(false);
+		expect(shouldCompact(4_096, 8_192, settings)).toBe(true);
+		expect(shouldCompact(8_191, 16_384, settings)).toBe(false);
+		expect(shouldCompact(8_192, 16_384, settings)).toBe(true);
+		// Windows of at least twice the reserve keep the configured reserve boundary.
+		expect(shouldCompact(16_383, 32_768, settings)).toBe(false);
+		expect(shouldCompact(16_384, 32_768, settings)).toBe(true);
+	});
 });
 
 describe("findCutPoint", () => {

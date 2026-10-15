@@ -11,7 +11,14 @@ import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
 import { setCapabilityOverrides } from "@earendil-works/pi-tui";
 import chalk from "chalk";
-import { type Args, type Mode, normalizeSessionName, parseArgs, printHelp } from "./cli/args.ts";
+import {
+	type Args,
+	type Mode,
+	normalizeSessionName,
+	parseArgs,
+	printHelp,
+	restoreBooleanFlagValues,
+} from "./cli/args.ts";
 import {
 	type AuthCheckResult,
 	checkProviderAuth,
@@ -368,9 +375,11 @@ async function promptConfirm(message: string): Promise<boolean> {
 			input: process.stdin,
 			output: process.stdout,
 		});
+		// EOF closes the interface without an answer; treat it as "no" instead of exiting silently.
+		rl.once("close", () => resolve(false));
 		rl.question(`${message} [y/N] `, (answer) => {
-			rl.close();
 			resolve(answer.toLowerCase() === "y" || answer.toLowerCase() === "yes");
+			rl.close();
 		});
 	});
 }
@@ -439,6 +448,7 @@ export async function createSessionManager(
 	cwd: string,
 	sessionDir: string | undefined,
 	settingsManager: SettingsManager,
+	appMode: AppMode,
 ): Promise<SessionManager> {
 	if (parsed.noSession || parsed.help || parsed.listModels !== undefined) {
 		return SessionManager.inMemory(cwd, parsed.sessionId !== undefined ? { id: parsed.sessionId } : undefined);
@@ -476,6 +486,15 @@ export async function createSessionManager(
 				return openSessionOrExit(resolved.path, sessionDir);
 
 			case "global": {
+				if (appMode !== "interactive") {
+					// Without a terminal to ask on, stdin carries the prompt or the RPC protocol.
+					console.error(
+						chalk.red(
+							`Session '${parsed.session}' belongs to a different project: ${resolved.cwd}. Use --fork ${parsed.session} to fork it into the current directory.`,
+						),
+					);
+					process.exit(1);
+				}
 				console.log(chalk.yellow(`Session found in different project: ${resolved.cwd}`));
 				const shouldFork = await promptConfirm("Fork this session into current directory?");
 				if (!shouldFork) {
@@ -776,7 +795,7 @@ export async function main(args: string[], options?: MainOptions) {
 		(parsed.sessionDir ? normalizePath(parsed.sessionDir) : undefined) ??
 		(envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
 		startupSettingsManager.getSessionDir();
-	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager, appMode);
 	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
 	if (missingSessionCwdIssue) {
 		if (appMode === "interactive") {
@@ -968,6 +987,18 @@ export async function main(args: string[], options?: MainOptions) {
 		await listModels(modelRuntime, searchPattern, AbortSignal.timeout(15_000));
 		process.exit(0);
 	}
+
+	// Extension flags are registered now. A boolean flag must give back the prompt parsed as its value.
+	restoreBooleanFlagValues(
+		parsed,
+		new Set(
+			resourceLoader.getExtensions().extensions.flatMap((extension) =>
+				Array.from(extension.flags.values())
+					.filter((flag) => flag.type === "boolean")
+					.map((flag) => flag.name),
+			),
+		),
+	);
 
 	// Read piped stdin content (if any) - skip for RPC mode which uses stdin for JSON-RPC
 	let stdinContent: string | undefined;

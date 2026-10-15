@@ -41,15 +41,19 @@ const channelDir = path.join(tempRoot, "supervisor-channels", "late-reply");
 type SentMessage = { message: { content: string; customType: string }; options: unknown };
 type ToolLike = { name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> };
 
-function fakePi(sent: SentMessage[] = []) {
+type CommandLike = { handler: (args: string, ctx: unknown) => Promise<void> };
+
+function fakePi(sent: SentMessage[] = [], extraTools: string[] = []) {
 	const tools: ToolLike[] = [];
+	const commands = new Map<string, CommandLike>();
 	const pi = {
 		registerTool: (tool: ToolLike) => tools.push(tool),
-		getAllTools: () => tools,
+		registerCommand: (name: string, command: CommandLike) => commands.set(name, command),
+		getAllTools: () => [...tools, ...extraTools.map((name) => ({ name }))],
 		sendMessage: (message: SentMessage["message"], options: unknown) => sent.push({ message, options }),
 		events: { emit: () => {}, on: () => () => {} },
 	};
-	return { pi: pi as unknown as ExtensionAPI, tools, sent };
+	return { pi: pi as unknown as ExtensionAPI, tools, sent, commands };
 }
 
 function parentState(): SubagentState {
@@ -223,5 +227,81 @@ describe("native supervisor late replies", () => {
 			channel.dispose();
 		}
 	});
-});
 
+	it("lets the user answer a waiting subagent directly with /subagent-reply", async () => {
+		process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "20000";
+		const child = fakePi();
+		registerNativeSupervisorClient(child.pi);
+		const contact = child.tools.find((tool) => tool.name === "contact_supervisor")!;
+
+		const parentSent: SentMessage[] = [];
+		const parent = fakePi(parentSent, ["ask_user"]);
+		const state = parentState();
+		const channel = createNativeSupervisorChannel(parent.pi, state, { platform: "win32" });
+		channel.start();
+		try {
+			const ask = contact.execute("call-1", { reason: "need_decision", message: "Which branch?" }, undefined);
+			const notice = await until(() => parentSent.find((sent) => sent.message.customType === "subagent_supervisor_request"));
+			expect(notice.message.content).toContain("ask them with ask_user");
+			expect(notice.message.content).toContain("/subagent-reply ");
+
+			// The user picks nothing to choose (one waiting subagent) and types the answer.
+			const notices: string[] = [];
+			const inputs: string[] = [];
+			const ui = {
+				hasUI: true,
+				sessionManager: { getSessionId: () => SESSION_ID },
+				ui: {
+					notify: (message: string) => notices.push(message),
+					select: async () => {
+						throw new Error("no choice needed for a single waiting subagent");
+					},
+					input: async (title: string) => {
+						inputs.push(title);
+						return "Use main.";
+					},
+				},
+			};
+			await parent.commands.get("subagent-reply")!.handler("", ui);
+			expect(inputs).toEqual(["Answer worker: Which branch?"]);
+			expect(notices).toEqual(["Sent your answer to worker."]);
+			const reply = await ask;
+			expect(reply.content[0]!.text).toContain("Use main.");
+
+			// The agent answering the same request afterwards learns the user already did.
+			const requestId = (notice.message as unknown as { details: { id: string } }).details.id;
+			const supervisor = parent.tools.find((tool) => tool.name === "subagent_supervisor")!;
+			await expect(
+				supervisor.execute("call-2", { action: "reply", replyTo: requestId, message: "Use dev." }),
+			).rejects.toThrow("already answered by the user");
+		} finally {
+			channel.dispose();
+		}
+	}, 30_000);
+
+	it("routes '/subagent-reply <agent> <answer>' to that agent's request", async () => {
+		process.env.PI_INTERCOM_ASK_TIMEOUT_MS = "20000";
+		const child = fakePi();
+		registerNativeSupervisorClient(child.pi);
+		const contact = child.tools.find((tool) => tool.name === "contact_supervisor")!;
+		const parentSent: SentMessage[] = [];
+		const parent = fakePi(parentSent);
+		const channel = createNativeSupervisorChannel(parent.pi, parentState(), { platform: "win32" });
+		channel.start();
+		try {
+			const ask = contact.execute("call-1", { reason: "need_decision", message: "Which DB?" }, undefined);
+			const notice = await until(() => parentSent.find((sent) => sent.message.customType === "subagent_supervisor_request"));
+			expect(notice.message.content).not.toContain("ask_user");
+			const notices: string[] = [];
+			await parent.commands.get("subagent-reply")!.handler("worker  Postgres, version 17", {
+				hasUI: true,
+				sessionManager: { getSessionId: () => SESSION_ID },
+				ui: { notify: (message: string) => notices.push(message) },
+			});
+			expect(notices).toEqual(["Sent your answer to worker."]);
+			expect((await ask).content[0]!.text).toContain("Postgres, version 17");
+		} finally {
+			channel.dispose();
+		}
+	}, 30_000);
+});

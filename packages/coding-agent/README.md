@@ -14,6 +14,8 @@ The package keeps the upstream npm identity `@earendil-works/pi-coding-agent` fo
 - Automatic model selection after logging in to a different provider.
 - Complete Nippon-color themes for UI, messages, tools, Markdown, diffs, syntax, search, and exports.
 - Interactive, print, JSON, RPC, and SDK modes inherited from Pi.
+- `ask_user` tool: the agent asks you a question (with options or free text) and waits for your answer instead of ending its turn; without a UI it proceeds on a stated assumption. Answer a subagent's question yourself with `/subagent-reply`.
+- `read` renders PDF pages as images with `render=true` (Ghostscript or poppler `pdftoppm`) for checking figures and layout.
 
 Pie shares `~/.pi/agent` with an existing Pi installation, including authentication and sessions.
 

@@ -462,4 +462,8 @@ subagent_supervisor({ action: "pending" })
 
 Native supervisor coordination does not expose generic `intercom` as a fallback. Use `subagent_supervisor` for parent replies.
 
+A decision the parent cannot make on its own belongs to the user: ask them with `ask_user` and relay the answer. The user can also answer directly with `/subagent-reply [request-id|agent] <answer>`, or `/subagent-reply` alone to pick the question and type the answer in a dialog; the parent's own reply to an already-answered request then reports that the user answered it.
+
+A child blocks on a decision for up to `PI_INTERCOM_ASK_TIMEOUT_MS` (10 minutes by default), then continues on a stated assumption. A reply sent later is still delivered to the running child as a steering message.
+
 If intercom messages do not show up, run `subagent({ action: "doctor" })` or `/subagents-doctor`.

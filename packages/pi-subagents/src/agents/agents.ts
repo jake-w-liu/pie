@@ -7,9 +7,8 @@ import * as fs from "node:fs";
 import { parse as parseYaml } from "yaml";
 import * as os from "node:os";
 import * as path from "node:path";
-import { withStateFileLock } from "../missions/workflow-state.ts";
-import { writeAtomicJson } from "../shared/atomic-json.ts";
 import { getPackageRoot } from "../shared/package-root.ts";
+import { withSettingsFileLock, writeSettingsFile } from "../shared/settings-file.ts";
 import { MAX_TIMER_DELAY_MS } from "../shared/timer-limits.ts";
 import type { AcceptanceInput, AcceptanceRole, AgentRunnerConfig, OutputMode, ToolBudgetConfig, TurnBudgetConfig } from "../shared/types.ts";
 import { CODE_OWNED_EXTERNAL_CLI_ADAPTER_LABEL, isCodeOwnedExternalCliAdapterId, parseExternalCliCapabilityNarrowing, validateCodeOwnedProfileRunner } from "../runs/shared/external-cli-contract.ts";
@@ -852,15 +851,6 @@ function readSettingsFileStrict(filePath: string): Record<string, unknown> {
 	return parsed as Record<string, unknown>;
 }
 
-/**
- * settings.json is shared with the coding agent and every other session. Callers hold
- * withStateFileLock across the read-modify-write; tmp+rename means a crash or a concurrent
- * reader never sees a truncated file. Same format as the coding agent's writer.
- */
-function writeSettingsFile(filePath: string, settings: Record<string, unknown>): void {
-	writeAtomicJson(filePath, settings);
-}
-
 function parseOverrideStringArrayOrFalse(
 	value: unknown,
 	meta: { filePath: string; name: string; field: string },
@@ -1517,7 +1507,7 @@ export function removeBuiltinAgentOverride(cwd: string, name: string, scope: "us
 	if (!filePath) throw new Error("Project override is not available here. No project config root was found.");
 	if (!fs.existsSync(filePath)) return { path: filePath, removed: false };
 
-	return withStateFileLock(filePath, () => {
+	return withSettingsFileLock(filePath, () => {
 		const settings = readSettingsFileStrict(filePath);
 		const subagents = settings.subagents;
 		if (!subagents || typeof subagents !== "object" || Array.isArray(subagents)) return { path: filePath, removed: false };
@@ -1548,7 +1538,7 @@ export function mergeBuiltinAgentOverride(
 	const filePath = scope === "project" ? getProjectAgentSettingsPath(cwd) : getUserAgentSettingsPath();
 	if (!filePath) throw new Error("Project override is not available here. No project config root was found.");
 
-	return withStateFileLock(filePath, () => {
+	return withSettingsFileLock(filePath, () => {
 		const settings = readSettingsFileStrict(filePath);
 		const subagents = settings.subagents && typeof settings.subagents === "object" && !Array.isArray(settings.subagents)
 			? { ...(settings.subagents as Record<string, unknown>) }
@@ -1579,7 +1569,7 @@ export function removeBuiltinAgentOverrideFields(
 	if (!filePath) throw new Error("Project override is not available here. No project config root was found.");
 	if (!fs.existsSync(filePath)) return { path: filePath, removed: false };
 
-	return withStateFileLock(filePath, () => {
+	return withSettingsFileLock(filePath, () => {
 		const settings = readSettingsFileStrict(filePath);
 		const subagents = settings.subagents;
 		if (!subagents || typeof subagents !== "object" || Array.isArray(subagents)) return { path: filePath, removed: false };

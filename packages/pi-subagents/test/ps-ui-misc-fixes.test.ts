@@ -12,7 +12,7 @@ import { createMission, readMission, resolveMissionStoreLocation, updateMission 
 import { readFleetTranscript, readFleetTranscriptIncrementally, renderFleetTranscript, type FleetTranscript } from "../src/tui/fleet-transcript.ts";
 import { renderFleetTranscriptIncrementally } from "../src/tui/fleet.ts";
 import { createRunFanoutBudget } from "../src/runs/shared/run-fanout-budget.ts";
-import { collectWatchdogLspDiagnostics } from "../src/watchdog/lsp-diagnostics.ts";
+import { collectWatchdogLspDiagnostics, WatchdogLspDiagnosticsLedger } from "../src/watchdog/lsp-diagnostics.ts";
 
 const runnerPath = fileURLToPath(new URL("../src/runs/background/subagent-runner.ts", import.meta.url));
 
@@ -190,6 +190,70 @@ process.stdin.on("data", (chunk) => {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	}, 30_000);
+
+	it("keeps the diagnostics a server published before it died", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "lsp-partial-"));
+		const binDir = path.join(root, "node_modules", ".bin");
+		fs.mkdirSync(binDir, { recursive: true });
+		fs.writeFileSync(path.join(root, "a.ts"), "export const a: number = 'x';\n");
+		fs.writeFileSync(path.join(root, "b.ts"), "export const b = 1;\n");
+		const server = path.join(binDir, "typescript-language-server");
+		// Publishes diagnostics for a.ts, then exits once it has read the last notification (the
+		// didSave for b.ts) and flushed its output, so b.ts never gets diagnostics.
+		fs.writeFileSync(server, `#!/usr/bin/env node
+let buffer = Buffer.alloc(0);
+const send = (message) => {
+ const body = JSON.stringify(message);
+ process.stdout.write(\`Content-Length: \${Buffer.byteLength(body)}\\r\\n\\r\\n\${body}\`);
+};
+process.stdin.on("data", (chunk) => {
+ buffer = Buffer.concat([buffer, chunk]);
+ while (true) {
+  const end = buffer.indexOf("\\r\\n\\r\\n");
+  if (end < 0) return;
+  const length = Number(/content-length:\\s*(\\d+)/i.exec(buffer.subarray(0, end).toString())[1]);
+  if (buffer.length < end + 4 + length) return;
+  const message = JSON.parse(buffer.subarray(end + 4, end + 4 + length).toString());
+  buffer = buffer.subarray(end + 4 + length);
+  const uri = message.params?.textDocument?.uri ?? "";
+  if (message.method === "initialize") send({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });
+  if (message.method === "textDocument/didOpen" && uri.endsWith("/a.ts")) {
+   send({ jsonrpc: "2.0", method: "textDocument/publishDiagnostics", params: { uri, diagnostics: [{ range: { start: { line: 0, character: 13 }, end: { line: 0, character: 14 } }, severity: 1, code: 2322, source: "typescript", message: "Type 'string' is not assignable to type 'number'." }] } });
+  }
+  if (message.method === "textDocument/didSave" && uri.endsWith("/b.ts")) process.stdout.write("", () => process.exit(1));
+ }
+});
+`);
+		fs.chmodSync(server, 0o755);
+		try {
+			const result = await collectWatchdogLspDiagnostics({
+				cwd: root,
+				root,
+				changedPaths: ["a.ts", "b.ts"],
+				// Generous: the server dies on its own, so the deadline only bounds a stuck run.
+				config: { enabled: true, timeoutMs: 20_000, maxFiles: 5, maxDiagnostics: 50 },
+			});
+			expect(result.status).toBe("failed");
+			expect(result.message).toContain("language server exited with code 1");
+			expect(result.diagnostics).toEqual([
+				{
+					path: "a.ts",
+					line: 1,
+					column: 14,
+					severity: "error",
+					source: "typescript",
+					code: "2322",
+					message: "Type 'string' is not assignable to type 'number'.",
+				},
+			]);
+			// Reported once, like the partial result of a timeout.
+			const ledger = new WatchdogLspDiagnosticsLedger();
+			expect(ledger.reduce(result).diagnostics).toHaveLength(1);
+			expect(ledger.reduce(result).diagnostics).toEqual([]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	}, 45_000);
 });
 
 describe("Herdr inspector startup regression", () => {

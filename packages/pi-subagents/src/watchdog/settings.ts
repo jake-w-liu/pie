@@ -1,8 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { withStateFileLock } from "../missions/workflow-state.ts";
-import { writeAtomicJson } from "../shared/atomic-json.ts";
 import { THINKING_LEVELS, type ThinkingLevel } from "../shared/model-info.ts";
+import { withSettingsFileLock, writeSettingsFile } from "../shared/settings-file.ts";
 import { getAgentDir, getProjectConfigDir } from "../shared/utils.ts";
 import {
 	WATCHDOG_DELIVERY_MODES,
@@ -501,26 +500,22 @@ function targetSettingsObject(watchdog: Record<string, unknown>, target: Watchdo
 	return ensureObjectField(overrides, target.agent.trim(), `subagents.watchdog.children.overrides.${target.agent.trim()}`, meta);
 }
 
-function writeSettingsFile(settingsPath: string, settings: Record<string, unknown>): string {
-	writeAtomicJson(settingsPath, settings);
-	return settingsPath;
-}
-
 export function writeUserWatchdogEnabled(enabled: boolean): string {
 	const settingsPath = getUserSettingsPath();
-	return withStateFileLock(settingsPath, () => {
+	return withSettingsFileLock(settingsPath, () => {
 		const meta: ParseMeta = { scope: "user", path: settingsPath };
 		const settings = readSettingsFileStrict(settingsPath);
 		const watchdog = ensureWatchdogSettings(settings, meta);
 		watchdog.enabled = enabled;
 		targetSettingsObject(watchdog, { kind: "main" }, meta).enabled = enabled;
-		return writeSettingsFile(settingsPath, settings);
+		writeSettingsFile(settingsPath, settings);
+		return settingsPath;
 	});
 }
 
 export function writeWatchdogModelSettings(input: WatchdogModelSettingsWrite): string {
 	const settingsPath = settingsPathForWrite(input.scope, input.cwd);
-	return withStateFileLock(settingsPath, () => {
+	return withSettingsFileLock(settingsPath, () => {
 		const meta: ParseMeta = { scope: input.scope, path: settingsPath };
 		const settings = readSettingsFileStrict(settingsPath);
 		const watchdog = ensureWatchdogSettings(settings, meta);
@@ -529,7 +524,8 @@ export function writeWatchdogModelSettings(input: WatchdogModelSettingsWrite): s
 		else if (input.model !== undefined) target.model = input.model;
 		if (input.thinking === null) delete target.thinking;
 		else if (input.thinking !== undefined) target.thinking = input.thinking;
-		return writeSettingsFile(settingsPath, settings);
+		writeSettingsFile(settingsPath, settings);
+		return settingsPath;
 	});
 }
 

@@ -111,6 +111,39 @@ export function requiresToolCallId(modelId: string): boolean {
 	);
 }
 
+// OpenAI Chat Completions keeps only the first 40 characters of a tool call id (see
+// openai-completions.ts), the shortest cut any replay applies; OpenAI Responses and Gemini 3 keep 64.
+const GENERATED_TOOL_CALL_ID_MAX_LENGTH = 40;
+// 16 symbols from a 62-character alphabet carry about 95 random bits, so two ids generated for
+// the same tool never collide in practice.
+const GENERATED_TOOL_CALL_ID_RANDOM_LENGTH = 16;
+const GENERATED_TOOL_CALL_ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+/**
+ * Id for a Gemini function call that arrived without one, or with a duplicate.
+ *
+ * Replaying a session to another provider cuts ids to 40 or 64 characters and replaces characters
+ * outside [a-zA-Z0-9_-]. A time-ordered suffix (a UUIDv7) after the full tool name differs only in
+ * its last characters between calls made in the same millisecond, so parallel calls of a
+ * long-named tool were cut down to one shared id. Here the random characters come right after the
+ * tool name, which is shortened until the whole id fits in 40 characters, and only
+ * [a-zA-Z0-9_-] is used, so no replay changes the id. Random ids also never repeat in a later
+ * process, which a resumed session relies on.
+ */
+export function createGoogleToolCallId(toolName: string | undefined): string {
+	const name = (toolName ?? "")
+		.replace(/[^a-zA-Z0-9_-]/g, "_")
+		.slice(0, GENERATED_TOOL_CALL_ID_MAX_LENGTH - GENERATED_TOOL_CALL_ID_RANDOM_LENGTH - 1);
+	const bytes = globalThis.crypto.getRandomValues(new Uint8Array(GENERATED_TOOL_CALL_ID_RANDOM_LENGTH));
+	// byte % 62 makes 8 of the 62 symbols slightly likelier (5/256 instead of 4/256), which costs
+	// less than 0.01 bit per character.
+	const random = Array.from(
+		bytes,
+		(byte) => GENERATED_TOOL_CALL_ID_ALPHABET[byte % GENERATED_TOOL_CALL_ID_ALPHABET.length],
+	).join("");
+	return `${name}_${random}`;
+}
+
 function getGeminiMajorVersion(modelId: string): number | undefined {
 	const match = modelId.toLowerCase().match(/^gemini(?:-live)?-(\d+)/);
 	if (!match) return undefined;

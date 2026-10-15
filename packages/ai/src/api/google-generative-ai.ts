@@ -24,11 +24,11 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { providerHeadersToRecord } from "../utils/headers.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
-import { uuidv7 } from "../utils/uuid.ts";
 import type { GoogleApiThinkingLevel, ResolvedGoogleThinkingLevel } from "./google-shared.ts";
 import {
 	convertMessages,
 	convertTools,
+	createGoogleToolCallId,
 	isThinkingPart,
 	mapStopReason,
 	resolveGoogleFunctionCallingMode,
@@ -185,13 +185,12 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
 							}
 
 							// Generate unique ID if not provided or if it's a duplicate. It must stay
-							// unique across processes: a resumed session replays earlier ids, and a
-							// per-process counter restarting at 1 repeated them (duplicate tool_use
-							// ids are rejected by Anthropic after a model switch).
+							// unique across processes (a resumed session replays earlier ids) and after
+							// other providers truncate it; see createGoogleToolCallId.
 							const providedId = part.functionCall.id;
 							const needsNewId =
 								!providedId || output.content.some((b) => b.type === "toolCall" && b.id === providedId);
-							const toolCallId = needsNewId ? `${part.functionCall.name}_${uuidv7()}` : providedId;
+							const toolCallId = needsNewId ? createGoogleToolCallId(part.functionCall.name) : providedId;
 
 							const toolCall: ToolCall = {
 								type: "toolCall",

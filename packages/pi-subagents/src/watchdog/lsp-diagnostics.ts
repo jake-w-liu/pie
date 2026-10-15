@@ -170,7 +170,9 @@ export class WatchdogLspDiagnosticsLedger {
 	}
 
 	reduce(result: WatchdogLspResult): WatchdogLspResult {
-		if (result.status === "disabled" || result.status === "unavailable" || result.status === "failed") return result;
+		// A failed run still carries what a server published before it died, so it is deduplicated
+		// like a timeout; only an "ok" run proves the paths it did not report are clean.
+		if (result.status === "disabled" || result.status === "unavailable") return result;
 		const currentByPath = new Map<string, Set<string>>();
 		const fresh: WatchdogLspDiagnostic[] = [];
 		for (const diagnostic of result.diagnostics) {
@@ -260,6 +262,7 @@ class JsonRpcLspClient {
 	private readonly child: ChildProcessWithoutNullStreams;
 	private stderr = "";
 	private exited = false;
+	private closed = false;
 	private terminating = false;
 	private transportError: Error | undefined;
 	private exitError: Error | undefined;
@@ -286,6 +289,11 @@ class JsonRpcLspClient {
 			this.exitError ??= new Error(`language server exited${code === null ? "" : ` with code ${code}`}${signal ? ` signal ${signal}` : ""}`);
 			this.rejectPending(this.exitError);
 			this.resolveExitWaiters();
+		});
+		// "exit" can arrive before Node has read everything the server wrote; "close" follows the
+		// end of its stdout, so every message it sent has been handled by then.
+		child.on("close", () => {
+			this.closed = true;
 		});
 	}
 
@@ -326,9 +334,12 @@ class JsonRpcLspClient {
 		this.child.kill("SIGTERM");
 	}
 
-	/** Why the server can no longer deliver diagnostics, once its transport failed or it exited. */
+	/**
+	 * Why the server can no longer deliver diagnostics: set once it has exited (a broken transport
+	 * kills it) and all of its output has been read.
+	 */
 	deadReason(): Error | undefined {
-		return this.transportError ?? this.exitError;
+		return this.closed ? (this.transportError ?? this.exitError) : undefined;
 	}
 
 	stderrTail(): string {
@@ -451,16 +462,21 @@ function initializeParams(root: string): unknown {
 	};
 }
 
-async function waitForDiagnostics(client: JsonRpcLspClient, targets: TargetFile[], timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+async function waitForDiagnostics(
+	client: JsonRpcLspClient,
+	targets: TargetFile[],
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<{ complete: boolean; dead?: Error }> {
 	const started = Date.now();
 	while (!signal?.aborted && Date.now() - started < timeoutMs) {
-		if (targets.every((target) => client.diagnostics.has(target.uri))) return true;
-		// A dead server will never publish the rest; report it instead of waiting out the deadline.
+		if (targets.every((target) => client.diagnostics.has(target.uri))) return { complete: true };
+		// A dead server will never publish the rest; stop instead of waiting out the deadline.
 		const dead = client.deadReason();
-		if (dead) throw dead;
+		if (dead) return { complete: false, dead };
 		await new Promise((resolve) => setTimeout(resolve, Math.min(50, Math.max(1, timeoutMs - (Date.now() - started)))));
 	}
-	return targets.every((target) => client.diagnostics.has(target.uri));
+	return { complete: targets.every((target) => client.diagnostics.has(target.uri)) };
 }
 
 async function collectWithTypeScriptLanguageServer(input: {
@@ -496,17 +512,25 @@ async function collectWithTypeScriptLanguageServer(input: {
 				text,
 			});
 		}
-		const complete = await waitForDiagnostics(client, input.targets, remaining(), input.signal);
+		const { complete, dead } = await waitForDiagnostics(client, input.targets, remaining(), input.signal);
+		// Partial results are kept: a server that died still published diagnostics for some files.
 		const diagnostics = input.targets
 			.flatMap((target) => convertDiagnostics(target, client.diagnostics.get(target.uri) ?? []))
 			.slice(0, input.config.maxDiagnostics);
+		let message: string | undefined;
+		if (dead) {
+			const stderr = client.stderrTail();
+			message = stderr ? `${dead.message}; ${stderr}` : dead.message;
+		} else if (!complete) {
+			message = `Timed out waiting ${input.config.timeoutMs}ms for fresh LSP diagnostics.`;
+		}
 		return {
-			status: complete ? "ok" : "timeout",
+			status: complete ? "ok" : dead ? "failed" : "timeout",
 			provider: input.command.label,
 			checkedPaths: input.targets.map((target) => target.relPath),
 			skippedPaths: input.skippedPaths,
 			diagnostics,
-			...(complete ? {} : { message: `Timed out waiting ${input.config.timeoutMs}ms for fresh LSP diagnostics.` }),
+			...(message ? { message } : {}),
 		};
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);

@@ -6,6 +6,7 @@ import { writeAtomicJson } from "../shared/atomic-json.ts";
 import { BUILTIN_AGENT_NAMES, validateSubagentAgentOverrides } from "../agents/agents.ts";
 import { getPiSpawnCommand } from "../runs/shared/pi-spawn.ts";
 import { findModelInfo, getSupportedThinkingLevels, splitKnownThinkingSuffix, toModelInfo } from "../shared/model-info.ts";
+import { withSettingsFileLock, writeSettingsFile } from "../shared/settings-file.ts";
 import { getAgentDir } from "../shared/utils.ts";
 
 export const DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS = 7;
@@ -474,18 +475,20 @@ export function readSubagentProfile(name: string): { filePath: string; profile: 
 export function applySubagentProfile(name: string): { filePath: string; settingsPath: string } {
 	const { filePath, profile } = readSubagentProfile(name);
 	const settingsPath = getUserSettingsPath();
-	const settings = readSettingsFile(settingsPath);
-	const existing = settings.subagents && typeof settings.subagents === "object" && !Array.isArray(settings.subagents)
-		? settings.subagents as Record<string, unknown>
-		: {};
-	// A profile owns the complete agent mapping, but unrelated subagent settings
-	// (notably disableBuiltins, modelScope, watchdog, etc.) survive profile switches.
-	settings.subagents = {
-		...existing,
-		...profile.subagents,
-		agentOverrides: profile.subagents.agentOverrides,
-	};
-	writeJsonFile(settingsPath, settings);
+	withSettingsFileLock(settingsPath, () => {
+		const settings = readSettingsFile(settingsPath);
+		const existing = settings.subagents && typeof settings.subagents === "object" && !Array.isArray(settings.subagents)
+			? settings.subagents as Record<string, unknown>
+			: {};
+		// A profile owns the complete agent mapping, but unrelated subagent settings
+		// (notably disableBuiltins, modelScope, watchdog, etc.) survive profile switches.
+		settings.subagents = {
+			...existing,
+			...profile.subagents,
+			agentOverrides: profile.subagents.agentOverrides,
+		};
+		writeSettingsFile(settingsPath, settings);
+	});
 	return { filePath, settingsPath };
 }
 

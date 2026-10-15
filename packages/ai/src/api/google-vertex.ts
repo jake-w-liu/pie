@@ -33,6 +33,7 @@ import type { GoogleApiThinkingLevel, ResolvedGoogleThinkingLevel } from "./goog
 import {
 	convertMessages,
 	convertTools,
+	createGoogleToolCallId,
 	isThinkingPart,
 	mapStopReason,
 	resolveGoogleFunctionCallingMode,
@@ -65,9 +66,6 @@ const THINKING_LEVEL_MAP: Record<GoogleApiThinkingLevel, ThinkingLevel> = {
 	MEDIUM: ThinkingLevel.MEDIUM,
 	HIGH: ThinkingLevel.HIGH,
 };
-
-// Counter for generating unique tool call IDs
-let toolCallCounter = 0;
 
 export const stream: StreamFunction<"google-vertex", GoogleVertexOptions> = (
 	model: Model<"google-vertex">,
@@ -207,9 +205,7 @@ export const stream: StreamFunction<"google-vertex", GoogleVertexOptions> = (
 							const providedId = part.functionCall.id;
 							const needsNewId =
 								!providedId || output.content.some((b) => b.type === "toolCall" && b.id === providedId);
-							const toolCallId = needsNewId
-								? `${part.functionCall.name}_${Date.now()}_${++toolCallCounter}`
-								: providedId;
+							const toolCallId = needsNewId ? createGoogleToolCallId(part.functionCall.name) : providedId;
 
 							const toolCall: ToolCall = {
 								type: "toolCall",

@@ -180,10 +180,15 @@ release_in_use() {
 	if command -v realpath >/dev/null 2>&1; then
 		resolved="$(realpath "$directory" 2>/dev/null || printf '%s' "$directory")"
 	fi
+	# Capture the listing first: under pipefail, `lsof | grep -q` reports failure exactly when
+	# grep matches early, because lsof then dies of SIGPIPE (status 141). That inverted this
+	# check and removed the release live sessions were still running from.
+	local listing
+	listing="$(lsof -F n 2>/dev/null || true)"
 	if [[ "$resolved" == "$directory" ]]; then
-		lsof -F n 2>/dev/null | grep -qF "n$directory"
+		grep -qF "n$directory" <<<"$listing"
 	else
-		lsof -F n 2>/dev/null | grep -qF -e "n$directory" -e "n$resolved"
+		grep -qF -e "n$directory" -e "n$resolved" <<<"$listing"
 	fi
 }
 

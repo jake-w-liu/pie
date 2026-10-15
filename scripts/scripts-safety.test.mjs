@@ -294,3 +294,23 @@ test("tool stats encodes session strings as JSON data instead of executable mark
 	assert.doesNotMatch(html, /globalThis\.PWNED=true<\/script>/);
 	assert.match(html, /\\u003c\/script>/);
 });
+
+test("refresh keeps a previous release that a running session still has open", { skip: process.platform === "win32" }, () => {
+	const root = temporaryRoot("pie-refresh-in-use-");
+	const script = readFileSync(join(repositoryRoot, "scripts/refresh-pie.sh"), "utf8");
+	const releaseInUse = /^release_in_use\(\) \{\n[\s\S]*?\n\}$/m.exec(script)?.[0];
+	assert.ok(releaseInUse, "release_in_use() not found in refresh-pie.sh");
+	// An lsof whose matching line comes first and is followed by a long listing: grep -q in a
+	// pipeline exits early, lsof dies of SIGPIPE, and pipefail used to turn the match into "not in use".
+	const bin = join(root, "bin");
+	mkdirSync(bin);
+	writeFileSync(
+		join(bin, "lsof"),
+		'#!/bin/bash\necho "n/releases/release.LIVE/node_modules/native.node"\nfor i in $(seq 1 200000); do echo "n/other/$i"; done\n',
+		{ mode: 0o755 },
+	);
+	const probe = `set -euo pipefail\n${releaseInUse}\nrelease_in_use /releases/release.LIVE && echo in-use || echo free\nrelease_in_use /releases/release.GONE && echo in-use || echo free\n`;
+	const result = run("bash", ["-c", probe], { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } });
+	assert.equal(result.status, 0, result.stderr);
+	assert.deepEqual(result.stdout.trim().split("\n"), ["in-use", "free"]);
+});

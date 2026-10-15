@@ -74,9 +74,12 @@ function findNextDataScheme(text: string, from: number): number {
 
 // RFC 2397 header: optional type/subtype, then ;parameters (one may be ;base64).
 // Tokens use RFC 2045 token characters except the backtick, which delimits Markdown code,
-// plus "@" for Gradio's "data:@file/octet-stream;base64,...". The slash may be JSON-escaped
-// ("image\/png"), as PHP's json_encode and so the WordPress REST API write it.
+// plus "@" for Gradio's "data:@file/octet-stream;base64,...". Inside a quoted string the slash
+// may be JSON-escaped ("image\/png"), as PHP's json_encode and so the WordPress REST API write
+// it. Outside quotes an escaped slash is code, such as the regex literal /^data:image\/png;/.
 const DATA_URI_HEADER_PATTERN =
+	/(?:[!#$%&'*+.^_{|}~0-9A-Za-z@-]+\/[!#$%&'*+.^_{|}~0-9A-Za-z@-]+)?(?:;[^\s;,]*)*/y;
+const QUOTED_DATA_URI_HEADER_PATTERN =
 	/(?:[!#$%&'*+.^_{|}~0-9A-Za-z@-]+\\?\/[!#$%&'*+.^_{|}~0-9A-Za-z@-]+)?(?:;[^\s;,]*)*/y;
 // A malformed URI may omit the header and comma ("data:iVBORw0KGgo..."). 64 base64
 // characters (48 bytes) tell such a payload from an identifier after a `data:` label in
@@ -84,9 +87,10 @@ const DATA_URI_HEADER_PATTERN =
 const HEADERLESS_BASE64_PATTERN = /[A-Za-z0-9+/]{64}/y;
 
 /** True when a header, the comma of an empty one, or a header-less base64 payload directly follows `data:`. */
-function startsWithDataUriHeader(text: string, headerStart: number): boolean {
-	DATA_URI_HEADER_PATTERN.lastIndex = headerStart;
-	const header = DATA_URI_HEADER_PATTERN.exec(text)?.[0] ?? "";
+function startsWithDataUriHeader(text: string, headerStart: number, quoted: boolean): boolean {
+	const pattern = quoted ? QUOTED_DATA_URI_HEADER_PATTERN : DATA_URI_HEADER_PATTERN;
+	pattern.lastIndex = headerStart;
+	const header = pattern.exec(text)?.[0] ?? "";
 	if (header.length > 0 || text[headerStart] === ",") return true;
 	HEADERLESS_BASE64_PATTERN.lastIndex = headerStart;
 	return HEADERLESS_BASE64_PATTERN.test(text);
@@ -336,7 +340,7 @@ function sanitizeTextInternal(text: string, sourcePath: string, state: Sanitizat
 		// Prose labels ("data: value") and code such as `send(data: Buffer, enc)` or
 		// `startsWith("data:")` have no header after the scheme and are not URIs; an
 		// enclosure scan would otherwise replace the whole parameter list.
-		if (!startsWithDataUriHeader(text, headerStart)) {
+		if (!startsWithDataUriHeader(text, headerStart, dataUriEnclosure(text, start)?.kind === "quote")) {
 			scanFrom = headerStart;
 			continue;
 		}

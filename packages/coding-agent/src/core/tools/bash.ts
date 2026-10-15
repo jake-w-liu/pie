@@ -501,7 +501,10 @@ export function createShellToolDefinition(
 					if (truncation.lastLinePartial) {
 						// The partial line is the first one shown; only empty lines can follow it.
 						const lastLineSize = formatSize(output.getLastLineBytes());
-						text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${startLine} (line is ${lastLineSize}). Full output: ${snapshot.fullOutputPath}]`;
+						// outputBytes also counts the empty lines after it; report only the partial line.
+						const shownLine = truncation.content.split("\n", 1)[0]!.replace(/\r$/, "");
+						const shownSize = formatSize(Buffer.byteLength(shownLine, "utf-8"));
+						text += `\n\n[Showing last ${shownSize} of line ${startLine} (line is ${lastLineSize}). Full output: ${snapshot.fullOutputPath}]`;
 					} else if (truncation.truncatedBy === "lines") {
 						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. Full output: ${snapshot.fullOutputPath}]`;
 					} else {

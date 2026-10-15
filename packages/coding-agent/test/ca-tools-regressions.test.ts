@@ -336,6 +336,10 @@ describe("coding-agent tool audit regressions", () => {
 			expect(output.startsWith("x".repeat(1024))).toBe(true);
 			expect(output).toContain(`[Showing last 50.0KB of line 2 (line is ${size}.0KB).`);
 		}
+		// The notice counts only the partial line, not the empty lines shown after it:
+		// 50KB budget minus 1500 newline bytes leaves 49700 bytes (48.5KB) of the line.
+		const manyBlank = await runBashWithOutput(`${"x".repeat(150 * 1024)}${"\n".repeat(1501)}`);
+		expect(manyBlank).toContain("[Showing last 48.5KB of line 1 (line is 150.0KB).");
 	});
 
 	it.skipIf(process.platform === "win32")(

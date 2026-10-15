@@ -22,7 +22,7 @@ function splitsSurrogatePair(text: string, offset: number): boolean {
 }
 
 function normalize(value: string): string {
-	return value.normalize("NFD").replace(/\p{Diacritic}/gu, "").toLocaleLowerCase();
+	return value.normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
 }
 
 function editDistanceWithin(left: string, right: string, maximum: number): boolean {

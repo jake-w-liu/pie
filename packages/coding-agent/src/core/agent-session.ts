@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import type {
@@ -322,6 +323,11 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 // AgentSession Class
 // ============================================================================
 
+/**
+ * The prompt() calls whose input handlers are on the current async stack. waitForIdle() must not
+ * wait for those: their runs cannot start until the handler that is waiting returns.
+ */
+const promptInputHandlerScope = new AsyncLocalStorage<ReadonlySet<object>>();
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -339,7 +345,7 @@ export class AgentSession {
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
 	/** prompt() calls that have not yet claimed a run, queued their message, or ended without one. */
-	private _preparingPromptCount = 0;
+	private readonly _preparingPrompts = new Set<object>();
 
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
 	private _steeringMessages: QueuedUserMessage[] = [];
@@ -1296,12 +1302,10 @@ export class AgentSession {
 		// The run is claimed only after the input handlers are awaited. Until then waitForIdle() must still
 		// wait for this prompt, or a run that an extension command starts without awaiting it
 		// (pi.sendUserMessage) begins after waitForIdle() has already returned.
-		let preparing = true;
-		this._preparingPromptCount++;
+		const preparingToken = {};
+		this._preparingPrompts.add(preparingToken);
 		const finishPreparing = (): void => {
-			if (!preparing) return;
-			preparing = false;
-			this._preparingPromptCount--;
+			if (!this._preparingPrompts.delete(preparingToken)) return;
 			this._resolveIdleWaitIfIdle();
 		};
 
@@ -1324,11 +1328,14 @@ export class AgentSession {
 			let currentText = text;
 			let currentImages = options?.images;
 			if (this._extensionRunner.hasHandlers("input")) {
-				const inputResult = await this._extensionRunner.emitInput(
-					currentText,
-					currentImages,
-					options?.source ?? "interactive",
-					this.isStreaming ? options?.streamingBehavior : undefined,
+				const enclosingPrompts = promptInputHandlerScope.getStore() ?? [];
+				const inputResult = await promptInputHandlerScope.run(new Set([...enclosingPrompts, preparingToken]), () =>
+					this._extensionRunner.emitInput(
+						currentText,
+						currentImages,
+						options?.source ?? "interactive",
+						this.isStreaming ? options?.streamingBehavior : undefined,
+					),
 				);
 				if (inputResult.action === "handled") {
 					preflightResult?.(true);
@@ -1845,9 +1852,18 @@ export class AgentSession {
 	async waitForIdle(): Promise<void> {
 		// Re-check after each wake-up: the idle wait resolves whenever the session becomes idle, which
 		// can happen while a prompt is still preparing.
-		while (!this.isIdle || this._preparingPromptCount > 0) {
+		while (!this.isIdle || this._hasPreparingPromptOutsideCaller()) {
 			await this._getIdleWaitPromise();
 		}
+	}
+
+	/** Whether a prompt is preparing whose input handlers are not the ones calling waitForIdle(). */
+	private _hasPreparingPromptOutsideCaller(): boolean {
+		const callerPrompts = promptInputHandlerScope.getStore();
+		for (const token of this._preparingPrompts) {
+			if (!callerPrompts?.has(token)) return true;
+		}
+		return false;
 	}
 
 	// =========================================================================

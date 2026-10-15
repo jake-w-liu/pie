@@ -89,6 +89,7 @@ describe("content finding", () => {
 			{ query: "installation", matchCount: 1 },
 			{ query: "it’s free", matchCount: 1 },
 		]);
+		expect(findContent(page, ["It’s"], "fuzzy").queryResults).toEqual([{ query: "It’s", matchCount: 1 }]);
 	});
 
 	it("splits fuzzy paragraphs at CRLF and whitespace-only blank lines", () => {
@@ -130,6 +131,9 @@ describe("inline data URI sanitization", () => {
 			"if (url.startsWith('data:')) return;",
 			"call(data:Buffer,encoding)",
 			"call(data:Buffer)",
+			// Regex literals escape the slash outside any quoted string.
+			"var body = req.rawBody.replace(/^data:image\\/png;base64,/, \"\");",
+			"if (/^data:application\\/pdf;base64,/.test(s)) {",
 		]) {
 			expect(sanitizeInlineDataUris(text, "content")).toEqual({ text, omissions: [] });
 		}
@@ -417,7 +421,7 @@ describe("GitHub extraction", () => {
 		const url = "https://github.com/acme/widget/blob/feature/payments/src/index.ts";
 		const parsed = parseGitHubUrl(url);
 		expect(parsed).not.toBeNull();
-		await expect(resolveGitHubUrlInfo(url, parsed!, 1000)).resolves.toMatchObject({
+		await expect(resolveGitHubUrlInfo(url, parsed!, 10_000)).resolves.toMatchObject({
 			ref: "feature/payments/src",
 			path: "index.ts",
 		});

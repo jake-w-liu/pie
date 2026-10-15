@@ -3304,6 +3304,7 @@ async function runSubagent(
 			.filter((step) => step.status === "running" && typeof step.currentTool === "string" && step.currentTool.length > 0)
 			.sort((left, right) => (right.currentToolStartedAt ?? 0) - (left.currentToolStartedAt ?? 0))[0];
 		setOptionalProperty(statusPayload, "currentTool", activeStep?.currentTool);
+		setOptionalProperty(statusPayload, "currentToolBlocksSupervisor", activeStep?.currentToolBlocksSupervisor);
 		setOptionalProperty(statusPayload, "currentToolStartedAt", activeStep?.currentToolStartedAt);
 		setOptionalProperty(statusPayload, "currentPath", activeStep?.currentPath);
 	};

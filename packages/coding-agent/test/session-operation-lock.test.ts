@@ -345,4 +345,33 @@ describe("session operation exclusion", () => {
 		expect(harness.getPendingResponseCount()).toBe(0);
 		await prompting;
 	}, 30_000);
+
+	it("waitForIdle() from an input handler does not wait for that handler's own prompt", async () => {
+		let waitedInHandler = false;
+		const harness: Harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", async (event) => {
+						if (event.text === "wait") {
+							// An extension holding a command context can reach waitForIdle() here.
+							await harness.session.waitForIdle();
+							waitedInHandler = true;
+						}
+						return undefined;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("answer")]);
+
+		const outcome = await Promise.race([
+			harness.session.prompt("wait").then(() => "settled"),
+			new Promise((resolve) => setTimeout(() => resolve("hung"), 5_000)),
+		]);
+
+		expect(outcome).toBe("settled");
+		expect(waitedInHandler).toBe(true);
+		expect(harness.session.messages.map(describeMessage)).toEqual(["user", "assistant:answer"]);
+	}, 30_000);
 });

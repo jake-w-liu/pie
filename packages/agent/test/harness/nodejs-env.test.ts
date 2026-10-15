@@ -515,14 +515,16 @@ describe("NodeExecutionEnv", () => {
 			const execution = env.exec(`echo $$ > ${toBashSingleQuotedArg(pidFile)}; exec sleep 60`, {
 				abortSignal: controller.signal,
 			});
-			for (let attempt = 0; attempt < 100 && !existsSync(pidFile); attempt++) {
+			// The redirect creates the file before the shell writes its pid into it.
+			const readPid = () => (existsSync(pidFile) ? Number.parseInt(readFileSync(pidFile, "utf8"), 10) : Number.NaN);
+			for (let attempt = 0; attempt < 500 && !Number.isFinite(readPid()); attempt++) {
 				await new Promise((resolve) => setTimeout(resolve, 10));
 			}
-			expect(existsSync(pidFile)).toBe(true);
+			expect(Number.isFinite(readPid())).toBe(true);
 
 			controller.abort();
 			await new Promise((resolve) => setTimeout(resolve, 0));
-			pid = Number.parseInt(readFileSync(pidFile, "utf8"), 10);
+			pid = readPid();
 			process.kill(pid, "SIGKILL");
 
 			const result = await execution;

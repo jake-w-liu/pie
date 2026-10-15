@@ -61,6 +61,9 @@
 - Fixed backward selections dropping endpoint characters and repeated drags becoming double-click selections.
 - Fixed fullscreen selection auto-scroll surviving keyboard input, overlay changes, resize, redraw resets, and non-primary releases.
 - Fixed interrupted CSI mouse reports swallowing subsequent mouse, focus, and keyboard input.
+- Fixed deeply nested blockquotes and lists growing exponentially and crashing the TUI (for example a pasted pytest banner of `>` characters).
+- Fixed a lone `$` or `\(` turning the rest of a finished message into raw Markdown; unclosed math stays raw only while streaming.
+- Fixed `sliceWithWidth` applying stale styles at the slice start, StdinBuffer swallowing typed text after a lone Escape, jump-backward from column 0, `@` completion for names starting with `-`, the unbounded kill ring (now 10 entries, evicting the oldest kill), and quadratic LaTeX rendering.
 
 ## [0.84.3] - 2026-08-24
 

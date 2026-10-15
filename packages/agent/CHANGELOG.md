@@ -57,6 +57,9 @@
 - Fixed a crash between claiming the JSONL writer lease and publishing its owner record leaving a session permanently unwritable. A lease whose owner record is missing or unreadable is reclaimed once the lock directory itself is stale, while a concurrent acquisition is still reported as in progress.
 - Fixed the edit tool inserting a replacement at the start of the file when the matched text was only whitespace, which the fuzzy matcher treated as an empty pattern that "matched" at offset 0; such an edit now reports the text as not found and leaves the file untouched.
 - Fixed fuzzy edit matches being applied in normalized space, which rewrote untouched bytes and converted a file's original line endings. Matches are now mapped back to the original content, so every byte outside the matched ranges and the file's own line endings are preserved.
+- Fixed the agent loop starting another provider request after an abort during `prepareNextTurn`, failing the whole run when a tool returned `undefined`, hanging past abort on a stream that ended without a terminal event, mutating the caller's messages in `agentLoopContinue`, and leaving the provider request running after a listener threw.
+- Fixed `atomicWriteFile` exposing new contents of a private file through a world-readable temp file and failing for writable files in non-writable directories.
+- Fixed JSONL session appends rereading the whole file, two processes stealing the same stale writer lease, prompt-template argument re-expansion, the file mutation queue running on a stale key after a path was repointed, bash spill-file failures turning successful commands into errors, and read reporting a phantom line after a trailing newline.
 
 ## [0.84.3] - 2026-08-24
 

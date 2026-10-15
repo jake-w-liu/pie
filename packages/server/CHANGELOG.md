@@ -8,6 +8,7 @@
 - Fixed the Unix listener socket being briefly world-connectable between `listen()` and the permission change; the socket is now created at its final mode by tightening the umask around the bind, which is restored on every path.
 - Hardened protocol adapters against contradictory lifecycle states, invalid identifiers and timestamps, sparse execution arrays, and additive `pi-ai` contract drift.
 - Sanitized service and runtime failures into stable `not_implemented` and `internal_error` responses without exposing private error details ([#7644](https://github.com/earendil-works/pi/pull/7644)).
+- Fixed clients being disconnected when a message contained a lone surrogate; text is now sanitized. A failed command whose error cannot be encoded gets a generic `internal_error` response, while a committed result or event that cannot be encoded still closes and detaches the connection so client state cannot silently drift.
 
 ## [0.84.3] - 2026-08-24
 

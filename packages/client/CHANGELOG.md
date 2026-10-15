@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a `hello_error` received after the handshake being reported as a generic protocol error instead of the server's error.
+
 ## [0.84.3] - 2026-08-24
 
 ## [0.84.2] - 2026-08-14

@@ -55,6 +55,10 @@
 - Fixed a provider rejecting an OAuth token with HTTP 401 before its stored expiry now triggering one token refresh and retry instead of failing every request until re-login.
 - Fixed replaying a turn whose response came from a configured fallback model keeping that model's signed thinking block when the replaying model no longer listed the fallback. The API rejects a signature produced by another model, so the cross-model verdict is now recorded with the response (`AssistantMessage.crossModelResponse`) instead of being re-derived at replay time.
 - Fixed model-catalog publication rejecting valid catalogs: deployment-scoped providers such as Azure OpenAI publish an empty `baseUrl` that is resolved at call time, and models whose price depends on the routed upstream are now dropped from the published catalog by models.dev's unknown-pricing sentinel while remaining available in the runtime model data.
+- Fixed Anthropic OAuth login failing when the callback port is busy; it now reports the bind failure and finishes through a pasted code.
+- Fixed Codex SSE and Mistral streams being aborted `timeoutMs` after the request started even while events kept arriving; `timeoutMs` now bounds the wait for headers and each idle gap.
+- Fixed generated Gemini tool-call ids repeating across processes, which produced duplicate `tool_use` ids after switching a resumed session to Anthropic.
+- Fixed `start` events exposing content the provider filled in later, which made consumers relayed through lazy providers see text twice.
 
 ## [0.84.3] - 2026-08-24
 

@@ -31,6 +31,7 @@
 - Added environment variables and advanced settings for overriding auto-detected terminal hyperlink, image, and truecolor capabilities ([#8665](https://github.com/earendil-works/pi/issues/8665)).
 - Added `fullscreenCopyOnSelect` to disable automatic fullscreen selection copy; when disabled, `Ctrl+X` copies the active text selection before falling back to the last assistant message, while `/tree` still copies the selected message ([#7720](https://github.com/earendil-works/pi/issues/7720)).
 - Built-in providers that define their own dynamic model refresh (NVIDIA, OpenRouter) now serve their models directly from their live provider endpoint instead of the pi.dev remote-catalog overlay, so their `/model` list stays current without waiting for the hosted catalog to update.
+- Added `render=true` to the read tool for PDFs: up to 10 pages are rendered with Ghostscript (or poppler's `pdftoppm`) and attached as images next to the page text, so figures and manuscript layout can be inspected visually.
 
 ### Changed
 
@@ -148,6 +149,15 @@
 - Fixed an edit whose old text was only whitespace inserting the replacement at the start of the file instead of reporting that the text was not found; the file is now left untouched and the edit fails with the usual not-found error.
 - Fixed a prompt that started while an `agent_settled` extension handler was still running clearing the live run's wait promise, which let manual compaction proceed while the other run was still writing to the session.
 - Fixed a paused bash output pipe staying paused when the output spool closed before its backpressure wait settled.
+- Fixed fuzzy edits rewriting text outside the matched region (collapsed indentation, normalized punctuation), undoing an intended re-indent, and miscounting a unique exact match as duplicated; edits no longer run a whole-file character diff, which took seconds to minutes on larger rewrites.
+- Fixed the edit tool silently replacing every non-UTF-8 byte in a file; such files are now refused.
+- Fixed grep globs and find patterns containing `/`, grep discarding all matches when one path was unreadable, quadratic reassembly of long grep output lines, and empty grep lines for invalid UTF-8 content.
+- Fixed bash showing `(no output)` when the last output line exceeded the output tail, the truncated-line size note, and bash timeouts or `pi.exec` cancellation hanging while a detached descendant kept writing.
+- Fixed read retaining every line of a requested window regardless of the output cap, ls omitting dangling symlinks, the PDF first-page line budget, atomic writes narrowing file modes through the umask, and image sniffing treating any file starting with `GIF` as an image.
+- Fixed manual compaction hanging when an `agent_settled` handler triggered a turn, turns triggered during `/tree` navigation leaving orphan tool results, `abort()` not cancelling an in-flight branch summary, image-only steering messages staying queued, and models with context windows of 16k tokens or less rejecting every prompt or branch summary.
+- Fixed print mode exiting before a turn started by an extension command (including behind asynchronous input handlers), reporting exit code 0 after an earlier prompt failed, and ignoring a repeated SIGINT/SIGTERM during shutdown; boolean extension flags no longer swallow the next prompt, `--session` from another project no longer prompts on stdin outside interactive mode, and `@file` arguments for directories and pipes give clean errors or are read.
+- Fixed JSON/RPC `message_start` events carrying text that later deltas repeated, quadratic JSONL record scanning, unbounded `RpcClient` stderr retention, and extension shortcut `ctx.shutdown()` doing nothing while idle.
+- Fixed `subagent_wait` not returning when a subagent asked its supervisor a question, which let the request expire unanswered, and supervisor replies sent after the subagent stopped blocking being rejected; late replies are now delivered to the still-running subagent as a steering message.
 
 ## [0.84.3] - 2026-08-24
 

@@ -51,6 +51,9 @@ export async function execCommand(
 		let killed = false;
 		let timeoutId: NodeJS.Timeout | undefined;
 		let forceKillId: NodeJS.Timeout | undefined;
+		// Once the command is cancelled, stop reading after a fixed pipe deadline: a descendant that
+		// left the process group can keep writing to the inherited pipe forever.
+		const cancellation = new AbortController();
 
 		const sendSignal = (signal: NodeJS.Signals) => {
 			if (useProcessGroup && proc.pid !== undefined) {
@@ -65,6 +68,7 @@ export async function execCommand(
 		};
 
 		const killProcess = () => {
+			cancellation.abort();
 			if (!killed && proc.exitCode === null && proc.signalCode === null) {
 				killed = true;
 				sendSignal("SIGTERM");
@@ -106,7 +110,7 @@ export async function execCommand(
 
 		// Wait for process termination without hanging on inherited stdio handles
 		// held open by detached descendants.
-		waitForChildProcess(proc)
+		waitForChildProcess(proc, cancellation.signal)
 			.then((code) => {
 				// The group leader can exit after TERM while a descendant ignores it.
 				// Finish cleaning up the owned process group before reporting completion.

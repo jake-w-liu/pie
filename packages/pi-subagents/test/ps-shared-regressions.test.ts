@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fsDefault, * as fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
@@ -12,14 +12,21 @@ import { fuzzyResolveModel } from "../src/runs/shared/model-fallback.ts";
 import { applyNestedEvent, type NestedEventRecord, type NestedRegistry } from "../src/runs/shared/nested-events.ts";
 import type { NestedRunSummary } from "../src/shared/types.ts";
 
-function runNode(script: string, args: string[] = [], env: NodeJS.ProcessEnv = process.env): Promise<void> {
-	return new Promise((resolve, reject) => {
-		const child = spawn(process.execPath, [script, ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
-		let stderr = "";
-		child.stderr.setEncoding("utf-8").on("data", (chunk: string) => { stderr += chunk; });
+type SpawnedNode = { child: ChildProcess; done: Promise<void> };
+
+function spawnNode(script: string, args: string[] = [], env: NodeJS.ProcessEnv = process.env): SpawnedNode {
+	const child = spawn(process.execPath, [script, ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
+	let stderr = "";
+	child.stderr.setEncoding("utf-8").on("data", (chunk: string) => { stderr += chunk; });
+	const done = new Promise<void>((resolve, reject) => {
 		child.on("error", reject);
 		child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`child exited ${code}: ${stderr}`)));
 	});
+	return { child, done };
+}
+
+function runNode(script: string, args: string[] = [], env: NodeJS.ProcessEnv = process.env): Promise<void> {
+	return spawnNode(script, args, env).done;
 }
 
 function waitForFile(file: string, timeoutMs = 10_000): Promise<void> {
@@ -149,7 +156,13 @@ import * as fs from "node:fs";
 const [index, ready, go, moduleUrl] = process.argv.slice(2);
 const history = await import(moduleUrl);
 fs.writeFileSync(ready, "");
-while (!fs.existsSync(go)) await new Promise((resolve) => setTimeout(resolve, 5));
+// Exit even if the parent test dies before writing the go file: a leaked child must not
+// keep polling (and burning CPU) for the rest of the session.
+const deadline = Date.now() + 60_000;
+while (!fs.existsSync(go)) {
+	if (Date.now() >= deadline) process.exit(1);
+	await new Promise((resolve) => setTimeout(resolve, 5));
+}
 history.recordRun("worker", \`child-\${index}\`, 0, 1);
 `);
 		const count = 12;
@@ -157,16 +170,48 @@ history.recordRun("worker", \`child-\${index}\`, 0, 1);
 		delete childEnv.PIE_CODING_AGENT_DIR;
 		const children = Array.from({ length: count }, (_unused, index) => {
 			const ready = path.join(root, `ready-${index}`);
-			return { ready, run: runNode(script, [String(index), ready, go, moduleUrl], childEnv) };
+			return { ready, ...spawnNode(script, [String(index), ready, go, moduleUrl], childEnv) };
 		});
-		await Promise.all(children.map(({ ready }) => waitForFile(ready)));
-		fs.writeFileSync(go, "");
-		await Promise.all(children.map(({ run }) => run));
+		try {
+			await Promise.all(children.map(({ ready }) => waitForFile(ready)));
+			fs.writeFileSync(go, "");
+			await Promise.all(children.map(({ done }) => done));
+		} finally {
+			// A child still waiting for `go` would poll forever once this test fails before writing it.
+			for (const { child } of children) child.kill("SIGKILL");
+			await Promise.allSettled(children.map(({ done }) => done));
+		}
 		const entries = fs.readFileSync(history, "utf-8").trim().split("\n").map((line) => JSON.parse(line) as { taskHash?: string });
 		const hashes = new Set(entries.map((entry) => entry.taskHash));
 		for (let index = 0; index < count; index++) {
 			expect(hashes.has(createHash("sha256").update(`child-${index}`).digest("hex"))).toBe(true);
 		}
+	}, 30_000);
+
+	it("records a run while the history lock is held past the retry budget", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "run-history-lock-timeout-"));
+		const history = path.join(root, "run-history.jsonl");
+		// Held by this test, so the writer's retry budget runs out with the lock still fresh.
+		fs.mkdirSync(`${history}.lock`);
+		const moduleUrl = pathToFileURL(fileURLToPath(new URL("../src/runs/shared/run-history.ts", import.meta.url))).href;
+		const script = path.join(root, "worker.ts");
+		fs.writeFileSync(script, `
+const [task, moduleUrl] = process.argv.slice(2);
+const history = await import(moduleUrl);
+history.recordRun("worker", task, 0, 1);
+`);
+		const childEnv: NodeJS.ProcessEnv = {
+			...process.env,
+			PI_CODING_AGENT_DIR: root,
+			PI_SUBAGENT_FS_RETRY_MAX_TOTAL_MS: "0",
+		};
+		delete childEnv.PIE_CODING_AGENT_DIR;
+		await runNode(script, ["contended", moduleUrl], childEnv);
+		const entries = (fs.existsSync(history) ? fs.readFileSync(history, "utf-8").trim() : "")
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => JSON.parse(line) as { taskHash?: string });
+		expect(entries.map((entry) => entry.taskHash)).toContain(createHash("sha256").update("contended").digest("hex"));
 	}, 30_000);
 
 	it("publishes a claimed non-dispatch bridge response", async () => {

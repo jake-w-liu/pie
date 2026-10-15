@@ -19,3 +19,8 @@
 - Fixed `subagent_wait` not returning for a pending `contact_supervisor` request (progress updates still do not end the wait), and late supervisor replies being lost: requests stay answerable while the subagent runs and late replies arrive as steering messages.
 - Fixed `settings.json` writes replacing a symlinked file with a regular file and resetting its mode, and taking a lock the coding agent could not reclaim after a crash; settings writes now follow links, keep the mode, and use the coding agent's lock protocol.
 - Fixed a language server that died after publishing some diagnostics losing them.
+- Fixed `run-history.jsonl` dropping a run when the history lock stayed contended past the retry budget (for example while several concurrent runs recorded under load); the entry is now appended without the lock instead of being discarded.
+
+### Added
+
+- Added `/subagent-reply` to answer a waiting subagent's question yourself; the agent is told about your answer, and question notices point the agent to `ask_user` for decisions that are yours.

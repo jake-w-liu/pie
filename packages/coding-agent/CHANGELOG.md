@@ -32,6 +32,8 @@
 - Added `fullscreenCopyOnSelect` to disable automatic fullscreen selection copy; when disabled, `Ctrl+X` copies the active text selection before falling back to the last assistant message, while `/tree` still copies the selected message ([#7720](https://github.com/earendil-works/pi/issues/7720)).
 - Built-in providers that define their own dynamic model refresh (NVIDIA, OpenRouter) now serve their models directly from their live provider endpoint instead of the pi.dev remote-catalog overlay, so their `/model` list stays current without waiting for the hosted catalog to update.
 - Added `render=true` to the read tool for PDFs: up to 10 pages are rendered with Ghostscript (or poppler's `pdftoppm`) and attached as images next to the page text, so figures and manuscript layout can be inspected visually.
+- Added the built-in `ask_user` tool: the agent asks you a question (with options or free text) and waits for your answer through the standard dialogs in the TUI and over RPC; without a UI it proceeds on a stated assumption. A user extension that defines its own `ask_user` replaces it.
+- Added `yieldsTools` for named inline extensions, so their tools give way to a same-named tool from another extension instead of conflicting.
 
 ### Changed
 
@@ -158,6 +160,8 @@
 - Fixed print mode exiting before a turn started by an extension command (including behind asynchronous input handlers), reporting exit code 0 after an earlier prompt failed, and ignoring a repeated SIGINT/SIGTERM during shutdown; boolean extension flags no longer swallow the next prompt, `--session` from another project no longer prompts on stdin outside interactive mode, and `@file` arguments for directories and pipes give clean errors or are read.
 - Fixed JSON/RPC `message_start` events carrying text that later deltas repeated, quadratic JSONL record scanning, unbounded `RpcClient` stderr retention, and extension shortcut `ctx.shutdown()` doing nothing while idle.
 - Fixed `subagent_wait` not returning when a subagent asked its supervisor a question, which let the request expire unanswered, and supervisor replies sent after the subagent stopped blocking being rejected; late replies are now delivered to the still-running subagent as a steering message.
+- Fixed two settings writers being able to reclaim the same abandoned `settings.json.lock` at once and both write; stale-lock reclaim is now serialized.
+- Fixed `npm run refresh:pie` deleting the previous release while running sessions still used it (its in-use check failed under pipefail), which broke subagents in those sessions.
 
 ## [0.84.3] - 2026-08-24
 

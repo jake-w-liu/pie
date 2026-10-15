@@ -12,6 +12,7 @@
 - The harness `read` tool takes an optional `pdfTextExtractor` and a `pages` parameter, so hosts with a PDF parser (the coding-agent CLI injects one) can read PDFs through the same tool. Without an extractor, PDFs are reported as unsupported instead of being dumped as binary text.
 - Added shared read-tool guards in `harness/tools/text-file.ts`: path checks for device files and known binary extensions, content checks for NUL bytes, UTF-16, and image formats models cannot receive, plus `isPdfPath`/`isPdfContent`. They are exported for hosts that implement their own read tool.
 - Added a cross-process writer lease for JSONL sessions: opening a session for writing claims a sibling lock directory, renews a heartbeat while it is held, and can take over a lease whose holder stopped renewing, so two processes can no longer interleave appends into one session file. Read-only opens hold no claim, never repair the file, and refuse mutations.
+- Added `acquireDirectoryLockSync` (exported from `@earendil-works/pi-agent-core/directory-lock` and `/node`): a proper-lockfile-compatible directory lock with serialized stale-lock reclaim.
 
 ### Changed
 

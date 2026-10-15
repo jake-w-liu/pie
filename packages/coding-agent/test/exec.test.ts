@@ -34,28 +34,42 @@ describe("execCommand", () => {
 	it.skipIf(process.platform === "win32")(
 		"kills its own process group when the timeout fires after the command exited",
 		async () => {
-			// The background loop stays in the command's process group and ignores SIGPIPE.
-			const result = await execCommand(
-				"sh",
-				["-c", "(trap '' PIPE; while :; do echo tick; sleep 0.05; done) & echo pid=$!; exit 0"],
-				process.cwd(),
-				{ timeout: 500 },
-			);
-			const loopPid = Number(/pid=(\d+)/.exec(result.stdout)?.[1]);
-			expect(loopPid).toBeGreaterThan(0);
-			expect(result.killed).toBe(true);
-			// SIGKILL is sent before the call settles; allow the orphan's reaper a moment.
-			const deadline = Date.now() + 3_000;
-			const alive = () => {
-				try {
-					process.kill(loopPid, 0);
-					return true;
-				} catch {
-					return false;
+			// A writer in the command's process group that outlives it, ignores SIGPIPE/EPIPE, and
+			// writes every ~10ms, so the 100ms post-exit pipe grace keeps being re-armed until the
+			// timeout fires. The shell starts it without an interpreter startup delay: a Node writer
+			// can take longer than the grace to print its first line on a loaded machine, and the call
+			// would then settle unkilled instead of exercising the timeout path.
+			let loopPid = 0;
+			try {
+				const result = await execCommand(
+					"sh",
+					["-c", "(trap '' PIPE; while :; do echo tick; sleep 0.01; done) & echo pid=$!; exit 0"],
+					process.cwd(),
+					{ timeout: 500 },
+				);
+				loopPid = Number(/pid=(\d+)/.exec(result.stdout)?.[1]);
+				expect(loopPid).toBeGreaterThan(0);
+				expect(result.killed).toBe(true);
+				// SIGKILL is sent before the call settles; allow the orphan's reaper a moment.
+				const deadline = Date.now() + 3_000;
+				const alive = () => {
+					try {
+						process.kill(loopPid, 0);
+						return true;
+					} catch {
+						return false;
+					}
+				};
+				while (alive() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+				expect(alive()).toBe(false);
+			} finally {
+				// Never leave the writer behind if an assertion failed; it is this test's own child.
+				if (loopPid > 0) {
+					try {
+						process.kill(loopPid, "SIGKILL");
+					} catch {}
 				}
-			};
-			while (alive() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
-			expect(alive()).toBe(false);
+			}
 		},
 		15_000,
 	);

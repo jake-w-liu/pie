@@ -344,6 +344,25 @@ describe("native supervisor late replies", () => {
 			expect([...channel.pending.values()].map((request) => request.agent)).toEqual(["reviewer"]);
 			await reply.handler("reviewer Lenient.", ui);
 			expect((await reviewer).content[0]!.text).toContain("Lenient.");
+
+			// The note names the newest answer: here the agent's, after older answers by the user.
+			const fourth = ask("worker", "Which port?");
+			const fourthRequest = await requestFor("worker");
+			await supervisor.execute("call", { action: "reply", replyTo: fourthRequest.id, message: "8080" });
+			expect((await fourth).content[0]!.text).toContain("8080");
+			await expect(supervisor.execute("call", { action: "reply", to: "worker", message: "9090" })).rejects.toThrow(
+				`Request ${fourthRequest.id} from worker was already answered by the agent`,
+			);
+
+			// A first word whose lowercase form is longer ("İ") is still cut off exactly.
+			const turkish = ask("İİx", "Proceed?");
+			const other = ask("reviewer", "Again?");
+			await requestFor("İİx");
+			await requestFor("reviewer");
+			await reply.handler("İİx abc def", ui);
+			expect((await turkish).content[0]!.text).toContain("abc def");
+			await reply.handler("reviewer done", ui);
+			await other;
 		} finally {
 			channel.dispose();
 		}

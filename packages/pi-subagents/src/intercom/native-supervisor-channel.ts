@@ -763,7 +763,8 @@ function matchPendingRequests(requests: PendingSupervisorRequest[], target: stri
 /** A precise reason why nothing is waiting for `target`, when the user already answered it. */
 function alreadyAnsweredNote(answered: AnsweredRequests, target: string): string {
 	const normalized = target.toLowerCase();
-	for (const [id, entry] of answered) {
+	// Newest first: the most recent answer is the one the caller is most likely asking about.
+	for (const [id, entry] of [...answered].reverse()) {
 		if (id.toLowerCase() === normalized || (normalized.length >= MIN_REQUEST_ID_PREFIX && id.toLowerCase().startsWith(normalized)) || entry.agent.toLowerCase() === normalized) {
 			return ` Request ${id} from ${entry.agent} was already answered by the ${entry.by}.`;
 		}
@@ -888,8 +889,10 @@ async function answerAsUser(
 	if (trimmed) {
 		// "<request-id> <answer>" always; "<agent> <answer>" only to choose among several waiting
 		// subagents. With one waiting, the whole text is the answer, so it may start with any word.
-		const first = trimmed.split(/\s+/, 1)[0]!.toLowerCase();
-		const rest = trimmed.slice(first.length).trim();
+		const firstWord = trimmed.split(/\s+/, 1)[0]!;
+		const first = firstWord.toLowerCase();
+		// Cut by the original word: lowercasing can change the length (for example "İ").
+		const rest = trimmed.slice(firstWord.length).trim();
 		const idMatches = first.length >= MIN_REQUEST_ID_PREFIX ? open.filter((candidate) => candidate.id.toLowerCase().startsWith(first)) : [];
 		const nameMatches = open.filter(
 			(candidate) => candidate.agent.toLowerCase() === first || candidate.childTarget?.toLowerCase() === first,
@@ -915,7 +918,7 @@ async function answerAsUser(
 		}
 	} else {
 		if (!ctx.hasUI) {
-			notify(`Usage: /${USER_REPLY_COMMAND} [request-id|agent] <answer>`, "warning");
+			notify(`Usage: /${USER_REPLY_COMMAND} <answer>, or /${USER_REPLY_COMMAND} <request-id|agent> <answer> when several subagents are waiting`, "warning");
 			return;
 		}
 		if (open.length === 1) {
@@ -931,7 +934,7 @@ async function answerAsUser(
 	if (!message?.trim()) {
 		// A target without an answer: ask for the answer.
 		if (!ctx.hasUI) {
-			notify(`Usage: /${USER_REPLY_COMMAND} [request-id|agent] <answer>`, "warning");
+			notify(`Usage: /${USER_REPLY_COMMAND} <answer>, or /${USER_REPLY_COMMAND} <request-id|agent> <answer> when several subagents are waiting`, "warning");
 			return;
 		}
 		message = await ctx.ui.input(`Answer ${request.agent}: ${questionSummary(request)}`, "Your answer");
@@ -989,7 +992,8 @@ export function createNativeSupervisorChannel(pi: ExtensionAPI, state: SubagentS
 	};
 	// Registered at load, so command listings and autocomplete include it from the start.
 	pi.registerCommand(USER_REPLY_COMMAND, {
-		description: "Answer a subagent's question yourself: /subagent-reply [request-id|agent] <answer>",
+		description:
+			"Answer a subagent's question yourself: /subagent-reply <answer>; with several waiting, start with a request id or agent name",
 		handler: (args, ctx) => answerAsUser(pi, args, ctx, pending, answered, state),
 	});
 

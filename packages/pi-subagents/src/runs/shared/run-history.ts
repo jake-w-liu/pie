@@ -168,7 +168,14 @@ function appendPrivateHistoryLine(historyPath: string, line: string): void {
 	}
 }
 
-function withHistoryLock<T>(historyPath: string, operation: () => T): T {
+/**
+ * Run `operation` while holding the history lock, and report whether it ran.
+ *
+ * `false` means the lock stayed contended past the retry budget, so the caller must
+ * not assume exclusivity. Waiting longer is not an option: this runs synchronously on
+ * the host's thread, so an unbounded wait would freeze the host to avoid a rare drop.
+ */
+function withHistoryLock(historyPath: string, operation: () => void): boolean {
 	const lockPath = `${historyPath}.lock`;
 	for (let attempt = 0; ; attempt++) {
 		try {
@@ -188,12 +195,13 @@ function withHistoryLock<T>(historyPath: string, operation: () => T): T {
 				continue;
 			}
 			const delay = DEFAULT_FILE_SYSTEM_RETRY_DELAYS_MS[attempt];
-			if (delay === undefined) throw new Error(`Timed out acquiring run history lock at '${lockPath}'.`);
+			if (delay === undefined) return false;
 			waitForFileSystemRetry(delay);
 		}
 	}
-	try { return operation(); }
+	try { operation(); }
 	finally { fs.rmSync(lockPath, { recursive: true, force: true }); }
+	return true;
 }
 
 export function recordRun(
@@ -225,13 +233,22 @@ export function recordRun(
 		};
 		const historyPath = getHistoryPath();
 		hardenHistoryStorage(historyPath);
-		withHistoryLock(historyPath, () => {
+		const line = JSON.stringify(entry);
+		const recorded = withHistoryLock(historyPath, () => {
 			let lineCount: number | undefined;
 			try { lineCount = sanitizeHistoryFile(historyPath); } catch {}
-			appendPrivateHistoryLine(historyPath, JSON.stringify(entry));
+			appendPrivateHistoryLine(historyPath, line);
 			if (lineCount === undefined) historyFileStates.delete(historyPath);
 			else rememberHistoryFile(historyPath, lineCount + 1);
 		});
+		if (!recorded) {
+			// Contention outlasted the retry budget (a slow holder under load). A concurrent
+			// rotation can still discard this line, but appending it best-effort keeps the run in
+			// the history in every other case, while dropping it loses the run outright. One
+			// O_APPEND write cannot tear a line or interleave with another writer's append.
+			historyFileStates.delete(historyPath);
+			appendPrivateHistoryLine(historyPath, line);
+		}
 	} catch {
 		// Best-effort — never crash the execution flow for history recording
 	}

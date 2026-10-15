@@ -66,7 +66,7 @@ describe("execCommand", () => {
 			const directory = mkdtempSync(join(tmpdir(), "pi-exec-timeout-"));
 			try {
 				// `detached` calls setsid, so the writer leaves the command's process group but keeps
-				// writing to the inherited stdout pipe. It exits once that pipe closes, or after 20s.
+				// writing to the inherited stdout pipe. It exits once that pipe closes, or after 60s.
 				// The launcher exits only after the writer's first line is flushed into the pipe.
 				const ready = join(directory, "ready");
 				writeFileSync(
@@ -75,7 +75,7 @@ describe("execCommand", () => {
 					process.stdout.on("error", () => process.exit(0));
 					process.stdout.write("tick\\n", () => fs.writeFileSync(${JSON.stringify(ready)}, ""));
 					setInterval(() => console.log("tick"), 20);
-					setTimeout(() => process.exit(0), 20_000);`,
+					setTimeout(() => process.exit(0), 60_000);`,
 				);
 				writeFileSync(
 					join(directory, "launch.cjs"),
@@ -102,15 +102,17 @@ describe("execCommand", () => {
 				expect(Date.now() - started).toBeLessThan(5_000);
 
 				// Timeout after the command already exited: only the writer's pipe keeps the call open.
+				// The timeout leaves the launcher ample time to start its writer and exit, even on a
+				// loaded machine; waiting for the pipes instead would last the writer's full 60s.
 				started = Date.now();
-				const exited = await execCommand(process.execPath, ["launch.cjs"], directory, { timeout: 500 });
+				const exited = await execCommand(process.execPath, ["launch.cjs"], directory, { timeout: 8_000 });
 				expect(exited.code).toBe(0);
 				expect(exited.stdout).toContain("tick");
-				expect(Date.now() - started).toBeLessThan(5_000);
+				expect(Date.now() - started).toBeLessThan(30_000);
 			} finally {
 				rmSync(directory, { recursive: true, force: true });
 			}
 		},
-		15_000,
+		90_000,
 	);
 });

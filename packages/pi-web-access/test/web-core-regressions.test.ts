@@ -168,6 +168,19 @@ describe("inline data URI sanitization", () => {
 		]);
 		expect(result.text).not.toContain(payload.slice(0, 16));
 	});
+
+	it("replaces JSON-escaped data URIs inside escaped or entity-encoded quotes", () => {
+		const payload = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+		for (const text of [
+			// WordPress content.rendered: JSON-encoded HTML escapes both the quote and the slash.
+			`{"content":{"rendered":"<p><img src=\\"data:image\\/png;base64,${payload}\\" alt=\\"\\"><\\/p>"}}`,
+			`<div data-props="{&quot;src&quot;:&quot;data:image\\/png;base64,${payload}&quot;}"></div>`,
+		]) {
+			const result = sanitizeInlineDataUris(text, "content");
+			expect(result.omissions).toHaveLength(1);
+			expect(result.text).not.toContain(payload.slice(0, 16));
+		}
+	});
 });
 
 describe("RSC extraction", () => {

@@ -96,6 +96,16 @@ function startsWithDataUriHeader(text: string, headerStart: number, quoted: bool
 	return HEADERLESS_BASE64_PATTERN.test(text);
 }
 
+/**
+ * Whether the URI starts a quoted string, including quotes that are themselves escaped by an
+ * outer encoding: `src=\"data:...` in JSON-encoded HTML (WordPress `content.rendered`) and
+ * `&quot;data:...` in HTML attributes. A regex literal (`/^data:image\/png;/`) is not quoted.
+ */
+function isQuotedDataUri(text: string, start: number): boolean {
+	if (dataUriEnclosure(text, start)?.kind === "quote") return true;
+	return /(?:\\["'`]|&quot;|&#0*34;|&#x0*22;)$/i.test(text.slice(Math.max(0, start - 8), start));
+}
+
 type DataUriEnclosure =
 	| { kind: "quote"; close: "\"" | "'" | "`" }
 	| { kind: "parentheses" }
@@ -340,7 +350,7 @@ function sanitizeTextInternal(text: string, sourcePath: string, state: Sanitizat
 		// Prose labels ("data: value") and code such as `send(data: Buffer, enc)` or
 		// `startsWith("data:")` have no header after the scheme and are not URIs; an
 		// enclosure scan would otherwise replace the whole parameter list.
-		if (!startsWithDataUriHeader(text, headerStart, dataUriEnclosure(text, start)?.kind === "quote")) {
+		if (!startsWithDataUriHeader(text, headerStart, isQuotedDataUri(text, start))) {
 			scanFrom = headerStart;
 			continue;
 		}

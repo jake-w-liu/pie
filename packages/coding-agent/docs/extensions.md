@@ -1136,6 +1136,8 @@ pi.registerCommand("my-cmd", {
 });
 ```
 
+It also waits for prompts that are still running `input` handlers, so a turn a command starts with `pi.sendUserMessage()` is covered. One exception avoids a deadlock: called from inside an `input` handler, including work that handler starts without awaiting it, `waitForIdle()` does not wait for the prompt that handler is processing, because that prompt cannot run until the handler returns. To observe that prompt's run from detached work, listen for `agent_settled` instead.
+
 ### ctx.newSession(options?)
 
 Create a new session:

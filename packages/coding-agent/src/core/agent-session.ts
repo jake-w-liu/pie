@@ -324,8 +324,10 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 // ============================================================================
 
 /**
- * The prompt() calls whose input handlers are on the current async stack. waitForIdle() must not
- * wait for those: their runs cannot start until the handler that is waiting returns.
+ * The prompt() calls whose input handlers started the current async context. waitForIdle() skips
+ * those, because a handler that awaits it would otherwise wait for its own prompt forever. The
+ * scope also reaches work a handler starts without awaiting; such work cannot use waitForIdle()
+ * to observe that prompt's run (documented in docs/extensions.md).
  */
 const promptInputHandlerScope = new AsyncLocalStorage<ReadonlySet<object>>();
 export class AgentSession {

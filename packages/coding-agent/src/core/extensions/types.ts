@@ -358,7 +358,10 @@ export interface ExtensionCommandContext extends ExtensionContext {
 	/** Get the current base system-prompt construction options. */
 	getSystemPromptOptions(): BuildSystemPromptOptions;
 
-	/** Wait for the agent to finish streaming */
+	/**
+	 * Wait for the agent to settle, including prompts still running input handlers. Called from an
+	 * input handler (or work it starts), it does not wait for the prompt that handler is processing.
+	 */
 	waitForIdle(): Promise<void>;
 
 	/** Start a new session, optionally with initialization. */

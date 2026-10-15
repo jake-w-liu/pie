@@ -49,4 +49,61 @@ describe("edit-diff fuzzy matching", () => {
 	it("normalizeForFuzzyMatch collapses leading indentation and trailing whitespace", () => {
 		expect(normalizeForFuzzyMatch("\tfoo   \n    bar")).toBe(" foo\n bar");
 	});
+
+	it("keeps the untouched start of a line when a mid-line fuzzy match adds lines", () => {
+		const content = "def f(x, y):\n    if x:\n        total = compute(x)  \n        return total\n    return 0\n";
+		const out = apply(
+			content,
+			"compute(x)\n        return total",
+			"compute(x, y)\n        log(total)\n        return total",
+		);
+		expect(out).toBe(
+			"def f(x, y):\n    if x:\n        total = compute(x, y)\n        log(total)\n        return total\n    return 0\n",
+		);
+	});
+
+	it("does not normalize characters outside a fuzzy match", () => {
+		const content = "msg = \u201cHello\u201d  # \uff08\u6ce8\u610f\uff09 \u00bd done \u2014 ok\nnext\n";
+		expect(apply(content, 'msg = "Hello"', 'msg = "Hi"')).toBe(
+			'msg = "Hi"  # \uff08\u6ce8\u610f\uff09 \u00bd done \u2014 ok\nnext\n',
+		);
+	});
+
+	it("does not match part of a character's normalized form", () => {
+		// "½" normalizes to "1⁄2"; replacing only "2" would also rewrite the rest of "½".
+		expect(() => apply("x = \u00bd;\n", "2;", "3;")).toThrow(/not found/i);
+	});
+
+	it("applies an intended re-indent when the old text used the file's indentation", () => {
+		// Trailing spaces after a() force the fuzzy path; the indentation itself matched.
+		const content = "def f(x):\n    if x:\n        a()  \n        b()\n    return 1\n";
+		expect(apply(content, "        a()\n        b()", "        a()\n    b()")).toBe(
+			"def f(x):\n    if x:\n        a()\n    b()\n    return 1\n",
+		);
+	});
+
+	it("translates the old text's indentation style to the file's, including added lines", () => {
+		const content = "function f() {\n\tif (a) {\n\t\tx();\n\t}\n}\n";
+		const out = apply(
+			content,
+			"    if (a) {\n        x();\n    }",
+			"    if (a) {\n        x();\n        y();\n    }",
+		);
+		expect(out).toBe("function f() {\n\tif (a) {\n\t\tx();\n\t\ty();\n\t}\n}\n");
+	});
+
+	it("accepts an exact match that is unique even when fuzzy normalization finds more", () => {
+		expect(apply("    return null;\n        return null;\n", "        return null;", "        return 0;")).toBe(
+			"    return null;\n        return 0;\n",
+		);
+	});
+
+	it("edits a file whose last line is whitespace-only without a trailing newline", () => {
+		const oldText = "const a = 1;\nconst b = 2;";
+		const newText = "const a = 10;\nconst b = 2;";
+		expect(apply("const a = 1;  \nconst b = 2;\n    ", oldText, newText)).toBe("const a = 10;\nconst b = 2;\n    ");
+		expect(apply("const a = 1;  \nconst b = 2;\n\u00a0", oldText, newText)).toBe(
+			"const a = 10;\nconst b = 2;\n\u00a0",
+		);
+	});
 });

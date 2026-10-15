@@ -56,36 +56,63 @@ export type GrepOutputMode = "content" | "files_with_matches" | "count";
 
 const DEFAULT_LIMIT = 20;
 
+/** Search errors quoted in a result; enough to name the unreadable paths without flooding it. */
+const MAX_REPORTED_SEARCH_ERRORS = 5;
+
 export function createUtf8LineDecoder(onLine: (line: string) => void): {
 	write: (chunk: Buffer) => void;
 	end: () => void;
 } {
 	const decoder = new StringDecoder("utf8");
-	let pending = "";
+	// Pieces of the current, still unterminated line. Only newly decoded text is searched for a
+	// newline, so a line spanning many chunks (rg's JSON for a minified file) costs linear time.
+	let partialLine: string[] = [];
 	let ended = false;
-	const drainLines = () => {
-		let newlineIndex = pending.indexOf("\n");
-		while (newlineIndex >= 0) {
-			onLine(pending.slice(0, newlineIndex));
-			pending = pending.slice(newlineIndex + 1);
-			newlineIndex = pending.indexOf("\n");
+	const push = (text: string) => {
+		let lineStart = 0;
+		for (let newline = text.indexOf("\n"); newline !== -1; newline = text.indexOf("\n", lineStart)) {
+			partialLine.push(text.slice(lineStart, newline));
+			const line = partialLine.join("");
+			partialLine = [];
+			onLine(line);
+			lineStart = newline + 1;
 		}
+		if (lineStart < text.length) partialLine.push(text.slice(lineStart));
 	};
 	return {
 		write(chunk) {
 			if (ended) return;
-			pending += decoder.write(chunk);
-			drainLines();
+			push(decoder.write(chunk));
 		},
 		end() {
 			if (ended) return;
 			ended = true;
-			pending += decoder.end();
-			drainLines();
-			if (pending) onLine(pending);
-			pending = "";
+			push(decoder.end());
+			if (partialLine.length > 0) onLine(partialLine.join(""));
+			partialLine = [];
 		},
 	};
+}
+
+/** rg's JSON carries text that is not valid UTF-8 as base64 `bytes` instead of `text`. */
+function decodeRgText(data: { text?: unknown; bytes?: unknown } | undefined): string {
+	if (typeof data?.text === "string") return data.text;
+	if (typeof data?.bytes === "string") return Buffer.from(data.bytes, "base64").toString("utf-8");
+	return "";
+}
+
+/** Summarize rg's stderr for a result that is still returned despite some search errors. */
+function formatSearchErrors(stderr: string): string {
+	const errors = stderr
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0);
+	const summary = "Some paths could not be searched, so results may be incomplete";
+	if (errors.length === 0) return `${summary}.`;
+	const shown = errors.slice(0, MAX_REPORTED_SEARCH_ERRORS).join("; ");
+	const more =
+		errors.length > MAX_REPORTED_SEARCH_ERRORS ? `; and ${errors.length - MAX_REPORTED_SEARCH_ERRORS} more` : "";
+	return `${summary}: ${shown}${more}`;
 }
 
 export interface GrepToolDetails {
@@ -262,7 +289,9 @@ export function createGrepToolDefinition(
 						// 'count' need the full result set.
 						const stopAtLimit = outputMode === "content";
 						const effectiveLimit = stopAtLimit ? Math.max(1, limit ?? DEFAULT_LIMIT) : Number.POSITIVE_INFINITY;
-						const formatPath = (filePath: string): string => {
+						const formatPath = (reportedPath: string): string => {
+							// rg reports paths relative to its working directory, the search directory.
+							const filePath = path.resolve(searchPath, reportedPath);
 							if (isDirectory) {
 								const relative = path.relative(searchPath, filePath);
 								if (relative && !relative.startsWith("..")) {
@@ -288,7 +317,10 @@ export function createGrepToolDefinition(
 						const args: string[] = ["--no-config", "--color=never", "--hidden", "--glob", "!**/.git/**"];
 						if (ignoreCase) args.push("--ignore-case");
 						if (literal) args.push("--fixed-strings");
-						if (glob) args.push("--glob", glob);
+						// rg matches a glob containing "/" relative to its working directory, so it runs
+						// from the search directory: "src/**/*.ts" then means <path>/src/**/*.ts. A leading
+						// "./" never matches in rg's gitignore-style globs and is dropped.
+						if (glob) args.push("--glob", glob.replace(/^(!?)(?:\.\/)+/, "$1"));
 						if (outputMode === "files_with_matches") {
 							args.push("-l");
 						} else if (outputMode === "count") {
@@ -297,9 +329,12 @@ export function createGrepToolDefinition(
 							if (contextValue > 0) args.push("-C", String(contextValue));
 							args.push("--json");
 						}
-						args.push("--", pattern, searchPath);
+						args.push("--", pattern, isDirectory ? "." : searchPath);
 
-						const child = spawn(rgPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+						const child = spawn(rgPath, args, {
+							cwd: isDirectory ? searchPath : undefined,
+							stdio: ["ignore", "pipe", "pipe"],
+						});
 						let stderr = "";
 						let matchCount = 0;
 						let matchLimitReached = false;
@@ -423,7 +458,7 @@ export function createGrepToolDefinition(
 								if (matchLimitReached && trailingContextRemaining === 0) return;
 								const contextLine = event.data?.line_number;
 								if (typeof contextLine === "number" && blockLines) {
-									pushContentLine(relativePath, contextLine, event.data?.lines?.text ?? "", false);
+									pushContentLine(relativePath, contextLine, decodeRgText(event.data?.lines), false);
 									if (trailingContextRemaining > 0 && --trailingContextRemaining === 0) stopChild(true);
 								}
 								return;
@@ -432,7 +467,7 @@ export function createGrepToolDefinition(
 							if (matchCount >= effectiveLimit) {
 								const contextLine = event.data?.line_number;
 								if (trailingContextRemaining > 0 && typeof contextLine === "number" && blockLines) {
-									pushContentLine(relativePath, contextLine, event.data?.lines?.text ?? "", false);
+									pushContentLine(relativePath, contextLine, decodeRgText(event.data?.lines), false);
 									if (--trailingContextRemaining === 0) stopChild(true);
 								}
 								return;
@@ -444,7 +479,7 @@ export function createGrepToolDefinition(
 
 							if (contextValue > 0) {
 								// Inside a begin..end block; rg already ordered the lines.
-								pushContentLine(relativePath, lineNumber, event.data?.lines?.text ?? "", true);
+								pushContentLine(relativePath, lineNumber, decodeRgText(event.data?.lines), true);
 							} else {
 								if (lastFile !== relativePath) {
 									if (outputLines.length > 0) outputLines.push("");
@@ -452,7 +487,7 @@ export function createGrepToolDefinition(
 									lastFile = relativePath;
 								}
 								blockLines = [];
-								pushContentLine(relativePath, lineNumber, event.data?.lines?.text ?? "", true);
+								pushContentLine(relativePath, lineNumber, decodeRgText(event.data?.lines), true);
 								outputLines.push(...blockLines);
 								blockLines = undefined;
 							}
@@ -491,11 +526,16 @@ export function createGrepToolDefinition(
 								settle(() => reject(new Error("Operation aborted")));
 								return;
 							}
-							if (!killedDueToLimit && code !== 0 && code !== 1) {
+							// rg exits 2 when any path could not be searched (for example a directory without
+							// read permission), even when other files matched. Keep those matches and report
+							// the errors with them.
+							const partialResults = code === 2 && matchCount > 0;
+							if (!killedDueToLimit && code !== 0 && code !== 1 && !partialResults) {
 								const errorMsg = stderr.trim() || `ripgrep exited with code ${code}`;
 								settle(() => reject(new Error(errorMsg)));
 								return;
 							}
+							const searchErrors = partialResults ? formatSearchErrors(stderr) : undefined;
 							if (matchCount === 0) {
 								const text = outputMode === "count" ? "0" : "No matches found";
 								settle(() => resolve({ content: [{ type: "text", text }], details: undefined }));
@@ -508,9 +548,10 @@ export function createGrepToolDefinition(
 								// had to re-read and the caller had to hold in memory.
 								const rawOutput = matchedFiles.map((filePath) => formatPath(filePath)).join("\n");
 								const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
-								const text = truncation.truncated
+								let text = truncation.truncated
 									? `${truncation.content}\n\n[${formatSize(DEFAULT_MAX_BYTES)} limit reached. Narrow the path or pattern to see more files.]`
 									: rawOutput;
+								if (searchErrors) text += `\n\n[${searchErrors}]`;
 								settle(() =>
 									resolve({
 										content: [{ type: "text", text }],
@@ -521,9 +562,8 @@ export function createGrepToolDefinition(
 							}
 
 							if (outputMode === "count") {
-								settle(() =>
-									resolve({ content: [{ type: "text", text: String(matchCount) }], details: undefined }),
-								);
+								const text = searchErrors ? `${matchCount}\n\n[${searchErrors}]` : String(matchCount);
+								settle(() => resolve({ content: [{ type: "text", text }], details: undefined }));
 								return;
 							}
 
@@ -550,6 +590,7 @@ export function createGrepToolDefinition(
 								);
 								details.linesTruncated = true;
 							}
+							if (searchErrors) notices.push(searchErrors);
 							if (notices.length > 0) output += `\n\n[${notices.join(". ")}]`;
 							settle(() =>
 								resolve({

@@ -44,6 +44,11 @@ const DEFAULT_LIMIT = 1000;
 // Upper bound so a garbage limit cannot turn a listing into an unbounded scan.
 const MAX_LIMIT = 100_000;
 
+/** Escape glob metacharacters with one-character classes, which fd reads the same way on every platform. */
+function escapeGlobLiteral(text: string): string {
+	return text.replace(/[*?[\]{}\\]/g, (char) => `[${char}]`);
+}
+
 export function getFindProcessError(code: number | null, stderr: string): Error | undefined {
 	if (code === 0) return undefined;
 	return new Error(stderr.trim() || `fd exited with code ${code}`);
@@ -271,13 +276,19 @@ export function createFindToolDefinition(
 						}
 
 						// fd --glob matches against the basename unless --full-path is set; in --full-path
-						// mode it matches against the absolute candidate path, so a path-containing
-						// pattern like 'src/**/*.spec.ts' needs a leading '**/' to match anything.
+						// mode it matches against the absolute candidate path. A path-containing pattern
+						// like 'src/**/*.spec.ts' is relative to the search directory, so it is anchored
+						// there: a '**/' prefix also matched directories above the search root.
 						let effectivePattern = pattern;
 						if (pattern.includes("/")) {
 							args.push("--full-path");
-							if (!pattern.startsWith("/") && !pattern.startsWith("**/") && pattern !== "**") {
-								effectivePattern = `**/${pattern}`;
+							if (!pattern.startsWith("/")) {
+								const root = searchPath.split(path.sep).join("/");
+								const rootPrefix = escapeGlobLiteral(root.endsWith("/") ? root : `${root}/`);
+								effectivePattern = rootPrefix + pattern.replace(/^(?:\.\/)+/, "");
+								// fd picks case sensitivity from uppercase letters in the whole pattern (smart
+								// case). Decide it from the pattern as written, not from the search root.
+								args.push(/\p{Uppercase}/u.test(pattern) ? "--case-sensitive" : "--ignore-case");
 							}
 							// fd matches full paths using native separators on Windows.
 							if (process.platform === "win32")

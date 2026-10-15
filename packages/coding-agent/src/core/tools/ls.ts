@@ -189,8 +189,8 @@ export function createLsToolDefinition(
 								const entryStat = await ops.stat(fullPath);
 								if (entryStat.isDirectory()) suffix = "/";
 							} catch {
-								// Skip entries we cannot stat.
-								continue;
+								// stat follows symlinks, so it fails for a dangling link. The entry still exists
+								// in the directory; list it without the directory suffix.
 							}
 							results.push(entry + suffix);
 						}

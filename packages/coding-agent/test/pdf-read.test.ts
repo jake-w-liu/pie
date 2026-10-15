@@ -233,6 +233,26 @@ describe("formatPdfText", () => {
 		expect(formatted.includedPages).toBeLessThan(50);
 	});
 
+	it("budgets the first page's blank line and marker against the line limit", () => {
+		// Header, blank line, marker, and two text lines are five lines; page 2 would add three more.
+		const formatted = formatPdfText(
+			{
+				ok: true,
+				totalPages: 2,
+				pages: [
+					{ pageNumber: 1, text: "a\nb" },
+					{ pageNumber: 2, text: "c" },
+				],
+				firstPage: 1,
+				lastPage: 2,
+			},
+			{ maxLines: 7, maxBytes: 1024 },
+		);
+		const body = formatted.text.split("\n\n[Showing pages")[0] ?? "";
+		expect(body.split("\n").length).toBeLessThanOrEqual(7);
+		expect(formatted.includedPages).toBe(1);
+	});
+
 	it("marks empty pages inside an otherwise extractable document", () => {
 		const text = formatPdfText({
 			ok: true,

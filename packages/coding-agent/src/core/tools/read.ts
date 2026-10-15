@@ -653,7 +653,9 @@ export function createReadToolDefinition(
 								// lines. This keeps memory bounded for large, newline-heavy files.
 								const startLine = offset === undefined ? 0 : offset - 1;
 								const startLineDisplay = startLine + 1;
-								const retainedLineLimit = limit ?? DEFAULT_MAX_LINES + 1;
+								// Output stops at DEFAULT_MAX_LINES lines, so one more line is enough to detect
+								// truncation. Retaining more of a larger requested window only costs memory and time.
+								const retainedLineLimit = Math.min(limit ?? Number.POSITIVE_INFINITY, DEFAULT_MAX_LINES + 1);
 								let allLines: string[];
 								let totalFileLines: number;
 								// A backend without a head read already has the bytes from the PDF probe.

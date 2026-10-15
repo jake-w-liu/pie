@@ -149,8 +149,13 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 			if (child.pid) trackDetachedChildPid(child.pid);
 			let timedOut = false;
 			let timeoutHandle: NodeJS.Timeout | undefined;
+			// Timeout and abort both kill the process tree, but a descendant that left it (setsid plus a
+			// double fork) can keep the output pipes open and keep writing. Ending the wait through one
+			// signal gives both the fixed pipe deadline instead of waiting for the pipes to go idle.
+			const termination = new AbortController();
 			const onAbort = () => {
 				if (child.pid) killLocalProcessTree(child.pid);
+				termination.abort();
 			};
 
 			try {
@@ -159,6 +164,7 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 					timeoutHandle = setTimeout(() => {
 						timedOut = true;
 						if (child.pid) killLocalProcessTree(child.pid);
+						termination.abort();
 					}, timeoutMs);
 				}
 				// Stream stdout and stderr, pausing both pipes while the output spool drains.
@@ -183,7 +189,7 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 				}
 				// Handle shell spawn errors and wait for the process to terminate without hanging
 				// on inherited stdio handles held by detached descendants.
-				const exitCode = await waitForChildProcess(child, signal);
+				const exitCode = await waitForChildProcess(child, termination.signal);
 				if (signal?.aborted) {
 					throw new Error("aborted");
 				}

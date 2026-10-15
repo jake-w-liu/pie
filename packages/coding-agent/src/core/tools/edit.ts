@@ -11,8 +11,9 @@ import { getExperimentalToolSampling } from "../experimental.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
 import {
 	applyEditsToNormalizedContent,
-	applyNormalizedChangesToOriginal,
+	applyReplacementsToOriginal,
 	computeEditsDiff,
+	decodeEditableText,
 	detectLineEnding,
 	type Edit,
 	type EditDiffError,
@@ -362,18 +363,21 @@ export function createEditToolDefinition(
 
 				// Read the file.
 				const buffer = await ops.readFile(absolutePath);
-				const rawContent = buffer.toString("utf-8");
 				throwIfAborted();
+				const rawContent = decodeEditableText(buffer, path);
 
 				// Strip BOM before matching. The model will not include an invisible BOM in oldText.
 				const { bom, text: content } = splitBom(rawContent);
 				const originalEnding = detectLineEnding(content);
 				const normalizedContent = normalizeToLF(content);
-				const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+				const { baseContent, newContent, replacements } = applyEditsToNormalizedContent(
+					normalizedContent,
+					edits,
+					path,
+				);
 				throwIfAborted();
 
-				const finalContent =
-					bom + applyNormalizedChangesToOriginal(content, normalizedContent, newContent, originalEnding);
+				const finalContent = bom + applyReplacementsToOriginal(content, replacements, originalEnding);
 				// From here the edit has already landed. An abort that arrives while the
 				// write is in flight must not turn a committed change into a failure:
 				// the model would read "Operation aborted" as "nothing happened" and

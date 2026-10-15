@@ -203,7 +203,7 @@ export function formatPdfText(
 		const markerBytes = Buffer.byteLength(marker, "utf8");
 		const sectionBytes = Buffer.byteLength(section.lines.join("\n"), "utf8");
 		if (included.length === 0) {
-			lineCount += 1 + section.lines.length;
+			lineCount += 2 + section.lines.length;
 			firstPageTruncated = lineCount > maxLines || byteCount + markerBytes + sectionBytes > maxBytes;
 		} else {
 			if (lineCount + 2 + section.lines.length > maxLines || byteCount + markerBytes + sectionBytes > maxBytes)

@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
 import { getEventListeners } from "node:events";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createBashTool } from "../src/core/tools/bash.ts";
 import { createEditTool } from "../src/core/tools/edit.ts";
 import { createFindTool, getFindProcessError } from "../src/core/tools/find.ts";
@@ -61,6 +61,39 @@ describe("coding-agent tool audit regressions", () => {
 		expect(await import("node:fs/promises").then(({ readFile }) => readFile(file, "utf8"))).toBe(
 			"progress 10%\r50%\r100%\nversion = 2\r\n",
 		);
+	});
+
+	it("refuses to edit a file that is not valid UTF-8 and leaves its bytes unchanged", async () => {
+		const directory = temporaryDirectory("pi-edit-latin1-");
+		const file = join(directory, "legacy.c");
+		// Latin-1 "é" (0xE9) on a line the edit does not touch.
+		const original = Buffer.concat([
+			Buffer.from("/* Auteur: Ren"),
+			Buffer.from([0xe9]),
+			Buffer.from(" */\nint x = 1;\n"),
+		]);
+		writeFileSync(file, original);
+		await expect(
+			createEditTool(directory).execute("test", {
+				path: "legacy.c",
+				edits: [{ oldText: "int x = 1;", newText: "int x = 2;" }],
+			}),
+		).rejects.toThrow(/not valid UTF-8/);
+		expect(readFileSync(file).equals(original)).toBe(true);
+	});
+
+	it("replaces exactly the matched range in a file with mixed line endings", async () => {
+		const directory = temporaryDirectory("pi-edit-mixed-");
+		const file = join(directory, "mixed.txt");
+		const tool = createEditTool(directory);
+		// The CRLF after "b" lies outside the match and must stay right after it.
+		writeFileSync(file, "a\nb\r\nc\n");
+		await tool.execute("test", { path: "mixed.txt", edits: [{ oldText: "b", newText: "b\nb" }] });
+		expect(readFileSync(file, "utf8")).toBe("a\nb\nb\r\nc\n");
+		// A line-for-line edit keeps each replaced line's own ending.
+		writeFileSync(file, "a\nb\r\nc\n");
+		await tool.execute("test", { path: "mixed.txt", edits: [{ oldText: "b\nc", newText: "B\nC" }] });
+		expect(readFileSync(file, "utf8")).toBe("a\nB\r\nC\n");
 	});
 
 	it("removes abort listeners after ls failures", async () => {
@@ -180,4 +213,165 @@ describe("coding-agent tool audit regressions", () => {
 			clearTimeout(timer);
 		}
 	}, 4_000);
+
+	it("anchors a grep glob containing a slash at the search directory", async () => {
+		const directory = temporaryDirectory("pi-grep-glob-");
+		mkdirSync(join(directory, "src"));
+		mkdirSync(join(directory, "test"));
+		writeFileSync(join(directory, "src", "a.ts"), "needle\n");
+		writeFileSync(join(directory, "test", "b.ts"), "needle\n");
+		const tool = createGrepTool(directory);
+		for (const glob of ["src/**/*.ts", "./src/*.ts"]) {
+			const result = await tool.execute("test", { pattern: "needle", glob, outputMode: "files_with_matches" });
+			expect(textOf(result)).toBe("src/a.ts");
+		}
+	});
+
+	it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+		"keeps grep matches when another path cannot be read",
+		async () => {
+			const directory = temporaryDirectory("pi-grep-unreadable-");
+			mkdirSync(join(directory, "ok"));
+			writeFileSync(join(directory, "ok", "a.txt"), "needle\n");
+			const locked = join(directory, "locked");
+			mkdirSync(locked);
+			chmodSync(locked, 0o000);
+			try {
+				const tool = createGrepTool(directory);
+				for (const outputMode of ["content", "files_with_matches", "count"] as const) {
+					const output = textOf(await tool.execute("test", { pattern: "needle", outputMode }));
+					expect(output).toMatch(outputMode === "count" ? /^1\n/ : /ok\/a\.txt/);
+					expect(output).toContain("could not be searched");
+				}
+			} finally {
+				chmodSync(locked, 0o755);
+			}
+		},
+	);
+
+	it("shows grep matches on lines that are not valid UTF-8", async () => {
+		const directory = temporaryDirectory("pi-grep-latin1-");
+		// Latin-1 "\u00e9" (0xE9): rg reports such a line as base64 bytes instead of text.
+		const bytes = Buffer.concat([Buffer.from("/* r"), Buffer.from([0xe9]), Buffer.from("sum */ needle;\n")]);
+		writeFileSync(join(directory, "legacy.c"), bytes);
+		const output = textOf(await createGrepTool(directory).execute("test", { pattern: "needle" }));
+		expect(output).toContain("legacy.c:1: /* r\ufffdsum */ needle;");
+	});
+
+	it("searches each decoded chunk once while reassembling a long grep line", () => {
+		const chunk = Buffer.alloc(16 * 1024, "x");
+		const chunkCount = 128;
+		const lines: string[] = [];
+		const decoder = createUtf8LineDecoder((line) => lines.push(line));
+		// Searching the whole pending line again for every chunk made reassembly quadratic. Count the
+		// text handed to the newline search: linear reassembly searches each character about once.
+		const originalIndexOf = String.prototype.indexOf;
+		let searched = 0;
+		const indexOf = vi.spyOn(String.prototype, "indexOf").mockImplementation(function (
+			this: string,
+			searchString: string,
+			position?: number,
+		) {
+			searched += this.length - (position ?? 0);
+			return originalIndexOf.call(this, searchString, position);
+		});
+		try {
+			for (let index = 0; index < chunkCount; index++) decoder.write(chunk);
+			decoder.write(Buffer.from("\n"));
+			decoder.end();
+		} finally {
+			indexOf.mockRestore();
+		}
+		expect(lines).toEqual(["x".repeat(chunk.length * chunkCount)]);
+		expect(searched).toBeLessThan(2 * chunk.length * chunkCount);
+	});
+
+	it("anchors a find pattern containing a slash at the search directory", async () => {
+		// A directory named "src" above the search root must not satisfy "src/**".
+		const project = join(temporaryDirectory("pi-find-anchor-"), "src", "proj");
+		mkdirSync(join(project, "src"), { recursive: true });
+		mkdirSync(join(project, "test"));
+		writeFileSync(join(project, "src", "a.ts"), "");
+		writeFileSync(join(project, "test", "b.ts"), "");
+		const tool = createFindTool(project);
+		for (const pattern of ["src/**/*.ts", "./src/*.ts"]) {
+			expect(textOf(await tool.execute("test", { pattern }))).toBe("src/a.ts");
+		}
+	});
+
+	async function runBashWithOutput(output: string): Promise<string> {
+		const tool = createBashTool(process.cwd(), {
+			operations: {
+				exec: async (_command, _cwd, { onData }) => {
+					onData(Buffer.from(output), "stdout");
+					return { exitCode: 0 };
+				},
+			},
+		});
+		const result = await tool.execute("long-line", { command: "produce" });
+		if (result.details?.fullOutputPath) rmSync(result.details.fullOutputPath, { force: true });
+		return textOf(result);
+	}
+
+	it("shows the end of an overlong last output line that ends with a newline", async () => {
+		// Beyond twice the rolling tail, the retained tail starts inside this line.
+		const output = await runBashWithOutput(`${"x".repeat(300 * 1024)}\n`);
+		expect(output.startsWith("x".repeat(1024))).toBe(true);
+		expect(output).toContain("[Showing last 50.0KB of line 1 (line is 300.0KB).");
+	});
+
+	it("reports the size of an overlong last line that ends with a newline", async () => {
+		const output = await runBashWithOutput(`${"x".repeat(150 * 1024)}\n`);
+		expect(output).toContain("[Showing last 50.0KB of line 1 (line is 150.0KB).");
+	});
+
+	it.skipIf(process.platform === "win32")(
+		"settles a timeout while a detached descendant keeps writing",
+		async () => {
+			const directory = temporaryDirectory("pi-bash-timeout-");
+			// `detached` calls setsid and the launcher exits at once, so the writer leaves the shell's
+			// process tree and group but keeps writing to the inherited stdout pipe. It exits by itself
+			// once that pipe closes, and after 20 seconds at the latest.
+			writeFileSync(
+				join(directory, "writer.cjs"),
+				`process.stdout.on("error", () => process.exit(0));
+				setInterval(() => console.log("tick"), 20);
+				setTimeout(() => process.exit(0), 20_000);`,
+			);
+			writeFileSync(
+				join(directory, "launch.cjs"),
+				`require("node:child_process").spawn(process.execPath, [${JSON.stringify(join(directory, "writer.cjs"))}], {
+					detached: true,
+					stdio: ["ignore", "inherit", "inherit"],
+				}).unref();`,
+			);
+			const started = Date.now();
+			const command = `${JSON.stringify(process.execPath)} launch.cjs; sleep 30`;
+			await expect(createBashTool(directory).execute("test", { command, timeout: 1 })).rejects.toThrow(
+				/timed out after 1 seconds/,
+			);
+			// Waiting for the pipes to go idle would last as long as the writer keeps writing.
+			expect(Date.now() - started).toBeLessThan(5_000);
+		},
+		15_000,
+	);
+
+	it("reads a window larger than the output limit like an unlimited read", async () => {
+		const directory = temporaryDirectory("pi-read-limit-");
+		writeFileSync(
+			join(directory, "many.txt"),
+			Array.from({ length: 5000 }, (_, index) => `line ${index}`).join("\n"),
+		);
+		const tool = createReadTool(directory);
+		const unlimited = await tool.execute("test", { path: "many.txt" });
+		const limited = await tool.execute("test", { path: "many.txt", limit: 1_000_000 });
+		expect(limited).toEqual(unlimited);
+	});
+
+	it.skipIf(process.platform === "win32")("lists a dangling symlink", async () => {
+		const directory = temporaryDirectory("pi-ls-dangling-");
+		writeFileSync(join(directory, "real.txt"), "");
+		symlinkSync(join(directory, "missing-target"), join(directory, "dangling-link"));
+		expect(textOf(await createLsTool(directory).execute("test", {}))).toBe("dangling-link\nreal.txt");
+	});
 });

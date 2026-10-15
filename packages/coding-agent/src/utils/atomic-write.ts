@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
+	chmodSync,
 	closeSync,
 	fsyncSync,
 	linkSync,
@@ -46,11 +47,18 @@ export function atomicWriteFileSync(
 	const mode = options?.mode ?? existingMode;
 	const tempPath = createTempPath(writeTarget);
 	try {
+		// Owner-only until the final mode is applied, so the new contents are never readable by others
+		// through the temp file. With no mode to apply, the default mode and umask apply as they would
+		// for an in-place create.
+		const createMode = mode === undefined ? undefined : 0o600;
 		if (typeof data === "string") {
-			writeFileSync(tempPath, data, { encoding: options?.encoding ?? "utf-8", mode });
+			writeFileSync(tempPath, data, { encoding: options?.encoding ?? "utf-8", mode: createMode });
 		} else {
-			writeFileSync(tempPath, data, { mode });
+			writeFileSync(tempPath, data, { mode: createMode });
 		}
+		// open(2) narrows a requested mode by the umask; chmod applies it exactly, so a replaced file
+		// keeps its permissions (under umask 022 a 0664 file used to become 0644).
+		if (mode !== undefined) chmodSync(tempPath, mode);
 		// fsync requires a write-capable handle on Windows ("r" fails with EPERM).
 		const fd = openSync(tempPath, "r+");
 		try {

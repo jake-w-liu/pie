@@ -48,6 +48,7 @@ export class OutputAccumulator {
 	private completedLines = 0;
 	private totalLines = 0;
 	private currentLineBytes = 0;
+	private lastCompletedLineBytes = 0;
 	private hasOpenLine = false;
 	private finished = false;
 
@@ -125,8 +126,12 @@ export class OutputAccumulator {
 		await this.spool?.close();
 	}
 
+	/**
+	 * Byte length of the output's last line, the one tail truncation shows partially: the open line,
+	 * or the line ended by a final newline.
+	 */
 	getLastLineBytes(): number {
-		return this.currentLineBytes;
+		return this.hasOpenLine ? this.currentLineBytes : this.lastCompletedLineBytes;
 	}
 
 	private appendDecodedText(text: string): void {
@@ -153,6 +158,9 @@ export class OutputAccumulator {
 			this.hasOpenLine = true;
 		} else {
 			this.completedLines += newlines;
+			const previousNewline = newlines > 1 ? text.lastIndexOf("\n", lastNewline - 1) : -1;
+			const lastLineBytes = byteLength(text.slice(previousNewline + 1, lastNewline));
+			this.lastCompletedLineBytes = newlines > 1 ? lastLineBytes : this.currentLineBytes + lastLineBytes;
 			const tail = text.slice(lastNewline + 1);
 			this.currentLineBytes = byteLength(tail);
 			this.hasOpenLine = tail.length > 0;
@@ -182,8 +190,11 @@ export class OutputAccumulator {
 			return this.tailText;
 		}
 
+		// Drop the partial first line, unless it is the last line: then nothing would be left, and tail
+		// truncation already shows the end of an overlong last line as a partial line.
 		const firstNewline = this.tailText.indexOf("\n");
-		return firstNewline === -1 ? this.tailText : this.tailText.slice(firstNewline + 1);
+		if (firstNewline === -1 || firstNewline === this.tailText.length - 1) return this.tailText;
+		return this.tailText.slice(firstNewline + 1);
 	}
 
 	private shouldUseTempFile(): boolean {

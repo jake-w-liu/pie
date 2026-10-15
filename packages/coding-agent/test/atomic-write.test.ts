@@ -1,4 +1,5 @@
 import {
+	chmodSync,
 	lstatSync,
 	mkdtempSync,
 	readdirSync,
@@ -76,6 +77,21 @@ describe("atomic-write", () => {
 		const target = join(d, "secret.txt");
 		atomicWriteFileSync(target, "secret", { mode: 0o600 });
 		expect(statSync(target).mode & 0o777).toBe(0o600);
+	});
+
+	it.skipIf(process.platform === "win32")("keeps an existing mode that the umask would narrow", () => {
+		const d = freshDir();
+		const target = join(d, "settings.json");
+		writeFileSync(target, "{}");
+		chmodSync(target, 0o664);
+		const previousUmask = process.umask(0o022);
+		try {
+			atomicWriteFileSync(target, '{"a":1}');
+		} finally {
+			process.umask(previousUmask);
+		}
+		expect(statSync(target).mode & 0o777).toBe(0o664);
+		expect(readFileSync(target, "utf-8")).toBe('{"a":1}');
 	});
 
 	it("updates a symlink target without replacing the link or its mode", () => {

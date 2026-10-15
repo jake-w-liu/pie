@@ -11,7 +11,8 @@ import { OPENCODE_GO_MODELS } from "./opencode-go.models.ts";
 export function opencodeGoProvider(): Provider<
 	"anthropic-messages" | "google-generative-ai" | "openai-completions" | "openai-responses"
 > {
-	return createProvider({
+	// Explicit API set: the generated catalog may or may not currently list a model for every API.
+	return createProvider<"anthropic-messages" | "google-generative-ai" | "openai-completions" | "openai-responses">({
 		id: "opencode-go",
 		name: "OpenCode Go",
 		auth: { apiKey: envApiKeyAuth("OpenCode API key", ["OPENCODE_API_KEY"]) },

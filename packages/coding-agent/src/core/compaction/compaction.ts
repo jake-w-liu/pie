@@ -271,9 +271,10 @@ function compactionThreshold(contextWindow: number, settings: CompactionSettings
 /**
  * The reserve is an absolute token count, and the default equals a whole 16k window. Cap it at
  * half the window so small-context models keep room for history below the trigger and for the
- * summary. Windows of at least twice the reserve are unaffected.
+ * summary, and branch summaries keep an input budget. Windows of at least twice the reserve are
+ * unaffected.
  */
-function effectiveReserveTokens(contextWindow: number, reserveTokens: number): number {
+export function effectiveReserveTokens(contextWindow: number, reserveTokens: number): number {
 	const reserve = Number.isFinite(reserveTokens) ? Math.max(0, reserveTokens) : 0;
 	return Number.isFinite(contextWindow) && contextWindow > 0
 		? Math.min(reserve, Math.floor(contextWindow / 2))

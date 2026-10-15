@@ -77,8 +77,9 @@ export function normalizeForFuzzyMatch(text: string): string {
 
 /**
  * Fuzzy-normalized content with, for each of its UTF-16 code units, the `[start, end)` range of
- * the source it came from. A collapsed indentation run maps to the whole run, and every unit of
- * a grapheme changed by NFKC maps to that whole grapheme.
+ * the source it came from. A collapsed indentation run maps to the whole run, every unit of a
+ * grapheme changed by NFKC maps to that whole grapheme, and every unit of a line that NFKC changes
+ * across graphemes maps to that whole line.
  */
 interface FuzzySourceMap {
 	text: string;
@@ -107,12 +108,15 @@ function normalizeLineNfkc(line: string): { text: string; starts?: number[]; end
 			ends.push(unchanged ? index + offset + 1 : index + segment.length);
 		}
 	}
-	// Normalizing grapheme by grapheme matches normalizing the whole line in practice. Refuse rather
-	// than map offsets through text that differs from what the old text is matched against.
+	// NFKC can also combine graphemes: compatibility jamo "ㅎㅏ" become the one syllable "하" only when
+	// normalized together. Such a line is mapped as one unit, so a match must cover all of it or none of
+	// it; the match boundary check rejects one that starts or ends inside it.
 	if (pieces.join("") !== text) {
-		throw new Error(
-			"Cannot map a fuzzy match back to the file content. Use the exact text from the file as oldText.",
-		);
+		return {
+			text,
+			starts: new Array<number>(text.length).fill(0),
+			ends: new Array<number>(text.length).fill(line.length),
+		};
 	}
 	return { text, starts, ends };
 }
@@ -165,12 +169,59 @@ function isBlank(line: string): boolean {
 	return line.trim().length === 0;
 }
 
+function greatestCommonDivisor(a: number, b: number): number {
+	return b === 0 ? a : greatestCommonDivisor(b, a % b);
+}
+
+/**
+ * One indentation step of `oldText` and the file's equivalent, such as four spaces and a tab, from the
+ * old -> file indentation levels of the matched lines. Each side must indent with one character and
+ * all levels must agree. Differences between levels give the step, so a uniform offset between
+ * `oldText` and the file cancels out. A lone level is used only when the sides indent with different
+ * characters, measured from column zero on both: with the same character, a different step cannot be
+ * told apart from an offset.
+ */
+function inferIndentStep(
+	indentMap: ReadonlyMap<string, string | null>,
+): { oldStep: string; fileStep: string } | undefined {
+	const levels: Array<[number, number]> = [];
+	let oldIndents = "";
+	let fileIndents = "";
+	for (const [oldIndent, fileIndent] of indentMap) {
+		if (fileIndent === null) return undefined;
+		levels.push([oldIndent.length, fileIndent.length]);
+		oldIndents += oldIndent;
+		fileIndents += fileIndent;
+	}
+	const oldChar = /^(?: +|\t+)$/.test(oldIndents) ? oldIndents[0] : undefined;
+	const fileChar = /^(?: +|\t+)$/.test(fileIndents) ? fileIndents[0] : undefined;
+	if (oldChar === undefined || fileChar === undefined || (levels.length === 1 && oldChar === fileChar)) {
+		return undefined;
+	}
+	levels.sort((a, b) => a[0] - b[0]);
+	const differences: Array<[number, number]> =
+		levels.length === 1
+			? levels
+			: levels
+					.slice(1)
+					.map(([oldLength, fileLength], index) => [oldLength - levels[index][0], fileLength - levels[index][1]]);
+	let step: [number, number] | undefined;
+	for (const [oldLength, fileLength] of differences) {
+		if (oldLength <= 0 || fileLength <= 0) return undefined;
+		const divisor = greatestCommonDivisor(oldLength, fileLength);
+		if (step && (step[0] !== oldLength / divisor || step[1] !== fileLength / divisor)) return undefined;
+		step = [oldLength / divisor, fileLength / divisor];
+	}
+	return step && { oldStep: oldChar.repeat(step[0]), fileStep: fileChar.repeat(step[1]) };
+}
+
 /**
  * Fuzzy matching ignores indentation style, so `oldText` can be indented differently from the lines
  * it matched (for example four spaces where the file uses a tab). Re-indent `newText` to the file's
  * style: a new line indented like an old line takes the file's indentation for that old line, and a
- * deeper line keeps its extra indentation on top of the closest such level. When `oldText` already
- * used the file's indentation, `newText` is returned unchanged so intended re-indents survive.
+ * deeper line adds its extra indentation to the closest such level, in the file's indentation step
+ * when that can be inferred. When `oldText` already used the file's indentation, `newText` is
+ * returned unchanged so intended re-indents survive.
  */
 function reindentFuzzyReplacement(
 	content: string,
@@ -202,6 +253,7 @@ function reindentFuzzyReplacement(
 		indentMap.set(pair.oldIndent, known === undefined || known === pair.fileIndent ? pair.fileIndent : null);
 	}
 
+	const step = inferIndentStep(indentMap);
 	const newLines = newText.split("\n");
 	// Line-for-line edits can use the old line at the same position, which also resolves an old
 	// indentation the file used in more than one way.
@@ -221,7 +273,13 @@ function reindentFuzzyReplacement(
 				if (closest === undefined || oldIndent.length > closest.length) closest = oldIndent;
 			}
 			if (closest === undefined) return line;
-			return `${indentMap.get(closest)}${indent.slice(closest.length)}${body}`;
+			// Whole steps of `oldText` become the file's steps, so a tab-indented file gets tabs.
+			let extra = indent.slice(closest.length);
+			const steps = step ? extra.length / step.oldStep.length : 0;
+			if (step && Number.isInteger(steps) && extra === step.oldStep.repeat(steps)) {
+				extra = step.fileStep.repeat(steps);
+			}
+			return `${indentMap.get(closest)}${extra}${body}`;
 		})
 		.join("\n");
 }
@@ -414,7 +472,8 @@ export function applyEditsToNormalizedContent(
 		const { starts, ends } = fuzzyContent;
 		const fuzzyEnd = fuzzyIndex + fuzzyOldText.length;
 		// A match that starts or ends inside the normalized form of one source character (the "2" of
-		// "½" -> "1⁄2") would replace the rest of that character too, so it does not count as found.
+		// "½" -> "1⁄2") or of a line mapped as one unit would replace the rest of it too, so it does not
+		// count as found.
 		if (
 			(fuzzyIndex > 0 && starts[fuzzyIndex - 1] === starts[fuzzyIndex]) ||
 			(fuzzyEnd < ends.length && ends[fuzzyEnd] === ends[fuzzyEnd - 1])

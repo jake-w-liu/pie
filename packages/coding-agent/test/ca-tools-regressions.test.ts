@@ -325,6 +325,19 @@ describe("coding-agent tool audit regressions", () => {
 		expect(output).toContain("[Showing last 50.0KB of line 1 (line is 150.0KB).");
 	});
 
+	it("shows the end of an overlong output line that only empty lines follow", async () => {
+		// 150KB fits the rolling tail; at 300KB the retained tail starts inside the line.
+		for (const [size, ending] of [
+			[150, "\n"],
+			[300, "\n"],
+			[150, "\r\n"],
+		] as const) {
+			const output = await runBashWithOutput(`first line${ending}${"x".repeat(size * 1024)}${ending}${ending}`);
+			expect(output.startsWith("x".repeat(1024))).toBe(true);
+			expect(output).toContain(`[Showing last 50.0KB of line 2 (line is ${size}.0KB).`);
+		}
+	});
+
 	it.skipIf(process.platform === "win32")(
 		"settles a timeout while a detached descendant keeps writing",
 		async () => {

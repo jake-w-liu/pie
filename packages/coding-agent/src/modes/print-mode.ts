@@ -202,13 +202,22 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		}
 
 		for (const sendPrompt of prompts) {
+			const lastBefore = session.state.messages[session.state.messages.length - 1];
 			await sendPrompt();
 			// An extension command can start a run without awaiting it (pi.sendUserMessage). Let it finish
 			// before reading the result, sending the next prompt, or disposing the runtime.
 			await session.waitForIdle();
-			// Do not build later prompts on a failed response; it is reported below.
+			// Do not build later prompts on a failed response to this prompt; it is reported below. Only a new
+			// last message is this prompt's: a command that starts no run leaves an earlier session's last
+			// message in place, and compaction can shorten the list, so compare identities, not counts.
 			const last = session.state.messages[session.state.messages.length - 1];
-			if (last?.role === "assistant" && (last.stopReason === "error" || last.stopReason === "aborted")) break;
+			if (
+				last !== lastBefore &&
+				last?.role === "assistant" &&
+				(last.stopReason === "error" || last.stopReason === "aborted")
+			) {
+				break;
+			}
 		}
 
 		const state = session.state;

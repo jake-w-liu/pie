@@ -338,6 +338,8 @@ export class AgentSession {
 	private _resolveAgentRunWait: (() => void) | undefined;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
+	/** prompt() calls that have not yet claimed a run, queued their message, or ended without one. */
+	private _preparingPromptCount = 0;
 
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
 	private _steeringMessages: QueuedUserMessage[] = [];
@@ -1291,12 +1293,24 @@ export class AgentSession {
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
 		let ownsRun = false;
+		// The run is claimed only after the input handlers are awaited. Until then waitForIdle() must still
+		// wait for this prompt, or a run that an extension command starts without awaiting it
+		// (pi.sendUserMessage) begins after waitForIdle() has already returned.
+		let preparing = true;
+		this._preparingPromptCount++;
+		const finishPreparing = (): void => {
+			if (!preparing) return;
+			preparing = false;
+			this._preparingPromptCount--;
+			this._resolveIdleWaitIfIdle();
+		};
 
 		try {
 			// Handle extension commands first (execute immediately, even during streaming)
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
 			if (expandPromptTemplates && text.startsWith("/")) {
-				const handled = await this._tryExecuteExtensionCommand(text);
+				// A command is not a prompt preparing a run, and its handler may wait for idle itself.
+				const handled = await this._tryExecuteExtensionCommand(text, finishPreparing);
 				if (handled) {
 					// Extension command executed, no prompt to send
 					preflightResult?.(true);
@@ -1357,6 +1371,7 @@ export class AgentSession {
 			this._markAgentRunActive();
 			this._runAbortController = new AbortController();
 			ownsRun = true;
+			finishPreparing();
 
 			// Flush any pending bash and custom messages before the new prompt
 			this._flushPendingBashMessages();
@@ -1459,6 +1474,8 @@ export class AgentSession {
 			preflightResult?.(false);
 			if (ownsRun) await this._emitAgentSettled();
 			throw error;
+		} finally {
+			finishPreparing();
 		}
 
 		if (!messages) {
@@ -1471,8 +1488,9 @@ export class AgentSession {
 
 	/**
 	 * Try to execute an extension command. Returns true if command was found and executed.
+	 * `onFound` is called when a command matches, before its handler runs.
 	 */
-	private async _tryExecuteExtensionCommand(text: string): Promise<boolean> {
+	private async _tryExecuteExtensionCommand(text: string, onFound: () => void): Promise<boolean> {
 		// Parse command name and args
 		const spaceIndex = text.indexOf(" ");
 		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
@@ -1480,6 +1498,7 @@ export class AgentSession {
 
 		const command = this._extensionRunner.getCommand(commandName);
 		if (!command) return false;
+		onFound();
 
 		// Get command context from extension runner (includes session control methods)
 		const ctx = this._extensionRunner.createCommandContext();
@@ -1814,14 +1833,21 @@ export class AgentSession {
 		this.abortBranchSummary();
 		this.abortRetry();
 		this.agent.abort();
-		await this.waitForIdle();
+		// Not waitForIdle(): a prompt still awaiting its input handlers has no run to abort yet, and those
+		// handlers can take arbitrarily long.
+		if (!this.isIdle) await this._getIdleWaitPromise();
 	}
 
+	/**
+	 * Wait until the session is idle and no prompt() call is still preparing its run. A prompt awaiting
+	 * input handlers has not claimed its run yet, so isIdle does not report it.
+	 */
 	async waitForIdle(): Promise<void> {
-		if (this.isIdle) {
-			return;
+		// Re-check after each wake-up: the idle wait resolves whenever the session becomes idle, which
+		// can happen while a prompt is still preparing.
+		while (!this.isIdle || this._preparingPromptCount > 0) {
+			await this._getIdleWaitPromise();
 		}
-		await this._getIdleWaitPromise();
 	}
 
 	// =========================================================================

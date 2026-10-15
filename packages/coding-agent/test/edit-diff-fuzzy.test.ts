@@ -92,6 +92,39 @@ describe("edit-diff fuzzy matching", () => {
 		expect(out).toBe("function f() {\n\tif (a) {\n\t\tx();\n\t\ty();\n\t}\n}\n");
 	});
 
+	it("converts deeper new lines to the file's indentation step", () => {
+		// One matched level: four spaces in oldText for the file's tab.
+		expect(apply("function f() {\n\ty();\n}\n", "    y();", "    if (c) {\n        y();\n    }")).toBe(
+			"function f() {\n\tif (c) {\n\t\ty();\n\t}\n}\n",
+		);
+		// Two matched levels give the step even when oldText is offset from the file.
+		expect(
+			apply(
+				"\t\tif (x) {\n\t\t\ty();\n\t\t}\n",
+				"    if (x) {\n        y();\n    }",
+				"    if (x) {\n        if (z) {\n            y();\n        }\n    }",
+			),
+		).toBe("\t\tif (x) {\n\t\t\tif (z) {\n\t\t\t\ty();\n\t\t\t}\n\t\t}\n");
+		// With one level and the same character, a different step cannot be told from an offset.
+		expect(
+			apply("class A:\n    def f(self):\n        x = \u201ca\u201d\n", '    x = "a"', '    if y:\n        x = "a"'),
+		).toBe('class A:\n    def f(self):\n        if y:\n            x = "a"\n');
+	});
+
+	it("edits beside a line whose compatibility jamo compose only when normalized together", () => {
+		// NFKC turns "\u314e\u314f" into "\ud558" as a pair, not one jamo at a time.
+		const content = 'const jamo = "\u314e\u314f";\nfunction greet() {\n\treturn \u201chello\u201d;\n}\n';
+		expect(apply(content, 'return "hello";', 'return "bye";')).toBe(
+			'const jamo = "\u314e\u314f";\nfunction greet() {\n\treturn "bye";\n}\n',
+		);
+		// A fuzzy match covers such a line entirely or not at all.
+		const padded = 'const jamo = "\u314e\u314f";  \nnext\n';
+		expect(apply(padded, 'const jamo = "\u314e\u314f";\nnext', 'const jamo = "x";\nnext')).toBe(
+			'const jamo = "x";\nnext\n',
+		);
+		expect(() => apply(padded, '"\u314e\u314f";\nnext', '"x";\nnext')).toThrow(/not found/i);
+	});
+
 	it("accepts an exact match that is unique even when fuzzy normalization finds more", () => {
 		expect(apply("    return null;\n        return null;\n", "        return null;", "        return 0;")).toBe(
 			"    return null;\n        return 0;\n",

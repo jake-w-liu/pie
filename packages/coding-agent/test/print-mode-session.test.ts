@@ -61,6 +61,57 @@ describe("runPrintMode with a real session", () => {
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
+	it("waits for a command-started turn that is still in an asynchronous input handler", async () => {
+		const { harness, runtime, stdout } = await createPrintRuntime({
+			extensionFactories: [
+				(pi) => {
+					// Finishing on a later macrotask keeps the turn unclaimed when the command returns.
+					pi.on("input", async () => {
+						await new Promise((resolve) => setImmediate(resolve));
+						return { action: "continue" };
+					});
+					pi.registerCommand("ask", {
+						description: "Ask the model",
+						handler: async (args) => {
+							pi.sendUserMessage(args);
+						},
+					});
+				},
+			],
+		});
+		harness.setResponses([fauxAssistantMessage("4")]);
+
+		const exitCode = await runPrintMode(runtime, { mode: "text", initialMessage: "/ask what is 2+2" });
+
+		expect(exitCode).toBe(0);
+		expect(stdout.join("")).toBe("4\n");
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
+	it("does not stop for a failure that an earlier invocation left as the last message", async () => {
+		const { harness, runtime, stdout, stderr } = await createPrintRuntime({
+			settings: { retry: { enabled: false } },
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("noop", { description: "Start no turn", handler: async () => {} });
+				},
+			],
+		});
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "earlier failure" }),
+			fauxAssistantMessage("fresh answer"),
+		]);
+		// A resumed session (--continue) whose last turn failed.
+		await harness.session.prompt("earlier task");
+
+		const exitCode = await runPrintMode(runtime, { mode: "text", initialMessage: "/noop", messages: ["next task"] });
+
+		expect(exitCode).toBe(0);
+		expect(stdout.join("")).toBe("fresh answer\n");
+		expect(stderr).not.toHaveBeenCalled();
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
 	it("stops at a failed earlier prompt and reports it", async () => {
 		const { harness, runtime, stdout, stderr } = await createPrintRuntime({
 			settings: { retry: { enabled: false } },

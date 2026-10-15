@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OutputSpool } from "./output-spool.ts";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, type TruncationResult, truncateTail } from "./truncate.ts";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, isEmptyLine, type TruncationResult, truncateTail } from "./truncate.ts";
 
 export interface OutputAccumulatorOptions {
 	maxLines?: number;
@@ -48,7 +48,9 @@ export class OutputAccumulator {
 	private completedLines = 0;
 	private totalLines = 0;
 	private currentLineBytes = 0;
-	private lastCompletedLineBytes = 0;
+	/** Whether the open line is empty in the sense of `isEmptyLine` (nothing, or a lone CR). */
+	private currentLineEmpty = true;
+	private lastNonEmptyCompletedLineBytes = 0;
 	private hasOpenLine = false;
 	private finished = false;
 
@@ -127,11 +129,11 @@ export class OutputAccumulator {
 	}
 
 	/**
-	 * Byte length of the output's last line, the one tail truncation shows partially: the open line,
-	 * or the line ended by a final newline.
+	 * Byte length of the output's last line that is not empty, the one tail truncation shows
+	 * partially: the open line, or the last completed line that is not empty.
 	 */
 	getLastLineBytes(): number {
-		return this.hasOpenLine ? this.currentLineBytes : this.lastCompletedLineBytes;
+		return this.currentLineEmpty ? this.lastNonEmptyCompletedLineBytes : this.currentLineBytes;
 	}
 
 	private appendDecodedText(text: string): void {
@@ -154,18 +156,37 @@ export class OutputAccumulator {
 			lastNewline = i;
 		}
 		if (newlines === 0) {
-			this.currentLineBytes += bytes;
-			this.hasOpenLine = true;
+			this.extendOpenLine(text);
 		} else {
 			this.completedLines += newlines;
-			const previousNewline = newlines > 1 ? text.lastIndexOf("\n", lastNewline - 1) : -1;
-			const lastLineBytes = byteLength(text.slice(previousNewline + 1, lastNewline));
-			this.lastCompletedLineBytes = newlines > 1 ? lastLineBytes : this.currentLineBytes + lastLineBytes;
-			const tail = text.slice(lastNewline + 1);
-			this.currentLineBytes = byteLength(tail);
-			this.hasOpenLine = tail.length > 0;
+			// Walk back over the lines this text completes, newest first, to the last one that is not empty.
+			for (let lineEnd = lastNewline; ; ) {
+				const lineStart = lineEnd === 0 ? 0 : text.lastIndexOf("\n", lineEnd - 1) + 1;
+				if (lineStart === 0) {
+					// The first line this text completes continues the open line.
+					this.extendOpenLine(text.slice(0, lineEnd));
+					if (!this.currentLineEmpty) this.lastNonEmptyCompletedLineBytes = this.currentLineBytes;
+					break;
+				}
+				const line = text.slice(lineStart, lineEnd);
+				if (!isEmptyLine(line)) {
+					this.lastNonEmptyCompletedLineBytes = byteLength(line);
+					break;
+				}
+				lineEnd = lineStart - 1;
+			}
+			this.currentLineBytes = 0;
+			this.currentLineEmpty = true;
+			this.extendOpenLine(text.slice(lastNewline + 1));
 		}
+		this.hasOpenLine = this.currentLineBytes > 0;
 		this.totalLines = this.completedLines + (this.hasOpenLine ? 1 : 0);
+	}
+
+	private extendOpenLine(text: string): void {
+		if (text.length === 0) return;
+		this.currentLineEmpty = this.currentLineBytes === 0 && text === "\r";
+		this.currentLineBytes += byteLength(text);
 	}
 
 	private trimTail(): void {
@@ -190,11 +211,12 @@ export class OutputAccumulator {
 			return this.tailText;
 		}
 
-		// Drop the partial first line, unless it is the last line: then nothing would be left, and tail
-		// truncation already shows the end of an overlong last line as a partial line.
+		// Drop the partial first line, unless only empty lines follow it: then it is the line tail
+		// truncation shows the end of, and dropping it would leave nothing but those empty lines.
 		const firstNewline = this.tailText.indexOf("\n");
-		if (firstNewline === -1 || firstNewline === this.tailText.length - 1) return this.tailText;
-		return this.tailText.slice(firstNewline + 1);
+		const rest = this.tailText.slice(firstNewline + 1);
+		if (firstNewline === -1 || rest.split("\n").every(isEmptyLine)) return this.tailText;
+		return rest;
 	}
 
 	private shouldUseTempFile(): boolean {

@@ -16,7 +16,7 @@ import {
 	createCustomMessage,
 } from "../messages.ts";
 import type { ReadonlySessionManager, SessionEntry } from "../session-manager.ts";
-import { completeSummarization, getSummarizationFailure } from "./compaction.ts";
+import { completeSummarization, effectiveReserveTokens, getSummarizationFailure } from "./compaction.ts";
 import {
 	computeFileLists,
 	createFileOps,
@@ -80,7 +80,7 @@ export interface GenerateBranchSummaryOptions {
 	customInstructions?: string;
 	/** If true, customInstructions replaces the default prompt instead of being appended */
 	replaceInstructions?: boolean;
-	/** Tokens reserved for prompt + LLM response (default 16384) */
+	/** Tokens reserved for prompt + LLM response (default 16384), capped at half the context window */
 	reserveTokens?: number;
 	/** Optional session stream function. Used to preserve SDK request behavior without mutating agent state. */
 	streamFn?: StreamFn;
@@ -302,9 +302,11 @@ export async function generateBranchSummary(
 		callbacks,
 	} = options;
 
-	// Token budget = context window minus reserved space for prompt + response
+	// Token budget = context window minus reserved space for prompt + response. The reserve is capped as
+	// for compaction, so the default reserve, a whole 16k window, leaves a budget on small models.
 	const contextWindow = model.contextWindow || 128000;
-	const tokenBudget = contextWindow - reserveTokens;
+	const reserve = effectiveReserveTokens(contextWindow, reserveTokens);
+	const tokenBudget = contextWindow - reserve;
 	if (!Number.isFinite(tokenBudget) || tokenBudget <= 0 || !Number.isFinite(reserveTokens) || reserveTokens < 0) {
 		return {
 			error: "No input budget is available for branch summarization. Reduce reserveTokens or use a larger-context model.",
@@ -371,7 +373,7 @@ export async function generateBranchSummary(
 
 	// Compute file lists and append to summary
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
-	summary += formatFileOperations(readFiles, modifiedFiles, Math.max(0, reserveTokens * 4 - summary.length));
+	summary += formatFileOperations(readFiles, modifiedFiles, Math.max(0, reserve * 4 - summary.length));
 
 	return {
 		summary,

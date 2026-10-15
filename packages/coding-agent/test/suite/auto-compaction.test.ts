@@ -137,6 +137,7 @@ describe("automatic compaction", () => {
 		const result = await generateBranchSummary(harness.sessionManager.getBranch(), {
 			model: harness.getModel(),
 			signal: new AbortController().signal,
+			reserveTokens: -1,
 			streamFn: harness.session.agent.streamFunction,
 		});
 		expect(result.error).toContain("No input budget");

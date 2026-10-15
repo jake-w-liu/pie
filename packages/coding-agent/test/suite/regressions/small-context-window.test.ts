@@ -1,6 +1,6 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it } from "vitest";
-import { createHarness, type Harness } from "../harness.ts";
+import { createHarness, getMessageText, type Harness } from "../harness.ts";
 
 let harness: Harness | undefined;
 afterEach(() => {
@@ -16,6 +16,28 @@ describe("small context windows with default compaction settings", () => {
 		await harness.session.prompt("hi");
 
 		expect(harness.eventsOfType("context_limit")).toEqual([]);
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
+	it.each([8_192, 16_384])("summarizes an abandoned branch on a %i-token model", async (contextWindow) => {
+		harness = await createHarness({ models: [{ id: `small-${contextWindow}`, contextWindow, maxTokens: 2_048 }] });
+		const { session, sessionManager } = harness;
+		harness.setResponses([
+			fauxAssistantMessage("a1"),
+			fauxAssistantMessage("a2"),
+			fauxAssistantMessage("## Goal\nbranch summary"),
+		]);
+		await session.prompt("u1");
+		await session.prompt("u2");
+		const target = sessionManager
+			.getEntries()
+			.find((entry) => entry.type === "message" && getMessageText(entry.message) === "a1");
+		expect(target).toBeDefined();
+
+		const result = await session.navigateTree(target!.id, { summarize: true });
+
+		expect(result.cancelled).toBe(false);
+		expect(result.summaryEntry?.summary).toContain("branch summary");
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 

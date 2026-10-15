@@ -314,4 +314,35 @@ describe("session operation exclusion", () => {
 		await compacting;
 		expect(harness.getPendingResponseCount()).toBe(1);
 	}, 30_000);
+
+	it("waitForIdle() waits for a prompt whose input handler has not finished", async () => {
+		const inputEntered = deferred();
+		const releaseInput = deferred();
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", async () => {
+						inputEntered.resolve();
+						await releaseInput.promise;
+						return undefined;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		const { session } = harness;
+		harness.setResponses([fauxAssistantMessage("answer")]);
+
+		const prompting = session.prompt("question");
+		await inputEntered.promise;
+		// The prompt has not claimed its run yet, so the session still reports no active run.
+		expect(session.isIdle).toBe(true);
+		const waiting = session.waitForIdle();
+		releaseInput.resolve();
+		await waiting;
+
+		expect(session.messages.map(describeMessage)).toEqual(["user", "assistant:answer"]);
+		expect(harness.getPendingResponseCount()).toBe(0);
+		await prompting;
+	}, 30_000);
 });

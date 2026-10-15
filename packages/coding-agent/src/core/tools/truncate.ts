@@ -27,7 +27,10 @@ export interface TruncationResult {
 	outputLines: number;
 	/** Number of bytes in the truncated output */
 	outputBytes: number;
-	/** Whether the last line was partially truncated (only for tail truncation edge case) */
+	/**
+	 * Whether the last line that is not empty was partially truncated (only for tail truncation edge
+	 * case). It is the first output line; only empty lines follow it.
+	 */
 	lastLinePartial: boolean;
 	/** Whether the first line exceeded the byte limit (for head truncation) */
 	firstLineExceedsLimit: boolean;
@@ -159,11 +162,17 @@ export function truncateHead(content: string, options: TruncationOptions = {}): 
 	};
 }
 
+/** Whether a line has no content: empty, or only the CR of a CRLF line ending. */
+export function isEmptyLine(line: string): boolean {
+	return line === "" || line === "\r";
+}
+
 /**
  * Truncate content from the tail (keep last N lines/bytes).
  * Suitable for bash output where you want to see the end (errors, final results).
  *
- * May return partial first line if the last line of original content exceeds byte limit.
+ * May return partial first line if the last line of original content that is not empty exceeds
+ * byte limit.
  */
 export function truncateTail(content: string, options: TruncationOptions = {}): TruncationResult {
 	const maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
@@ -195,19 +204,23 @@ export function truncateTail(content: string, options: TruncationOptions = {}): 
 	let outputBytesCount = 0;
 	let truncatedBy: "lines" | "bytes" = "lines";
 	let lastLinePartial = false;
+	let onlyEmptyLinesAdded = true;
 
 	for (let i = lines.length - 1; i >= 0 && outputLinesArr.length < maxLines; i--) {
 		const line = lines[i];
-		const lineBytes = Buffer.byteLength(line, "utf-8") + (outputLinesArr.length > 0 ? 1 : 0); // +1 for newline
+		const separatorBytes = outputLinesArr.length > 0 ? 1 : 0; // newline
+		const lineBytes = Buffer.byteLength(line, "utf-8") + separatorBytes;
 
 		if (outputBytesCount + lineBytes > maxBytes) {
 			truncatedBy = "bytes";
-			// Edge case: if we haven't added ANY lines yet and this line exceeds maxBytes,
-			// take the end of the line (partial)
-			if (outputLinesArr.length === 0) {
-				const truncatedLine = truncateStringToBytesFromEnd(line, maxBytes);
+			// Edge case: if we haven't added any lines yet, or only empty ones (`print(big); print()`),
+			// and this line exceeds the remaining bytes, take the end of the line (partial) instead of
+			// showing nothing but those empty lines
+			const remainingBytes = maxBytes - outputBytesCount - separatorBytes;
+			if (onlyEmptyLinesAdded && remainingBytes > 0) {
+				const truncatedLine = truncateStringToBytesFromEnd(line, remainingBytes);
 				outputLinesArr.unshift(truncatedLine);
-				outputBytesCount = Buffer.byteLength(truncatedLine, "utf-8");
+				outputBytesCount += Buffer.byteLength(truncatedLine, "utf-8") + separatorBytes;
 				lastLinePartial = true;
 			}
 			break;
@@ -215,6 +228,7 @@ export function truncateTail(content: string, options: TruncationOptions = {}): 
 
 		outputLinesArr.unshift(line);
 		outputBytesCount += lineBytes;
+		if (!isEmptyLine(line)) onlyEmptyLinesAdded = false;
 	}
 
 	// If we exited due to line limit

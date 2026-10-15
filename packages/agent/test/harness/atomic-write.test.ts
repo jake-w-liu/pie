@@ -144,9 +144,12 @@ describe("atomicWriteFile", () => {
 		await fs.chmod(dir, 0o500);
 
 		try {
+			// Resolve before starting the write: awaiting inside the matcher argument would leave its
+			// rejection unhandled until .rejects attaches.
+			const expectedPath = await fs.realpath(target);
 			await expect(atomicWriteFile(target, "replacement")).rejects.toMatchObject({
 				code: "EACCES",
-				path: await fs.realpath(target),
+				path: expectedPath,
 			});
 			expect(await fs.readFile(target, "utf-8")).toBe("original");
 		} finally {

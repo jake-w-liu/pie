@@ -69,9 +69,11 @@ it("keeps the original and reports the target path when replacement fails for an
 	injected.renameCode = "EIO";
 
 	// realpath, because the target is resolved through symlinks (macOS /var -> /private/var).
+	// Resolved before the write starts, so its rejection is handled as soon as it happens.
+	const expectedPath = await fs.realpath(target);
 	await expect(atomicWriteFile(target, "replacement")).rejects.toMatchObject({
 		code: "EIO",
-		path: await fs.realpath(target),
+		path: expectedPath,
 	});
 	expect(await fs.readFile(target, "utf-8")).toBe("original");
 	expect(await tempFiles()).toEqual([]);

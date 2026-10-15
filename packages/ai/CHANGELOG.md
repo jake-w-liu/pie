@@ -60,6 +60,9 @@
 - Fixed generated Gemini tool-call ids repeating across processes, which produced duplicate `tool_use` ids after switching a resumed session to Anthropic.
 - Fixed `start` events exposing content the provider filled in later, which made consumers relayed through lazy providers see text twice.
 - Fixed the OpenCode Go provider not registering the Google Generative AI API, which failed the package build once models.dev listed a Gemini model for OpenCode Go.
+- Fixed the Mistral adapter ignoring `maxRetries` and `maxRetryDelayMs`; a retryable 429/5xx now retries through the shared retry helper like every other adapter.
+- Fixed Google Generative AI and Vertex reporting a negative `usage.input` (and negative input cost) when a gateway reports more cached tokens than prompt tokens.
+- Fixed the OpenAI Responses stream leaving a content block open when a terminal event arrives without `response.output_item.done`; text, thinking, and tool-call blocks are now finalized and their staging scratch fields removed, matching every other adapter.
 
 ## [0.84.3] - 2026-08-24
 

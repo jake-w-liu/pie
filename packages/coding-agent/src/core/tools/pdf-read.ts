@@ -219,7 +219,17 @@ export function formatPdfText(
 		const section = included[index];
 		body.push("", `--- page ${section.pageNumber} ---`);
 		if (index === 0 && firstPageTruncated) {
-			const truncated = truncateHead(section.lines.join("\n"), { maxLines, maxBytes });
+			// `body` already holds the header, the blank line, and the page marker, and a
+			// truncation notice costs two more lines. Truncate against what is left so the
+			// rendered text stays inside the limits this function promises.
+			const lineNotice = `[Page ${section.pageNumber} truncated at the ${maxLines}-line limit.]`;
+			const byteNotice = `[Page ${section.pageNumber} truncated at the ${formatSize(maxBytes)} limit.]`;
+			const prefixBytes = Buffer.byteLength(body.join("\n"), "utf8");
+			const noticeBytes = Math.max(Buffer.byteLength(lineNotice, "utf8"), Buffer.byteLength(byteNotice, "utf8"));
+			const truncated = truncateHead(section.lines.join("\n"), {
+				maxLines: Math.max(1, maxLines - body.length - 2),
+				maxBytes: Math.max(1, maxBytes - prefixBytes - noticeBytes - 1),
+			});
 			body.push(truncated.content);
 			if (truncated.truncated) {
 				const reason =

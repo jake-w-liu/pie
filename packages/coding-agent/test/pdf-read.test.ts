@@ -215,6 +215,31 @@ describe("formatPdfText", () => {
 		expect(text.includedPages).toBe(1);
 	});
 
+	it("keeps a truncated first page inside the line budget", () => {
+		// Header, blank line, marker, and the truncation notice all count toward the
+		// limit the read tool advertises. The first page used to be truncated against
+		// the full budget, so the result ran one line (or more) over.
+		const formatted = formatPdfText(
+			{
+				ok: true,
+				totalPages: 1,
+				pages: [
+					{
+						pageNumber: 1,
+						text: Array.from({ length: 1998 }, (_, index) => `line ${index}`).join("\n"),
+					},
+				],
+				firstPage: 1,
+				lastPage: 1,
+			},
+			{ maxLines: 2000, maxBytes: 50 * 1024 },
+		);
+		const body = formatted.text.split("\n\n[Showing pages")[0] ?? "";
+		expect(body.split("\n").length).toBeLessThanOrEqual(2000);
+		expect(Buffer.byteLength(body, "utf8")).toBeLessThanOrEqual(50 * 1024);
+		expect(formatted.text).toContain("[Page 1 truncated at the");
+	});
+
 	it("keeps the rendered text within the line and byte budgets it is given", () => {
 		const pages = Array.from({ length: 50 }, (_, index) => ({
 			pageNumber: index + 1,

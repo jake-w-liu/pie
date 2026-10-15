@@ -25,7 +25,7 @@ import { CONFIG_DIR_NAME, getAgentDir, isBunBinary } from "../../config.ts";
 // NOTE: This import works because loader.ts exports are NOT re-exported from index.ts,
 // avoiding a circular dependency. Extensions can import from @earendil-works/pi-coding-agent.
 import * as _bundledPiCodingAgent from "../../index.ts";
-import { resolvePath } from "../../utils/paths.ts";
+import { isPathWithin, resolvePath } from "../../utils/paths.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
 import { execCommand } from "../exec.ts";
@@ -737,6 +737,10 @@ function resolveExtensionEntries(dir: string): string[] | null {
 			const entries: string[] = [];
 			for (const extPath of manifest.extensions) {
 				const resolvedExtPath = path.resolve(dir, extPath);
+				// A manifest entry must stay inside the package it belongs to; otherwise a
+				// shared or malicious package can point the loader at any readable file on
+				// the machine and have it imported and executed as an extension.
+				if (!isPathWithin(dir, resolvedExtPath)) continue;
 				if (fs.existsSync(resolvedExtPath)) {
 					entries.push(resolvedExtPath);
 				}

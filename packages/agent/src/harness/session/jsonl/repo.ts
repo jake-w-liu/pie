@@ -79,18 +79,27 @@ export async function listJsonlSessionMetadata(
 ): Promise<JsonlSessionMetadata[]> {
 	const metadata: JsonlSessionMetadata[] = [];
 	for (const directory of await jsonlSessionDirectories(options, query.cwd)) {
-		const files = fileResult(
-			await options.fs.listDir(directory),
-			`Failed to list sessions directory ${directory}`,
-		).filter((entry) => entry.kind !== "directory" && entry.name.endsWith(".jsonl"));
+		// Discovery is best-effort: a directory that cannot be listed (for example a
+		// dangling symlink) must not hide the sessions that are still readable, matching
+		// the coding-agent session-manager contract.
+		const listed = await options.fs.listDir(directory);
+		if (!listed.ok) continue;
+		const files = listed.value.filter((entry) => entry.kind !== "directory" && entry.name.endsWith(".jsonl"));
 		for (const file of files) {
-			const [firstLine] = fileResult(
-				await options.fs.readTextLines(file.path, { maxLines: 1 }),
-				`Failed to read session header ${file.path}`,
-			);
+			let firstLine: string | undefined;
+			try {
+				[firstLine] = fileResult(
+					await options.fs.readTextLines(file.path, { maxLines: 1 }),
+					`Failed to read session header ${file.path}`,
+				);
+			} catch {
+				// Skip a session file that vanished or cannot be read; keep listing the rest.
+				continue;
+			}
 			if (!firstLine) continue;
 			const headerResult = parseHeader(firstLine);
 			if (!headerResult.ok) continue;
+			// A canonical resolution failure is a real storage fault, so it still propagates.
 			const path = fileResult(await options.fs.canonicalPath(file.path), `Failed to resolve session ${file.path}`);
 			metadata.push(metadataFromHeader(headerResult.value, path, file.mtimeMs));
 		}

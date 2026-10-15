@@ -21,6 +21,7 @@ import { headersToRecord } from "../utils/headers.ts";
 import { cancelResponseBody } from "../utils/http-response.ts";
 import { parseStreamingJson, shouldReparseStreamingJson } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
+import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { iterateSseMessages } from "../utils/sse.ts";
 import { getJsonSchemaToolParameters, resolveJsonSchemaStrictSampling } from "./constrained-sampling.ts";
@@ -312,12 +313,33 @@ async function requestMistralStream(
 			: (options?.signal ?? headerTimeout?.signal);
 	let response: Response;
 	try {
-		response = await (options?.fetch ?? globalThis.fetch)(url, {
-			method: "POST",
-			headers,
-			body: JSON.stringify(toMistralWirePayload(payload)),
-			signal,
-		});
+		// Mistral is a plain REST endpoint, so unlike the SDK-based adapters it must opt
+		// into the shared retry contract itself. Without this `maxRetries` was accepted
+		// and silently ignored, leaving a single 429/5xx to fail the request.
+		response = await retryProviderRequest(
+			async () => {
+				const candidate = await (options?.fetch ?? globalThis.fetch)(url, {
+					method: "POST",
+					headers,
+					body: JSON.stringify(toMistralWirePayload(payload)),
+					signal,
+				});
+				if (!candidate.ok) {
+					const body = await candidate.text();
+					await cancelResponseBody(candidate);
+					throw new MistralHttpError(candidate.status, body, candidate.statusText, candidate.headers);
+				}
+				return candidate;
+			},
+			{
+				maxRetries: options?.maxRetries,
+				maxRetryDelayMs: options?.maxRetryDelayMs,
+				// Retry cancellation follows the caller's signal, not the header timeout:
+				// a header timeout must surface its own "timed out" error instead of being
+				// rewritten into a generic abort.
+				signal: options?.signal,
+			},
+		);
 	} catch (error) {
 		headerTimeout?.clear();
 		throw error;
@@ -326,10 +348,6 @@ async function requestMistralStream(
 	try {
 		await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 
-		if (!response.ok) {
-			const body = await response.text();
-			throw new MistralHttpError(response.status, body, response.statusText);
-		}
 		if (!response.body) {
 			throw new Error("Mistral response has no body");
 		}
@@ -345,12 +363,17 @@ async function requestMistralStream(
 
 class MistralHttpError extends Error {
 	statusCode: number;
+	/** Mirrors `statusCode` under the name the shared retry helper inspects. */
+	status: number;
+	headers: Headers;
 	body: string;
 
-	constructor(statusCode: number, body: string, statusText: string) {
+	constructor(statusCode: number, body: string, statusText: string, headers: Headers) {
 		super(statusText || `Request failed with status ${statusCode}`);
 		this.name = "MistralHttpError";
 		this.statusCode = statusCode;
+		this.status = statusCode;
+		this.headers = headers;
 		this.body = body;
 	}
 }

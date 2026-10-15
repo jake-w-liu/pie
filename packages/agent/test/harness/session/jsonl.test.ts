@@ -7,6 +7,7 @@ import {
 	realpathSync,
 	rmSync,
 	statSync,
+	symlinkSync,
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
@@ -215,6 +216,19 @@ describe("JSONL v4 persistence", () => {
 		await expect(repository.open(metadata)).rejects.toMatchObject({ code: "invalid_entry" });
 		expect((await repository.list({ cwd: root })).map((listed) => listed.id)).toEqual(["valid"]);
 		expect(readFileSync(metadata.path, "utf8")).toBe(malformed);
+	});
+
+	it("skips an unreadable session file when listing instead of failing the whole listing", async () => {
+		// Discovery is best-effort: one dangling symlink used to make list() reject and
+		// hide every readable session in the repository.
+		const root = createTempDir();
+		const repository = createRepository(root);
+		const created = await repository.create({ id: "valid", cwd: root });
+		const metadata = await created.getMetadata();
+		symlinkSync(join(root, "missing-target.jsonl"), join(dirname(metadata.path), "broken.jsonl"));
+
+		expect((await repository.list({ cwd: root })).map((listed) => listed.id)).toEqual(["valid"]);
+		expect((await repository.list()).map((listed) => listed.id)).toEqual(["valid"]);
 	});
 
 	it("rejects session ids that cannot be used in coding-agent filenames", async () => {

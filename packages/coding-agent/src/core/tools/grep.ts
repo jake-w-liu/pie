@@ -59,23 +59,27 @@ const DEFAULT_LIMIT = 20;
 /** Search errors quoted in a result; enough to name the unreadable paths without flooding it. */
 const MAX_REPORTED_SEARCH_ERRORS = 5;
 
-export function createUtf8LineDecoder(onLine: (line: string) => void): {
+export function createUtf8LineDecoder(
+	onLine: (line: string) => void,
+	delimiter: string = "\n",
+): {
 	write: (chunk: Buffer) => void;
 	end: () => void;
 } {
 	const decoder = new StringDecoder("utf8");
-	// Pieces of the current, still unterminated line. Only newly decoded text is searched for a
-	// newline, so a line spanning many chunks (rg's JSON for a minified file) costs linear time.
+	// Pieces of the current, still unterminated record. Only newly decoded text is searched for
+	// the delimiter, so a record spanning many chunks (rg's JSON for a minified file) costs
+	// linear time.
 	let partialLine: string[] = [];
 	let ended = false;
 	const push = (text: string) => {
 		let lineStart = 0;
-		for (let newline = text.indexOf("\n"); newline !== -1; newline = text.indexOf("\n", lineStart)) {
+		for (let newline = text.indexOf(delimiter); newline !== -1; newline = text.indexOf(delimiter, lineStart)) {
 			partialLine.push(text.slice(lineStart, newline));
 			const line = partialLine.join("");
 			partialLine = [];
 			onLine(line);
-			lineStart = newline + 1;
+			lineStart = newline + delimiter.length;
 		}
 		if (lineStart < text.length) partialLine.push(text.slice(lineStart));
 	};
@@ -288,13 +292,23 @@ export function createGrepToolDefinition(
 						// Only 'content' mode stops at the match limit; 'files_with_matches' and
 						// 'count' need the full result set.
 						const stopAtLimit = outputMode === "content";
+						// ripgrep prints raw paths for "-l" (and for "-c" over a directory). Request
+						// NUL termination there so a path containing a newline is not split into two
+						// bogus paths. A single-file "-c" prints only the bare count, so it stays
+						// line-based.
+						const nulDelimited = outputMode === "files_with_matches" || (outputMode === "count" && isDirectory);
 						const effectiveLimit = stopAtLimit ? Math.max(1, limit ?? DEFAULT_LIMIT) : Number.POSITIVE_INFINITY;
 						const formatPath = (reportedPath: string): string => {
 							// rg reports paths relative to its working directory, the search directory.
 							const filePath = path.resolve(searchPath, reportedPath);
 							if (isDirectory) {
 								const relative = path.relative(searchPath, filePath);
-								if (relative && !relative.startsWith("..")) {
+								// Containment must test path components, not a string prefix: a legal
+								// first component such as "..cache" also starts with "..".
+								const isInside =
+									relative === "" ||
+									(relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+								if (relative && isInside) {
 									return relative.replace(/\\/g, "/");
 								}
 							}
@@ -329,6 +343,7 @@ export function createGrepToolDefinition(
 							if (contextValue > 0) args.push("-C", String(contextValue));
 							args.push("--json");
 						}
+						if (nulDelimited) args.push("--null");
 						args.push("--", pattern, isDirectory ? "." : searchPath);
 
 						const child = spawn(rgPath, args, {
@@ -347,6 +362,10 @@ export function createGrepToolDefinition(
 						// Paths seen in "-l" mode, in first-seen order.
 						const matchedFiles: string[] = [];
 						const seenFiles = new Set<string>();
+						// "-c" over a directory writes "<path>\0<count>\n" per file, so NUL records
+						// alternate: a path, then the previous file's count followed by the next path.
+						// This tracks whether the next record is a path.
+						let countHavePath = false;
 						// Current begin..end block in "--json -C" mode.
 						let blockFile: string | undefined;
 						let blockLines: string[] | undefined;
@@ -410,6 +429,30 @@ export function createGrepToolDefinition(
 							const colon = line.lastIndexOf(":");
 							const count = Number.parseInt(colon < 0 ? line : line.slice(colon + 1), 10);
 							if (Number.isFinite(count)) matchCount += count;
+						};
+
+						const handleNulRecord = (rawRecord: string): void => {
+							if (outputMode === "files_with_matches") {
+								if (rawRecord.length === 0) return;
+								if (!seenFiles.has(rawRecord)) {
+									seenFiles.add(rawRecord);
+									matchedFiles.push(rawRecord);
+									// "-l" reports one record per matching file and no match events, so
+									// count the file here to keep the "no matches" check below honest.
+									matchCount++;
+								}
+								return;
+							}
+							if (!countHavePath) {
+								countHavePath = true;
+								return;
+							}
+							const newline = rawRecord.indexOf("\n");
+							const countText = newline === -1 ? rawRecord : rawRecord.slice(0, newline);
+							const parsed = Number.parseInt(countText.trim(), 10);
+							if (Number.isFinite(parsed)) matchCount += parsed;
+							const nextPath = newline === -1 ? "" : rawRecord.slice(newline + 1);
+							countHavePath = nextPath !== "";
 						};
 
 						const handleLine = (rawLine: string): void => {
@@ -501,8 +544,12 @@ export function createGrepToolDefinition(
 							}
 						};
 
-						// Split stdout on newlines without corrupting code points divided between chunks.
-						const lineDecoder = createUtf8LineDecoder(handleLine);
+						// Split stdout without corrupting code points divided between chunks. Modes
+						// that print raw paths frame records on NUL instead of newline.
+						const lineDecoder = createUtf8LineDecoder(
+							nulDelimited ? handleNulRecord : handleLine,
+							nulDelimited ? "\0" : "\n",
+						);
 						child.stdout?.on("data", lineDecoder.write);
 						// Drain whatever is still buffered and close any open block. Idempotent: the
 						// "end" handler already did this in the common case, and "close" calls it

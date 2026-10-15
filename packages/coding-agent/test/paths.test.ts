@@ -7,9 +7,11 @@ import {
 	canonicalizePath,
 	getCwdRelativePath,
 	isLocalPath,
+	isPathWithin,
 	normalizePath,
 	normalizeWindowsShellPath,
 	resolvePath,
+	shortenHomePath,
 } from "../src/utils/paths.ts";
 
 let tempDir: string;
@@ -66,6 +68,28 @@ describe("canonicalizePath", () => {
 		symlinkSync(target, link);
 		// realpathSync would throw, so canonicalizePath returns the link path.
 		expect(canonicalizePath(link)).toBe(link);
+	});
+});
+
+describe("shortenHomePath", () => {
+	it("replaces the home directory with ~", () => {
+		expect(shortenHomePath("/Users/jake/notes.md", "/Users/jake")).toBe("~/notes.md");
+		expect(shortenHomePath("/Users/jake", "/Users/jake")).toBe("~");
+	});
+
+	it("matches whole path components, not a shared string prefix", () => {
+		expect(shortenHomePath("/Users/jaker/notes.md", "/Users/jake")).toBe("/Users/jaker/notes.md");
+		// A trailing separator on the home directory must not break the match.
+		expect(shortenHomePath("/Users/jake/notes.md", "/Users/jake/")).toBe("~/notes.md");
+	});
+});
+
+describe("isPathWithin", () => {
+	it("is true for the root and its descendants only", () => {
+		expect(isPathWithin("/a/b", "/a/b")).toBe(true);
+		expect(isPathWithin("/a/b", "/a/b/c.ts")).toBe(true);
+		expect(isPathWithin("/a/b", "/a/bc")).toBe(false);
+		expect(isPathWithin("/a/b", "/a/b/../outside.ts")).toBe(false);
 	});
 });
 

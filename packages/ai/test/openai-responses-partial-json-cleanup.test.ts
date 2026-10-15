@@ -103,4 +103,52 @@ describe("openai responses partialJson cleanup", () => {
 		expect(toolCallEnd.toolCall).toBe(persistedToolCall);
 		expect("partialJson" in toolCallEnd.toolCall).toBe(false);
 	});
+
+	it("finalizes an open block when the terminal event arrives without output_item.done", async () => {
+		// Codex synthesizes response.completed from response.done and can end the stream
+		// before the last output_item.done. Unlike every other adapter, this path used to
+		// leave the block without a toolcall_end and with its staging scratch fields attached.
+		const model: Model<"openai-responses"> = {
+			id: "gpt-5-mini",
+			name: "GPT-5 Mini",
+			api: "openai-responses",
+			provider: "openai",
+			baseUrl: "https://api.openai.com/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+		async function* unfinishedFunctionCallEvents(): AsyncIterable<ResponseStreamEvent> {
+			yield {
+				type: "response.output_item.added",
+				item: { type: "function_call", id: "fc_test", call_id: "call_test", name: "edit", arguments: "" },
+			} as ResponseStreamEvent;
+			yield { type: "response.function_call_arguments.delta", delta: '{"path":"a"}' } as ResponseStreamEvent;
+			yield {
+				type: "response.completed",
+				sequence_number: 1,
+				response: { id: "resp_test", status: "completed" },
+			} as ResponseStreamEvent;
+		}
+
+		const output = createOutput(model);
+		const stream = new AssistantMessageEventStream();
+		const pushSpy = vi.spyOn(stream, "push");
+
+		await processResponsesStream(unfinishedFunctionCallEvents(), output, stream, model);
+
+		const persistedToolCall = output.content[0];
+		expect(persistedToolCall?.type).toBe("toolCall");
+		if (!persistedToolCall || persistedToolCall.type !== "toolCall") {
+			throw new Error("Expected toolCall block");
+		}
+		expect(persistedToolCall.arguments).toEqual({ path: "a" });
+		expect("partialJson" in persistedToolCall).toBe(false);
+		expect("parsedJsonLength" in persistedToolCall).toBe(false);
+
+		const emittedEvents = pushSpy.mock.calls.map(([event]) => event as AssistantMessageEvent);
+		expect(emittedEvents.some((event) => event.type === "toolcall_end")).toBe(true);
+	});
 });

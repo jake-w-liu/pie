@@ -122,6 +122,15 @@ const AUTH_UNSUPPORTED_ARG_FIELDS = [
 	"skills",
 	"promptTemplates",
 	"noPromptTemplates",
+	"themes",
+	"useTheme",
+	"noThemes",
+	"noContextFiles",
+	"listModels",
+	"offline",
+	"tuiMode",
+	"verbose",
+	"projectTrustOverride",
 ] as const satisfies ReadonlyArray<keyof Args>;
 
 export function validateAuthCommandArgs(args: Args, kind: AuthCommandKind): { provider?: string; model?: string } {

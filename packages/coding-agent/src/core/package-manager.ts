@@ -41,7 +41,13 @@ import { CONFIG_DIR_NAME } from "../config.ts";
 import { spawnProcess, spawnProcessSync } from "../utils/child-process.ts";
 import { isOfflineModeEnabled } from "../utils/env.ts";
 import { type GitSource, parseGitUrl } from "../utils/git.ts";
-import { canonicalizePath, isLocalPath, markPathIgnoredByCloudSync, resolvePath } from "../utils/paths.ts";
+import {
+	canonicalizePath,
+	isLocalPath,
+	isPathWithin as isWithinRoot,
+	markPathIgnoredByCloudSync,
+	resolvePath,
+} from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { addIgnoreRules, type IgnoreMatcher } from "./ignore-rules.ts";
 import { isStdoutTakenOver } from "./output-guard.ts";
@@ -511,21 +517,6 @@ function collectAutoThemeEntries(dir: string): string[] {
 	}
 
 	return entries;
-}
-
-/**
- * True when `candidate` resolves inside `root` (or is `root` itself).
- *
- * A package manifest declares what that package ships, so manifest entries resolve
- * against the package root and anything landing outside it is dropped: a plain
- * `../outside.ts`, an absolute path, or a glob whose matches escape via `..`. Without
- * this a manifest could pull arbitrary readable files off the machine into the
- * resource set and get them loaded as extensions.
- */
-function isWithinRoot(root: string, candidate: string): boolean {
-	const resolvedRoot = resolve(root);
-	const resolved = resolve(candidate);
-	return resolved === resolvedRoot || resolved.startsWith(`${resolvedRoot}${sep}`);
 }
 
 function resolveExtensionEntries(dir: string): string[] | null {

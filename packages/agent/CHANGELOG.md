@@ -61,6 +61,7 @@
 - Fixed the agent loop starting another provider request after an abort during `prepareNextTurn`, failing the whole run when a tool returned `undefined`, hanging past abort on a stream that ended without a terminal event, mutating the caller's messages in `agentLoopContinue`, and leaving the provider request running after a listener threw.
 - Fixed `atomicWriteFile` exposing new contents of a private file through a world-readable temp file and failing for writable files in non-writable directories.
 - Fixed JSONL session appends rereading the whole file, two processes stealing the same stale writer lease, prompt-template argument re-expansion, the file mutation queue running on a stale key after a path was repointed, bash spill-file failures turning successful commands into errors, and read reporting a phantom line after a trailing newline.
+- Fixed JSONL session listing failing as a whole when one `.jsonl` entry is unreadable, for example a dangling symlink; unreadable files and directories are now skipped so the remaining sessions still list.
 
 ## [0.84.3] - 2026-08-24
 

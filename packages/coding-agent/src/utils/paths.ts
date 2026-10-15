@@ -121,6 +121,33 @@ export function formatPathRelativeToCwdOrAbsolute(filePath: string, cwd: string)
 	return (getCwdRelativePath(absolutePath, cwd) ?? absolutePath).split(sep).join("/");
 }
 
+/**
+ * True when `candidate` is `root` itself or a descendant of it.
+ *
+ * Compares resolved path components rather than string prefixes, so `/a/bc`
+ * is correctly reported as outside `/a/b`. Raw `~` is not expanded, matching
+ * how package manifests resolve their entries.
+ */
+export function isPathWithin(root: string, candidate: string): boolean {
+	const resolvedRoot = nodeResolvePath(root);
+	const resolved = nodeResolvePath(candidate);
+	return resolved === resolvedRoot || resolved.startsWith(`${resolvedRoot}${sep}`);
+}
+
+/**
+ * Replace a leading home-directory prefix with `~` for display.
+ *
+ * Matches whole path components only, so with home `/Users/jake` the sibling
+ * `/Users/jaker/notes.md` is returned unchanged instead of `~r/notes.md`.
+ */
+export function shortenHomePath(input: string, homeDir: string = homedir()): string {
+	const home = homeDir.replace(/[\\/]+$/, "");
+	if (home.length === 0) return input;
+	if (input === home) return "~";
+	if (input.startsWith(`${home}${sep}`)) return `~${input.slice(home.length)}`;
+	return input;
+}
+
 export function markPathIgnoredByCloudSync(path: string): void {
 	const attrs =
 		process.platform === "darwin"

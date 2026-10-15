@@ -1,7 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { unlink } from "node:fs/promises";
-import * as os from "node:os";
 import {
 	type Component,
 	Container,
@@ -15,7 +14,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { KeybindingsManager } from "../../../core/keybindings.ts";
 import type { SessionInfo, SessionListProgress } from "../../../core/session-manager.ts";
-import { canonicalizePath as _canonicalizePath } from "../../../utils/paths.ts";
+import { canonicalizePath as _canonicalizePath, shortenHomePath } from "../../../utils/paths.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyHint, keyText } from "./keybinding-hints.ts";
@@ -24,12 +23,8 @@ import { filterAndSortSessions, hasSessionName, type NameFilter, type SortMode }
 type SessionScope = "current" | "all";
 
 function shortenPath(path: string): string {
-	const home = os.homedir();
 	if (!path) return path;
-	if (path.startsWith(home)) {
-		return `~${path.slice(home.length)}`;
-	}
-	return path;
+	return shortenHomePath(path);
 }
 
 function formatSessionDate(date: Date): string {

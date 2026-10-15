@@ -122,4 +122,40 @@ describe("Google streaming protocol edge cases", () => {
 			}
 		});
 	});
+
+	it("clamps usage.input to zero when cached tokens exceed prompt tokens", async () => {
+		// A gateway can report cachedContentTokenCount above promptTokenCount; without
+		// the clamp this produced a negative input count and a negative input cost.
+		const body = sse({
+			candidates: [{ content: { parts: [{ text: "ok" }] }, finishReason: "STOP" }],
+			usageMetadata: {
+				promptTokenCount: 100,
+				cachedContentTokenCount: 120,
+				candidatesTokenCount: 5,
+				totalTokenCount: 125,
+			},
+		});
+
+		await withSse(body, async (baseUrl) => {
+			const googleModel: Model<"google-generative-ai"> = {
+				...baseModel,
+				api: "google-generative-ai",
+				provider: "google",
+				baseUrl: `${baseUrl}/v1beta`,
+			};
+			const vertexModel: Model<"google-vertex"> = {
+				...baseModel,
+				api: "google-vertex",
+				provider: "google-vertex",
+				baseUrl: `${baseUrl}/v1`,
+			};
+
+			const google = await streamGoogle(googleModel, context, { apiKey: "test" }).result();
+			const vertex = await streamVertex(vertexModel, context, { apiKey: "test" }).result();
+			for (const result of [google, vertex]) {
+				expect(result.usage.input).toBe(0);
+				expect(result.usage.cacheRead).toBe(120);
+			}
+		});
+	});
 });

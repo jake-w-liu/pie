@@ -5,7 +5,7 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
@@ -42,7 +42,7 @@ import { listModels } from "./cli/list-models.ts";
 import { createProjectTrustContext } from "./cli/project-trust.ts";
 import { selectSession } from "./cli/session-picker.ts";
 import { shouldRunFirstTimeSetup, showFirstTimeSetup, showStartupSelector } from "./cli/startup-ui.ts";
-import { APP_NAME, ENV_SESSION_DIR, expandTildePath, getAgentDir, VERSION } from "./config.ts";
+import { APP_NAME, CONFIG_DIR_NAME, ENV_SESSION_DIR, expandTildePath, getAgentDir, VERSION } from "./config.ts";
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "./core/agent-session-runtime.ts";
 import {
 	type AgentSessionRuntimeDiagnostic,
@@ -121,13 +121,35 @@ function isPlainRuntimeMetadataCommand(parsed: Args): boolean {
 	return !parsed.print && parsed.mode === undefined && (parsed.help === true || parsed.listModels !== undefined);
 }
 
-function shouldFastPrintCoreHelp(parsed: Args): boolean {
+/**
+ * True when an extension could still register a CLI flag. The fast help path
+ * exists to avoid loading resources, so it must only run when nothing can add to
+ * the flag list; otherwise `--help` would omit extension flags for the common
+ * case of auto-discovered or installed extensions.
+ */
+function extensionFlagSourcesExist(cwd: string, agentDir: string, settings: Settings): boolean {
+	if ((settings.extensions?.length ?? 0) > 0 || (settings.packages?.length ?? 0) > 0) return true;
+	const extensionDirs = [join(agentDir, "extensions"), join(cwd, CONFIG_DIR_NAME, "extensions")];
+	for (const dir of extensionDirs) {
+		try {
+			if (existsSync(dir) && readdirSync(dir).length > 0) return true;
+		} catch {
+			// Unreadable: fall back to the full load so flags are not silently dropped.
+			return true;
+		}
+	}
+	// Project settings can add extension packages, which register flags when loaded.
+	return existsSync(join(cwd, CONFIG_DIR_NAME, "settings.json"));
+}
+
+function shouldFastPrintCoreHelp(parsed: Args, cwd: string, agentDir: string, settings: Settings): boolean {
 	return (
 		parsed.help === true &&
 		isPlainRuntimeMetadataCommand(parsed) &&
 		parsed.projectTrustOverride === undefined &&
 		(parsed.extensions?.length ?? 0) === 0 &&
-		parsed.unknownFlags.size === 0
+		parsed.unknownFlags.size === 0 &&
+		!extensionFlagSourcesExist(cwd, agentDir, settings)
 	);
 }
 
@@ -564,6 +586,14 @@ function buildSessionOptions(
 	// Model from CLI
 	// - supports --provider <name> --model <pattern>
 	// - supports --model <provider>/<pattern>
+	// --provider alone only disambiguates a model id across providers, so it is an error
+	// without --model instead of silently falling back to the settings/default model.
+	if (parsed.provider && !parsed.model) {
+		diagnostics.push({
+			type: "error",
+			message: `--provider requires --model (for example: --provider ${parsed.provider} --model <pattern>)`,
+		});
+	}
 	if (parsed.model) {
 		const resolved = resolveCliModel({
 			cliProvider: parsed.provider,
@@ -768,7 +798,7 @@ export async function main(args: string[], options?: MainOptions) {
 	const startupSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: startupProjectTrusted });
 	const startupSettingsDiagnostics = collectSettingsDiagnostics(startupSettingsManager);
 
-	if (shouldFastPrintCoreHelp(parsed)) {
+	if (shouldFastPrintCoreHelp(parsed, cwd, agentDir, startupSettingsManager.getGlobalSettings())) {
 		reportDiagnostics(startupSettingsDiagnostics);
 		printHelp([]);
 		process.exit(0);

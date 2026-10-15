@@ -174,7 +174,13 @@ export function parseArgs(args: string[]): Args {
 		} else if (arg === "--models") {
 			const value = takeValue("--models");
 			if (value !== undefined) {
-				result.models = value.split(",").map((s) => s.trim());
+				// Drop empty entries: an empty pattern matches every model in the substring
+				// matcher ("x".includes("") is always true), so a stray comma would silently
+				// add an arbitrary model to the cycle list instead of narrowing it.
+				result.models = value
+					.split(",")
+					.map((s) => s.trim())
+					.filter((pattern) => pattern.length > 0);
 			}
 		} else if (arg === "--no-tools" || arg === "-nt") {
 			result.noTools = true;
@@ -342,7 +348,7 @@ ${chalk.bold("Commands:")}
   ${APP_NAME} <command> --help          Show help for install/remove/uninstall/update/list/config/auth
 
 ${chalk.bold("Options:")}
-  --provider <name>              Provider name (default: google)
+  --provider <name>              Provider to search for --model (requires --model)
   --model <pattern>              Model pattern or ID (supports "provider/id" and optional ":<thinking>")
   --api-key <key>                API key (defaults to env vars)
   --system-prompt <text>         System prompt (default: coding assistant prompt)

@@ -155,6 +155,14 @@ describe("parseArgs", () => {
 			const result = parseArgs(["--models", "gpt-4o,claude-sonnet,gemini-pro"]);
 			expect(result.models).toEqual(["gpt-4o", "claude-sonnet", "gemini-pro"]);
 		});
+
+		test("drops empty --models entries so they cannot match every model", () => {
+			// An empty pattern matches every model in the substring matcher, so a
+			// trailing or doubled comma used to add an arbitrary model to the cycle list.
+			expect(parseArgs(["--models", "haiku,"]).models).toEqual(["haiku"]);
+			expect(parseArgs(["--models", ",,"]).models).toEqual([]);
+			expect(parseArgs(["--models", " gpt-4o , , sonnet "]).models).toEqual(["gpt-4o", "sonnet"]);
+		});
 	});
 
 	describe("--name flag", () => {

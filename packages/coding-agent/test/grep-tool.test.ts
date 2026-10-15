@@ -149,6 +149,64 @@ describe("grep flag handling", () => {
 	});
 });
 
+describe("grep path reporting", () => {
+	it("keeps a matched path whose first component starts with '..'", async () => {
+		// `relative.startsWith("..")` was used as a containment test, so a legal
+		// in-tree name like `..cache` was reported as a bare basename, colliding with
+		// the real `a.ts` at the search root.
+		const dottedRoot = mkdtempSync(join(tmpdir(), "pie-grep-dotted-"));
+		try {
+			mkdirSync(join(dottedRoot, "..cache"));
+			writeFileSync(join(dottedRoot, "..cache", "a.ts"), "MATCH\n");
+			writeFileSync(join(dottedRoot, "a.ts"), "MATCH\n");
+			const dottedTool = createGrepTool(dottedRoot);
+			const text = (result: Awaited<ReturnType<typeof dottedTool.execute>>) =>
+				result.content.map((part) => ("text" in part ? part.text : "")).join("");
+
+			const files = await dottedTool.execute("test", {
+				pattern: "MATCH",
+				path: dottedRoot,
+				outputMode: "files_with_matches",
+			} as never);
+			expect(text(files).split("\n").sort()).toEqual(["..cache/a.ts", "a.ts"]);
+
+			const content = await dottedTool.execute("test", { pattern: "MATCH", path: dottedRoot } as never);
+			expect(text(content)).toContain("..cache/a.ts:1: MATCH");
+		} finally {
+			rmSync(dottedRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a matching filename that contains a newline intact", async () => {
+		// rg's -l/-c output was split on newlines, so this name became two paths and
+		// named `y.txt`, which never matched.
+		const newlineRoot = mkdtempSync(join(tmpdir(), "pie-grep-newline-"));
+		try {
+			writeFileSync(join(newlineRoot, "x\ny.txt"), "MATCH\n");
+			writeFileSync(join(newlineRoot, "y.txt"), "other\n");
+			const newlineTool = createGrepTool(newlineRoot);
+			const text = (result: Awaited<ReturnType<typeof newlineTool.execute>>) =>
+				result.content.map((part) => ("text" in part ? part.text : "")).join("");
+
+			const files = await newlineTool.execute("test", {
+				pattern: "MATCH",
+				path: newlineRoot,
+				outputMode: "files_with_matches",
+			} as never);
+			expect(text(files)).toBe("x\ny.txt");
+
+			const count = await newlineTool.execute("test", {
+				pattern: "MATCH",
+				path: newlineRoot,
+				outputMode: "count",
+			} as never);
+			expect(text(count)).toBe("1");
+		} finally {
+			rmSync(newlineRoot, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("grep output ceiling", () => {
 	it("bounds files_with_matches output and reports the truncation", async () => {
 		const manyRoot = mkdtempSync(join(tmpdir(), "pie-grep-many-"));

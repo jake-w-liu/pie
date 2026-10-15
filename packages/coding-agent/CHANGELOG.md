@@ -162,6 +162,15 @@
 - Fixed `subagent_wait` not returning when a subagent asked its supervisor a question, which let the request expire unanswered, and supervisor replies sent after the subagent stopped blocking being rejected; late replies are now delivered to the still-running subagent as a steering message.
 - Fixed two settings writers being able to reclaim the same abandoned `settings.json.lock` at once and both write; stale-lock reclaim is now serialized.
 - Fixed `npm run refresh:pie` deleting the previous release while running sessions still used it (its in-use check failed under pipefail), which broke subagents in those sessions.
+- Fixed `--provider` without `--model` being silently ignored, which ran the settings/default model on a different provider; it now reports `--provider requires --model`, matching the documented option text.
+- Fixed `--models "a,"` adding an arbitrary extra model to the cycle list: an empty pattern matches every model in the substring matcher, so empty entries are now dropped.
+- Fixed the `grep` tool reporting a bare basename for an in-tree path whose first component starts with `..` (for example `..cache/a.ts`), which could point the model at a different file.
+- Fixed the `grep` tool splitting a matching filename that contains a newline into two paths in `files_with_matches` and `count`; both modes now request `--null` and parse NUL-framed records.
+- Fixed `auth` commands silently ignoring `--list-models`, `--offline`, `--verbose`, `--tui-mode`, `--use-theme`, `--no-context-files`, and `--approve`; they are now rejected like the other session-only options.
+- Fixed `pie --help` omitting extension CLI flags registered by auto-discovered extensions or installed packages.
+- Fixed the PDF first page still exceeding the read tool's line budget when truncated in place: the truncation notice and the already-emitted header, blank line, and page marker are now budgeted.
+- Fixed extension discovery importing files outside a package root through a `pi.extensions` entry (`../x.ts` or an absolute path); the loader now applies the same containment check as package installation.
+- Fixed display shortening of `/Users/jaker/x` to `~r/x` for home `/Users/jake` in the read/edit/find/ls/grep call headers and the session and tree pickers.
 
 ## [0.84.3] - 2026-08-24
 

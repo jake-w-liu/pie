@@ -769,6 +769,44 @@ export async function processResponsesStream<TApi extends Api>(
 	if (!sawTerminalResponseEvent) {
 		throw new Error("OpenAI Responses stream ended before a terminal response event");
 	}
+
+	// Finalize any block still open. Every other adapter closes its pending blocks after
+	// the stream loop; here the close events only fired from `response.output_item.done`,
+	// so a terminal event that arrives without one (incomplete/truncated responses, and
+	// Codex's synthesized `response.completed` from `response.done`) used to leave the
+	// block without its `*_end` event and with the staging scratch fields attached.
+	for (const slot of [...outputSlots.values()].sort((left, right) => left.contentIndex - right.contentIndex)) {
+		if (slot.type === "thinking") {
+			stream.push({
+				type: "thinking_end",
+				contentIndex: slot.contentIndex,
+				content: slot.block.thinking,
+				partial: output,
+			});
+		} else if (slot.type === "text") {
+			stream.push({
+				type: "text_end",
+				contentIndex: slot.contentIndex,
+				content: slot.block.text,
+				partial: output,
+			});
+		} else {
+			if (slot.block.customInput) {
+				delete slot.block.customInput;
+			} else if (slot.block.partialJson !== undefined) {
+				slot.block.arguments = parseStreamingJson(slot.block.partialJson || "{}");
+				delete slot.block.partialJson;
+				delete slot.block.parsedJsonLength;
+			}
+			stream.push({
+				type: "toolcall_end",
+				contentIndex: slot.contentIndex,
+				toolCall: slot.block,
+				partial: output,
+			});
+		}
+	}
+	outputSlots.clear();
 }
 
 function mapStopReason(

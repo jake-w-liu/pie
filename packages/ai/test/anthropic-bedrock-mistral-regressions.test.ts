@@ -440,6 +440,49 @@ describe("Anthropic regressions", () => {
 });
 
 describe("Mistral regressions", () => {
+	it("retries a retryable response when maxRetries is set", async () => {
+		// Mistral is a plain fetch call, so it must opt into the shared retry helper
+		// itself; before that `maxRetries` was accepted and silently ignored.
+		let attempts = 0;
+		const event = { id: "r1", choices: [{ delta: { content: "hello" }, finish_reason: "stop" }] };
+		const result = await streamMistral(
+			mistralModel,
+			{ messages: [userMessage] },
+			{
+				apiKey: "test",
+				maxRetries: 2,
+				fetch: async () => {
+					attempts += 1;
+					if (attempts < 3) {
+						return new Response("rate limited", { status: 429, headers: { "retry-after-ms": "0" } });
+					}
+					return new Response(`data: ${JSON.stringify(event)}\n\n`, { status: 200 });
+				},
+			},
+		).result();
+
+		expect(attempts).toBe(3);
+		expect(result.stopReason).toBe("stop");
+	});
+
+	it("does not retry by default", async () => {
+		let attempts = 0;
+		const result = await streamMistral(
+			mistralModel,
+			{ messages: [userMessage] },
+			{
+				apiKey: "test",
+				fetch: async () => {
+					attempts += 1;
+					return new Response("rate limited", { status: 429 });
+				},
+			},
+		).result();
+
+		expect(attempts).toBe(1);
+		expect(result.stopReason).toBe("error");
+	});
+
 	it("strips streaming scratch fields from terminal errors", async () => {
 		const event = {
 			id: "r1",

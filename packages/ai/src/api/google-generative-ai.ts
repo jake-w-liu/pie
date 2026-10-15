@@ -227,8 +227,12 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
 
 				if (chunk.usageMetadata) {
 					output.usage = {
-						input:
+						// A gateway can report more cached tokens than prompt tokens; clamp so
+						// `input` and the derived cost never go negative.
+						input: Math.max(
+							0,
 							(chunk.usageMetadata.promptTokenCount || 0) - (chunk.usageMetadata.cachedContentTokenCount || 0),
+						),
 						output:
 							(chunk.usageMetadata.candidatesTokenCount || 0) + (chunk.usageMetadata.thoughtsTokenCount || 0),
 						cacheRead: chunk.usageMetadata.cachedContentTokenCount || 0,

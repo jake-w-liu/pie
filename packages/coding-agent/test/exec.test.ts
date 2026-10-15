@@ -38,18 +38,27 @@ describe("execCommand", () => {
 			try {
 				// `detached` calls setsid, so the writer leaves the command's process group but keeps
 				// writing to the inherited stdout pipe. It exits once that pipe closes, or after 20s.
+				// The launcher exits only after the writer's first line is flushed into the pipe.
+				const ready = join(directory, "ready");
 				writeFileSync(
 					join(directory, "writer.cjs"),
-					`process.stdout.on("error", () => process.exit(0));
+					`const fs = require("node:fs");
+					process.stdout.on("error", () => process.exit(0));
+					process.stdout.write("tick\\n", () => fs.writeFileSync(${JSON.stringify(ready)}, ""));
 					setInterval(() => console.log("tick"), 20);
 					setTimeout(() => process.exit(0), 20_000);`,
 				);
 				writeFileSync(
 					join(directory, "launch.cjs"),
-					`require("node:child_process").spawn(process.execPath, [${JSON.stringify(join(directory, "writer.cjs"))}], {
+					`const fs = require("node:fs");
+					fs.rmSync(${JSON.stringify(ready)}, { force: true });
+					require("node:child_process").spawn(process.execPath, [${JSON.stringify(join(directory, "writer.cjs"))}], {
 						detached: true,
 						stdio: ["ignore", "inherit", "inherit"],
-					}).unref();`,
+					}).unref();
+					const deadline = Date.now() + 10_000;
+					const wait = () => (fs.existsSync(${JSON.stringify(ready)}) || Date.now() > deadline ? undefined : setTimeout(wait, 10));
+					wait();`,
 				);
 				// Timeout while the command runs: the shell is killed, the writer escaped the group.
 				let started = Date.now();

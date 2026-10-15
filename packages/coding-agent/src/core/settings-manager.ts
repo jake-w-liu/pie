@@ -1,10 +1,10 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import { acquireDirectoryLockSync } from "@earendil-works/pi-agent-core/node";
 import type { Transport } from "@earendil-works/pi-ai";
 import type { TuiMode as RendererTuiMode, ScrollViewScrollbar, TerminalCapabilities } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
 import { existsSync, mkdirSync, readFileSync } from "fs";
 import { dirname, join } from "path";
-import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { atomicWriteFileSync } from "../utils/atomic-write.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
@@ -214,6 +214,9 @@ function toSettingsError(scope: SettingsScope, error: unknown, path?: string): S
 	};
 }
 
+/** Waits between settings-lock attempts: ten attempts, 20ms apart. */
+const SETTINGS_LOCK_RETRY_DELAYS_MS: readonly number[] = Array.from({ length: 9 }, () => 20);
+
 export class FileSettingsStorage implements SettingsStorage {
 	private globalSettingsPath: string;
 	private projectSettingsPath: string;
@@ -226,29 +229,10 @@ export class FileSettingsStorage implements SettingsStorage {
 	}
 
 	private acquireLockSyncWithRetry(path: string): () => void {
-		const maxAttempts = 10;
-		const delayMs = 20;
-		let lastError: unknown;
-
-		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-			try {
-				return lockfile.lockSync(path, { realpath: false });
-			} catch (error) {
-				const code =
-					typeof error === "object" && error !== null && "code" in error
-						? String((error as { code?: unknown }).code)
-						: undefined;
-				if (code !== "ELOCKED" || attempt === maxAttempts) {
-					throw error;
-				}
-				lastError = error;
-				// Block without busy-spinning the CPU. The event loop stays blocked
-				// for up to delayMs, which is inherent to the synchronous lock API.
-				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
-			}
-		}
-
-		throw (lastError as Error) ?? new Error("Failed to acquire settings lock");
+		// Shared with pi-subagents' settings writers: proper-lockfile's on-disk lock, plus a
+		// serialized reclaim so two writers can never both remove the same abandoned lock.
+		// Ten attempts 20ms apart, as before; the event loop blocks for each wait.
+		return acquireDirectoryLockSync(`${path}.lock`, { retryDelaysMs: SETTINGS_LOCK_RETRY_DELAYS_MS });
 	}
 
 	read(scope: SettingsScope): string | undefined {

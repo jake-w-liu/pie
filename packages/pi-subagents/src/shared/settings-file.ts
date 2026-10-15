@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { acquireDirectoryLockSync } from "@earendil-works/pi-agent-core/node";
 import {
 	DEFAULT_FILE_SYSTEM_RETRY_DELAYS_MS,
 	isRetryableFileSystemError,
@@ -12,54 +13,9 @@ import {
 // packages/coding-agent/src/core/settings-manager.ts), and this extension edits it too.
 // Both must lock it and replace it the same way.
 
-/**
- * proper-lockfile's default `stale` time. The coding agent locks settings.json with
- * `lockfile.lockSync(path, { realpath: false })`, which treats a lock directory older than this
- * as abandoned; using the same threshold keeps both writers' views of a stale lock identical.
- */
-const SETTINGS_LOCK_STALE_MS = 10_000;
-
-function lockIsStale(lockPath: string): boolean {
-	try {
-		return Date.now() - fs.statSync(lockPath).mtimeMs > SETTINGS_LOCK_STALE_MS;
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
-		throw error;
-	}
-}
-
-/**
- * Take the coding agent's settings lock using proper-lockfile's on-disk protocol: an empty
- * `<file>.lock` directory on the unresolved path, created with mkdir and released or reclaimed
- * with rmdir. Keeping the directory empty is what lets either writer reclaim the other's
- * abandoned lock.
- */
+/** Take the coding agent's settings lock (shared helper: same on-disk protocol, serialized reclaim). */
 function acquireSettingsLock(filePath: string): () => void {
-	const lockPath = `${filePath}.lock`;
-	for (let attempt = 0; ; attempt++) {
-		try {
-			fs.mkdirSync(lockPath);
-			return () => {
-				try {
-					fs.rmdirSync(lockPath);
-				} catch (error) {
-					// Already reclaimed as stale by another writer; nothing left to release.
-					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-				}
-			};
-		} catch (error) {
-			const code = (error as NodeJS.ErrnoException).code;
-			if (code === "EEXIST" && lockIsStale(lockPath)) {
-				// A lock from an older pi-subagents version holds an owner record; it is stale either way.
-				fs.rmSync(lockPath, { recursive: true, force: true });
-				continue;
-			}
-			if (code !== "EEXIST" && !isRetryableFileSystemError(error)) throw error;
-			const delayMs = DEFAULT_FILE_SYSTEM_RETRY_DELAYS_MS[attempt];
-			if (delayMs === undefined) throw new Error(`Timed out acquiring settings lock '${lockPath}'.`, { cause: error });
-			waitForFileSystemRetry(delayMs);
-		}
-	}
+	return acquireDirectoryLockSync(`${filePath}.lock`, { retryDelaysMs: DEFAULT_FILE_SYSTEM_RETRY_DELAYS_MS });
 }
 
 /**

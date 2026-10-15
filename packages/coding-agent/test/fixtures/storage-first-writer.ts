@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import lockfile from "proper-lockfile";
 import { FileAuthStorageBackend } from "../../src/core/auth-storage.ts";
 import { SettingsManager } from "../../src/core/settings-manager.ts";
 
@@ -47,15 +46,17 @@ if (kind.startsWith("auth")) {
 	else backend.withLock(update);
 } else {
 	const manager = SettingsManager.create(path, path);
-	const lock = lockfile.lockSync;
+	// Pause right before the settings lock directory is created, the lock acquisition boundary.
+	const mkdir = fs.mkdirSync;
 	let paused = false;
-	lockfile.lockSync = (file, options) => {
-		if (!paused) {
+	fs.mkdirSync = ((dir: fs.PathLike, options?: fs.MakeDirectoryOptions | fs.Mode | null) => {
+		if (!paused && String(dir).endsWith("settings.json.lock")) {
 			paused = true;
 			barrier();
 		}
-		return lock(file, options);
-	};
+		return mkdir(dir, options);
+	}) as typeof fs.mkdirSync;
+	syncBuiltinESMExports();
 	if (scope === "project") manager.setProjectSkillPaths(["delayed-skill"]);
 	else manager.setTheme("delayed-theme");
 	await manager.flush();

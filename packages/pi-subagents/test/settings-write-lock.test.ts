@@ -62,8 +62,8 @@ describe("C7: shared settings.json override writes", () => {
 		// Same lock directory the coding agent's settings writer (proper-lockfile) uses.
 		fs.mkdirSync(`${settingsPath}.lock`);
 
-		expect(() => mergeBuiltinAgentOverride(process.cwd(), "worker", "user", { model: "c/d" })).toThrow(/Timed out acquiring/);
-		expect(() => removeBuiltinAgentOverrideFields(process.cwd(), "worker", "user", ["disabled"])).toThrow(/Timed out acquiring/);
+		expect(() => mergeBuiltinAgentOverride(process.cwd(), "worker", "user", { model: "c/d" })).toThrow(/Lock is held by another writer/);
+		expect(() => removeBuiltinAgentOverrideFields(process.cwd(), "worker", "user", ["disabled"])).toThrow(/Lock is held by another writer/);
 		expect(fs.readFileSync(settingsPath, "utf-8")).toBe(original);
 
 		fs.rmdirSync(`${settingsPath}.lock`);

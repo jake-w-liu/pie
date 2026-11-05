@@ -103,7 +103,7 @@ Useful session commands:
 - `/tree` navigates the in-file session tree and can summarize abandoned branches.
 - `/fork` creates a new session from an earlier user message.
 - `/clone` duplicates the current active branch into a new session file.
-- Automatic compaction starts at the earlier of 87% context usage or the configured reserve boundary; `/compact` summarizes older messages manually.
+- Automatic compaction starts when the context reaches 87% of the model window or leaves only the configured `reserveTokens` free, whichever comes first; `/compact` summarizes older messages manually.
 
 See [Sessions](sessions.md) and [Compaction](compaction.md) for details.
 

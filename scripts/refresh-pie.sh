@@ -5,14 +5,24 @@ usage() {
 	cat <<'EOF'
 Usage: scripts/refresh-pie.sh [options]
 
-Build the current Pie checkout, stage and validate a local npm installation,
-atomically activate it for new terminal invocations, then remove repository
-build artifacts. The upstream `pi` executable is never modified.
+Bump every Pie package to the next patch version, commit the bump, and push the
+current branch. Then build the checkout, stage and validate a local npm
+installation, atomically activate it for new terminal invocations, and remove
+repository build artifacts. The upstream `pi` executable is never modified.
+
+The version commit contains only version files (package manifests, lockfiles,
+the coding-agent shrinkwrap and install lock, and README.md), which must have
+no other uncommitted changes. Other uncommitted work is built and installed but
+not committed. No tag is created, so nothing is published. If the push fails,
+the installation still completes and refresh exits with status 1.
 
 Run this command only while no other build or test is using this checkout;
 refresh cleans shared repository dist/ outputs before and after installation.
 
 Options:
+  --no-push        Bump and commit the version without fetching or pushing
+  --no-bump        Reinstall the current version without bumping, committing,
+                   or pushing
   --check          Run npm run check before the final build
   --test           Run ./test.sh after building
   --online-models  Refresh model catalogs during the build instead of reusing
@@ -24,6 +34,8 @@ Options:
 EOF
 }
 
+bump=true
+push=true
 run_check=false
 run_tests=false
 online_models=false
@@ -32,6 +44,12 @@ slim=false
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
+		--no-push)
+			push=false
+			;;
+		--no-bump)
+			bump=false
+			;;
 		--check)
 			run_check=true
 			;;
@@ -135,6 +153,13 @@ original_bin_exists=false
 original_bin_target=""
 original_canonical_type="absent"
 original_canonical_target=""
+bump_backup_dir=""
+bump_applied=false
+bump_committed=false
+push_failed=false
+previous_version=""
+new_version=""
+bump_commit=""
 
 remove_owned_directory() {
 	local directory="$1"
@@ -241,6 +266,100 @@ restore_original_activation() {
 	return 0
 }
 
+# Bump every package to the next patch version, commit only the version files, and
+# push the current branch. Runs in the repository root. Sets the bump_* globals that
+# cleanup() reads to restore the version files when the bump is not committed.
+bump_commit_and_push() {
+	local branch behind path dirty_version_files push_remote="" push_ref=""
+	local -a version_files=() changed_version_files=()
+	if ! branch="$(git symbolic-ref --quiet --short HEAD)"; then
+		printf 'error: HEAD is detached; check out a branch to commit the version bump, or use --no-bump\n' >&2
+		exit 1
+	fi
+	if [[ "$push" == true ]]; then
+		push_remote="$(git config --get "branch.$branch.remote" || true)"
+		push_ref="$(git config --get "branch.$branch.merge" || true)"
+		if [[ -z "$push_remote" || -z "$push_ref" ]]; then
+			printf 'error: branch %s has no upstream; set one with git push -u, or use --no-push\n' "$branch" >&2
+			exit 1
+		fi
+		# Fail before bumping when the push could not fast-forward the upstream branch.
+		if ! git fetch --quiet "$push_remote" "$push_ref"; then
+			printf 'error: could not fetch %s from %s; use --no-push to refresh offline\n' "$push_ref" "$push_remote" >&2
+			exit 1
+		fi
+		behind="$(git rev-list --count HEAD..FETCH_HEAD)"
+		if [[ "$behind" != "0" ]]; then
+			printf 'error: %s is %s commit(s) behind %s %s; integrate them first (for example: git pull --rebase)\n' "$branch" "$behind" "$push_remote" "$push_ref" >&2
+			exit 1
+		fi
+	fi
+
+	while IFS= read -r -d '' path; do
+		version_files+=("$path")
+	done < <(git ls-files -z -- ':(glob)**/package.json' ':(glob)**/package-lock.json' ':(glob)**/npm-shrinkwrap.json' README.md)
+	if [[ ${#version_files[@]} -eq 0 ]]; then
+		printf 'error: no tracked version files found\n' >&2
+		exit 1
+	fi
+	# The version commit must contain only the bump, never unrelated edits to these files.
+	dirty_version_files="$(git status --porcelain --untracked-files=no -- "${version_files[@]}")"
+	if [[ -n "$dirty_version_files" ]]; then
+		printf 'error: version files have uncommitted changes; commit them before refreshing, or use --no-bump:\n%s\n' "$dirty_version_files" >&2
+		exit 1
+	fi
+
+	bump_backup_dir="$(mktemp -d "${TMPDIR:-/tmp}/pie-refresh-bump.XXXXXX")"
+	touch "$bump_backup_dir/.pie-refresh-owned"
+	for path in "${version_files[@]}"; do
+		mkdir -p -- "$bump_backup_dir/files/$(dirname -- "$path")"
+		cp -p -- "$path" "$bump_backup_dir/files/$path"
+	done
+
+	previous_version="$(read_package_field "$repo_dir/packages/coding-agent/package.json" version)"
+	bump_applied=true
+	new_version="$(node scripts/bump-version.mjs | tail -n 1)"
+	if [[ "$new_version" != "$(read_package_field "$repo_dir/packages/coding-agent/package.json" version)" ]]; then
+		printf 'error: version bump reported %s, which does not match packages/coding-agent/package.json\n' "$new_version" >&2
+		exit 1
+	fi
+
+	while IFS= read -r -d '' path; do
+		changed_version_files+=("$path")
+	done < <(git diff --name-only -z -- "${version_files[@]}")
+	if [[ ${#changed_version_files[@]} -eq 0 ]]; then
+		printf 'error: version bump changed no files\n' >&2
+		exit 1
+	fi
+	# Committing named paths ignores anything else staged in the index. The bump
+	# intentionally updates package-lock.json, which the pre-commit hook guards.
+	if ! PI_ALLOW_LOCKFILE_CHANGE=1 git commit --quiet -m "Bump version to $new_version" -- "${changed_version_files[@]}"; then
+		printf 'error: committing the version bump failed; fix the reported errors and rerun refresh\n' >&2
+		exit 1
+	fi
+	bump_committed=true
+	bump_commit="$(git rev-parse --short=12 HEAD)"
+	printf 'Committed version %s -> %s as %s\n' "$previous_version" "$new_version" "$bump_commit"
+
+	if [[ "$push" == true ]]; then
+		if git push --quiet "$push_remote" "HEAD:$push_ref"; then
+			printf 'Pushed %s to %s %s\n' "$bump_commit" "$push_remote" "$push_ref"
+		else
+			push_failed=true
+			printf 'warning: git push failed; the version commit is only local. Retry with: git push %s HEAD:%s\n' "$push_remote" "$push_ref" >&2
+		fi
+	fi
+}
+
+# Put back the version files saved before an uncommitted bump, so a failed refresh
+# leaves the checkout's versions unchanged.
+restore_version_files() {
+	local relative
+	while IFS= read -r -d '' relative; do
+		cp -p -- "$bump_backup_dir/files/$relative" "$repo_dir/$relative" || return 1
+	done < <(cd "$bump_backup_dir/files" && find . -type f -print0)
+}
+
 cleanup() {
 	local status=$?
 	local cleanup_failed=false
@@ -248,6 +367,19 @@ cleanup() {
 	set +e
 
 	restore_original_activation || cleanup_failed=true
+
+	if [[ "$bump_applied" == true && "$bump_committed" != true ]]; then
+		if restore_version_files; then
+			printf 'Restored version files after the failed version bump.\n' >&2
+		else
+			printf 'error: could not restore version files; copies remain in %s\n' "$bump_backup_dir/files" >&2
+			bump_backup_dir=""
+			cleanup_failed=true
+		fi
+	fi
+	if [[ -n "$bump_backup_dir" && -d "$bump_backup_dir" ]]; then
+		remove_owned_directory "$bump_backup_dir" ".pie-refresh-owned" || cleanup_failed=true
+	fi
 
 	if [[ -n "$release_dir" && -d "$release_dir" ]]; then
 		if { [[ -L "$pie_link" ]] && [[ "$(readlink "$pie_link")" == "$release_pie" ]]; } ||
@@ -360,9 +492,17 @@ elif [[ -e "$canonical_root" ]]; then
 fi
 
 cd "$repo_dir"
+
+if [[ "$bump" == true ]]; then
+	bump_commit_and_push
+fi
+
 source_revision="$(git rev-parse --short=12 HEAD)"
 if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
 	source_revision="$source_revision-dirty"
+	if [[ "$bump" == true ]]; then
+		printf 'note: uncommitted changes are included in this build but not in the version commit\n' >&2
+	fi
 fi
 printf 'Refreshing Pie from %s\n' "$source_revision"
 
@@ -546,3 +686,7 @@ printf 'Bundle SHA-256: %s\n' "$source_bundle_hash"
 printf 'Active release: %s\n' "$release_dir"
 printf 'Launcher: %s\n' "$pie_link"
 printf 'New pie invocations now use this build; restart existing Pie sessions.\n'
+if [[ "$push_failed" == true ]]; then
+	printf 'error: the installation succeeded, but pushing version commit %s failed\n' "$bump_commit" >&2
+	exit 1
+fi

@@ -12,6 +12,7 @@
 
 ### Changed
 
+- Changed `npm run refresh:pie` to bump every package to the next patch version, commit only the version files, and push the current branch before rebuilding and reinstalling. It stops before bumping when the branch is behind its upstream or a version file has uncommitted edits, restores the version files if the bump or its commit fails, and still installs when the push fails (exiting with status 1). `--no-push` skips the push and `--no-bump` reinstalls without git changes.
 - Activated the built-in `grep` and `find` tools by default. They were registered but inactive, so the agent searched by shelling out to `rg`/`find` through `bash` and never reached the tool the previous change optimised. Override with `defaultTools` in settings or `--tools` as before.
 - Made the built-in `grep` tool take context lines from ripgrep's own context events instead of re-reading and caching every matched file. An unbounded context search over a 35MB, 4500-file corpus dropped from a 1839ms median to 806ms, with peak RSS down from 215MB to 188MB. `files_with_matches` and `count` now select ripgrep's `-l` and `-c` output instead of parsing a match event per hit, so they no longer build a full result set in memory. Output format is unchanged, and ripgrep is now invoked with `--no-config` so a user `RIPGREP_CONFIG_PATH` cannot inject flags that break the parsing.
 

@@ -16,10 +16,15 @@ interface CodingAgentPackageJson {
 const packageJson = JSON.parse(
 	readFileSync(new URL("../package.json", import.meta.url), "utf8"),
 ) as CodingAgentPackageJson;
+const aiPackageJson = JSON.parse(readFileSync(new URL("../../ai/package.json", import.meta.url), "utf8")) as {
+	version: string;
+};
 
 describe("package distribution entrypoints", () => {
 	test("uses the bundle for executables and modular output for libraries", () => {
-		expect(packageJson.version).toBe("0.1.0");
+		// Pie restarts at 0.x and bumps every package in lockstep (scripts/bump-version.mjs).
+		expect(packageJson.version).toMatch(/^0\.\d+\.\d+$/);
+		expect(packageJson.version).toBe(aiPackageJson.version);
 		expect(packageJson.bin).toEqual({ pie: "dist/bundle/pie-cli.js" });
 		expect(packageJson.piConfig).toEqual({
 			configDir: ".pi",

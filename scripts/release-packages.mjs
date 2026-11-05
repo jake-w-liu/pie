@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { findPackageDirectories } from "./package-workspaces.mjs";
 
@@ -50,4 +50,34 @@ export function getPublicWorkspacePackages() {
 		}))
 		.filter((pkg) => pkg.private !== true)
 		.map(({ directory, name, version }) => ({ directory, name, version }));
+}
+
+/**
+ * npm version can temporarily lock the previous workspace versions under nested
+ * node_modules before sync-versions updates inter-package ranges. Remove those
+ * stale entries so the next lockfile refresh links the bumped workspaces.
+ * Returns the number of removed entries.
+ */
+export function removeStaleWorkspaceLockEntries(lockPath = "package-lock.json") {
+	const workspaceVersions = new Map(getPublicWorkspacePackages().map((pkg) => [pkg.name, pkg.version]));
+	const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+	let removed = 0;
+
+	for (const [path, pkg] of Object.entries(lock.packages)) {
+		if (!path.startsWith("packages/") || pkg.link === true) {
+			continue;
+		}
+		for (const [name, version] of workspaceVersions) {
+			if (path.endsWith(`/node_modules/${name}`) && pkg.version !== version) {
+				delete lock.packages[path];
+				removed++;
+				break;
+			}
+		}
+	}
+
+	if (removed > 0) {
+		writeFileSync(lockPath, `${JSON.stringify(lock, null, "\t")}\n`);
+	}
+	return removed;
 }

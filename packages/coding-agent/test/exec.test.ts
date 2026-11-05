@@ -4,6 +4,32 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { execCommand } from "../src/core/exec.ts";
 
+const isAlive = (pid: number): boolean => {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+};
+
+/**
+ * Wait for a process to disappear, and report whether it did.
+ *
+ * execCommand sends SIGTERM and then SIGKILL to the command's process group before it settles, but
+ * the kernel delivers the signal and reaps the orphan asynchronously, so a loaded runner can still
+ * report the pid alive when the call returns. Monitoring the pid is the only portable way to
+ * observe the kill; a process that outlives the deadline is a real failure.
+ */
+async function waitUntilGone(pid: number, deadlineMs: number): Promise<boolean> {
+	const deadline = Date.now() + deadlineMs;
+	while (isAlive(pid)) {
+		if (Date.now() >= deadline) return false;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	return true;
+}
+
 describe("execCommand", () => {
 	it("decodes UTF-8 continuously across output chunks", async () => {
 		const script = [
@@ -22,14 +48,30 @@ describe("execCommand", () => {
 		expect(result).toMatchObject({ code: 0, stdout: "€", stderr: "" });
 	});
 
-	it.skipIf(process.platform === "win32")("terminates descendants on timeout", async () => {
-		const result = await execCommand("sh", ["-c", "sleep 30 & echo $!; wait"], process.cwd(), { timeout: 100 });
-		const descendantPid = Number(result.stdout.trim());
+	it.skipIf(process.platform === "win32")(
+		"terminates descendants on timeout",
+		async () => {
+			let descendantPid = 0;
+			try {
+				const result = await execCommand("sh", ["-c", "sleep 30 & echo $!; wait"], process.cwd(), {
+					timeout: 100,
+				});
+				descendantPid = Number(result.stdout.trim());
 
-		expect(result.killed).toBe(true);
-		expect(descendantPid).toBeGreaterThan(0);
-		expect(() => process.kill(descendantPid, 0)).toThrow();
-	});
+				expect(result.killed).toBe(true);
+				expect(descendantPid).toBeGreaterThan(0);
+				expect(await waitUntilGone(descendantPid, 3_000)).toBe(true);
+			} finally {
+				// Never leave the descendant behind if an assertion failed; it is this test's own child.
+				if (descendantPid > 0) {
+					try {
+						process.kill(descendantPid, "SIGKILL");
+					} catch {}
+				}
+			}
+		},
+		15_000,
+	);
 
 	it.skipIf(process.platform === "win32")(
 		"kills its own process group when the timeout fires after the command exited",
@@ -50,18 +92,7 @@ describe("execCommand", () => {
 				loopPid = Number(/pid=(\d+)/.exec(result.stdout)?.[1]);
 				expect(loopPid).toBeGreaterThan(0);
 				expect(result.killed).toBe(true);
-				// SIGKILL is sent before the call settles; allow the orphan's reaper a moment.
-				const deadline = Date.now() + 3_000;
-				const alive = () => {
-					try {
-						process.kill(loopPid, 0);
-						return true;
-					} catch {
-						return false;
-					}
-				};
-				while (alive() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
-				expect(alive()).toBe(false);
+				expect(await waitUntilGone(loopPid, 3_000)).toBe(true);
 			} finally {
 				// Never leave the writer behind if an assertion failed; it is this test's own child.
 				if (loopPid > 0) {

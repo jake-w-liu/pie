@@ -56,11 +56,14 @@ if [ "$RUN_BROWSER_SMOKE" -eq 1 ]; then
 fi
 
 # Only files that were staged before formatting are returned to the index.
+# A staged deletion exists in neither the worktree nor the index, so git add would
+# reject its pathspec; it is already staged and formatting cannot recreate it.
 node - "$STAGED_FILES" <<'NODE'
-const { readFileSync } = require("node:fs");
+const { existsSync, readFileSync } = require("node:fs");
 const { execFileSync } = require("node:child_process");
 const paths = readFileSync(process.argv[2]).toString().split("\0").filter(Boolean);
-if (paths.length > 0) execFileSync("git", ["add", "-A", "--", ...paths], { stdio: "inherit" });
+const present = paths.filter((path) => existsSync(path));
+if (present.length > 0) execFileSync("git", ["add", "-A", "--", ...present], { stdio: "inherit" });
 NODE
 
 echo "✅ All pre-commit checks passed!"

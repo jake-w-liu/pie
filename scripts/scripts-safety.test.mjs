@@ -281,6 +281,25 @@ test("pre-commit hook refuses partially staged files without staging the remaini
 	assert.doesNotMatch(git(root, "diff", "--cached"), /UNSTAGED-SECRET/);
 });
 
+test("pre-commit hook accepts a commit that deletes a file", () => {
+	const root = temporaryRoot("pi-hook-delete-");
+	initializeGit(root);
+	mkdirSync(join(root, "scripts"));
+	writeFileSync(join(root, "scripts/check-lockfile-commit.mjs"), "process.exit(0);\n");
+	writeFileSync(join(root, "package.json"), `${JSON.stringify({ scripts: { check: 'node -e "process.exit(0)"' } })}\n`);
+	writeFileSync(join(root, "keep.ts"), "base\n");
+	writeFileSync(join(root, "gone.ts"), "obsolete\n");
+	git(root, "add", ".");
+	git(root, "commit", "-qm", "initial");
+	git(root, "rm", "-q", "gone.ts");
+	writeFileSync(join(root, "keep.ts"), "base\nchanged\n");
+	git(root, "add", "keep.ts");
+	// Husky runs hooks with `sh -e`, so any failing command fails the commit.
+	const result = run("sh", ["-e", join(repositoryRoot, ".husky/pre-commit")], { cwd: root });
+	assert.equal(result.status, 0, result.stderr);
+	assert.deepEqual(git(root, "diff", "--cached", "--name-status").trim().split("\n"), ["D\tgone.ts", "M\tkeep.ts"]);
+});
+
 test("tool stats encodes session strings as JSON data instead of executable markup", () => {
 	const root = temporaryRoot("pi-tool-stats-");
 	const sessions = join(root, "sessions");

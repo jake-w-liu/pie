@@ -664,7 +664,7 @@ describe("harness compaction", () => {
 		}
 	});
 
-	it("uses a valid default summary budget when the response reserve is zero", async () => {
+	it("requests the model output limit regardless of the response reserve", async () => {
 		const messages: AgentMessage[] = [createUserMessage("Summarize this.")];
 		const seenOptions: Array<Record<string, unknown> | undefined> = [];
 		const { faux, model } = createFauxModel(false);
@@ -673,13 +673,52 @@ describe("harness compaction", () => {
 				seenOptions.push(options as Record<string, unknown> | undefined);
 				return fauxAssistantMessage("summary");
 			},
+			(_context, options) => {
+				seenOptions.push(options as Record<string, unknown> | undefined);
+				return fauxAssistantMessage("summary");
+			},
 		]);
 
 		getOrThrow(await generateSummary(messages, models, model, 0));
+		getOrThrow(await generateSummary(messages, models, model, DEFAULT_COMPACTION_SETTINGS.reserveTokens));
 
-		expect(seenOptions[0]?.maxTokens).toBe(
-			Math.min(model.maxTokens, Math.floor(DEFAULT_COMPACTION_SETTINGS.reserveTokens * 0.8)),
+		expect(seenOptions.map((options) => options?.maxTokens)).toEqual([model.maxTokens, model.maxTokens]);
+	});
+
+	it("retries a reasoning summary that stops at the output limit once with reduced reasoning", async () => {
+		// Reasoning shares the output limit on some providers and can use it up before the summary text.
+		const messages: AgentMessage[] = [createUserMessage("Summarize this.")];
+		const seenOptions: Array<Record<string, unknown> | undefined> = [];
+		const { faux, model } = createFauxModel(true, 128000);
+		faux.setResponses([
+			(_context, options) => {
+				seenOptions.push(options as Record<string, unknown> | undefined);
+				return fauxAssistantMessage("partial", { stopReason: "length" });
+			},
+			(_context, options) => {
+				seenOptions.push(options as Record<string, unknown> | undefined);
+				return fauxAssistantMessage("## Goal\nsummary");
+			},
+		]);
+
+		const result = getOrThrow(
+			await generateSummaryWithUsage(
+				messages,
+				models,
+				model,
+				DEFAULT_COMPACTION_SETTINGS.reserveTokens,
+				undefined,
+				undefined,
+				undefined,
+				"high",
+			),
 		);
+
+		expect(result.text).toBe("## Goal\nsummary");
+		expect(seenOptions.map((options) => [options?.reasoning, options?.maxTokens])).toEqual([
+			["high", 128000],
+			["minimal", 128000],
+		]);
 	});
 
 	it("clamps compaction summary maxTokens to the model output cap", async () => {

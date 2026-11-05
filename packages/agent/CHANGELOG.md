@@ -4,6 +4,7 @@
 
 ### Breaking Changes
 
+- Removed `getSummarizationTokenBudget()`. Harness compaction, turn-prefix, and branch summaries request the model's output limit instead of a share of `reserveTokens`; `getSummarizationOutputLimit()` and `getSummarizationOutputAllowance()` expose the new sizing, and `generateSummary()`/`generateSummaryWithUsage()` ignore their `reserveTokens` argument.
 - `JsonlSessionRepoFileSystem` now requires the existing `FileSystem.canonicalPath()` operation. Custom JSONL filesystems must implement symlink-aware canonical resolution and propagate resolution failures. Repository metadata file paths are canonical; header `cwd` spelling is unchanged.
 - Changed `prepareNextTurn` and `prepareNextTurnWithContext` to run only after `shouldStopAfterTurn` and queued-message checks determine that the agent loop will start another assistant turn. They no longer run after final or terminating turns; move end-of-run work to `agent_end` handling ([#6879](https://github.com/earendil-works/pi/issues/6879)).
 
@@ -21,6 +22,7 @@
 
 ### Fixed
 
+- Fixed harness summaries failing with "generation hit the token cap" on reasoning models: the output limit was 80% (history) or 50% (turn prefix) of `reserveTokens` and 2048 tokens for branch summaries, which reasoning can use up before the summary text on providers where it shares the limit. A reasoning summary that still stops at the limit is retried once with the lowest listed thinking level, and update summaries now drop stale details instead of preserving every previous one.
 - The harness `read` tool no longer returns raw binary text for files it cannot present as text: device files (`/dev/zero`, `/proc/*/fd/0-2`), binary extensions, NUL-byte content, UTF-16 files, and unsupported image formats (animated PNG, TIFF, JPEG 2000/JPEG-LS, ICO, HEIC/AVIF) now fail with an actionable message. The local execution environment already rejects FIFOs and other non-regular files.
 - Revalidated JSONL identities at admission, redirecting only after releasing stale file/directory queues and failing bounded repeated churn. Case-only generation replacement cannot leave a deleted writer unsealed or publish an independent stale-key writer; both-missing retargeted directory-alias deletion now selects the proved current owner without sealing the healthy historical owner.
 - Coordinated canonical JSONL publication with existing-file open/delete, including symlink aliases. Successful deletion now seals live writers without resurrecting headerless logs; failed deletions preserve usable handles and idle publication-queue records are reclaimed.

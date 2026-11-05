@@ -15,6 +15,8 @@ import { BranchSummaryError, err, ok, type Result, toError } from "../types.ts";
 import {
 	completeSimpleWithRetries,
 	estimateSummarizationInputTokens,
+	getSummarizationOutputAllowance,
+	getSummarizationOutputLimit,
 	SUMMARIZATION_SYSTEM_PROMPT,
 } from "./compaction.ts";
 import {
@@ -206,9 +208,6 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
-/** Upper bound on the summary output reservation. */
-const BRANCH_SUMMARY_MAX_OUTPUT_TOKENS = 2048;
-
 /** Generate a summary for abandoned branch entries. */
 export async function generateBranchSummary(
 	entries: Entry[],
@@ -244,21 +243,15 @@ export async function generateBranchSummary(
 	} else {
 		instructions = BRANCH_SUMMARY_PROMPT;
 	}
-	// The public reserve covers the generated summary. Never request more output
-	// than was reserved, and subtract the fixed prompt envelope before selecting
-	// branch messages.
-	const maxOutputTokens = Math.max(
-		1,
-		Math.min(
-			BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
-			model.maxTokens || BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
-			Math.floor(reserveTokens),
-		),
-	);
+	// The reserve bounds the output planned while selecting branch messages; subtract it
+	// and the fixed prompt envelope from the window. The request itself asks for the
+	// model's output limit, which providers fit into the remaining context, so reasoning
+	// that shares the limit cannot use up a small fixed cap.
+	const plannedOutputTokens = getSummarizationOutputAllowance(model, reserveTokens);
 	const fixedEnvelope = Math.ceil(
 		(SUMMARIZATION_SYSTEM_PROMPT.length + instructions.length + "<conversation>\n\n</conversation>\n\n".length) / 4,
 	);
-	const tokenBudget = contextWindow - maxOutputTokens - fixedEnvelope;
+	const tokenBudget = contextWindow - plannedOutputTokens - fixedEnvelope;
 	if (!Number.isFinite(tokenBudget) || tokenBudget <= 0) {
 		return err(
 			new BranchSummaryError(
@@ -292,7 +285,7 @@ export async function generateBranchSummary(
 		},
 	];
 	const completionContext = { systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages };
-	if (estimateSummarizationInputTokens(completionContext) + maxOutputTokens > contextWindow) {
+	if (estimateSummarizationInputTokens(completionContext) + plannedOutputTokens > contextWindow) {
 		return err(
 			new BranchSummaryError(
 				"summarization_failed",
@@ -306,7 +299,7 @@ export async function generateBranchSummary(
 			models,
 			model,
 			completionContext,
-			{ signal, maxTokens: maxOutputTokens },
+			{ signal, maxTokens: getSummarizationOutputLimit(model) },
 			retry,
 			callbacks,
 		);

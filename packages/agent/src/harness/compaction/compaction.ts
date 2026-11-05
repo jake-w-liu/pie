@@ -2,6 +2,7 @@ import {
 	type Api,
 	type AssistantMessage,
 	type Context,
+	clampThinkingLevel,
 	contentText,
 	type Message,
 	type Model,
@@ -110,6 +111,38 @@ export function estimateSummarizationInputTokens(context: Context): number {
 	);
 }
 
+/** Smallest output allowance (reasoning plus summary text) a summary request must leave room for. */
+const MIN_SUMMARY_OUTPUT_TOKENS = 1024;
+
+/** Share of the context window planned for summary output when the model allows that much. */
+const SUMMARY_OUTPUT_WINDOW_FRACTION = 0.25;
+
+/**
+ * Output limit requested for a summary: the model's own limit. Providers reduce it to the
+ * context left after the prompt. A limit derived from reserveTokens let reasoning, which
+ * shares the output limit on some providers, use it up before the summary text started.
+ */
+export function getSummarizationOutputLimit(model: Model<Api>): number | undefined {
+	return Number.isFinite(model.maxTokens) && model.maxTokens > 0 ? Math.floor(model.maxTokens) : undefined;
+}
+
+/**
+ * Output tokens planned when deciding how much input a summary request may carry: up to a
+ * quarter of the context window, never more than the model's limit or the caller's reserve.
+ */
+export function getSummarizationOutputAllowance(model: Model<Api>, reserveTokens?: number): number {
+	const window = model.contextWindow > 0 ? model.contextWindow : Number.POSITIVE_INFINITY;
+	const limit = getSummarizationOutputLimit(model) ?? MIN_SUMMARY_OUTPUT_TOKENS;
+	let allowance = Math.min(
+		limit,
+		Math.max(MIN_SUMMARY_OUTPUT_TOKENS, Math.floor(window * SUMMARY_OUTPUT_WINDOW_FRACTION)),
+	);
+	if (reserveTokens !== undefined && Number.isFinite(reserveTokens) && reserveTokens > 0) {
+		allowance = Math.min(allowance, Math.floor(reserveTokens));
+	}
+	return Math.max(1, allowance);
+}
+
 export async function completeSimpleWithRetries(
 	models: Models,
 	model: Model<Api>,
@@ -120,7 +153,13 @@ export async function completeSimpleWithRetries(
 ): Promise<AssistantMessage> {
 	options.signal?.throwIfAborted();
 	const inputTokens = estimateSummarizationInputTokens(context);
-	if (model.contextWindow > 0 && inputTokens + (options.maxTokens ?? model.maxTokens) > model.contextWindow) {
+	// The provider fits the requested output into the remaining context; the input only has
+	// to leave room for a useful summary.
+	const requestedOutput = options.maxTokens ?? getSummarizationOutputLimit(model) ?? MIN_SUMMARY_OUTPUT_TOKENS;
+	if (
+		model.contextWindow > 0 &&
+		inputTokens + Math.min(requestedOutput, MIN_SUMMARY_OUTPUT_TOKENS) > model.contextWindow
+	) {
 		throw new CompactionError(
 			"summarization_failed",
 			"Summarization input exceeds the model context budget. Use a larger-context model or reduce the summary input.",
@@ -173,7 +212,7 @@ function combineUsage(first: Usage, second: Usage): Usage {
 export interface CompactionSettings {
 	/** Enable automatic compaction decisions. */
 	enabled: boolean;
-	/** Tokens reserved for summary prompt and output. */
+	/** Tokens kept free below the context window; a larger reserve triggers compaction earlier. */
 	reserveTokens: number;
 	/** Approximate recent-context tokens to keep after compaction. */
 	keepRecentTokens: number;
@@ -192,18 +231,6 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
  * `min(ratio * contextWindow, contextWindow - reserveTokens)`.
  */
 export const DEFAULT_COMPACTION_TRIGGER_RATIO = 0.87;
-
-/** Token budget for a summarization request, shared by compaction and branch summaries. */
-export function getSummarizationTokenBudget(reserveTokens: number, ratio: number, modelMaxTokens: number): number {
-	const effectiveReserve =
-		Number.isFinite(reserveTokens) && reserveTokens > 0 ? reserveTokens : DEFAULT_COMPACTION_SETTINGS.reserveTokens;
-	const reserveBudget = Math.max(1, Math.floor(effectiveReserve * ratio));
-	const modelBudget =
-		Number.isFinite(modelMaxTokens) && modelMaxTokens > 0
-			? Math.max(1, Math.floor(modelMaxTokens))
-			: Number.POSITIVE_INFINITY;
-	return Math.min(reserveBudget, modelBudget);
-}
 
 /**
  * Returns an error message when a summarization response cannot be persisted.
@@ -244,6 +271,52 @@ async function settleCompactionCompletion(
 			),
 		);
 	}
+}
+
+const THINKING_LEVEL_ORDER: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/** Lowest level the model lists above "off", when it is below `level`. */
+function reducedThinkingLevel(model: Model<Api>, level: ThinkingLevel | undefined): ThinkingLevel | undefined {
+	if (!level || level === "off") return undefined;
+	const floor = clampThinkingLevel(model, "minimal");
+	return THINKING_LEVEL_ORDER.indexOf(floor) < THINKING_LEVEL_ORDER.indexOf(level) ? floor : undefined;
+}
+
+/**
+ * Send one summary request at the model's output limit. Reasoning shares that limit on some
+ * providers, so a response that stops at it is retried once with reduced reasoning.
+ */
+async function requestSummaryText(
+	models: Models,
+	model: Model<Api>,
+	context: Context,
+	label: string,
+	signal: AbortSignal | undefined,
+	thinkingLevel: ThinkingLevel | undefined,
+	retry: RetryPolicy | undefined,
+	callbacks: RetryCallbacks | undefined,
+): Promise<Result<{ text: string; usage: Usage }, CompactionError>> {
+	const level = model.reasoning && thinkingLevel && thinkingLevel !== "off" ? thinkingLevel : undefined;
+	const reduced = reducedThinkingLevel(model, level);
+	const attemptLevels = reduced ? [level, reduced] : [level];
+	let usage: Usage | undefined;
+	for (const [index, attemptLevel] of attemptLevels.entries()) {
+		const options: SimpleStreamOptions = { signal };
+		const maxTokens = getSummarizationOutputLimit(model);
+		if (maxTokens !== undefined) options.maxTokens = maxTokens;
+		if (attemptLevel && attemptLevel !== "off") options.reasoning = attemptLevel;
+		const completion = await settleCompactionCompletion(
+			completeSimpleWithRetries(models, model, context, options, retry, callbacks),
+			signal,
+		);
+		if (!completion.ok) return err(completion.error);
+		const response = completion.value;
+		usage = usage ? combineUsage(usage, response.usage) : response.usage;
+		if (response.stopReason === "length" && index < attemptLevels.length - 1) continue;
+		const text = extractSummaryText(response, label);
+		return text.ok ? ok({ text: text.value, usage }) : err(text.error);
+	}
+	return err(new CompactionError("summarization_failed", `${label} failed: no summary was produced`));
 }
 
 function extractSummaryText(response: AssistantMessage, label: string): Result<string, CompactionError> {
@@ -733,7 +806,7 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
 
 Update the existing structured summary with new information. RULES:
-- PRESERVE all existing information from the previous summary
+- KEEP information from the previous summary that is still true and relevant; drop details that are stale or superseded
 - ADD new progress, decisions, and context from the new messages
 - UPDATE the Progress section: move items from "In Progress" to "Done" when completed
 - UPDATE "Next Steps" based on what was accomplished
@@ -804,7 +877,8 @@ export async function generateSummaryWithUsage(
 	currentMessages: AgentMessage[],
 	models: Models,
 	model: Model<Api>,
-	reserveTokens: number,
+	// Unused. Kept for existing callers; summaries request the model's output limit.
+	_reserveTokens: number,
 	signal?: AbortSignal,
 	customInstructions?: string,
 	previousSummary?: string,
@@ -813,38 +887,23 @@ export async function generateSummaryWithUsage(
 	callbacks?: RetryCallbacks,
 	cacheReuse?: SummarizationCacheReuse,
 ): Promise<Result<{ text: string; usage: Usage }, CompactionError>> {
-	const maxTokens = getSummarizationTokenBudget(reserveTokens, 0.8, model.maxTokens);
 	const llmMessages = convertToLlm(currentMessages);
 
 	// Cache-reusing path: replay the live system prompt + messages as a prefix and
-	// append the compaction instruction as the final user message.
+	// append the compaction instruction as the final user message. Replay is used only
+	// when it fits next to the planned output; otherwise tool results are bounded.
 	if (cacheReuse?.systemPrompt !== undefined) {
 		const instruction = buildCompactionInstruction(previousSummary, customInstructions);
-		const completionOptions =
-			model.reasoning && thinkingLevel && thinkingLevel !== "off"
-				? { maxTokens, signal, reasoning: thinkingLevel }
-				: { maxTokens, signal };
-		const completion = await settleCompactionCompletion(
-			completeSimpleWithRetries(
-				models,
-				model,
-				buildCacheReusingSummarizationContext(
-					cacheReuse.systemPrompt,
-					cacheReuse.tools,
-					instruction,
-					llmMessages,
-					model.contextWindow > 0 ? model.contextWindow - maxTokens : Number.POSITIVE_INFINITY,
-				),
-				completionOptions,
-				retry,
-				callbacks,
-			),
-			signal,
+		const context = buildCacheReusingSummarizationContext(
+			cacheReuse.systemPrompt,
+			cacheReuse.tools,
+			instruction,
+			llmMessages,
+			model.contextWindow > 0
+				? model.contextWindow - getSummarizationOutputAllowance(model)
+				: Number.POSITIVE_INFINITY,
 		);
-		if (!completion.ok) return err(completion.error);
-		const response = completion.value;
-		const text = extractSummaryText(response, "Summarization");
-		return text.ok ? ok({ text: text.value, usage: response.usage }) : err(text.error);
+		return requestSummaryText(models, model, context, "Summarization", signal, thinkingLevel, retry, callbacks);
 	}
 
 	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
@@ -858,26 +917,16 @@ export async function generateSummaryWithUsage(
 	}
 	promptText += basePrompt;
 
-	const completionOptions =
-		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, reasoning: thinkingLevel }
-			: { maxTokens, signal };
-
-	const completion = await settleCompactionCompletion(
-		completeSimpleWithRetries(
-			models,
-			model,
-			buildSummarizationContext(promptText),
-			completionOptions,
-			retry,
-			callbacks,
-		),
+	return requestSummaryText(
+		models,
+		model,
+		buildSummarizationContext(promptText),
+		"Summarization",
 		signal,
+		thinkingLevel,
+		retry,
+		callbacks,
 	);
-	if (!completion.ok) return err(completion.error);
-	const response = completion.value;
-	const text = extractSummaryText(response, "Summarization");
-	return text.ok ? ok({ text: text.value, usage: response.usage }) : err(text.error);
 }
 
 /** Prepared inputs for a compaction run. */
@@ -1050,7 +1099,6 @@ export async function compact(
 			turnPrefixMessages,
 			models,
 			model,
-			settings.reserveTokens,
 			signal,
 			thinkingLevel,
 			retry,
@@ -1112,41 +1160,22 @@ async function generateTurnPrefixSummary(
 	messages: AgentMessage[],
 	models: Models,
 	model: Model<Api>,
-	reserveTokens: number,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 ): Promise<Result<{ text: string; usage: Usage }, CompactionError>> {
-	const maxTokens = getSummarizationTokenBudget(reserveTokens, 0.5, model.maxTokens);
 	const llmMessages = convertToLlm(messages);
 	const conversationText = serializeConversation(llmMessages);
 	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
-
-	const completionOptions =
-		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, reasoning: thinkingLevel }
-			: { maxTokens, signal };
-	const completion = await settleCompactionCompletion(
-		completeSimpleWithRetries(
-			models,
-			model,
-			{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
-			completionOptions,
-			retry,
-			callbacks,
-		),
+	return requestSummaryText(
+		models,
+		model,
+		buildSummarizationContext(promptText),
+		"Turn prefix summarization",
 		signal,
+		thinkingLevel,
+		retry,
+		callbacks,
 	);
-	if (!completion.ok) return err(completion.error);
-	const response = completion.value;
-	const text = extractSummaryText(response, "Turn prefix summarization");
-	return text.ok ? ok({ text: text.value, usage: response.usage }) : err(text.error);
 }

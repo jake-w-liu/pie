@@ -10,6 +10,7 @@ import type { AssistantMessage } from "../types.ts";
  *
  * - Anthropic: "prompt is too long: 213462 tokens > 200000 maximum"
  * - Anthropic: "413 {\"error\":{\"type\":\"request_too_large\",\"message\":\"Request exceeds the maximum size\"}}"
+ * - Anthropic: "input length and `max_tokens` exceed context limit: 182831 + 64000 > 200000, decrease input length or `max_tokens` and try again"
  * - OpenAI: "Your input exceeds the context window of this model"
  * - OpenAI/LiteLLM: "Requested token count exceeds the model's maximum context length of 131072 tokens"
  * - OpenAI-compatible: "Input length (265330) exceeds model's maximum context length (262144)."
@@ -37,6 +38,7 @@ import type { AssistantMessage } from "../types.ts";
 const OVERFLOW_PATTERNS = [
 	/prompt is too long/i, // Anthropic token overflow
 	/request_too_large/i, // Anthropic request byte-size overflow (HTTP 413)
+	/input length and `?max_tokens`? exceed context limit/i, // Anthropic: input plus requested output exceeds the window
 	/input is too long for requested model/i, // Amazon Bedrock
 	/exceeds the context window/i, // OpenAI (Completions & Responses API)
 	/exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))/i, // OpenAI-compatible proxies (LiteLLM)
@@ -91,7 +93,7 @@ const NON_OVERFLOW_PATTERNS = [
  * ## Reliability by Provider
  *
  * **Reliable detection (returns error with detectable message):**
- * - Anthropic: "prompt is too long: X tokens > Y maximum" or "request_too_large"
+ * - Anthropic: "prompt is too long: X tokens > Y maximum", "input length and `max_tokens` exceed context limit", or "request_too_large"
  * - OpenAI (Completions & Responses): "exceeds the context window", "exceeds the model's maximum context length of X tokens", or "exceeds model's maximum context length (X)"
  * - Google Gemini: "input token count exceeds the maximum"
  * - xAI (Grok): "maximum prompt length is X but request contains Y"

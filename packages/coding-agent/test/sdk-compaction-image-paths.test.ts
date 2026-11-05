@@ -15,7 +15,7 @@ it.each([
 	{ automatic: true, split: true, blocked: true },
 	{ automatic: false, split: true, blocked: false },
 ])(
-	"enforces SDK image policy through compaction (automatic=$automatic split=$split blocked=$blocked)",
+	"keeps image payloads out of compaction requests and intact in the session (automatic=$automatic split=$split blocked=$blocked)",
 	async ({ automatic, split, blocked }) => {
 		const dir = mkdtempSync(join(tmpdir(), "pi-sdk-compaction-images-"));
 		const manager = SessionManager.create(dir, join(dir, "sessions"));
@@ -76,16 +76,12 @@ it.each([
 			expect(reasons).toEqual([automatic ? "threshold" : "manual"]);
 			expect(captured).toHaveLength(summaries + (automatic ? 1 : 0));
 			for (const context of captured.slice(0, summaries)) {
+				// Summary requests carry a serialized text transcript under any image policy.
 				const payload = JSON.stringify(context.messages);
-				if (blocked) {
-					expect(payload).not.toContain('"type":"image"');
-					expect(payload).not.toContain("original-user-image");
-					expect(payload).not.toContain("original-tool-image");
-					expect(payload).toContain("Image reading is disabled."); // Raw replay, not text-only fallback.
-				} else {
-					expect(payload).toContain("original-user-image");
-					expect(payload).toContain("original-tool-image");
-				}
+				expect(payload).not.toContain('"type":"image"');
+				expect(payload).not.toContain("original-user-image");
+				expect(payload).not.toContain("original-tool-image");
+				expect(payload).toMatch(/image request \d/);
 			}
 			expect(manager.getEntries().slice(0, original.length)).toEqual(original);
 			const bytes = readFileSync(manager.getSessionFile()!, "utf8");

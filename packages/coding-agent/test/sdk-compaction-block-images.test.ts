@@ -8,13 +8,14 @@ import {
 import { expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { generateSummaryWithUsage } from "../src/core/compaction/index.ts";
+import { SUMMARIZATION_SYSTEM_PROMPT } from "../src/core/compaction/utils.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { createInMemoryModelRegistry, getModelRuntime } from "./model-runtime-test-utils.ts";
 import { createTestResourceLoader } from "./utilities.ts";
 
-it("applies dynamic image policy to SDK compaction requests without altering stored images", async () => {
+it("sends SDK compaction requests as text-only transcripts under any image policy without altering stored images", async () => {
 	const model: Model<"openai-responses"> = {
 		id: "test-model",
 		name: "Test model",
@@ -103,22 +104,16 @@ it("applies dynamic image policy to SDK compaction requests without altering sto
 				undefined,
 				undefined,
 				session.sessionId,
-				"Live system prompt",
 			);
 			expect(result.text).toBe("A summary");
 			const context = captured.at(-1);
-			expect(context?.systemPrompt).toBe("Live system prompt");
+			expect(context?.systemPrompt).toBe(SUMMARIZATION_SYSTEM_PROMPT);
+			expect(context?.tools).toBeUndefined();
 			const outgoing = JSON.stringify(context?.messages);
-			if (blocked) {
-				expect(outgoing).not.toContain("image-data");
-				expect(context?.messages[0].content).toEqual([
-					{ type: "text", text: "Read the images" },
-					{ type: "text", text: "Image reading is disabled." },
-				]);
-			} else {
-				expect(outgoing).toContain("original-image-data");
-				expect(outgoing).toContain("tool-image-data");
-			}
+			// The summary request carries a serialized transcript, never image payloads.
+			expect(outgoing).not.toContain("image-data");
+			expect(outgoing).not.toContain('"type":"image"');
+			expect(outgoing).toContain("Read the images");
 			expect(messages).toEqual(original);
 			expect(sessionManager.buildSessionContext().messages).toEqual(original);
 		}

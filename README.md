@@ -13,7 +13,7 @@ Pie keeps Pi's provider support, sessions, SDK, and extension system while shipp
 - Installs pinned defaults for `pi-web-access` and `pi-subagents` on a fresh Pie configuration.
 - Enables default-on Headroom request compression for large tool results while preserving exact session data and on-demand retrieval.
 - Switches to the authenticated provider's default model after cross-provider `/login` and remembers interactive model changes for the next startup.
-- Starts automatic context compaction at the earlier of 87% usage or the configured response-token reserve.
+- Starts automatic context compaction at the earlier of 87% usage or the configured reserve boundary, and sizes summary requests from the model's own limits so long sessions on high-reasoning models keep compacting.
 - Optimizes long-session terminal rendering, streaming Markdown and Bash previews, narrow selectors, and masked authentication input.
 - Uses complete dark and light palettes from the [NIPPON COLORS](https://nipponcolors.com/) catalog.
 - Ships only the `pie` executable (no `pi` binary) while keeping full access to the Pi ecosystem: providers, sessions, extensions, and `~/.pi` credentials.

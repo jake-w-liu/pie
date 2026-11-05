@@ -3,7 +3,12 @@ import { fauxAssistantMessage, fauxToolCall, type Message } from "@earendil-work
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import { generateBranchSummary } from "../../src/core/compaction/branch-summarization.ts";
-import { type CompactionPreparation, compact, generateSummaryWithUsage } from "../../src/core/compaction/index.ts";
+import {
+	type CompactionPreparation,
+	compact,
+	generateSummaryWithUsage,
+	summaryHardLimitTokens,
+} from "../../src/core/compaction/index.ts";
 import { createHarness, getUserTexts, type Harness } from "./harness.ts";
 
 const settings = { enabled: true, reserveTokens: 2000, keepRecentTokens: 2000 };
@@ -185,7 +190,7 @@ describe("automatic compaction", () => {
 		harness.sessionManager.appendMessage({ role: "user", content: "retained request", timestamp: Date.now() });
 		harness.setResponses([fauxAssistantMessage("summary")]);
 		const result = await harness.session.compact();
-		expect(result.summary.length).toBeLessThanOrEqual(settings.reserveTokens * 4);
+		expect(result.summary.length).toBeLessThanOrEqual(summaryHardLimitTokens(harness.getModel().contextWindow) * 4);
 		expect(result.details).toMatchObject({ readFiles: files.toSorted(), modifiedFiles: [] });
 		expect(result.summary).toContain("summary metadata");
 	});
@@ -228,8 +233,6 @@ describe("automatic compaction", () => {
 			undefined,
 			undefined,
 			undefined,
-			"live system prompt",
-			[],
 		);
 		expect(result.text).toBe("summary of large results");
 		expect(sentCharacters).toBeLessThan(128000 * 4);

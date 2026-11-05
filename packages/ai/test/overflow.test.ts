@@ -30,6 +30,13 @@ function createErrorMessage(errorMessage: string): AssistantMessage {
 }
 
 describe("isContextOverflow", () => {
+	it("detects Anthropic input-plus-max_tokens context limit errors", () => {
+		const message = createErrorMessage(
+			'400 {"type":"error","error":{"type":"invalid_request_error","message":"input length and `max_tokens` exceed context limit: 182831 + 64000 > 200000, decrease input length or `max_tokens` and try again"}}',
+		);
+		expect(isContextOverflow(message, 200000)).toBe(true);
+	});
+
 	it("detects explicit Ollama prompt-too-long errors", () => {
 		const message = createErrorMessage("400 `prompt too long; exceeded max context length by 100918 tokens`");
 		expect(isContextOverflow(message, 32768)).toBe(true);

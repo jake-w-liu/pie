@@ -5,10 +5,9 @@
  * a summary of the branch being left so context isn't lost.
  */
 
-import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, StreamFn, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { RetryCallbacks, RetryPolicy } from "@earendil-works/pi-ai";
-import { contentText } from "@earendil-works/pi-ai";
-import type { Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
+import type { Model, Usage } from "@earendil-works/pi-ai/compat";
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
@@ -16,7 +15,15 @@ import {
 	createCustomMessage,
 } from "../messages.ts";
 import type { ReadonlySessionManager, SessionEntry } from "../session-manager.ts";
-import { completeSummarization, effectiveReserveTokens, getSummarizationFailure } from "./compaction.ts";
+import { effectiveReserveTokens } from "./compaction.ts";
+import {
+	CONCISE_RETRY_NOTE,
+	type SummaryInstructionContext,
+	summarizeTranscript,
+	summaryHardLimitTokens,
+	summaryLengthRule,
+	summaryTargetTokens,
+} from "./summarization.ts";
 import {
 	computeFileLists,
 	createFileOps,
@@ -24,8 +31,6 @@ import {
 	extractFileOpsFromMessage,
 	type FileOperations,
 	formatFileOperations,
-	SUMMARIZATION_SYSTEM_PROMPT,
-	serializeConversation,
 } from "./utils.ts";
 
 // ============================================================================
@@ -82,6 +87,8 @@ export interface GenerateBranchSummaryOptions {
 	replaceInstructions?: boolean;
 	/** Tokens reserved for prompt + LLM response (default 16384), capped at half the context window */
 	reserveTokens?: number;
+	/** Session thinking level. Forwarded so the request uses an effort level the model accepts. */
+	thinkingLevel?: ThinkingLevel;
 	/** Optional session stream function. Used to preserve SDK request behavior without mutating agent state. */
 	streamFn?: StreamFn;
 	/** Retry policy for transient summarization errors. Reuses coding-agent's `settings.retry`. */
@@ -249,11 +256,7 @@ Summary of that exploration:
 
 `;
 
-const BRANCH_SUMMARY_PROMPT = `Create a structured summary of this conversation branch for context when returning later.
-
-Use this EXACT format:
-
-## Goal
+const BRANCH_SUMMARY_SECTIONS = `## Goal
 [What was the user trying to accomplish in this branch?]
 
 ## Constraints & Preferences
@@ -274,9 +277,36 @@ Use this EXACT format:
 - **[Decision]**: [Brief rationale]
 
 ## Next Steps
-1. [What should happen next to continue this work]
+1. [What should happen next to continue this work]`;
 
-Keep each section concise. Preserve exact file paths, function names, and error messages.`;
+interface BranchInstructionOptions extends SummaryInstructionContext {
+	targetTokens: number;
+	customInstructions?: string;
+	replaceInstructions?: boolean;
+}
+
+/** Instructions for one branch summary request; later chunks consolidate the summary of earlier ones. */
+function buildBranchInstructions(options: BranchInstructionOptions): string {
+	const parts: string[] = [];
+	if (options.hasPreviousSummary) {
+		parts.push(
+			"The <previous-summary> summarizes the earlier part of this branch. Produce one consolidated summary that covers both.",
+		);
+	}
+	if (options.replaceInstructions && options.customInstructions) {
+		parts.push(options.customInstructions);
+	} else {
+		parts.push(
+			`Create a structured summary of this conversation branch for context when returning later.\n\nUse this EXACT format:\n\n${BRANCH_SUMMARY_SECTIONS}`,
+		);
+		parts.push(
+			`Keep each section concise. Preserve exact file paths, function names, and error messages. ${summaryLengthRule(options.targetTokens)}`,
+		);
+		if (options.customInstructions) parts.push(`Additional focus: ${options.customInstructions}`);
+	}
+	if (options.concise) parts.push(CONCISE_RETRY_NOTE);
+	return parts.join("\n\n");
+}
 
 /**
  * Generate a summary of abandoned branch entries.
@@ -297,6 +327,7 @@ export async function generateBranchSummary(
 		customInstructions,
 		replaceInstructions,
 		reserveTokens = 16384,
+		thinkingLevel,
 		streamFn,
 		retry,
 		callbacks,
@@ -321,49 +352,28 @@ export async function generateBranchSummary(
 			: { summary: "No content to summarize" };
 	}
 
-	// Transform to LLM-compatible messages, then serialize to text
-	// Serialization prevents the model from treating it as a conversation to continue
-	const llmMessages = convertToLlm(messages);
-	const conversationText = serializeConversation(llmMessages);
-
-	// Build prompt
-	let instructions: string;
-	if (replaceInstructions && customInstructions) {
-		instructions = customInstructions;
-	} else if (customInstructions) {
-		instructions = `${BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: ${customInstructions}`;
-	} else {
-		instructions = BRANCH_SUMMARY_PROMPT;
-	}
-	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${instructions}`;
-
-	const summarizationMessages = [
-		{
-			role: "user" as const,
-			content: [{ type: "text" as const, text: promptText }],
-			timestamp: Date.now(),
-		},
-	];
-
-	// Call LLM for summarization. Prefer the session stream function so SDK
-	// request behavior (timeouts, retries, attribution headers) stays consistent
-	// without running through agent state/events. Retried via completeSummarization
-	// so transient stream drops reuse the configured retry policy.
-	const context = { systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages };
-	const requestOptions: SimpleStreamOptions = { apiKey, headers, env, signal, maxTokens: 2048 };
-	const response = await completeSummarization(model, context, requestOptions, streamFn, retry, callbacks);
-
-	// Check if aborted or errored
-	if (response.stopReason === "aborted") {
-		return { aborted: true };
-	}
-	const summaryText = contentText(response.content);
-	const failure = getSummarizationFailure(response, "Branch summarization", summaryText);
-	if (failure) {
-		return { error: failure };
-	}
-	if (response.content.some((block) => block.type === "toolCall")) {
-		return { error: "Branch summarization attempted to call a tool" };
+	// Serialized transcript requests, chunked to fit the model and retried with less reasoning or
+	// smaller input when the model runs out of room. Prefer the session stream function so SDK
+	// request behavior (timeouts, retries, attribution headers) stays consistent without running
+	// through agent state/events.
+	const targetTokens = Math.max(1024, Math.floor(summaryTargetTokens(model.contextWindow) / 2));
+	let summaryText: string;
+	let usage: Usage;
+	try {
+		const result = await summarizeTranscript(
+			convertToLlm(messages),
+			undefined,
+			(context) => buildBranchInstructions({ ...context, targetTokens, customInstructions, replaceInstructions }),
+			{ model, apiKey, headers, env, signal, thinkingLevel, streamFn, retry, callbacks },
+			{ label: "Branch summarization", condenseAboveTokens: targetTokens * 2, condenseTargetTokens: targetTokens },
+		);
+		summaryText = result.text;
+		usage = result.usage;
+	} catch (error) {
+		if (signal.aborted || (error instanceof Error && error.name === "AbortError")) {
+			return { aborted: true };
+		}
+		return { error: error instanceof Error ? error.message : String(error) };
 	}
 
 	let summary = summaryText;
@@ -371,13 +381,14 @@ export async function generateBranchSummary(
 	// Prepend preamble to provide context about the branch summary
 	summary = BRANCH_SUMMARY_PREAMBLE + summary;
 
-	// Compute file lists and append to summary
+	// Compute file lists and append to summary within the checkpoint's hard length limit.
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
-	summary += formatFileOperations(readFiles, modifiedFiles, Math.max(0, reserve * 4 - summary.length));
+	const checkpointCharLimit = summaryHardLimitTokens(model.contextWindow) * 4;
+	summary += formatFileOperations(readFiles, modifiedFiles, Math.max(0, checkpointCharLimit - summary.length));
 
 	return {
 		summary,
-		usage: response.usage,
+		usage,
 		readFiles,
 		modifiedFiles,
 	};

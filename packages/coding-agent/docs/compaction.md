@@ -5,6 +5,7 @@ LLMs have limited context windows. When conversations grow too long, Pi uses com
 **Source files** ([pi-mono](https://github.com/earendil-works/pi-mono)):
 - [`packages/coding-agent/src/core/compaction/compaction.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) - Auto-compaction logic
 - [`packages/coding-agent/src/core/compaction/branch-summarization.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts) - Branch summarization
+- [`packages/coding-agent/src/core/compaction/summarization.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/summarization.ts) - Summary request sizing, chunking, and recovery
 - [`packages/coding-agent/src/core/compaction/utils.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/utils.ts) - Shared utilities (file tracking, serialization)
 - [`packages/coding-agent/src/core/session-manager.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/session-manager.ts) - Entry types (`CompactionEntry`, `BranchSummaryEntry`)
 - [`packages/coding-agent/src/core/extensions/types.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/extensions/types.ts) - Extension event types
@@ -32,15 +33,17 @@ Auto-compaction triggers at the earlier of two boundaries:
 contextTokens >= min(floor(contextWindow * 0.87), contextWindow - min(reserveTokens, floor(contextWindow / 2)))
 ```
 
-The 87% boundary keeps large-context models from reaching nearly 100% before compaction. The reserve boundary remains authoritative when it triggers earlier. The reserve is capped at half the context window, so the default 16384-token reserve still leaves room for history on 8k and 16k models; the same capped reserve sizes the summary output. Model catalog output limits do not change this threshold: many providers publish limits close to or equal to the whole context window, so treating them as mandatory free space would compact almost immediately and could stop valid tool runs. Pie evaluates every completed assistant/tool turn before the next provider request, combining provider-reported usage with a side-effect-free projection of Headroom-compressed tool results. Compressible results are measured at their projected request size; skipped or uncompressible results retain their full size. If compaction cannot bring the projected context below the trigger, Pie stops automatic continuation instead of sending an over-limit request. The footer caps its percentage display at 100%, while raw token counts remain available for compaction and session statistics. By default, `reserveTokens` is 16384 tokens (configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`).
+The 87% boundary keeps large-context models from reaching nearly 100% before compaction. The reserve boundary remains authoritative when it triggers earlier. The reserve is capped at half the context window, so the default 16384-token reserve still leaves room for history on 8k and 16k models. The reserve only decides when compaction starts; it does not limit the summary output. Model catalog output limits do not change this threshold: many providers publish limits close to or equal to the whole context window, so treating them as mandatory free space would compact almost immediately and could stop valid tool runs. By default, `reserveTokens` is 16384 tokens (configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`).
+
+Pie checks the threshold at three points: after a completed run, between turns before the next provider request, and before sending a new prompt, where the measured context includes the prompt itself and any extension messages. Every check uses one estimate, which combines provider-reported usage with a side-effect-free projection of Headroom-compressed tool results; compressible results are measured at their projected request size, while skipped or uncompressible results retain their full size. Because the trigger and the limit check use the same estimate, Pie always attempts compaction before it reports a context limit. If compaction cannot bring the projected context below the trigger, Pie stops automatic continuation instead of sending an over-limit request. The footer caps its percentage display at 100%, while raw token counts remain available for compaction and session statistics.
 
 You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary.
 
 ### How It Works
 
-1. **Find cut point**: Walk backwards from newest message, accumulating token estimates until `keepRecentTokens` (default 20k, configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`) is reached
+1. **Find cut point**: Walk backwards from newest message, accumulating token estimates until `keepRecentTokens` (default 20k, configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`) is reached. Retention is bounded so compaction always frees room: retained messages may use at most half of the threshold, minus the system prompt, a full-length summary, and a pending prompt. When one large recent message would exceed that bound, the cut moves past it and the message is summarized. When the latest provider usage shows that the character-based estimates undercount the real prompt (for example, replayed encrypted reasoning), the estimates are scaled up to match before the cut is chosen.
 2. **Extract messages**: Collect messages from the previous kept boundary (or session start) up to the cut point
-3. **Generate summary**: Call LLM to summarize with structured format, passing the previous summary as iterative context when present
+3. **Generate summary**: Call LLM to summarize with structured format, passing the previous summary as iterative context when present (see [Summary Requests](#summary-requests))
 4. **Append entry**: Save `CompactionEntry` with summary and `firstKeptEntryId`
 5. **Rebuilds context**: Session rebuilds the context for the next request, using summary + messages from `firstKeptEntryId` onwards
 
@@ -76,7 +79,18 @@ What the LLM sees:
     prompt   from cmp          messages from firstKeptEntryId
 ```
 
-On repeated compactions, the summarized span starts at the previous compaction's kept boundary (`firstKeptEntryId`), not at the compaction entry itself, falling back to the entry after the previous compaction if that kept entry cannot be found in the path. This preserves messages that survived the earlier compaction by including them in the next summarization pass as well. Pi also recalculates `tokensBefore` from the rebuilt session context before writing the new `CompactionEntry`, so the token count reflects the actual pre-compaction context being replaced.
+On repeated compactions, the summarized span starts at the previous compaction's kept boundary (`firstKeptEntryId`), not at the compaction entry itself, falling back to the entry after the previous compaction if that kept entry cannot be found in the path. This preserves messages that survived the earlier compaction by including them in the next summarization pass as well. A compaction can follow another one directly when the new cut point removes more history, for example when the context is still above the threshold after the first. Pi also recalculates `tokensBefore` from the rebuilt session context before writing the new `CompactionEntry`, so the token count reflects the actual pre-compaction context being replaced.
+
+### Summary Requests
+
+Compaction, split-turn, and branch summaries share one request path:
+
+- **Standalone transcript**: Each request sends the serialized conversation (see [Message Serialization](#message-serialization)) under a dedicated summarizer system prompt, without tools.
+- **Output limit**: Requests ask for the model's own output limit, reduced only to fit the context left after the prompt. Reasoning shares that limit on some providers (adaptive Anthropic thinking, OpenAI Responses), so a small fixed limit would let high thinking levels use it up before the summary text.
+- **Reasoning level**: Requests use the session thinking level, capped at `high`.
+- **Chunking**: A transcript larger than one request is split into chunks that fit the context window next to the output allowance. Each chunk is summarized together with the summary of everything before it, so a history of any size produces one summary. A single message larger than one request keeps its head and tail.
+- **Recovery**: A response that stops at the output limit is retried once with the lowest thinking level the model lists above `off` and a request for a shorter summary. If it still stops there, the chunk is split once; if the provider reports a context overflow, the chunk is split or truncated until it fits. Only then does the operation fail.
+- **Length target**: Summaries are asked to stay under a target of about 3% of the context window (1k to 8k tokens). A summary longer than twice its target is condensed once, so checkpoints do not grow without bound across repeated compactions. If condensing fails, the complete longer summary is kept.
 
 ### Split Turns
 
@@ -252,7 +266,7 @@ path/to/changed.ts
 </modified-files>
 ```
 
-Visible file tags are limited to the checkpoint's remaining character budget, using the same four-characters-per-token estimate as context accounting. Complete file lists remain in the entry's `details`; individual paths are never cut in half.
+Visible file tags are limited to the checkpoint's remaining character budget below twice its length target, using the same four-characters-per-token estimate as context accounting. Complete file lists remain in the entry's `details`; individual paths are never cut in half.
 
 ### Message Serialization
 
@@ -269,7 +283,7 @@ Output from tool
 
 This prevents the model from treating it as a conversation to continue.
 
-Tool results are truncated to 2000 characters during serialization. Content beyond that limit is replaced with a marker indicating how many characters were truncated. This keeps summarization requests within reasonable token budgets, since tool results (especially from `read` and `bash`) are typically the largest contributors to context size.
+Tool results are truncated to 2000 characters during serialization, keeping the head and tail around a marker that records how many characters were removed. This keeps summarization requests within reasonable token budgets, since tool results (especially from `read` and `bash`) are typically the largest contributors to context size. Images are not sent to the summarizer.
 
 ## Custom Summarization via Extensions
 
@@ -413,7 +427,7 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `true` | Enable auto-compaction at the earlier of 87% usage or the reserve boundary |
-| `reserveTokens` | `16384` | Tokens to reserve for the LLM response, capped at half the context window; a larger reserve can trigger before 87% |
-| `keepRecentTokens` | `20000` | Target for recent tokens to keep; reduced on small models to leave room below the trigger for the replacement checkpoint |
+| `reserveTokens` | `16384` | Tokens kept free below the context window, capped at half the window; a larger reserve triggers before 87%. Does not limit summary output |
+| `keepRecentTokens` | `20000` | Target for recent tokens to keep; reduced on small models and bounded so the retained messages leave room below the trigger |
 
 Disable auto-compaction with `"enabled": false`. You can still compact manually with `/compact`.

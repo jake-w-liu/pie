@@ -122,7 +122,7 @@ const TOOL_RESULT_MAX_CHARS = 2000;
  * Keeps the leading portion and the trailing portion joined by a "middle
  * pruned" marker, which is what the pruner's `headChars`/`tailChars` do.
  */
-function truncateForSummary(text: string, maxChars: number): string {
+export function truncateForSummary(text: string, maxChars: number): string {
 	if (text.length <= maxChars) return text;
 	// Default head/tail split: 80% head, 20% tail, keeping the full resource
 	// bounded by maxChars and always retaining a meaningful recent tail.
@@ -159,6 +159,51 @@ function boundedContentText(content: string | readonly { type: string; text?: st
 }
 
 /**
+ * Serialize one LLM message to transcript text for summarization, or return an
+ * empty string when the message carries no summarizable content.
+ * Tool results are truncated; user and assistant text is kept in full.
+ */
+export function serializeMessage(msg: Message): string {
+	if (msg.role === "user") {
+		const content = contentText(msg.content, "");
+		return content ? `[User]: ${content}` : "";
+	}
+	if (msg.role === "assistant") {
+		const parts: string[] = [];
+		const thinkingParts: string[] = [];
+		const toolCalls: string[] = [];
+
+		for (const block of msg.content) {
+			if (block.type === "thinking") {
+				thinkingParts.push(block.thinking);
+			} else if (block.type === "toolCall") {
+				const args = (block.arguments ?? {}) as Record<string, unknown>;
+				const argsStr = Object.entries(args)
+					.map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+					.join(", ");
+				toolCalls.push(`${block.name}(${argsStr})`);
+			}
+		}
+
+		if (thinkingParts.length > 0) {
+			parts.push(`[Assistant thinking]: ${thinkingParts.join("\n")}`);
+		}
+		if (msg.content.some((block) => block.type === "text")) {
+			parts.push(`[Assistant]: ${contentText(msg.content)}`);
+		}
+		if (toolCalls.length > 0) {
+			parts.push(`[Assistant tool calls]: ${toolCalls.join("; ")}`);
+		}
+		return parts.join("\n\n");
+	}
+	if (msg.role === "toolResult") {
+		const content = boundedContentText(msg.content, TOOL_RESULT_MAX_CHARS);
+		return content ? `[Tool result]: ${msg.toolName} (call ${msg.toolCallId})\n${content}` : "";
+	}
+	return "";
+}
+
+/**
  * Serialize LLM messages to text for summarization.
  * This prevents the model from treating it as a conversation to continue.
  * Call convertToLlm() first to handle custom message types.
@@ -167,46 +212,10 @@ function boundedContentText(content: string | readonly { type: string; text?: st
  * reasonable token budgets. Full content is not needed for summarization.
  */
 export function serializeConversation(messages: Message[]): string {
-	const parts: string[] = [];
-
-	for (const msg of messages) {
-		if (msg.role === "user") {
-			const content = contentText(msg.content, "");
-			if (content) parts.push(`[User]: ${content}`);
-		} else if (msg.role === "assistant") {
-			const thinkingParts: string[] = [];
-			const toolCalls: string[] = [];
-
-			for (const block of msg.content) {
-				if (block.type === "thinking") {
-					thinkingParts.push(block.thinking);
-				} else if (block.type === "toolCall") {
-					const args = block.arguments as Record<string, unknown>;
-					const argsStr = Object.entries(args)
-						.map(([k, v]) => `${k}=${JSON.stringify(v)}`)
-						.join(", ");
-					toolCalls.push(`${block.name}(${argsStr})`);
-				}
-			}
-
-			if (thinkingParts.length > 0) {
-				parts.push(`[Assistant thinking]: ${thinkingParts.join("\n")}`);
-			}
-			if (msg.content.some((block) => block.type === "text")) {
-				parts.push(`[Assistant]: ${contentText(msg.content)}`);
-			}
-			if (toolCalls.length > 0) {
-				parts.push(`[Assistant tool calls]: ${toolCalls.join("; ")}`);
-			}
-		} else if (msg.role === "toolResult") {
-			const content = boundedContentText(msg.content, TOOL_RESULT_MAX_CHARS);
-			if (content) {
-				parts.push(`[Tool result]: ${msg.toolName} (call ${msg.toolCallId})\n${content}`);
-			}
-		}
-	}
-
-	return parts.join("\n\n");
+	return messages
+		.map(serializeMessage)
+		.filter((part) => part.length > 0)
+		.join("\n\n");
 }
 
 /** Estimate the token footprint of one message after summary serialization and truncation. */

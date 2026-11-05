@@ -1,6 +1,6 @@
 {
 	"name": "@earendil-works/pi-ext-web-access",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Web search, fetch, and content-extraction extension for pie (vendored from pi-web-access)",
 	"type": "module",
 	"main": "./index.ts",
@@ -11,12 +11,12 @@
 		"LICENSE",
 		"SECURITY.md"
 	],
-  "scripts": {
-    "clean": "shx rm -rf dist",
-    "build": "tsgo -p tsconfig.build.json",
-    "typecheck": "tsgo -p tsconfig.build.json",
-    "test": "vitest --run"
-  },
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json",
+		"typecheck": "tsgo -p tsconfig.build.json",
+		"test": "vitest --run"
+	},
 	"license": "MIT",
 	"dependencies": {
 		"@mozilla/readability": "0.6.0",
@@ -30,9 +30,9 @@
 		"undici": "8.10.2"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-ai": "^0.1.0",
-		"@earendil-works/pi-coding-agent": "^0.1.0",
-		"@earendil-works/pi-tui": "^0.1.0"
+		"@earendil-works/pi-ai": "^0.1.1",
+		"@earendil-works/pi-coding-agent": "^0.1.1",
+		"@earendil-works/pi-tui": "^0.1.1"
 	},
 	"pi": {
 		"extensions": [

@@ -55,6 +55,7 @@ Type `/` in the editor to open command completion. Extensions can register custo
 | `/import <file>` | Import and resume a session from a JSONL file |
 | `/share` | Upload as private GitHub gist with shareable HTML link |
 | `/reload` | Reload keybindings, extensions, skills, prompts, themes, and context files |
+| `/update` | Fast-forward the git checkout Pie was installed from and reinstall it (`scripts/update-pie.sh`) |
 | `/hotkeys` | Show all keyboard shortcuts |
 | `/changelog` | Display version history |
 | `/quit` | Quit pi |
@@ -102,7 +103,7 @@ Useful session commands:
 - `/tree` navigates the in-file session tree and can summarize abandoned branches.
 - `/fork` creates a new session from an earlier user message.
 - `/clone` duplicates the current active branch into a new session file.
-- Automatic compaction starts at the earlier of 87% context usage or the configured response-token reserve; `/compact` summarizes older messages manually.
+- Automatic compaction starts at the earlier of 87% context usage or the configured reserve boundary; `/compact` summarizes older messages manually.
 
 See [Sessions](sessions.md) and [Compaction](compaction.md) for details.
 

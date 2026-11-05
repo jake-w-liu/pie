@@ -43,6 +43,7 @@
 		"publish:dry": "npm run prepublishOnly && node scripts/publish.mjs --dry-run",
 		"release:local": "node scripts/local-release.mjs",
 		"refresh:pie": "bash scripts/refresh-pie.sh",
+		"update:pie": "bash scripts/update-pie.sh",
 		"shrinkwrap:coding-agent": "node scripts/generate-coding-agent-shrinkwrap.mjs",
 		"install-lock:coding-agent": "node scripts/generate-coding-agent-install-lock.mjs",
 		"release:patch": "node scripts/release.mjs patch",

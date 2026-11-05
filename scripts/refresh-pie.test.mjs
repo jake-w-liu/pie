@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -184,4 +184,86 @@ test("refresh with --no-push commits without contacting the remote", { skip: pro
 	assert.equal(result.status, 0, result.stderr);
 	assert.match(result.stdout, /RESULT 0\.1\.1 true false/);
 	assert.equal(git(work, "log", "-1", "--format=%s"), "Bump version to 0.1.1");
+});
+
+/** A release root with managed releases (each with the refresh marker unless marker is false). */
+function createReleaseRoot() {
+	const root = mkdtempSync(join(tmpdir(), "pie-refresh-prune-"));
+	temporaryRoots.push(root);
+	const releases = join(root, "pie-releases");
+	const release = (name, { marker = true } = {}) => {
+		const directory = join(releases, name);
+		mkdirSync(join(directory, "node_modules"), { recursive: true });
+		if (marker) writeFileSync(join(directory, ".pie-refresh-release"), "");
+		return directory;
+	};
+	return { root, releases, release };
+}
+
+function runPrune(releases, active, env) {
+	const probe = `set -euo pipefail
+releases_dir="$1"
+${extractFunction("remove_owned_directory")}
+${extractFunction("remove_managed_release")}
+${extractFunction("release_in_use")}
+${extractFunction("retain_in_use_release")}
+${extractFunction("prune_old_releases")}
+prune_old_releases "$2"
+release_in_use "$2" && echo "active in use" || echo "active free"
+`;
+	// An absolute bash path, because env.PATH may deliberately lack common tools.
+	return spawnSync("/bin/bash", ["-c", probe, "probe", releases, active], { encoding: "utf8", env });
+}
+
+test("refresh removes every old release that no running process uses", { skip: process.platform === "win32" }, () => {
+	const { root, releases, release } = createReleaseRoot();
+	const active = release("release.ACTIVE");
+	const old = [release("release.OLD001"), release("release.OLD002")];
+	const live = release("release.LIVE01");
+	const unmarked = release("release.NOMARK", { marker: false });
+	const linkTarget = join(root, "link-target");
+	mkdirSync(linkTarget);
+	writeFileSync(join(linkTarget, ".pie-refresh-release"), "");
+	symlinkSync(linkTarget, join(releases, "release.LINK01"));
+	// A running Pie process keeps its installation's package.json open (pinInstallation).
+	const bin = join(root, "bin");
+	mkdirSync(bin);
+	const lsofLog = join(root, "lsof.log");
+	writeFileSync(
+		join(bin, "lsof"),
+		`#!/bin/bash\nprintf '%s\\n' "$*" >> "${lsofLog}"\necho p123\necho "n${live}/node_modules/@earendil-works/pi-coding-agent/package.json"\n`,
+		{ mode: 0o755 },
+	);
+
+	const result = runPrune(releases, active, { ...process.env, PATH: `${bin}:${process.env.PATH}` });
+
+	assert.equal(result.status, 0, result.stderr);
+	assert.ok(existsSync(active));
+	assert.match(result.stdout, /active free/);
+	for (const directory of old) assert.ok(!existsSync(directory), `${directory} was not removed`);
+	assert.ok(existsSync(live));
+	assert.match(result.stderr, /keeping release .*release\.LIVE01, which a running Pie process uses/);
+	assert.ok(existsSync(unmarked));
+	assert.match(result.stderr, /without a release marker: .*release\.NOMARK/);
+	// A symlink is neither followed nor removed.
+	assert.ok(existsSync(join(releases, "release.LINK01")));
+	assert.ok(existsSync(join(linkTarget, ".pie-refresh-release")));
+	// Name lookups made a single system-wide listing take about 26 seconds on macOS.
+	for (const line of readFileSync(lsofLog, "utf8").trim().split("\n")) assert.equal(line, "-n -P -F n");
+});
+
+test("refresh keeps old releases when it cannot check whether they are in use", { skip: process.platform === "win32" }, () => {
+	const { root, releases, release } = createReleaseRoot();
+	const active = release("release.ACTIVE");
+	const old = release("release.OLD001");
+	const emptyBin = join(root, "empty-bin");
+	mkdirSync(emptyBin);
+
+	const result = runPrune(releases, active, { ...process.env, PATH: emptyBin });
+
+	assert.equal(result.status, 0, result.stderr);
+	assert.ok(existsSync(old));
+	assert.match(result.stderr, /lsof not found; keeping old releases/);
+	// Without lsof, release_in_use reports every release as in use.
+	assert.match(result.stdout, /active in use/);
 });

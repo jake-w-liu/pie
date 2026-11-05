@@ -113,6 +113,7 @@ import { ensureTool, type ToolStatus } from "../../utils/tools-manager.ts";
 import { ArminComponent } from "./components/armin.ts";
 import { AssistantMessageComponent } from "./components/assistant-message.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
+import { BorderedLoader } from "./components/bordered-loader.ts";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.ts";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.ts";
 import { CustomEditor } from "./components/custom-editor.ts";
@@ -154,6 +155,7 @@ import { UserMessageSelectorComponent } from "./components/user-message-selector
 import { editInExternalEditor } from "./external-editor.ts";
 import { refreshModelCatalogs } from "./model-catalog-refresh.ts";
 import { getModelSearchText } from "./model-search.ts";
+import { lastOutputLines, resolvePieSourceCheckout, runPieUpdate, summarizePieUpdate } from "./self-update.ts";
 import { shareSession } from "./session-share.ts";
 import {
 	getAvailableThemes,
@@ -3292,6 +3294,11 @@ export class InteractiveMode {
 				await this.handleReloadCommand();
 				return;
 			}
+			if (text === "/update") {
+				this.editor.setText("");
+				await this.handleUpdateCommand();
+				return;
+			}
 			if (text === "/debug") {
 				this.handleDebugCommand();
 				this.editor.setText("");
@@ -6368,6 +6375,71 @@ export class InteractiveMode {
 				return;
 			}
 			await this.handleFatalRuntimeError("Failed to import session", error);
+		}
+	}
+
+	/** Fetch the latest Pie source for the installed checkout and reinstall it. */
+	private async handleUpdateCommand(): Promise<void> {
+		if (process.platform === "win32") {
+			this.showError("/update uses scripts/refresh-pie.sh, which supports macOS and Linux.");
+			return;
+		}
+		// The update swaps the editor for its progress loader until the build finishes. During a
+		// response, the user could not steer it, and a tool's prompt would swap the loader out.
+		if (this.session.isStreaming) {
+			this.showWarning("Wait for the current response to finish before updating.");
+			return;
+		}
+		if (this.session.isCompacting) {
+			this.showWarning("Wait for compaction to finish before updating.");
+			return;
+		}
+		const checkout = resolvePieSourceCheckout();
+		if (!checkout.ok) {
+			this.showError(checkout.error);
+			return;
+		}
+
+		const loader = new BorderedLoader(this.ui, theme, `Updating ${APP_NAME} from ${checkout.repository}...`);
+		const restoreEditor = () => {
+			loader.dispose();
+			this.editorContainer.clear();
+			this.editorContainer.addChild(this.editor);
+			this.ui.setFocus(this.editor);
+			this.ui.requestRender();
+		};
+		this.editorContainer.clear();
+		this.editorContainer.addChild(loader);
+		this.ui.setFocus(loader);
+		this.ui.requestRender();
+
+		const controller = new AbortController();
+		loader.onAbort = () => controller.abort();
+		let pending = "";
+		try {
+			const result = await runPieUpdate(checkout, {
+				signal: controller.signal,
+				onOutput: (chunk) => {
+					pending = (pending + chunk).slice(-4096);
+					const latest = lastOutputLines(pending, 1)[0];
+					if (latest) {
+						loader.setMessage(`Updating ${APP_NAME}: ${latest}`);
+						this.ui.requestRender();
+					}
+				},
+			});
+			restoreEditor();
+			if (controller.signal.aborted) {
+				this.showStatus("Update cancelled.");
+			} else if (result.code === 0) {
+				this.showStatus(summarizePieUpdate(result.output));
+			} else {
+				const reason = result.code === null ? `signal ${result.signal}` : `exit code ${result.code}`;
+				this.showError(`Update failed (${reason}):\n${lastOutputLines(result.output, 15).join("\n")}`);
+			}
+		} catch (error) {
+			restoreEditor();
+			this.showError(`Update failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 

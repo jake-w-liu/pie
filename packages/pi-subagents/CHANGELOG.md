@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
+- The detached async runner keeps one file of its Pie installation open for its lifetime, so `npm run refresh:pie` and `/update` no longer delete an installation that a running subagent run still loads modules and starts children from.
 - Nested control results advance the projection cursor instead of being re-read on every status render, and are reclaimed once no waiter can still match them, so the nested event sink no longer grows without bound.
 - A workflow child aborted during setup is retried once under a delegated one-use child permit, instead of failing with a misleading permit error; the retry is host-initiated, granted for that child only, and bounded to one spawn so a delegated workflow still cannot spawn unbounded children. A launch refused for a mismatched projection no longer consumes the allowance.
 

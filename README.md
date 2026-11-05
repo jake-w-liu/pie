@@ -50,9 +50,24 @@ npm run refresh:pie
 
 Each refresh first bumps every package to the next patch version, commits only the version files (`Bump version to X.Y.Z`), and pushes the current branch to its upstream; it stops before bumping if the branch is behind its upstream or a version file has uncommitted edits. Other uncommitted work is built and installed but not committed, and no tag is created. If the push fails, the installation still completes and the command exits with status 1. Pass `-- --no-push` to commit without pushing (for example, offline) or `-- --no-bump` to reinstall the current version without any git changes.
 
-The command then reuses the installed model catalog data when available, builds offline, packs Pie and its six internal runtime workspaces, validates a versioned release, atomically switches `~/.local/bin/pie`, updates `~/.local/share/pie`, and removes repository build artifacts. On a first install it hydrates model data before building. Pass `-- --check`, `-- --test`, `-- --online-models`, `-- --keep-build`, or `-- --slim` when needed. `--slim` also removes the repository `node_modules` after a successful install so the checkout stays minimal; run `npm ci` (or the next refresh) to restore it. Run it only when no other build or test is using the checkout because cleanup removes shared `dist/` outputs. Already-running Pie sessions must be restarted.
+The command then reuses the installed model catalog data when available, builds offline, packs Pie and its six internal runtime workspaces, validates a versioned release, atomically switches `~/.local/bin/pie`, updates `~/.local/share/pie`, removes older installations that no running Pie process uses, and removes repository build artifacts. Running Pie processes and detached subagent runs keep a file of their installation open, so a release in use is kept until a later refresh finds it unused; without `lsof` every old release is kept. On a first install it hydrates model data before building. Pass `-- --check`, `-- --test`, `-- --online-models`, `-- --keep-build`, or `-- --slim` when needed. `--slim` also removes the repository `node_modules` after a successful install so the checkout stays minimal; run `npm ci` (or the next refresh) to restore it. Run it only when no other build or test is using the checkout because cleanup removes shared `dist/` outputs. Already-running Pie sessions must be restarted.
 
 Pie is source-managed; its `update` command updates installed packages rather than the application itself.
+
+### Updating other machines
+
+On every machine that runs Pie from a checkout of this repository, `/update` in Pie (or `npm run update:pie` in the checkout) installs the latest pushed code. It reads the checkout path that `refresh:pie` records with each installation, fetches the branch's upstream, fast-forwards the checkout, runs `npm ci --ignore-scripts` when `package-lock.json` changed or is newer than the installed dependencies, and reinstalls with `refresh:pie -- --no-bump`, so updating never creates commits or pushes. It stops without changes when the checkout has uncommitted changes to tracked files or has diverged from its upstream, and skips the reinstall when the installed build already matches the upstream. It waits for a running response or compaction to finish first, because the update takes over the editor until the build completes. Restart Pie sessions afterwards.
+
+A machine whose installation predates `/update` needs one manual update first:
+
+```bash
+cd <your Pie checkout>
+git pull --ff-only
+npm ci --ignore-scripts
+npm run refresh:pie -- --no-bump
+```
+
+For a new machine, clone `https://github.com/jake-w-liu/pie.git` and run the last two commands in the clone.
 
 ## Checking upstream for Pie
 

@@ -46,6 +46,11 @@ export class BorderedLoader extends Container {
 		return this.signalController?.signal ?? new AbortController().signal;
 	}
 
+	/** Replace the loader message, for example with the latest progress line. */
+	setMessage(message: string): void {
+		this.loader.setMessage(message);
+	}
+
 	set onAbort(fn: (() => void) | undefined) {
 		if (this.cancellable) {
 			(this.loader as CancellableLoader).onAbort = fn;

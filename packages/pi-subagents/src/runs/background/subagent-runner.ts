@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { finished } from "node:stream/promises";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Message } from "@earendil-works/pi-ai";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { writeAsyncResultFile, writePendingAsyncResultFile } from "./result-files.ts";
@@ -5710,6 +5710,17 @@ function startConfiguredSubagent(config: SubagentRunConfig): void {
 		console.error("Subagent runner error:", runErr);
 		process.exit(1);
 	});
+}
+
+// Keep this module open for the life of the runner. scripts/refresh-pie.sh deletes an old Pie
+// installation only when lsof shows no process with a file open under it, and the runner loads
+// modules and starts subagents from its installation after the session that started it exits.
+if (process.platform !== "win32") {
+	try {
+		fs.openSync(fileURLToPath(import.meta.url), "r");
+	} catch {
+		// Without the descriptor, refresh-pie.sh can only see the runner through other open files.
+	}
 }
 
 const configArg = process.argv[2];

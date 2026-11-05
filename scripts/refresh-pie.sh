@@ -7,8 +7,9 @@ Usage: scripts/refresh-pie.sh [options]
 
 Bump every Pie package to the next patch version, commit the bump, and push the
 current branch. Then build the checkout, stage and validate a local npm
-installation, atomically activate it for new terminal invocations, and remove
-repository build artifacts. The upstream `pi` executable is never modified.
+installation, atomically activate it for new terminal invocations, remove older
+installations that no running Pie process uses, and remove repository build
+artifacts. The upstream `pi` executable is never modified.
 
 The version commit contains only version files (package manifests, lockfiles,
 the coding-agent shrinkwrap and install lock, and README.md), which must have
@@ -189,15 +190,14 @@ remove_managed_release() {
 	remove_owned_directory "$directory" ".pie-refresh-release"
 }
 
-# Best-effort check: true when a live process still holds files open under
-# $1. Used to avoid deleting the previous release out from under running Pie
-# sessions (long-lived sessions keep running from the old directory after
-# activation, and Node module resolution from a deleted path fails). When
-# lsof is unavailable the check reports "not in use" and behavior is
-# unchanged apart from the restart reminder at the end of refresh.
+# True when a live process has files open under $1, so the release is not deleted out
+# from under it: Pie sessions keep running from their release after activation, load
+# modules from it lazily, and start subagents from it. Pie processes and the subagent
+# runner keep a file in their installation open for their lifetime, which makes them
+# visible here. Without lsof, use cannot be checked, so the release counts as in use.
 release_in_use() {
 	local directory="$1"
-	command -v lsof >/dev/null 2>&1 || return 1
+	command -v lsof >/dev/null 2>&1 || return 0
 	# Resolve symlinks (/tmp -> /private/tmp on macOS) so the prefix match hits.
 	# Match both the raw and resolved forms: lsof prints the path as opened,
 	# which may differ from the canonical directory path via symlinks.
@@ -208,8 +208,9 @@ release_in_use() {
 	# Capture the listing first: under pipefail, `lsof | grep -q` reports failure exactly when
 	# grep matches early, because lsof then dies of SIGPIPE (status 141). That inverted this
 	# check and removed the release live sessions were still running from.
+	# -n and -P skip host and port name lookups, which can take tens of seconds.
 	local listing
-	listing="$(lsof -F n 2>/dev/null || true)"
+	listing="$(lsof -n -P -F n 2>/dev/null || true)"
 	if [[ "$resolved" == "$directory" ]]; then
 		grep -qF "n$directory" <<<"$listing"
 	else
@@ -218,7 +219,32 @@ release_in_use() {
 }
 
 retain_in_use_release() {
-	printf 'warning: retaining in-use previous release: %s (restart sessions using it, then remove manually)\n' "$1" >&2
+	printf 'note: keeping release %s, which a running Pie process uses; a later refresh removes it\n' "$1" >&2
+}
+
+# Remove every managed release except the active one ($1), keeping releases that live
+# processes use. A release kept for a running session is removed by a later refresh,
+# after that session exits, so releases do not accumulate.
+prune_old_releases() {
+	local active="$1" directory
+	if ! command -v lsof >/dev/null 2>&1; then
+		printf 'warning: lsof not found; keeping old releases in %s because their use cannot be checked\n' "$releases_dir" >&2
+		return 0
+	fi
+	for directory in "$releases_dir"/release.*; do
+		if [[ "$directory" == "$active" || -L "$directory" || ! -d "$directory" ]]; then
+			continue
+		fi
+		if [[ ! -f "$directory/.pie-refresh-release" ]]; then
+			printf 'warning: skipping directory without a release marker: %s\n' "$directory" >&2
+			continue
+		fi
+		if release_in_use "$directory"; then
+			retain_in_use_release "$directory"
+		elif ! remove_managed_release "$directory"; then
+			printf 'warning: could not remove old release: %s\n' "$directory" >&2
+		fi
+	done
 }
 
 restore_original_activation() {
@@ -349,6 +375,35 @@ bump_commit_and_push() {
 			printf 'warning: git push failed; the version commit is only local. Retry with: git push %s HEAD:%s\n' "$push_remote" "$push_ref" >&2
 		fi
 	fi
+}
+
+# Record the checkout a release was built from in its source.json, so `/update` and
+# scripts/update-pie.sh can find the repository to update later.
+# $3 and $4 are the commit and dirty state (true or false) captured when the build started.
+write_source_metadata() {
+	local destination="$1" version="$2" revision="$3" dirty="$4"
+	local branch remote="" remote_url=""
+	branch="$(git -C "$repo_dir" symbolic-ref --quiet --short HEAD || true)"
+	if [[ -n "$branch" ]]; then
+		remote="$(git -C "$repo_dir" config --get "branch.$branch.remote" || true)"
+	fi
+	if [[ -n "$remote" ]]; then
+		remote_url="$(git -C "$repo_dir" config --get "remote.$remote.url" || true)"
+	fi
+	node --input-type=module -e '
+		import { writeFileSync } from "node:fs";
+		const [destination, repository, branch, remote, remoteUrl, revision, dirty, version] = process.argv.slice(1);
+		const metadata = {
+			repository,
+			branch: branch || null,
+			remote: remote || null,
+			remoteUrl: remoteUrl || null,
+			revision,
+			dirty: dirty === "true",
+			version,
+		};
+		writeFileSync(destination, `${JSON.stringify(metadata, null, "\t")}\n`);
+	' "$destination" "$repo_dir" "$branch" "$remote" "$remote_url" "$revision" "$dirty" "$version"
 }
 
 # Put back the version files saved before an uncommitted bump, so a failed refresh
@@ -497,8 +552,13 @@ if [[ "$bump" == true ]]; then
 	bump_commit_and_push
 fi
 
+# Record what the build is made from before it starts; source.json reports it, and
+# scripts/update-pie.sh skips reinstalling only a clean build of the upstream commit.
+source_commit="$(git rev-parse HEAD)"
 source_revision="$(git rev-parse --short=12 HEAD)"
+source_dirty=false
 if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+	source_dirty=true
 	source_revision="$source_revision-dirty"
 	if [[ "$bump" == true ]]; then
 		printf 'note: uncommitted changes are included in this build but not in the version commit\n' >&2
@@ -619,6 +679,7 @@ if [[ "$(cd /tmp && "$release_pie" --version)" != "$expected_version" ]]; then
 	exit 1
 fi
 (cd /tmp && "$release_pie" --help >/dev/null)
+write_source_metadata "$release_dir/source.json" "$expected_version" "$source_commit" "$source_dirty"
 
 # The terminal launcher is the activation point. renameSync atomically replaces
 # its symlink, so a concurrent invocation resolves either the old or new release.
@@ -659,27 +720,7 @@ if [[ -n "$backup_dir" ]]; then
 	remove_owned_directory "$backup_dir" ".pie-refresh-owned"
 	backup_dir=""
 fi
-if [[ "$original_canonical_type" == "symlink" && "$original_canonical_target" != "$release_dir" ]]; then
-	if release_in_use "$original_canonical_target"; then
-		retain_in_use_release "$original_canonical_target"
-	else
-		remove_managed_release "$original_canonical_target"
-	fi
-fi
-if [[ "$original_bin_exists" == true ]]; then
-	case "$original_bin_target" in
-		"$releases_dir"/release.*/node_modules/.bin/pie)
-			previous_bin_release="${original_bin_target%/node_modules/.bin/pie}"
-			if [[ "$previous_bin_release" != "$release_dir" && "$previous_bin_release" != "$original_canonical_target" ]]; then
-				if release_in_use "$previous_bin_release"; then
-					retain_in_use_release "$previous_bin_release"
-				else
-					remove_managed_release "$previous_bin_release"
-				fi
-			fi
-			;;
-	esac
-fi
+prune_old_releases "$release_dir"
 
 printf 'Installed Pie %s from %s\n' "$expected_version" "$source_revision"
 printf 'Bundle SHA-256: %s\n' "$source_bundle_hash"

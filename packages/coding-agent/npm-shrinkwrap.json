@@ -1,21 +1,21 @@
 {
 	"name": "@earendil-works/pi-coding-agent",
-	"version": "0.1.5",
+	"version": "0.1.6",
 	"lockfileVersion": 3,
 	"requires": true,
 	"packages": {
 		"": {
 			"name": "@earendil-works/pi-coding-agent",
-			"version": "0.1.5",
+			"version": "0.1.6",
 			"license": "MIT",
 			"dependencies": {
-				"@earendil-works/pi-agent-core": "^0.1.5",
-				"@earendil-works/pi-ai": "^0.1.5",
-				"@earendil-works/pi-client": "^0.1.5",
-				"@earendil-works/pi-ext-subagents": "^0.1.5",
-				"@earendil-works/pi-ext-web-access": "^0.1.5",
-				"@earendil-works/pi-protocol": "^0.1.5",
-				"@earendil-works/pi-tui": "^0.1.5",
+				"@earendil-works/pi-agent-core": "^0.1.6",
+				"@earendil-works/pi-ai": "^0.1.6",
+				"@earendil-works/pi-client": "^0.1.6",
+				"@earendil-works/pi-ext-subagents": "^0.1.6",
+				"@earendil-works/pi-ext-web-access": "^0.1.6",
+				"@earendil-works/pi-protocol": "^0.1.6",
+				"@earendil-works/pi-tui": "^0.1.6",
 				"@silvia-odwyer/photon-node": "0.3.4",
 				"chalk": "5.6.2",
 				"cross-spawn": "7.0.6",
@@ -479,12 +479,12 @@
 			}
 		},
 		"node_modules/@earendil-works/pi-agent-core": {
-			"version": "0.1.5",
-			"resolved": "https://registry.npmjs.org/@earendil-works/pi-agent-core/-/pi-agent-core-0.1.5.tgz",
+			"version": "0.1.6",
+			"resolved": "https://registry.npmjs.org/@earendil-works/pi-agent-core/-/pi-agent-core-0.1.6.tgz",
 			"license": "MIT",
 			"dependencies": {
-				"@earendil-works/pi-ai": "^0.1.5",
-				"@earendil-works/pi-telemetry": "^0.1.5",
+				"@earendil-works/pi-ai": "^0.1.6",
+				"@earendil-works/pi-telemetry": "^0.1.6",
 				"diff": "8.0.4",
 				"ignore": "7.0.5",
 				"typebox": "1.3.7",
@@ -495,13 +495,13 @@
 			}
 		},
 		"node_modules/@earendil-works/pi-ai": {
-			"version": "0.1.5",
-			"resolved": "https://registry.npmjs.org/@earendil-works/pi-ai/-/pi-ai-0.1.5.tgz",
+			"version": "0.1.6",
+			"resolved": "https://registry.npmjs.org/@earendil-works/pi-ai/-/pi-ai-0.1.6.tgz",
 			"license": "MIT",
 			"dependencies": {
 				"@anthropic-ai/sdk": "0.91.1",
 				"@aws-sdk/client-bedrock-runtime": "3.1048.0",
-				"@earendil-works/pi-telemetry": "^0.1.5",
+				"@earendil-works/pi-telemetry": "^0.1.6",
 				"@google/genai": "1.52.0",
 				"@smithy/node-http-handler": "4.7.3",
 				"http-proxy-agent": "7.0.2",
@@ -518,19 +518,19 @@
 			}
 		},
 		"node_modules/@earendil-works/pi-client": {
-			"version": "0.1.5",
-			"resolved": "https://registry.npmjs.org/@earendil-works/pi-client/-/pi-client-0.1.5.tgz",
+			"version": "0.1.6",
+			"resolved": "https://registry.npmjs.org/@earendil-works/pi-client/-/pi-client-0.1.6.tgz",
 			"license": "MIT",
 			"dependencies": {
-				"@earendil-works/pi-protocol": "^0.1.5"
+				"@earendil-works/pi-protocol": "^0.1.6"
 			},
 			"engines": {
 				"node": ">=22.19.0"
 			}
 		},
 		"node_modules/@earendil-works/pi-ext-subagents": {
-			"version": "0.1.5",
-			"resolved": "https://registry.npmjs.org/@earendil-works/pi-ext-subagents/-/pi-ext-subagents-0.1.5.tgz",
+			"version": "0.1.6",
+			"resolved": "https://registry.npmjs.org/@earendil-works/pi-ext-subagents/-/pi-ext-subagents-0.1.6.tgz",
 			"license": "MIT",
 			"dependencies": {
 				"acorn": "8.18.0",
@@ -539,15 +539,15 @@
 				"yaml": "2.8.3"
 			},
 			"peerDependencies": {
-				"@earendil-works/pi-ai": "^0.1.5",
-				"@earendil-works/pi-agent-core": "^0.1.5",
-				"@earendil-works/pi-coding-agent": "^0.1.5",
-				"@earendil-works/pi-tui": "^0.1.5"
+				"@earendil-works/pi-ai": "^0.1.6",
+				"@earendil-works/pi-agent-core": "^0.1.6",
+				"@earendil-works/pi-coding-agent": "^0.1.6",
+				"@earendil-works/pi-tui": "^0.1.6"
 			}
 		},
 		"node_modules/@earendil-works/pi-ext-web-access": {
-			"version": "0.1.5",
-			"resolved": "https://registry.npmjs.org/@earendil-works/pi-ext-web-access/-/pi-ext-web-access-0.1.5.tgz",
+			"version": "0.1.6",
+			"resolved": "https://registry.npmjs.org/@earendil-works/pi-ext-web-access/-/pi-ext-web-access-0.1.6.tgz",
 			"license": "MIT",
 			"dependencies": {
 				"@mozilla/readability": "0.6.0",
@@ -561,14 +561,14 @@
 				"undici": "8.10.2"
 			},
 			"peerDependencies": {
-				"@earendil-works/pi-ai": "^0.1.5",
-				"@earendil-works/pi-coding-agent": "^0.1.5",
-				"@earendil-works/pi-tui": "^0.1.5"
+				"@earendil-works/pi-ai": "^0.1.6",
+				"@earendil-works/pi-coding-agent": "^0.1.6",
+				"@earendil-works/pi-tui": "^0.1.6"
 			}
 		},
 		"node_modules/@earendil-works/pi-protocol": {
-			"version": "0.1.5",
-			"resolved": "https://registry.npmjs.org/@earendil-works/pi-protocol/-/pi-protocol-0.1.5.tgz",
+			"version": "0.1.6",
+			"resolved": "https://registry.npmjs.org/@earendil-works/pi-protocol/-/pi-protocol-0.1.6.tgz",
 			"license": "MIT",
 			"dependencies": {
 				"typebox": "1.3.7"
@@ -578,16 +578,16 @@
 			}
 		},
 		"node_modules/@earendil-works/pi-telemetry": {
-			"version": "0.1.5",
-			"resolved": "https://registry.npmjs.org/@earendil-works/pi-telemetry/-/pi-telemetry-0.1.5.tgz",
+			"version": "0.1.6",
+			"resolved": "https://registry.npmjs.org/@earendil-works/pi-telemetry/-/pi-telemetry-0.1.6.tgz",
 			"license": "MIT",
 			"engines": {
 				"node": ">=22.19.0"
 			}
 		},
 		"node_modules/@earendil-works/pi-tui": {
-			"version": "0.1.5",
-			"resolved": "https://registry.npmjs.org/@earendil-works/pi-tui/-/pi-tui-0.1.5.tgz",
+			"version": "0.1.6",
+			"resolved": "https://registry.npmjs.org/@earendil-works/pi-tui/-/pi-tui-0.1.6.tgz",
 			"license": "MIT",
 			"dependencies": {
 				"get-east-asian-width": "1.6.0",

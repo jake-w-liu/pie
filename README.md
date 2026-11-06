@@ -4,7 +4,7 @@ Pie is a terminal coding agent and a maintained fork of [Pi Agent](https://githu
 
 Pie keeps Pi's provider support, sessions, SDK, and extension system while shipping an opinionated local setup under the `pie` command. Only the `pie` executable is shipped; the Pi ecosystem (packages, extensions, sessions, credentials in `~/.pi`) stays fully accessible.
 
-- **Pie version:** `0.1.5`
+- **Pie version:** `0.1.6`
 - **Upstream base:** Pi commit [`56f3f33`](https://github.com/earendil-works/pi/commit/56f3f33a9a675ef2a2c30cf2e35a6a385cdf2ed4)
 - **Repository:** <https://github.com/jake-w-liu/pie>
 

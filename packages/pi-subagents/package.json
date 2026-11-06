@@ -1,6 +1,6 @@
 {
 	"name": "@earendil-works/pi-ext-subagents",
-	"version": "0.1.5",
+	"version": "0.1.6",
 	"description": "Subagent orchestration, fleet UI, and workflow extension for pie (vendored from pi-subagents)",
 	"type": "module",
 	"exports": {
@@ -40,10 +40,10 @@
 		"yaml": "2.8.3"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-ai": "^0.1.5",
-		"@earendil-works/pi-agent-core": "^0.1.5",
-		"@earendil-works/pi-coding-agent": "^0.1.5",
-		"@earendil-works/pi-tui": "^0.1.5"
+		"@earendil-works/pi-ai": "^0.1.6",
+		"@earendil-works/pi-agent-core": "^0.1.6",
+		"@earendil-works/pi-coding-agent": "^0.1.6",
+		"@earendil-works/pi-tui": "^0.1.6"
 	},
 	"pi": {
 		"extensions": [

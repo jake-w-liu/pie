@@ -4,7 +4,9 @@
 
 ### Added
 
+- The generated model catalog now also reads models.dev's v2 catalog and folds in the chat models the legacy catalog omits, so newer entries such as `chat-latest`, `gpt-5.6-cyber`, `gpt-6-cyber`, `gemini-robotics-er-2-preview`, and `qwen4-max-preview` ship in the built-in catalog. Legacy entries keep their existing metadata; the v2 catalog only adds models it alone lists, and its entry type keeps non-chat entries (realtime, image, speech) out.
 - Added GPT-6 Astra, GPT-6 Luna, GPT-6 Sol, and GPT-6.1 Sol to the OpenAI Codex (ChatGPT OAuth) model list, with the effort ladder each build advertises (`none` only on Sol and Luna) and 272K context.
+- The OpenAI Codex model list now also carries GPT-6.1 Terra, GPT-6.2 Astra, and GPT-6.2 Sol, and GPT-6.1 Sol, GPT-6.1 Terra, and GPT-6.2 Sol use their 500K context window. Added DeepSeek V4.1 Flash (`deepseek-flash`) and MiniMax-M3.1-Flash, and stopped filtering MiniMax-M3.1-Flash out of the direct MiniMax providers.
 - GPT-6 models on the OpenAI API and Azure OpenAI now use the 272K short-context tier and carry long-context pricing tiers plus tool-search and `additional_tools` support, matching the OpenAI list prices the gateway catalogs report.
 - Added `RetryCallbacks.onResponse` to report every physical attempt, including failed and aborted responses, for complete usage accounting.
 - NVIDIA and OpenRouter now refresh their model catalogs live from their own `/models` endpoints at runtime instead of relying only on the shipped static catalog, so new models appear in the `/model` picker without waiting for a release. NVIDIA keeps its curated static baseline and adds newly-available chat models (filtering out embeddings, safety guards, and code/vision-only endpoints); OpenRouter replaces baseline entries with current metadata (context window, pricing, reasoning, tool support).

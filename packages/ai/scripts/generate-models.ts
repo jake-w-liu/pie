@@ -4,6 +4,12 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSy
 import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
 import { getEffortThinkingLevelMap, type ModelsDevReasoningOption } from "./models-dev-reasoning-options.ts";
+import {
+	loadModelsDevCatalog,
+	type ModelsDevCatalog,
+	type ModelsDevModel,
+	type ModelsDevProvider,
+} from "./models-dev-v2.ts";
 import { markModelCatalogOutput, replaceModelCatalogOutput } from "./owned-output-directory.ts";
 import {
 	getOpenRouterThinkingLevelMap,
@@ -92,49 +98,6 @@ function readGeneratorOptions(args: string[]): {
 }
 
 const generatorOptions = readGeneratorOptions(process.argv.slice(2));
-
-interface ModelsDevModel {
-	id: string;
-	name: string;
-	tool_call?: boolean;
-	structured_output?: boolean;
-	reasoning?: boolean;
-	reasoning_options?: ModelsDevReasoningOption[];
-	status?: string;
-	limit?: {
-		context?: number;
-		output?: number;
-	};
-	cost?: {
-		input?: number;
-		output?: number;
-		cache_read?: number;
-		cache_write?: number;
-		tiers?: {
-			input?: number;
-			output?: number;
-			cache_read?: number;
-			cache_write?: number;
-			tier?: {
-				type?: string;
-				size?: number;
-			};
-		}[];
-	};
-	modalities?: {
-		input?: string[];
-		output?: string[];
-	};
-	provider?: {
-		npm?: string;
-	};
-}
-
-interface ModelsDevProvider {
-	models?: Record<string, ModelsDevModel>;
-}
-
-type ModelsDevCatalog = Record<string, ModelsDevProvider>;
 
 interface NvidiaNimModelListItem {
 	id: string;
@@ -1008,13 +971,14 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	if (model.api === "anthropic-messages" && isAnthropicTemperatureUnsupportedModel(model.id)) {
 		mergeAnthropicMessagesCompat(model, { supportsTemperature: false });
 	}
-	if (model.api === "openai-completions" && model.id.includes("deepseek-v4")) {
+	const isDeepSeekFlash = model.id === "deepseek-flash" && model.provider === "deepseek";
+	if (model.api === "openai-completions" && (model.id.includes("deepseek-v4") || isDeepSeekFlash)) {
 		mergeThinkingLevelMap(
 			model,
 			model.provider === "openrouter"
 				? { ...DEEPSEEK_V4_THINKING_LEVEL_MAP, xhigh: "xhigh", max: null }
 				: (model.provider === "deepseek" || model.provider === "opencode" || model.provider === "opencode-go") &&
-					model.id.includes("deepseek-v4-flash")
+					(model.id.includes("deepseek-v4-flash") || isDeepSeekFlash)
 					? DEEPSEEK_V4_FLASH_THINKING_LEVEL_MAP
 					: DEEPSEEK_V4_THINKING_LEVEL_MAP,
 		);
@@ -1509,9 +1473,7 @@ function processFireworksModels(provider: ModelsDevProvider | undefined): Model<
 async function loadModelsDevData(): Promise<Model<any>[]> {
 	try {
 		console.log("Fetching models from models.dev API...");
-		const response = await fetch("https://models.dev/api.json");
-		if (!response.ok) throw new Error(`models.dev API returned ${response.status}`);
-		const data = (await response.json()) as ModelsDevCatalog;
+		const data = await loadModelsDevCatalog();
 
 		const models: Model<any>[] = [];
 		const nvidiaNimModelIds = data.nvidia?.models ? await fetchNvidiaNimModelIds() : new Map<string, string>();
@@ -2632,6 +2594,24 @@ async function generateModels() {
 	};
 	const deepseekV4Models: Model<"openai-completions">[] = [
 		{
+			id: "deepseek-flash",
+			name: "DeepSeek V4.1 Flash",
+			api: "openai-completions",
+			baseUrl: "https://api.deepseek.com",
+			provider: "deepseek",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: {
+				input: 0.3,
+				output: 1.2,
+				cacheRead: 0.006,
+				cacheWrite: 0,
+			},
+			contextWindow: 1000000,
+			maxTokens: 384000,
+			compat: deepseekCompat,
+		},
+		{
 			id: "deepseek-v4-flash",
 			name: "DeepSeek V4 Flash",
 			api: "openai-completions",
@@ -2769,7 +2749,12 @@ async function generateModels() {
 		}
 	}
 
-	const minimaxDirectSupportedIds = new Set(["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M3"]);
+	const minimaxDirectSupportedIds = new Set([
+		"MiniMax-M2.7",
+		"MiniMax-M2.7-highspeed",
+		"MiniMax-M3",
+		"MiniMax-M3.1-Flash",
+	]);
 
 	for (let i = allModels.length - 1; i >= 0; i--) {
 		const candidate = allModels[i];
@@ -2783,11 +2768,12 @@ async function generateModels() {
 
 	// OpenAI Codex (ChatGPT OAuth) models
 	// NOTE: These are not fetched from models.dev; we keep a small, explicit list to avoid aliases.
-	// Older model limits are based on observed server behavior; GPT-5.6 and GPT-6 follow Codex's
-	// 272k catalog limit (formerly 372k).
+	// Older model limits are based on observed server behavior; GPT-5.6 and most GPT-6 builds follow
+	// Codex's 272k catalog limit (formerly 372k), while GPT-6.1 and later Sol/Terra builds report 500k.
 	const CODEX_BASE_URL = "https://chatgpt.com/backend-api";
 	const CODEX_CONTEXT = 272000;
 	const CODEX_GPT_56_CONTEXT = 272000;
+	const CODEX_LONG_CONTEXT = 500000;
 	const CODEX_SPARK_CONTEXT = 128000;
 	const CODEX_MAX_TOKENS = 128000;
 	// GPT-6 Codex builds expose the same effort ladder models.dev reports for the matching OpenAI
@@ -2934,7 +2920,46 @@ async function generateModels() {
 			input: ["text", "image"],
 			cost: withOpenAiLongContextPricing({ input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 }),
 			thinkingLevelMap: { ...CODEX_GPT_6_THINKING_LEVELS, off: null },
+			contextWindow: CODEX_LONG_CONTEXT,
+			maxTokens: CODEX_MAX_TOKENS,
+		},
+		{
+			id: "gpt-6.1-terra",
+			name: "GPT-6.1 Terra",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: CODEX_BASE_URL,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: withOpenAiLongContextPricing({ input: 1, output: 5, cacheRead: 0.05, cacheWrite: 1.25 }),
+			thinkingLevelMap: { ...CODEX_GPT_6_THINKING_LEVELS, off: "none" },
+			contextWindow: CODEX_LONG_CONTEXT,
+			maxTokens: CODEX_MAX_TOKENS,
+		},
+		{
+			id: "gpt-6.2-astra",
+			name: "GPT-6.2 Astra",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: CODEX_BASE_URL,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: withOpenAiLongContextPricing({ input: 8, output: 40, cacheRead: 0.4, cacheWrite: 10 }),
+			thinkingLevelMap: { ...CODEX_GPT_6_THINKING_LEVELS, off: null },
 			contextWindow: CODEX_CONTEXT,
+			maxTokens: CODEX_MAX_TOKENS,
+		},
+		{
+			id: "gpt-6.2-sol",
+			name: "GPT-6.2 Sol",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: CODEX_BASE_URL,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: withOpenAiLongContextPricing({ input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 }),
+			thinkingLevelMap: { ...CODEX_GPT_6_THINKING_LEVELS, off: null },
+			contextWindow: CODEX_LONG_CONTEXT,
 			maxTokens: CODEX_MAX_TOKENS,
 		},
 	];
